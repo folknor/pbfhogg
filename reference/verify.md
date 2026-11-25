@@ -145,9 +145,12 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   indexed node blob and one indexed way blob, the same change fails
   exactly the comparisons whose outputs hold the way: plain getid,
   `getid --invert` without way IDs and both `--add-referenced` modes. cat `--dedupe` is driven on four indexed
-  node blobs whose way exists only in the fake decoding, so every merge
-  keeps the declaration and the same change fails each merge's element
-  comparison; no real way blob is in that fixture. Its fake writes the
+  node blobs whose way exists only in the fake decoding, so every merge of
+  declaring operands keeps the declaration and the same change fails its
+  element comparison, while the two merges with the operand derived
+  without it compare no coordinates and pass it; a suppressed loss
+  warning fails exactly those two by name. No real way blob is in that
+  fixture. Its fake writes the
   layout the verifier's own plan predicts, so each merge's plan is also
   held to a hand-written segment trace, and a blob after the last segment
   and a wrong summary count each fail their arm in every merge. Each of these field-policy witnesses names the comparisons a fault fails, in
@@ -169,8 +172,15 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   splice copies them beside the renumbered refs. osmium renumber's output never declares it, so the
   renumber check judges the declaration only, never a coordinate value;
   the CLI suite holds the values. The kept declaration is what makes the element comparison read
-  every coordinate. A `cat --dedupe` of operands that disagree on the
-  declaration is not driven: the judgement reads one input header. The sort
+  every coordinate. The judgement reads every PBF operand of the run: the
+  output declares it exactly when every operand does and the command keeps
+  it, and carries the loss warning exactly when some operand declares it
+  and the output does not, so a spurious warning fails as a missing one
+  does. `cat --dedupe` drives a merge of operands that disagree (the
+  input with its selection derived without the declaration, in both
+  orders), held to the dropped declaration with the warning and to the
+  input's elements without coordinates; whether its rewritten ways keep
+  their arrays is not judged, since an undeclared output may carry them. The sort
   check holds its input to its domain of one object per kind and ID before
   judging anything pbfhogg did: a `HistoricalInformation`
   header is refused, and osmium's reference sort runs first, its output's
@@ -609,7 +619,7 @@ suite because a later comparison cannot make that run complete.
 | `field-policies` | osmium decodings of one-field edits of an osmium-built slice of the input | each policy reads exactly the field classes it claims, with every edit isolated by an independent decoding; `between` by declaration (see How outputs are judged) |
 | `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim; an input holding an object more than once (a history header, or a repeat the reference sort's order scan finds) is `ERROR` |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
-| `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, the disjoint union of that subset and its complement in both orders, and merges with a window of the input's own blobs in both orders: element equality with the input, blob layout and summary counts against the plan predicted from both framings, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
+| `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, the disjoint union of that subset and its complement in both orders, merges with a window of the input's own blobs in both orders, and on a `LocationsOnWays` input merges with the subset derived without the declaration in both orders: element equality with the input, blob layout and summary counts against the plan predicted from both framings, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
 | `tags-filter` | `osmium tags-filter -R`; `osmium tags-filter`, `-t` and `-i` | three expressions with omitted references, then default mode on `highway=primary`, `r/type=route_master` (nested relation closure), `--remove-tags w/highway=primary` and `--invert-match highway=primary`, same content/order checks as cat; default arms refuse inputs where osmium's sign folding could differ (below) |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
@@ -695,7 +705,10 @@ the input under `Policy::between`, claim the sort order, and keep or drop
 `LocationsOnWays` as documented. A window operand W, `osmium getid` of
 every second ID of the tail half of one interior node blob of A and the
 head half of the next, and of one interior way and relation blob, adds
-`dedupe(A, W)` and `dedupe(W, A)`. The derived operands carry no indexdata,
+`dedupe(A, W)` and `dedupe(W, A)`. On an input declaring
+`LocationsOnWays`, U, the selection derived without the declaration (held
+to lack it, else a verifier error), adds `dedupe(A, U)` and `dedupe(U, A)`.
+The derived operands carry no indexdata,
 so their runs pass `--force`; each must be strictly ordered and hold an
 object, else a verifier error.
 
@@ -705,8 +718,8 @@ Every merge is also held to the blob layout the documented plan
 payload bytes in place, each run's re-encoded blobs wholly within its ID
 span and ascending, nothing after the last segment; the summary's blob
 counts equal the prediction (pbfhogg's own account, beside the layout); and
-`LocationsOnWays` is kept when the input declares it, a way blob in a run
-included. The
+`LocationsOnWays` is kept when both operands declare it, a way blob in a
+run included, and dropped with the loss warning when only one does. The
 prediction's domain is every blob nonempty, single-kind, one element field
 per group, strictly ascending non-negative IDs, and indexdata, where
 present, equal to the decode; else a verifier error. The window must yield

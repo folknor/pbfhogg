@@ -756,7 +756,7 @@ pub fn run(
     harness.require_success(&captured, "pbfhogg renumber")?;
     harness.judge_way_locations(
         "pbfhogg renumber",
-        pbf,
+        &[pbf],
         &pbfhogg_out,
         &captured,
         crate::harness::WayLocations::Kept,

@@ -158,7 +158,7 @@ fn run_mode(
     harness.require_success(&captured, &format!("pbfhogg {label}"))?;
     harness.judge_way_locations(
         &format!("pbfhogg {label}"),
-        input.pbf,
+        &[input.pbf],
         &ours,
         &captured,
         crate::harness::WayLocations::Kept,

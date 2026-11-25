@@ -51,7 +51,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         harness.require_success(&captured, "pbfhogg cat")?;
         harness.judge_way_locations(
             &format!("pbfhogg cat -t {elem_type}"),
-            pbf,
+            &[pbf],
             &pbfhogg_out,
             &captured,
             locations,

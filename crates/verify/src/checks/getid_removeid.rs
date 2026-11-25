@@ -123,7 +123,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     harness.require_success(&captured, "pbfhogg getid")?;
     harness.judge_way_locations(
         "pbfhogg getid",
-        pbf,
+        &[pbf],
         &pbfhogg_getid,
         &captured,
         WayLocations::Kept,
@@ -291,7 +291,7 @@ impl Invert<'_> {
         } else {
             "pbfhogg getid --invert"
         };
-        harness.judge_way_locations(label, self.pbf, &ours, &captured, WayLocations::Kept)?;
+        harness.judge_way_locations(label, &[self.pbf], &ours, &captured, WayLocations::Kept)?;
 
         // The declaration, not payload arrays: undeclared arrays are not
         // content pbfhogg promises and its output never declares them, so

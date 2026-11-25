@@ -358,7 +358,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         )?;
         harness.judge_way_locations(
             &format!("pbfhogg extract --{strategy_name}"),
-            pbf,
+            &[pbf],
             &pbfhogg_out,
             &pbfhogg_captured,
             crate::harness::WayLocations::Kept,

@@ -3,9 +3,11 @@
 //! The input is four indexed node blobs, declaring `Sort.Type_then_ID` and
 //! `LocationsOnWays`, whose marker carries a way with an inline coordinate:
 //! the way exists in the fake decoding only, not in any blob. So no way blob
-//! is ever in an overlap run, every merge keeps the declaration, and each of
-//! the six merges compares inline coordinates (`Policy::between`, both
-//! declared). This witnesses the check's wiring and the field policy it
+//! is ever in an overlap run. The six merges of declaring operands keep the
+//! declaration and compare inline coordinates (`Policy::between`, both
+//! declared); the two merges with the selection derived without it
+//! ([`MIXED`]) drop it with the loss warning and compare none, and a
+//! suppressed warning fails exactly them. This witnesses the check's wiring and the field policy it
 //! passes; it does not witness a real way surviving dedupe, which no
 //! self-merge can show (a real way blob is always in the self run).
 //!
@@ -33,14 +35,24 @@ const BLOBS: [&[i64]; 4] = [&[1, 2], &[3, 4], &[5, 6], &[7, 8]];
 /// `R<min>-<reach>[<input>:<blob>,...]` a run and its members. The selection
 /// is the input's even blobs, its complement the odd ones, and the window
 /// `n4 n5`, bridging blobs 1 and 2.
-const TRACES: [&str; 6] = [
+const TRACES: [&str; 8] = [
     "self R1-2[0:0,1:0] R3-4[0:1,1:1] R5-6[0:2,1:2] R7-8[0:3,1:3]",
     "input+selected R1-2[0:0,1:0] P0:1 R5-6[0:2,1:1] P0:3",
     "selected+rest P0:0 P1:0 P0:1 P1:1",
     "rest+selected P1:0 P0:0 P1:1 P0:1",
     "input+window P0:0 R3-6[0:1,1:0,0:2] P0:3",
     "window+input P1:0 R3-6[1:1,0:0,1:2] P1:3",
+    "input+undeclared R1-2[0:0,1:0] P0:1 R5-6[0:2,1:1] P0:3",
+    "undeclared+input R1-2[0:0,1:0] P1:1 R5-6[0:1,1:2] P1:3",
 ];
+
+/// The merges of an operand derived without `LocationsOnWays`: their output
+/// declares no coordinates, so none are compared, and they alone owe the
+/// loss warning.
+const MIXED: [&str; 2] = ["input+undeclared", "undeclared+input"];
+
+/// Whether a fault must fail the merge with this label.
+type Reached = fn(&str) -> bool;
 
 pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join(ROOT);
@@ -61,12 +73,29 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         cache,
     );
     let labels = TRACES.map(|t| t.split(' ').next().unwrap());
-    for (fault, arm) in [
+    // Which merges each fault must fail: the coordinate fault every merge
+    // but the mixed ones, whose comparison reads no coordinates, and the
+    // suppressed loss warning the mixed ones only.
+    let every: Reached = |_| true;
+    let unmixed: Reached = |l| !MIXED.contains(&l);
+    let mixed: Reached = |l| MIXED.contains(&l);
+    let faults: [(&str, Option<(&str, Reached)>); 5] = [
         ("", None),
-        ("coords", Some("vs input elements")),
-        ("layout", Some("output blobs in the predicted layout")),
-        ("summary", Some("summary blob counts as predicted")),
-    ] {
+        ("coords", Some(("vs input elements", unmixed))),
+        (
+            "layout",
+            Some(("output blobs in the predicted layout", every)),
+        ),
+        ("summary", Some(("summary blob counts as predicted", every))),
+        (
+            "warning",
+            Some((
+                "output declares LocationsOnWays as its command documents",
+                mixed,
+            )),
+        ),
+    ];
+    for (fault, arm) in faults {
         h.run = run::Run::create(&dir, exe, true).unwrap();
         h.run.watch(&input).unwrap();
         std::fs::write(dir.join("fault"), fault).unwrap();
@@ -89,9 +118,10 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 assert_eq!(judged.status, harness::CheckStatus::Passed, "{judged:?}");
                 assert!(judged.failed.is_empty(), "{judged:?}");
             }
-            Some(arm) => {
+            Some((arm, reached)) => {
                 let want: Vec<String> = labels
                     .iter()
+                    .filter(|l| reached(l))
                     .map(|l| format!("pbfhogg cat --dedupe {l} {arm}"))
                     .collect();
                 assert_eq!(judged.status, harness::CheckStatus::Failed, "{judged:?}");
@@ -127,11 +157,14 @@ fn node_ids(path: &Path, blob: &pbf_frames::ClaimedBlob) -> Vec<i64> {
 }
 
 /// Assert an osmium run writing PBF asks to keep inline locations exactly
-/// when its input declares them, and answer whether it does.
+/// when its input declares them, except for the operand derived without
+/// them on purpose, and answer whether it does.
 fn asks_locations(args: &[&str]) -> bool {
-    let locations = fake_pbf::features(Path::new(args[1]))
-        .iter()
-        .any(|f| f == LOW);
+    let undeclared = args.iter().any(|a| a.contains("undeclared-filtered"));
+    let locations = !undeclared
+        && fake_pbf::features(Path::new(args[1]))
+            .iter()
+            .any(|f| f == LOW);
     assert_eq!(args.contains(&"pbf,locations_on_ways=true"), locations);
     locations
 }
@@ -265,11 +298,16 @@ fn dedupe(fault: &str, root: &Path, inputs: [&Path; 2], output: &Path) {
     // a racing read-modify-write.
     std::fs::write(root.join(format!("trace-{label}")), trace).unwrap();
 
-    let declared = inputs
-        .iter()
-        .all(|p| fake_pbf::features(p).iter().any(|f| f == LOW));
+    let declares = inputs.map(|p| fake_pbf::features(p).iter().any(|f| f == LOW));
+    let declared = declares.iter().all(|d| *d);
     // pbfhogg keeps the declaration when every input has it, re-encoding
-    // rewritten ways with their coordinates.
+    // rewritten ways with their coordinates, and warns when only some do.
+    if declares.iter().any(|d| *d) && !declared && fault != "warning" {
+        eprintln!(
+            "Warning: the input declares {LOW}, which the output does not declare: this command \
+             does not keep it on every way it writes, or cannot vouch for it in the output"
+        );
+    }
     let features: &[&str] = if declared { &[SORTED, LOW] } else { &[SORTED] };
     let mut marker = fake_pbf::full_marker(inputs[0]);
     if fault == "coords" {

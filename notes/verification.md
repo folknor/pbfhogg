@@ -46,18 +46,6 @@ every identity, which the strict element comparison and order check refuse. A
 witness needs overlapping way blobs with disjoint identities that keep inline
 coordinates and true indexdata.
 
-## VER-157 - cat-dedupe never judges a merge of operands that disagree on LocationsOnWays
-
-Reported by: the CMD-073 spar partner (2026-11-24).
-
-`judge_merge` (`crates/verify/src/checks/cat_dedupe.rs`) passes the original
-input to `Harness::judge_way_locations`, which reads that one header. Every
-operand today is derived from it and carries its header, so all declare or
-none does. A merge where only some operands declare `LocationsOnWays` would
-be judged against the wrong baseline: pbfhogg declares only when every input
-does and warns when any does, so the judge would need both facts. No such
-scenario is driven.
-
 ## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 
 Every `fault_*_input` reference run asserts the exact transport of each pinned

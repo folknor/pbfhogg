@@ -197,7 +197,7 @@ impl StrategyRun<'_> {
             let label = format!("sequential {name} extract {}", named.stem);
             harness.judge_way_locations(
                 &label,
-                pbf,
+                &[pbf],
                 &seq_out,
                 &captured,
                 crate::harness::WayLocations::Kept,
@@ -287,7 +287,7 @@ impl StrategyRun<'_> {
                 // keeping the declaration, with no loss warning for it.
                 harness.judge_way_locations(
                     &label,
-                    pbf,
+                    &[pbf],
                     &multi_pbf,
                     &captured,
                     crate::harness::WayLocations::Kept,

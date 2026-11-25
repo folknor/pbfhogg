@@ -118,7 +118,13 @@ pub fn run(
     let captured = harness.pbfhogg_discard(pbfhogg_args)?;
     harness.require_success(&captured, "pbfhogg apply-changes")?;
     let kept = if locations_on_ways { Kept } else { Dropped };
-    harness.judge_way_locations("pbfhogg apply-changes", pbf, &pbfhogg_out, &captured, kept)?;
+    harness.judge_way_locations(
+        "pbfhogg apply-changes",
+        &[pbf],
+        &pbfhogg_out,
+        &captured,
+        kept,
+    )?;
 
     // --- osmium apply-changes ---
     let osmium_out = outdir.join("osmium.osm.pbf");

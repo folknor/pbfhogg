@@ -157,7 +157,7 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // input without it is held to an output that does not declare it.
     h.judge_way_locations(
         "pbfhogg sort",
-        pbf,
+        &[pbf],
         &ours,
         &ended,
         crate::harness::WayLocations::Kept,

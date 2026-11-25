@@ -220,7 +220,7 @@ fn run_case(
     harness.require_success(&captured, &format!("pbfhogg {label}"))?;
     harness.judge_way_locations(
         &format!("pbfhogg {label}"),
-        pbf,
+        &[pbf],
         &pbfhogg_out,
         &captured,
         crate::harness::WayLocations::Kept,

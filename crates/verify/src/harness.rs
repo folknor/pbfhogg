@@ -74,11 +74,12 @@ fn counts_of([nodes, ways, relations]: [u64; 3]) -> crate::counts::Counts {
 }
 
 /// What a command's documented header rule allows its output's
-/// `LocationsOnWays` declaration to be on an input that declares it
+/// `LocationsOnWays` declaration to be when its inputs declare it
 /// ([`Harness::judge_way_locations`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WayLocations {
-    /// Every way blob is copied whole, so the declaration is kept.
+    /// Every way carries its coordinates, so the declaration is kept when
+    /// every input declares it.
     Kept,
     /// Ways are re-encoded without coordinates: dropped, with the warning.
     Dropped,
@@ -384,41 +385,57 @@ impl Harness {
     }
 
     /// Judge `ours`'s `LocationsOnWays` declaration against what its command
-    /// documents for `input` (docs/cli/commands.md "Output header"), with
-    /// `ended` the run that wrote it. The element comparison reads inline
-    /// coordinates only when both compared files declare them
+    /// documents for its PBF `inputs` (docs/cli/commands.md "Output
+    /// header"), with `ended` the run that wrote it. The element comparison
+    /// reads inline coordinates only when both compared files declare them
     /// ([`Policy::between`]), so a declaration lost without this would pass
-    /// silently. A command may drop the declaration only where its table
-    /// says so, and then warns; that warning is read from stderr, the CLI's
-    /// rendering of the library's `header.way_metadata_loss`. An output
-    /// never declares it when the input did not. Judged on the file pbfhogg
-    /// wrote, before any osmium-sorted copy.
+    /// silently. The output declares it exactly when every input does and
+    /// `expect` is [`WayLocations::Kept`]; the loss warning, read from
+    /// stderr as the CLI renders the library's `header.way_metadata_loss`,
+    /// appears exactly when some input declares it and the output does not.
+    /// Both halves are judged, so a spurious warning fails as a missing one
+    /// does. Judged on the file pbfhogg wrote, before any osmium-sorted copy.
     pub(crate) fn judge_way_locations(
         &mut self,
         label: &str,
-        input: &Path,
+        inputs: &[&Path],
         ours: &Path,
         ended: &Ended,
         expect: WayLocations,
     ) -> Result<(), Error> {
         const LOW: &str = "LocationsOnWays";
-        let had = pbf_frames::header(input, Origin::Other)?.optional_feature(LOW);
+        if inputs.is_empty() {
+            return Err(Error::tool(format!(
+                "{label}: the LocationsOnWays judgement was handed no input"
+            )));
+        }
+        let mut all = true;
+        let mut any = false;
+        for input in inputs {
+            let declares = pbf_frames::header(input, Origin::Other)?.optional_feature(LOW);
+            all &= declares;
+            any |= declares;
+        }
         let has = pbf_frames::header(ours, Origin::Pbfhogg)?.optional_feature(LOW);
         let warned = warns_locations_loss(&ended.stderr_text());
-        let (ok, why) = match (had, has, expect) {
-            (false, true, _) => (false, "declared, but the input does not declare it"),
-            (false, false, _) => (true, "not declared, as the input does not"),
-            (true, true, WayLocations::Kept) => (true, "kept as the input declares"),
-            (true, true, WayLocations::Dropped) => (
-                false,
-                "declared, but this command re-encodes ways without them",
-            ),
-            (true, false, WayLocations::Kept) => (false, "dropped, but this run must keep it"),
-            (true, false, WayLocations::Dropped) if warned => {
-                (true, "dropped with the loss warning")
-            }
-            (true, false, _) => (false, "dropped without the loss warning"),
+        let want_has = all && expect == WayLocations::Kept;
+        let want_warned = any && !want_has;
+        let declaration = match (has, want_has) {
+            (true, true) => "kept as every input declares",
+            (false, false) if any => "dropped",
+            (false, false) => "not declared, as no input does",
+            (true, false) if !all => "declared, but not every input declares it",
+            (true, false) => "declared, but this command re-encodes ways without them",
+            (false, true) => "dropped, but this run must keep it",
         };
+        let warning = match (warned, want_warned) {
+            (true, true) => ", with the loss warning",
+            (false, false) => "",
+            (false, true) => ", without the loss warning",
+            (true, false) => ", with a loss warning naming it",
+        };
+        let ok = has == want_has && warned == want_warned;
+        let why = format!("{declaration}{warning}");
         self.msg(&format!(
             "  {label}: {LOW} {why} {}",
             if ok { "PASS" } else { "FAIL" }

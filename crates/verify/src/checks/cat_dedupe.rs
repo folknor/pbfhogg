@@ -32,7 +32,10 @@
 //! ([`dedupe_plan`]): each passthrough blob's payload bytes in its place,
 //! each run's re-encoded blobs within its ID span, the summary's blob counts
 //! (pbfhogg's own account, beside the layout) and the `LocationsOnWays`
-//! declaration (dropped exactly when a way blob is in a run). Byte equality
+//! declaration (kept exactly when both operands declare it, the loss
+//! warning exactly when only one does). On a declaring input,
+//! `dedupe(A, U)` and `dedupe(U, A)`, U the selection derived without the
+//! declaration, judge a merge of operands that disagree on it. Byte equality
 //! witnesses the preserved payload, not that nothing decoded it.
 //!
 //! B, C and W carry no indexdata (osmium writes none), so every run naming
@@ -155,23 +158,46 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let w: Operand<'_> = (&window, &window_entries);
     require_transitions(&input, &window_entries, &windowed)?;
 
-    let cases: [(&str, [Operand<'_>; 2]); 5] = [
+    let bare = if locations {
+        Some(undeclared(harness, &outdir, pbf, tags(false))?)
+    } else {
+        None
+    };
+
+    let mut cases: Vec<(&str, [Operand<'_>; 2])> = vec![
         ("input+selected", [a, s]),
         ("selected+rest", [s, c]),
         ("rest+selected", [c, s]),
         ("input+window", [a, w]),
         ("window+input", [w, a]),
     ];
+    if let Some((entries, path)) = &bare {
+        let u: Operand<'_> = (path, entries);
+        cases.push(("input+undeclared", [a, u]));
+        cases.push(("undeclared+input", [u, a]));
+    }
     merge_grouped(harness, &outdir, pbf, &cases, direct_io)?;
+    Ok(Some(claim(bare.is_some())))
+}
 
-    Ok(Some(format!(
+/// The check's PASS claim, `mixed` when the merges of operands that disagree
+/// on `LocationsOnWays` ran.
+fn claim(mixed: bool) -> String {
+    format!(
         "identical to the input as osmium decodes it (metadata included): merged with itself, \
          with its {SPLIT} selection, as the disjoint union of that selection and its \
          complement in both orders, and with a window of its own blobs in both orders; every \
          output blob in the documented passthrough or overlap-run place, the window \
-         witnessing runs that start and end between passthrough stretches; the survivor rule \
-         among differing copies is not established"
-    )))
+         witnessing runs that start and end between passthrough stretches; {}; the survivor \
+         rule among differing copies is not established",
+        if mixed {
+            "with the selection derived without LocationsOnWays in both orders, the declaration \
+             dropped with the loss warning and coordinates not compared"
+        } else {
+            "the input declares no LocationsOnWays, so no merge of operands that disagree on it \
+             is judged"
+        }
+    )
 }
 
 /// The merges of `cases`, all on unindexed operands. They read only the
@@ -349,6 +375,36 @@ fn derive(
     Ok(operand)
 }
 
+/// On a declaring input, the selection derived once more without the
+/// declaration (`args` the `tags-filter` arguments), and its decoded blobs,
+/// so a merge of operands that disagree on it is judged: the output must not
+/// declare it and must warn of its loss. Its elements are still the input's,
+/// compared without coordinates since the output does not declare them.
+/// Whether rewritten ways keep their arrays there is not judged: an
+/// undeclared output may carry arrays, as its copied way blobs do.
+fn undeclared(
+    harness: &mut Harness,
+    outdir: &Path,
+    pbf: &Path,
+    args: Vec<String>,
+) -> Result<(Vec<Entry>, PathBuf), Error> {
+    let bare = derive(
+        harness,
+        outdir,
+        pbf,
+        "undeclared",
+        ("cat-dedupe-undeclared.1", "tags-filter", args),
+        false,
+    )?;
+    if pbf_frames::header(&bare, Origin::Other)?.optional_feature("LocationsOnWays") {
+        return Err(Error::tool(
+            "osmium declared LocationsOnWays on the operand derived without it, so the merge of \
+             operands that disagree on it is unexercised",
+        ));
+    }
+    Ok((dedupe_plan::entries(&bare)?, bare))
+}
+
 /// The output of the merge labelled `label`.
 fn merge_output(outdir: &Path, label: &str) -> PathBuf {
     outdir.join(format!("pbfhogg-{label}.osm.pbf"))
@@ -405,12 +461,16 @@ fn judge_merge(
     let out = merge_output(outdir, label);
     let name = format!("pbfhogg cat --dedupe {label}");
     harness.require_success(captured, &name)?;
-    // Every operand is derived from `pbf` and carries its header, so either
-    // all declare LocationsOnWays or none does; with all, the merge keeps it,
-    // re-encoding rewritten ways with their coordinates. A merge of operands
-    // that disagree is outside this check (`judge_way_locations` reads one
-    // input header).
-    harness.judge_way_locations(&name, pbf, &out, captured, WayLocations::Kept)?;
+    // Judged against the operands, not the input: the merge declares
+    // LocationsOnWays when every operand does, re-encoding rewritten ways
+    // with their coordinates, and warns of its loss when only some do.
+    harness.judge_way_locations(
+        &name,
+        &[inputs[0].0, inputs[1].0],
+        &out,
+        captured,
+        WayLocations::Kept,
+    )?;
 
     let layout = dedupe_plan::judge(&out, &[inputs[0].0, inputs[1].0], &plan)?;
     harness.msg(&format!(

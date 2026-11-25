@@ -654,7 +654,7 @@
 - **History `time-filter` runs on every core.** A history input's versions
   are now selected and encoded on the read's decode workers; only objects
   whose versions straddle a blob boundary are joined in order. A planet-sized
-  history file fell from about 20 minutes to about 3. Output is the same
+  history file fell from about 20 minutes to about 2m40s. Output is the same
   elements, but blocks now follow the input blobs (each input blob's
   survivors in blocks of up to 8000) instead of being packed across them.
   Only a surviving version's payload is read, so a bad user or role string

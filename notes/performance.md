@@ -1387,19 +1387,24 @@ Kind: strong hypothesis.
 
 Reported by: pipeline, copy.
 
-Mechanism: both paths now select and encode on the decode workers, but each
-blob is still fully decoded (every element's tags, refs and members) before
-selection reads only identity, version, timestamp and visibility; the history
-path also walks the block a second time to encode winners, and a third for
-its last block's alternative ending when the blob's last object has a visible
-candidate.
+Mechanism: both paths build a validated `PrimitiveBlock` and select through
+`block.elements()`. Element iteration is lazy for plain nodes, ways and
+relations (tags, refs and members are not decoded by selection), but dense
+iteration advances every coordinate and metadata column and walks
+`keys_vals` per node even though selection reads only ID, version,
+timestamp and visibility. The history path then walks the block a second
+time to encode its winners (the alternative ending no longer re-encodes; it
+forks the builder).
 
-Redesign: a projection that reads the selection fields only, then encodes
-winners from the projected positions (encoded selection, copying unchanged
-fields rather than rebuilding them; see PERF-007).
+Redesign: a selection projection riding on the validator (dense nodes visit
+last in validation order, so selection must keep iteration order and raise
+its errors only after validation succeeds), handing the encoder the winner
+positions directly. Copying unchanged fields instead of re-encoding them is
+PERF-007, not this entry.
 
-Kind: hypothesis; the history rewrite is read-bound on bygg's planet
-`history2` snapshot, so the payoff is in CPU, not wall, there.
+Kind: hypothesis, unsized. The path is CPU-bound on bygg's planet `history2`
+(about 27 cores), but the hotpath cell does not split selection from
+encoding inside `select_blob`; validation stays either way.
 
 ## PERF-052 - getid with references scans whole kinds
 

@@ -47,6 +47,7 @@ use crate::read::wire_schema::{primitive_block, string_table};
 /// tag lookup to harden pre-seeding alone. Replacing it is a separate policy
 /// choice covering both `add` and `pre_seed`; an element-count bound or slot
 /// deduplication is not a substitute (deduplication breaks raw sid identity).
+#[derive(Clone)]
 pub(super) struct StringTable {
     bytes: Vec<u8>,
     slots: Vec<(usize, usize)>,

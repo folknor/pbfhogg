@@ -328,41 +328,52 @@ impl crate::commands::BlockSink for Fitted<'_> {
     }
 }
 
-/// Encode the elements of `block` at `positions` (ascending) into `bb`,
-/// flushing into `output`. Returns the index into `positions` of the first
-/// element of the block left open in `bb`.
-fn encode_positions(
+/// Encode the winners of `block` (positions, ascending) in one walk: the
+/// blocks they close go to `done`, the block left open to `open`. With a
+/// visible `candidate` (a position after every winner), the alternative
+/// ending is the open block with the candidate appended, under the usual kind
+/// and count checks; it is built on a clone of the builder taken just before
+/// the candidate, so the open block's elements are encoded once and the clone
+/// holds exactly the state a re-encode of them from an empty builder would
+/// reach. It comes back as a result, not raised: a later blob may supersede
+/// the candidate, and then its encoding is not this run's concern. The
+/// unconditional blocks' errors come first.
+fn encode_endings(
     block: &PrimitiveBlock,
-    positions: impl Iterator<Item = usize>,
-    bb: &mut BlockBuilder,
-    output: &mut Fitted<'_>,
-) -> Result<usize> {
-    let mut positions = positions.enumerate().peekable();
-    let mut open_from = 0;
+    winners: &[usize],
+    candidate: Option<usize>,
+    done: &mut Fitted<'_>,
+    open: &mut Fitted<'_>,
+) -> Result<Option<crate::Result<Vec<OwnedBlock>>>> {
+    let mut bb = BlockBuilder::new();
+    let mut wanted = winners.iter().copied().peekable();
     let mut bufs = EncodeBufs::default();
-    for (pos, element) in block.elements().enumerate() {
-        let Some(&(nth, wanted)) = positions.peek() else {
+    let mut elements = block.elements().enumerate();
+    let mut at_candidate = None;
+    for (pos, element) in elements.by_ref() {
+        if wanted.peek() == Some(&pos) {
+            wanted.next();
+            encode_kept(&element, &mut bb, done, &mut bufs)?;
+        } else if Some(pos) == candidate {
+            at_candidate = Some(element);
             break;
-        };
-        if pos != wanted {
-            continue;
+        } else if wanted.peek().is_none() && candidate.is_none() {
+            break;
         }
-        positions.next();
-        if bb.is_empty() || !can_take(bb, &element) {
-            open_from = nth;
-        }
-        encode_kept(&element, bb, output, &mut bufs)?;
     }
-    Ok(open_from)
-}
-
-/// Whether `bb` can take `element` without closing its block.
-fn can_take(bb: &BlockBuilder, element: &Element<'_>) -> bool {
-    match element {
-        Element::DenseNode(_) | Element::Node(_) => bb.can_add_node(),
-        Element::Way(_) => bb.can_add_way(),
-        Element::Relation(_) => bb.can_add_relation(),
-    }
+    let fork = at_candidate.as_ref().map(|_| bb.clone());
+    flush_local(&mut bb, open)?;
+    let (Some(element), Some(mut fork)) = (at_candidate, fork) else {
+        return Ok(None);
+    };
+    let mut alt = Fitted {
+        blocks: Vec::new(),
+        limits: open.limits,
+    };
+    let ending = encode_kept(&element, &mut fork, &mut alt, &mut bufs)
+        .and_then(|()| flush_local(&mut fork, &mut alt))
+        .map(|()| alt.blocks);
+    Ok(Some(ending))
 }
 
 fn element_visible(element: &Element<'_>) -> bool {
@@ -423,37 +434,27 @@ fn select_blob(
         });
     };
 
-    let mut bb = BlockBuilder::new();
     let mut done = Fitted {
         blocks: Vec::new(),
         limits,
     };
-    let open_from = encode_positions(block, winners.iter().copied(), &mut bb, &mut done)?;
     let mut open = Fitted {
         blocks: Vec::new(),
         limits,
     };
-    flush_local(&mut bb, &mut open)?;
-
-    let tail = match last.winner {
-        None => Tail::None,
-        Some((_, false)) => Tail::Deleted,
-        Some((pos, true)) => {
-            // The open block's survivors again, then the candidate, with the
-            // usual kind and count checks: the alternative ending.
-            let reopened = winners[open_from..]
-                .iter()
-                .copied()
-                .chain(std::iter::once(pos));
-            let mut alt = Fitted {
-                blocks: Vec::new(),
-                limits,
-            };
-            let ending = encode_positions(block, reopened, &mut bb, &mut alt)
-                .and_then(|_| flush_local(&mut bb, &mut alt))
-                .map(|()| alt.blocks);
-            Tail::Visible(ending)
-        }
+    let candidate = match last.winner {
+        Some((pos, true)) => Some(pos),
+        _ => None,
+    };
+    let ending = encode_endings(block, &winners, candidate, &mut done, &mut open)?;
+    let tail = match (last.winner, ending) {
+        (None, _) => Tail::None,
+        (Some((_, false)), _) => Tail::Deleted,
+        (Some((_, true)), ending) => Tail::Visible(ending.unwrap_or_else(|| {
+            Err(crate::Error::internal(
+                "history time-filter: a visible candidate produced no ending",
+            ))
+        })),
     };
 
     Ok(HistorySlice {

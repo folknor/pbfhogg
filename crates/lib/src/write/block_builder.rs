@@ -410,6 +410,12 @@ pub(super) fn member_type_value(mt: MemberType) -> i32 {
 /// Dropping a builder is cleanup only: what it holds, a refusal included,
 /// is discarded without an error. A refusal reaches the caller only through
 /// finalization, so finalize every builder whose output counts.
+///
+/// A clone holds the block in progress as it stands, so finalizing it and
+/// the original after different additions gives two alternative blocks that
+/// share a prefix without encoding the prefix twice (the history
+/// `time-filter` uses this for a blob's two possible endings).
+#[derive(Clone)]
 pub struct BlockBuilder {
     string_table: StringTable,
     block_type: Option<BlockType>,
@@ -2854,7 +2860,7 @@ const UNSEEDED_SLOT: u32 = u32::MAX;
 
 /// One raw element's indices translated to output slots under a subset
 /// seed, the buffers kept across elements.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SubsetScratch {
     tags: Vec<(u32, u32)>,
     keys: Vec<u8>,

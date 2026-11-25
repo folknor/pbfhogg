@@ -1478,6 +1478,17 @@ impl MultiNodeConsumer<'_> {
                 "multi-extract: a decode blob was scheduled as passthrough",
             ));
         };
+        // This rereads the frame classify verified, from the same schedule
+        // entry, so on an input unchanged during the run the copy is the body
+        // classify decoded. An in-place rewrite of the input between the two
+        // reads would copy bytes nobody verified, credited with classify's
+        // membership and count; that is outside the stable-input contract
+        // every multipass route shares (a pin identifies a file, it is not a
+        // snapshot: read/input.rs, reference/pipeline.md), and the decode
+        // route has the same exposure through its frozen membership. Not
+        // guarded on purpose: carrying the frame would retain every verified
+        // candidate of the kind across the classify-to-write boundary, and a
+        // recheck would only cover part of the frame or cost a per-byte hash.
         let frame_start = blob.entry.frame_start();
         let frame = self
             .frame_buf

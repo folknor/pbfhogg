@@ -505,6 +505,13 @@ impl PreadConsumer<'_> {
                 "extract: a decode blob was scheduled as passthrough",
             ));
         };
+        // A reread of the frame classify verified, from the same header-walk
+        // descriptor. Sound for an input unchanged during the run; an in-place
+        // rewrite between the reads is outside the stable-input contract (a
+        // pin is not a snapshot: read/input.rs, reference/pipeline.md) and is
+        // not guarded, since carrying every verified frame across the phase
+        // boundary or hashing it would cost on the measured path for a case
+        // the decode route is equally exposed to.
         self.frame_read_buf.resize(d.frame_size, 0);
         self.file
             .read_exact_at(&mut self.frame_read_buf, d.frame_offset)?;

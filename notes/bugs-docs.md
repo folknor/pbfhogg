@@ -339,3 +339,55 @@ than pipelined") and `docs/guide/reading.md` repeat it. The figure dates
 from `a39d7fe7` (2026-03-02) and no cell in `reference/performance/` backs
 it; the reader has changed many times since. Either record a measurement
 with commit and host, or reword without the ratio.
+
+## DOC-048 - check/mod.rs lists --ids only with --full
+
+Reported by: the spar accounting of the fused default check pair, from its
+scout's lateral (2026-11-25).
+
+The `check/mod.rs` module doc lists "Four modes" and gives the ID check as
+"`--ids --full`: ID uniqueness and ordering". Plain `--ids` (order only,
+uniqueness proved only for an ordered kind) also runs `verify_ids`, and the
+same doc's last paragraph names `--ids` alone as half the default pair.
+Name `--ids` as the mode and `--full` as its duplicate pass.
+
+## DOC-049 - check.md points "above" at an entry that sits below
+
+Reported by: the spar accounting of the fused default check pair, from its
+scout's lateral (2026-11-25).
+
+`reference/performance/check.md`, section "check --ids --full proves an
+ordered kind duplicate-free (bygg, 2026-11-08 ...)", says the plain order
+scan "until the 2026-11-18 entry above, recorded negative IDs as
+`IdOutOfRange`"; the 2026-11-18 section ("check handles negative IDs
+exactly") follows it in the file. Reword to name the section rather than
+its position.
+
+## DOC-050 - README says no history dataset is configured or benchmarked
+
+Reported by: the spar accounting of the parallel history time-filter
+change, from its scout's lateral (2026-11-25).
+
+`README.md`'s note under the planet table says history-shaped input is
+outside the validation surface: "no history dataset is configured or
+benchmarked". bygg's host config now registers a `planet` snapshot of a
+two-version osmium merge, and `reference/performance/time-filter.md`
+records history-path cells on it. `notes/todo.md` was rewritten to say a
+real multi-version history file is still absent; the README needs the same
+correction while keeping the scope statement.
+
+## DOC-051 - time-filter's selection rule differs from osmium's unrecorded
+
+Reported by: the spar accounting of the parallel history time-filter
+change, from its scout's lateral (2026-11-25); read from both sources, not
+run.
+
+On a history file osmium (`command_time_filter.cpp`, libosmium
+`diff_object.hpp` `is_visible_at`) keeps a version whose timestamp is at
+or before the cutoff when the next record of the same object has a later
+timestamp, with no version rule. pbfhogg keeps the last record at or
+before the cutoff and refuses versions that do not strictly ascend. They
+agree on well-formed files; they answer differently where a later version
+carries an earlier timestamp, and pbfhogg refuses input osmium accepts
+(descending, repeated or absent versions). `DEVIATIONS.md` records only the
+sequence-number difference for time-filter.

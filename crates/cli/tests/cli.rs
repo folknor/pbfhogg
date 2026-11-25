@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use crate::invoker::CliInvoker;
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 
 /// Write a minimal valid PBF file using the library API.
 fn write_minimal_pbf(path: &Path) {
@@ -355,8 +356,9 @@ fn cli_direct_io_rejected_without_feature() {
         .arg("--direct-io")
         .run();
 
-    assert!(
-        !result.status.success(),
+    assert_eq!(
+        result.status.code(),
+        Some(EXIT_USAGE),
         "should fail without linux-direct-io feature"
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -385,8 +387,9 @@ fn cli_io_uring_rejected_without_feature() {
         .arg("--io-uring")
         .run();
 
-    assert!(
-        !result.status.success(),
+    assert_eq!(
+        result.status.code(),
+        Some(EXIT_USAGE),
         "should fail without linux-io-uring feature"
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -405,11 +408,7 @@ fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
         vec!["extract", "input.pbf", "-o", "output.pbf"],
     ] {
         let output = CliInvoker::new(&invocation_scratch).args(&args).run();
-        assert_eq!(
-            output.status.code(),
-            Some(crate::invoker::EXIT_USAGE),
-            "args: {args:?}"
-        );
+        assert_eq!(output.status.code(), Some(EXIT_USAGE), "args: {args:?}");
     }
 }
 
@@ -431,7 +430,21 @@ fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
             .arg("-o")
             .arg(dir.path().join("out.pbf"))
             .run();
-        assert!(!output.status.success());
+        // The name routes each: a .pbf is read as PBF and refused by the
+        // blob reader (2); an OSC name goes to the OSC filter, whose output
+        // name check then refuses the .pbf output (64).
+        let (code, routed) = if name.ends_with(".pbf") {
+            (EXIT_FAILED, "blob header")
+        } else {
+            (EXIT_USAGE, "OSC output name")
+        };
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{name}: {}",
+            output.stderr_str()
+        );
+        output.assert_stderr_contains(routed);
         assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
     }
 }
@@ -453,7 +466,9 @@ fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
         .arg("-o")
         .arg(dir.path().join("out.osc"))
         .run();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(EXIT_FAILED));
+    // Read as PBF: the blob reader, not the OSC parser, refuses it.
+    output.assert_stderr_contains("blob header is too big");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
 }
 
@@ -502,7 +517,7 @@ fn cli_diff_quiet_osc_without_output_retains_error() {
     let output = CliInvoker::new(&invocation_scratch)
         .args(["diff", "old.pbf", "new.pbf", "--format", "osc", "-q"])
         .run();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("--output is required with --format osc")
     );

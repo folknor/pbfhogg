@@ -479,9 +479,12 @@ dev's overflow checks panic where release would wrap, wherever a fixture
 reaches the operation and the test does not accept the panic as an
 outcome (a worker's caught panic comes back as an `ErrorKind::Panicked`
 error, and the CLI exits 101 for one, so a test that names the refusal
-kind it expects, or a CLI test that requires exit 2, fails on a panic; a
-test that asserts only `is_err()` or a non-zero exit still passes on one,
-and the suite does not yet forbid that shape); the `no-debug-only-invariants` textlint
+kind it expects, or a CLI test that requires exit 2, fails on a panic.
+`CliInvoker` offers no any-failure assertion, only exact statuses
+(`assert_refused`, `assert_usage`, `assert_exit`), and the CLI tests
+assert an exact status wherever they expect a failure. A library or unit
+test that asserts only `is_err()` still passes on a panic, and the suite
+does not yet forbid that shape); the `no-debug-only-invariants` textlint
 enforces ADR-0021, so a production debug-only check exists only on a line
 carrying its `debug-only-measured:` record, which review polices; and every
 bench and verify run is a release build on real data. Not covered by any

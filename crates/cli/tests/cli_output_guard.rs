@@ -103,7 +103,7 @@ fn missing_input_is_reported_as_a_missing_input() {
         .arg("-o")
         .arg(dest.as_os_str())
         .run();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(EXIT_FAILED));
     let stderr = out.stderr_str();
     assert!(
         stderr.contains("nowhere.osm.pbf"),
@@ -126,7 +126,7 @@ fn input_output_alias_is_still_rejected() {
         .arg("-o")
         .arg(input.as_os_str())
         .run();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(EXIT_FAILED));
     assert!(
         out.stderr_str().contains("aliases input"),
         "aliasing check did not fire; stderr:\n{}",
@@ -209,7 +209,7 @@ fn framing_error_names_the_input_file() {
         .arg("-o")
         .arg(dest.as_os_str())
         .run();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(EXIT_FAILED));
     let stderr = out.stderr_str();
     assert!(
         stderr.contains("corrupt.osm.pbf"),
@@ -250,7 +250,11 @@ fn cat_failure_leaves_preexisting_destination_intact() {
         .arg(dest.as_os_str())
         .arg("--overwrite")
         .run();
-    assert!(!out.status.success(), "corrupt input should fail the run");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
+        "corrupt input should fail the run"
+    );
     assert_eq!(
         std::fs::read(&dest).unwrap(),
         b"user data",
@@ -308,8 +312,9 @@ fn altw_missing_nodes_leave_preexisting_destination_intact() {
         .arg(dest.as_os_str())
         .arg("--overwrite")
         .run();
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "an unresolvable way node ref must fail the run; stderr:\n{}",
         out.stderr_str()
     );
@@ -357,7 +362,7 @@ fn usage_error_keeps_claps_message_and_exits_64() {
         .run();
     assert_eq!(
         out.status.code(),
-        Some(crate::invoker::EXIT_USAGE),
+        Some(EXIT_USAGE),
         "usage error should exit 64; stderr:\n{}",
         out.stderr_str()
     );
@@ -397,6 +402,7 @@ fn help_exits_zero_on_stdout() {
 // syncing the file makes both fall short.
 
 use crate::invoker::marker_counter as counter;
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 
 /// Run the CLI with the marker stream armed; `None` when the run reports
 /// that the host lacks what `args` asked for (O_DIRECT, io_uring).

@@ -19,6 +19,7 @@ use crate::common::{
     write_multi_block_test_pbf, write_test_pbf,
 };
 use crate::invoker::CliInvoker;
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 use pbfhogg::MemberId;
 
 /// Invoke `pbfhogg cat <inputs...> -o <output> [--type T] [--clean A]...
@@ -305,7 +306,7 @@ fn cat_rejects_unknown_type_without_creating_output() {
     write_test_pbf(&input, &[], &[], &[]);
 
     let result = run_cat(&[&input], &output, Some("nodes"), &[], false);
-    assert!(!result.status.success());
+    assert_eq!(result.status.code(), Some(EXIT_USAGE));
     assert!(result.stderr_str().contains("invalid element type 'nodes'"));
     assert!(!output.exists());
 }
@@ -318,7 +319,7 @@ fn cat_rejects_input_output_alias_before_truncation() {
     let before = std::fs::read(&input).expect("read input before command");
 
     let result = run_cat(&[&input], &input, None, &[], false);
-    assert!(!result.status.success());
+    assert_eq!(result.status.code(), Some(EXIT_FAILED));
     assert!(result.stderr_str().contains("aliases input"));
     assert_eq!(std::fs::read(&input).expect("read preserved input"), before);
 }
@@ -994,14 +995,14 @@ fn clean_keeps_input_order() {
         [("way", 31, 31, 1), ("way", 30, 30, 1)]
     );
     // The poisoned blob is what a node selection reads, so it fails there.
-    let out = CliInvoker::new(&invocation_scratch)
+    CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&poisoned)
         .arg("-o")
         .arg(dir.path().join("nodes.osm.pbf"))
         .args(["--clean", "version", "--type", "node"])
-        .run();
-    assert!(!out.status.success(), "{}", out.stderr_str());
+        .assert_refused("varint overflows u64 (in ")
+        .assert_stderr_contains("blob 2,");
 }
 
 /// The `CAT_FILTERED_*` and kind-phase marker names of one `cat` run, in
@@ -1415,8 +1416,9 @@ fn cat_dedupe_refuses_an_input_without_exactly_one_leading_header() {
     ] {
         let output = dir.path().join(format!("out-{label}.osm.pbf"));
         let out = run_dedupe(&[&good, bad], &output);
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
             "{label}: cat --dedupe must refuse the input; stderr:\n{}",
             out.stderr_str()
         );
@@ -1535,7 +1537,11 @@ fn cat_dedupe_refuses_a_believed_claim_its_decoded_overlap_blob_contradicts() {
     let output = dir.path().join("out.osm.pbf");
 
     let out = run_dedupe(&[&input], &output);
-    assert!(!out.status.success(), "dedupe published a wrong answer");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
+        "dedupe published a wrong answer"
+    );
     out.assert_stderr_contains("claims node elements but the blob holds way elements");
     assert!(!output.exists(), "a refused dedupe published output");
 }
@@ -1621,7 +1627,11 @@ fn cat_dedupe_refuses_a_believed_blob_that_descends() {
     write_raw_block_pbf(&input, true, &[], &[(true, nodes)]);
 
     let out = run_dedupe(&[&input, &input], &output);
-    assert!(!out.status.success(), "dedupe published a wrong answer");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
+        "dedupe published a wrong answer"
+    );
     out.assert_stderr_contains("internally out of order");
     assert!(!output.exists(), "a refused dedupe published output");
 }
@@ -1803,7 +1813,12 @@ fn every_cat_path_refuses_non_leading_header_frames() {
                 .arg("-o")
                 .arg(dir.path().join(format!("out-{mode}-{insertion}.osm.pbf")))
                 .run();
-            assert!(!out.status.success(), "{mode}: {}", out.stderr_str());
+            assert_eq!(
+                out.status.code(),
+                Some(EXIT_FAILED),
+                "{mode}: {}",
+                out.stderr_str()
+            );
             assert!(
                 out.stderr_str().contains("a second OSMHeader blob"),
                 "{mode}: {}",
@@ -2170,14 +2185,12 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
     );
 
     // A command that needs indexdata on every blob refuses the input.
-    let refused = CliInvoker::new(&invocation_scratch)
+    CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&input)
         .arg("-o")
         .arg(dir.path().join("renumbered-input.osm.pbf"))
-        .run();
-    assert!(!refused.status.success(), "{}", refused.stderr_str());
-    refused.assert_stderr_contains("indexdata");
+        .assert_refused("indexdata");
 
     let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
@@ -2919,12 +2932,7 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
         .arg(&output)
         .run();
     // The block is the data's fault (2); the rest are the command line's (64).
-    assert_eq!(
-        out.status.code(),
-        Some(crate::invoker::EXIT_USAGE),
-        "{}",
-        out.stderr_str()
-    );
+    assert_eq!(out.status.code(), Some(EXIT_USAGE), "{}", out.stderr_str());
     out.assert_stderr_contains("exactly one input");
     for flags in [
         &["--dedupe"][..],
@@ -2941,7 +2949,7 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
             .run();
         assert_eq!(
             out.status.code(),
-            Some(crate::invoker::EXIT_USAGE),
+            Some(EXIT_USAGE),
             "{flags:?}: {}",
             out.stderr_str()
         );
@@ -3245,7 +3253,7 @@ fn repair_refuses_what_the_merge_cannot_make_valid() {
         let out = run_cat_args(&overrun, &output, flags);
         assert_eq!(
             out.status.code(),
-            Some(crate::invoker::EXIT_USAGE),
+            Some(EXIT_USAGE),
             "{flags:?}: {}",
             out.stderr_str()
         );
@@ -3323,11 +3331,11 @@ fn reencoders_and_comparisons_refuse_an_unrepresentable_coordinate() {
                 .arg("content")
                 .arg(input);
             if refused {
-                cat.assert_failure().assert_stderr_contains(REFUSAL);
+                cat.assert_refused(REFUSAL);
                 assert!(!out.exists(), "cat publishes nothing, {case}");
-                getid.assert_failure().assert_stderr_contains(REFUSAL);
+                getid.assert_refused(REFUSAL);
                 assert!(!got.exists(), "getid publishes nothing, {case}");
-                digest.assert_failure().assert_stderr_contains(REFUSAL);
+                digest.assert_refused(REFUSAL);
             } else {
                 let nodes = |p: &Path| -> Vec<(i64, i32, i32)> {
                     read_all_elements_with_coords(p)
@@ -3348,7 +3356,6 @@ fn reencoders_and_comparisons_refuse_an_unrepresentable_coordinate() {
             .arg("-c")
             .arg(&control)
             .arg(&corrupt)
-            .assert_failure()
-            .assert_stderr_contains(REFUSAL);
+            .assert_refused(REFUSAL);
     }
 }

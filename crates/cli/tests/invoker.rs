@@ -65,6 +65,10 @@ pub const NAMESPACE_DENIED: i32 = 100;
 #[cfg(target_os = "linux")]
 pub const NAMESPACE_BROKEN: i32 = 110;
 
+/// The CLI's negative-answer status: a check or comparison ran and its
+/// answer is no (`docs/cli/commands.md`, Exit codes).
+pub const EXIT_ANSWER_NEGATIVE: i32 = 1;
+
 /// The CLI's runtime-failure status (`docs/cli/commands.md`, Exit codes).
 pub const EXIT_FAILED: i32 = 2;
 
@@ -596,16 +600,45 @@ impl<'a> CliInvoker<'a> {
         out
     }
 
-    /// Run and assert exit status is failure. Returns captured output
-    /// so the test can inspect the error message.
-    pub fn assert_failure(self) -> CliOutput {
+    /// Run and assert the exact exit status `code`. Returns captured output
+    /// so the test can inspect what else it promises.
+    ///
+    /// There is deliberately no "any failure" assertion: a caught panic
+    /// exits 101 (`docs/cli/commands.md`, Exit codes), so a test that
+    /// accepts every non-zero status passes when the command panics
+    /// instead of refusing.
+    pub fn assert_exit(self, code: i32) -> CliOutput {
         let out = self.run();
-        assert!(
-            !out.status.success(),
-            "pbfhogg exited successfully but test expected failure; stdout:\n{}\nstderr:\n{}",
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "pbfhogg exited {} but the test expected exit {code}; stdout:\n{}\nstderr:\n{}",
+            out.status,
             out.stdout_str(),
             out.stderr_str(),
         );
+        out
+    }
+
+    /// Run and assert a runtime refusal ([`EXIT_FAILED`]) whose stderr
+    /// carries `needle`, a fragment naming the cause the test promises.
+    pub fn assert_refused(self, needle: &str) -> CliOutput {
+        let out = self.assert_exit(EXIT_FAILED);
+        out.assert_stderr_contains(needle);
+        out
+    }
+
+    /// Run and assert a runtime refusal ([`EXIT_FAILED`]) for a test that
+    /// checks the cause by other evidence (stdout, published files) after.
+    pub fn assert_failed(self) -> CliOutput {
+        self.assert_exit(EXIT_FAILED)
+    }
+
+    /// Run and assert a usage refusal ([`EXIT_USAGE`]) whose stderr
+    /// carries `needle`, a fragment naming the cause the test promises.
+    pub fn assert_usage(self, needle: &str) -> CliOutput {
+        let out = self.assert_exit(EXIT_USAGE);
+        out.assert_stderr_contains(needle);
         out
     }
 }

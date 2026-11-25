@@ -26,6 +26,7 @@ use crate::common::{
     write_indexed_pbf, write_multi_block_test_pbf,
 };
 use crate::invoker::CliInvoker;
+use crate::invoker::EXIT_ANSWER_NEGATIVE;
 
 /// A multi-blob fixture carrying tags on several distinct blobs across all
 /// three element kinds, so both the indexdata and the tagdata checks have more
@@ -48,9 +49,6 @@ fn write_fixture(
     write_multi_block_test_pbf(path, &nodes, &ways, &rels, 20);
     (nodes, ways, rels)
 }
-
-/// Exit code the CLI uses for "ran fine, answer is negative".
-const EXIT_ANSWER_NEGATIVE: i32 = 1;
 
 fn check_index(path: &Path) -> crate::invoker::CliOutput {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -990,7 +988,7 @@ mod serial {
         let out = CliInvoker::new(&invocation_scratch)
             .args(["check", "--ids", "--full", "--json", "--max-errors", "2"])
             .arg(&input)
-            .assert_failure();
+            .assert_exit(EXIT_ANSWER_NEGATIVE);
         assert!(
             out.stdout_str().contains("duplicate"),
             "{}",

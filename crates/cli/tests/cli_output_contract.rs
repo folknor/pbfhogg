@@ -50,6 +50,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use crate::invoker::EXIT_USAGE;
 use crate::invoker::{CliInvoker, CliOutput, subcommands};
 use pbfhogg_test_scratch::TestScratch;
 
@@ -931,8 +932,9 @@ fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
         );
         let out = run(&inv, &tmp_args(tmp_path));
         ensure!(
-            !out.status.success(),
-            "the corrupt input did not fail the run (tmp-dir {tmp_path:?}); stderr:\n{}",
+            out.status.code() == Some(crate::invoker::EXIT_FAILED),
+            "the corrupt input did not refuse the run, exit {:?} (tmp-dir {tmp_path:?}); stderr:\n{}",
+            out.status.code(),
             out.stderr_str()
         );
         for output in &inv.outputs {
@@ -970,8 +972,9 @@ fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
     }
     let out = run(&inv, &["--overwrite".into()]);
     ensure!(
-        !out.status.success(),
-        "the corrupt input did not fail the replacing run; stderr:\n{}",
+        out.status.code() == Some(crate::invoker::EXIT_FAILED),
+        "the corrupt input did not refuse the replacing run, exit {:?}; stderr:\n{}",
+        out.status.code(),
         out.stderr_str()
     );
     for output in &inv.outputs {
@@ -1135,8 +1138,9 @@ fn bad_tmp_dir_is_refused_first(fx: &Fx, row: &Row) -> Result<(), String> {
         let stderr = out.stderr_str();
         let verdict = (|| {
             ensure!(
-                !out.status.success(),
-                "{what} --tmp-dir was accepted; stderr:\n{stderr}"
+                out.status.code() == Some(crate::invoker::EXIT_FAILED),
+                "{what} --tmp-dir was not refused, exit {:?}; stderr:\n{stderr}",
+                out.status.code()
             );
             ensure!(
                 stderr.contains(wording) && stderr.contains(&tmp.display().to_string()),
@@ -2367,15 +2371,18 @@ mod in_publication {
             "the counting run's test hooks failed or it panicked; stderr:\n{}",
             out.stderr_str()
         );
+        // An injected publication fault is a runtime failure (2); any other
+        // failure status (a signal, a usage error) is not the one wanted.
+        let wanted = if scenario.fails {
+            out.status.code() == Some(crate::invoker::EXIT_FAILED)
+        } else {
+            exited_ok(row, &out)
+        };
         ensure!(
-            exited_ok(row, &out) != scenario.fails,
+            wanted,
             "the counting run exited {:?}, wanted {}; stderr:\n{}",
             out.status.code(),
-            if scenario.fails {
-                "a failure"
-            } else {
-                "success"
-            },
+            if scenario.fails { "exit 2" } else { "success" },
             out.stderr_str()
         );
         let steps: Vec<String> = std::fs::read_to_string(&trace)
@@ -2692,7 +2699,7 @@ fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
         .run();
     assert_eq!(
         usage.status.code(),
-        Some(crate::invoker::EXIT_USAGE),
+        Some(EXIT_USAGE),
         "{}",
         usage.stderr_str()
     );
@@ -3260,7 +3267,7 @@ fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
             let label = format!("{} -> {name}", producer.label);
             assert_eq!(
                 result.status.code(),
-                Some(crate::invoker::EXIT_USAGE),
+                Some(EXIT_USAGE),
                 "{label}: {}",
                 result.stderr_str()
             );

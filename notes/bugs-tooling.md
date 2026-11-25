@@ -162,15 +162,24 @@ reach it is unchecked.
 
 Reported by: the release-sweep retirement (commit `e716ad49`).
 
-A caught worker panic is now `ErrorKind::Panicked` and exits 101, so a
-test naming its refusal kind, or a CLI test requiring exit 2, fails on one.
-What remains: tests that accept any error still pass on a panic (dev
-overflow checks panic where release wraps). `CliInvoker::assert_failure`
-and about 26 direct `!status.success()` sites accept 101; library and unit
-tests holding bare `is_err()`, discarded `unwrap_err`/`expect_err`, or
-`Err(_)` patterns accept `Panicked`; and no source-policy rule keeps new
-ones out. The settled rulings and the remaining links (CLI refusal bar,
-source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
+A caught worker panic is `ErrorKind::Panicked` and exits 101, and the CLI
+tests assert exact exit statuses (`CliInvoker` has no any-failure
+assertion). What remains: library and unit tests holding bare `is_err()`,
+discarded `unwrap_err`/`expect_err`, or `Err(_)` patterns still pass on a
+panic (dev overflow checks panic where release wraps), and no source-policy
+rule keeps new ones out. The settled rulings and the remaining links
+(source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
+
+## TOOL-055 - The .osc.gz routing fixture cannot detect a broken suffix fallback
+
+Reported by: TOOL-032 link 2 review.
+
+`cli_tags_filter_ambiguous_content_uses_legacy_fallback` (crates/cli/tests/cli.rs)
+writes gzip magic into `unknown.osc.gz`, so on a host whose input pin
+sniffs content the file reaches the OSC route by sniff, not by its suffix;
+the expected 64 is the same either way, so the cell cannot catch a broken
+`.osc.gz` name fallback there. Use bytes that sniff as neither kind under
+that suffix.
 
 # From the 2026-11-21 verifier performance hunt
 

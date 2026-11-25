@@ -1278,6 +1278,13 @@ fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
         let label = row.words.join(" ");
         let refused = run(&force_argv(&fx, row, n, false));
         let stderr = refused.stderr_str();
+        if refused.status.code() != Some(2) || !stderr.contains(GATE) {
+            failures.push(format!(
+                "[{label}] without --force: exit {:?}, wanted 2 with the gate's advice; stderr:\n{stderr}",
+                refused.status.code()
+            ));
+            continue;
+        }
         let Some(recipe) = printed_recipe(&stderr) else {
             failures.push(format!("[{label}] no recipe printed; stderr:\n{stderr}"));
             continue;

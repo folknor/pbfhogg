@@ -46,17 +46,18 @@ CLI exit 101, harness `panicked`, docs (`docs/cli/commands.md`,
 `reference/library-protocol.md`, `reference/pipeline.md`,
 `reference/testing.md`) and CHANGELOG.
 
-## Link plan
+## Landed (link 2)
 
-**Link 2 - the CLI refusal bar (medium).** `CliInvoker::assert_failure`
-becomes `assert_refused`: exit exactly 2. Callers that meant a usage
-refusal (`cli_degrade` `degrade_requires_at_least_one_flag`, the degrade
-option-conflict helper near line 959, any other clap refusal) move to an
-exact 64 assertion. Sweep direct `!out.status.success()` sites (about 26,
-for example `cli_apply_changes` out-of-range coordinate near line 1955,
-`cli_cat` near 1004) to an exact status plus a positive diagnostic where the
-test promises a specific refusal. Printing stderr as the failure message
-checks nothing.
+`CliInvoker::assert_failure` is gone. `assert_refused(needle)` (exact 2),
+`assert_usage(needle)` (exact 64), `assert_exit(code)` and
+`assert_failed()` (exact 2, evidence checked after). `EXIT_ANSWER_NEGATIVE`
+moved to the invoker. Every CLI-test `!status.success()` refusal is an
+exact status; codes were settled by running the suite and reading each
+mismatch. A wrong code read off the binary is never blessed. One test had
+passed on a clap usage error and never reached its refusal (degrade
+corrupt-indexdata on an unindexed blob under `--force`).
+
+## Link plan
 
 **Link 3 - the source-policy rule (large).** New rule in
 `crates/source-policy/src/rules/` over the three integration test trees and

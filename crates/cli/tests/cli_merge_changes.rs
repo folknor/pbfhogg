@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::invoker::CliInvoker;
+use crate::invoker::EXIT_USAGE;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -427,7 +428,7 @@ fn merge_changes_failure(inputs: &[&Path], output: &Path, extra: &[&str]) -> Str
     for a in extra {
         cli = cli.arg(*a);
     }
-    cli.assert_failure().stderr_str()
+    cli.assert_failed().stderr_str()
 }
 
 /// `merge-changes` must not throw away metadata just because `version`
@@ -748,7 +749,7 @@ fn allow_version_regression_requires_simplify() {
         .run();
     assert_eq!(
         result.status.code(),
-        Some(crate::invoker::EXIT_USAGE),
+        Some(EXIT_USAGE),
         "expected a usage error; stderr:\n{}",
         result.stderr_str()
     );

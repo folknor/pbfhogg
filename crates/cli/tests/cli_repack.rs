@@ -217,8 +217,7 @@ fn repack_rejects_zero_cap() {
         .arg(&output)
         .arg("--elements-per-blob")
         .arg("0")
-        .assert_failure()
-        .assert_stderr_contains("must be > 0");
+        .assert_usage("must be > 0");
 }
 
 /// When the cap exceeds every kind's total element count, the central
@@ -960,7 +959,7 @@ fn repack_refuses_a_blob_whose_claimed_kind_is_false() {
             .arg(&output)
             .arg("--elements-per-blob")
             .arg("10")
-            .assert_failure();
+            .assert_failed();
         out.assert_stderr_contains(&format!(
             "blob indexdata claims {claimed} elements but the blob holds way elements"
         ));

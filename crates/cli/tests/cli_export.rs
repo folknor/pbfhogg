@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use crate::invoker::CliInvoker;
+use crate::invoker::EXIT_FAILED;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -221,8 +222,7 @@ fn metadata_timestamp_scaling_overflow_is_refused() {
         .arg("export")
         .arg(&input)
         .args(["--type", "node", "--metadata"])
-        .assert_failure()
-        .assert_stderr_contains("node 5")
+        .assert_refused("node 5")
         .assert_stderr_contains("overflows i64 milliseconds");
 }
 
@@ -254,8 +254,7 @@ fn metadata_timestamp_beyond_year_9999_is_refused() {
         .arg("--type")
         .arg("node")
         .arg("--metadata")
-        .assert_failure()
-        .assert_stderr_contains("node 5")
+        .assert_refused("node 5")
         .assert_stderr_contains("outside years 0000 to 9999");
 }
 
@@ -478,12 +477,11 @@ fn metadata_types_and_locations_gate() {
         .arg(raw.as_os_str())
         .arg("--type")
         .arg("way")
-        .assert_failure()
-        .assert_stderr_contains("input PBF is missing required feature: LocationsOnWays");
+        .assert_refused("input PBF is missing required feature: LocationsOnWays");
     CliInvoker::new(&invocation_scratch)
         .arg("export")
         .arg(raw.as_os_str())
-        .assert_failure()
+        .assert_failed()
         // The library half of the message must stay flag-free; the
         // `--type node` half is added by the CLI, not by `ErrorKind`.
         .assert_stderr_contains(
@@ -501,8 +499,7 @@ fn metadata_types_and_locations_gate() {
         .arg(raw.as_os_str())
         .arg("--type")
         .arg("relation")
-        .assert_failure()
-        .assert_stderr_contains("export cannot export relations");
+        .assert_usage("export cannot export relations");
 }
 
 #[test]
@@ -517,8 +514,7 @@ fn file_output_is_guarded_against_input_aliases() {
         .arg(input.as_os_str())
         .arg("--output")
         .arg(input.as_os_str())
-        .assert_failure()
-        .assert_stderr_contains("aliases input");
+        .assert_refused("aliases input");
     assert_eq!(std::fs::read(&input).unwrap(), before);
 
     let hardlink = temp.path().join("hardlink.pbf");
@@ -528,8 +524,7 @@ fn file_output_is_guarded_against_input_aliases() {
         .arg(input.as_os_str())
         .arg("--output")
         .arg(hardlink.as_os_str())
-        .assert_failure()
-        .assert_stderr_contains("aliases input");
+        .assert_refused("aliases input");
     assert_eq!(std::fs::read(&input).unwrap(), before);
 
     std::fs::remove_file(&hardlink).unwrap();
@@ -560,7 +555,7 @@ fn file_output_is_guarded_against_input_aliases() {
         .arg("geojson")
         .arg("--output")
         .arg(partial.as_os_str())
-        .assert_failure();
+        .assert_failed();
     assert!(!partial.exists(), "partial output survived decode failure");
 
     // A failing export must not touch a pre-existing file that merely
@@ -574,7 +569,7 @@ fn file_output_is_guarded_against_input_aliases() {
         .arg("geojson")
         .arg("--output")
         .arg(precious.as_os_str())
-        .assert_failure();
+        .assert_failed();
     assert_eq!(
         std::fs::read(&precious).unwrap(),
         b"user data",
@@ -630,7 +625,7 @@ fn closed_stdout_keeps_an_input_error_and_ends_a_good_run_quietly() {
         .run();
     assert_eq!(
         failed.status.code(),
-        Some(crate::invoker::EXIT_FAILED),
+        Some(EXIT_FAILED),
         "a truncated input is a failure whatever stdout does; stderr:\n{}",
         failed.stderr_str(),
     );

@@ -640,7 +640,7 @@ fn polygon_rejects_degenerate_exterior_without_publishing_output() {
         .arg(&geojson)
         .arg("--simple")
         .arg("--set-bounds")
-        .assert_failure();
+        .assert_failed();
     result.assert_stderr_contains("at least 3");
     assert!(
         !output.exists(),
@@ -1261,7 +1261,7 @@ fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
         .arg(&config)
         .arg("--simple")
         .arg("--set-bounds")
-        .assert_failure();
+        .assert_failed();
     result.assert_stderr_contains("resolve to the same file");
     assert!(
         !dir.path().join("dup.osm.pbf").exists(),
@@ -1305,7 +1305,7 @@ fn multi_extract_rejects_symlinked_output_paths() {
         .arg(&config)
         .arg("--simple")
         .arg("--set-bounds")
-        .assert_failure();
+        .assert_failed();
     result.assert_stderr_contains("resolve to the same file");
     assert_eq!(
         std::fs::read(&real).expect("read seeded output"),
@@ -1357,7 +1357,7 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
         .arg("--simple")
         .arg("--set-bounds")
         .arg("--overwrite")
-        .assert_failure();
+        .assert_failed();
     // Refused before any extraction, even with overwrite permission: a
     // directory is never replaced by a file output.
     result.assert_stderr_contains("is not a regular file");
@@ -1408,7 +1408,7 @@ fn multi_extract_refuses_more_regions_than_the_descriptor_limit_holds() {
         .arg(&config)
         .arg("--simple")
         .open_file_limit(64)
-        .assert_failure();
+        .assert_failed();
     result.assert_stderr_contains("need 49 descriptors");
     result.assert_stderr_contains("extract fewer regions per call");
     for i in 0..REGIONS {
@@ -1635,7 +1635,7 @@ fn multi_extract_directory_override_keeps_subpaths_and_refuses_escapes() {
         .arg("--directory")
         .arg(&override_dir)
         .arg("--simple")
-        .assert_failure();
+        .assert_failed();
     assert!(
         result
             .stderr_str()
@@ -2141,7 +2141,7 @@ fn simple_extract_refuses_an_inexact_id_range_it_relies_on() {
             .arg("--bbox")
             .arg(BBOX_STR)
             .arg("--simple")
-            .assert_failure();
+            .assert_failed();
         out.assert_stderr_contains("this run places and counts the blob by its claim");
         assert!(!output.exists(), "{name}: nothing is published");
     }
@@ -2245,7 +2245,7 @@ fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
         .arg("-o")
         .arg(&output)
         .args(["--bbox", BBOX_STR, "--simple"])
-        .assert_failure();
+        .assert_failed();
     out.assert_stderr_contains(refusal);
     assert!(!output.exists(), "nothing is published");
 
@@ -2256,7 +2256,7 @@ fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
         .arg("--config")
         .arg(&config)
         .args(["--simple", "--set-bounds"])
-        .assert_failure();
+        .assert_failed();
     out.assert_stderr_contains(refusal);
     assert!(
         !dir.path().join("multi-refused.osm.pbf").exists(),
@@ -2482,7 +2482,7 @@ fn extract_refuses_a_blob_whose_claimed_kind_is_false() {
                     .arg(BBOX_STR);
                 let out = strategy_args(cli, strategy)
                     .arg("--set-bounds")
-                    .assert_failure();
+                    .assert_failed();
                 out.assert_stderr_contains(&refusal_text(forged.claimed, forged.found));
                 assert!(
                     !output.exists(),
@@ -2526,7 +2526,7 @@ fn extract_refuses_a_passthrough_candidate_holding_ways() {
         .arg("-o")
         .arg(&output)
         .args(["--bbox", BBOX_STR, "--simple"])
-        .assert_failure();
+        .assert_failed();
     out.assert_stderr_contains(&refusal_text("node", "way"));
     assert!(!output.exists(), "nothing is published");
 
@@ -2537,7 +2537,7 @@ fn extract_refuses_a_passthrough_candidate_holding_ways() {
         .arg("--config")
         .arg(&config)
         .args(["--simple", "--set-bounds"])
-        .assert_failure();
+        .assert_failed();
     out.assert_stderr_contains(&refusal_text("node", "way"));
     assert!(
         !dir.path().join("multi-candidate.osm.pbf").exists(),
@@ -2561,7 +2561,7 @@ fn multi_extract_refuses_a_blob_whose_claimed_kind_is_false() {
             .arg("--config")
             .arg(&config)
             .args(["--simple", "--set-bounds"])
-            .assert_failure();
+            .assert_failed();
         out.assert_stderr_contains(&refusal_text(forged.claimed, forged.found));
         assert!(
             !dir.path().join(format!("{name}.osm.pbf")).exists(),
@@ -2877,7 +2877,7 @@ fn extract_writers_and_raw_copy_refuse_an_unrepresentable_coordinate() {
                 .arg("--bbox=-1,-1,1,1");
             let cli = strategy_args(cli, strategy);
             if refused {
-                cli.assert_failure().assert_stderr_contains(REFUSAL);
+                cli.assert_refused(REFUSAL);
                 assert!(!out.exists(), "{name}: nothing is published");
             } else {
                 cli.assert_success();
@@ -2906,7 +2906,7 @@ fn extract_writers_and_raw_copy_refuse_an_unrepresentable_coordinate() {
             .arg(&config)
             .arg("--simple");
         if refused {
-            cli.assert_failure().assert_stderr_contains(REFUSAL);
+            cli.assert_refused(REFUSAL);
             assert!(!dir.path().join(&a).exists(), "multi: nothing is published");
         } else {
             cli.assert_success();
@@ -2962,7 +2962,7 @@ fn every_extract_route_refuses_an_unrepresentable_coordinate() {
                         };
                         let cli = strategy_args(cli, strategy);
                         if refused {
-                            cli.assert_failure().assert_stderr_contains(REFUSAL);
+                            cli.assert_refused(REFUSAL);
                             assert!(!out.exists(), "{name}, {case}: nothing is published");
                         } else {
                             cli.assert_success();
@@ -3002,7 +3002,7 @@ fn every_extract_route_refuses_an_unrepresentable_coordinate() {
                         .arg(&config)
                         .arg("--simple");
                     if refused {
-                        cli.assert_failure().assert_stderr_contains(REFUSAL);
+                        cli.assert_refused(REFUSAL);
                         assert!(!dir.path().join("a.osm.pbf").exists(), "multi, {case}");
                     } else {
                         cli.assert_success();

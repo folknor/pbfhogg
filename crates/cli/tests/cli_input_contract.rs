@@ -28,6 +28,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::invoker::{CliInvoker, CliOutput, subcommands};
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 use pbfhogg_test_scratch::TestScratch;
 
 /// The one spelling of the missing-header error.
@@ -1447,8 +1448,7 @@ fn policy_holds(fx: &Fx, row: &PolicyRow) -> Result<(), String> {
                 Escape::Rejected(parser_text) => {
                     let (out, text) = run_policy_row(fx, row, &input, &["--force"]);
                     ensure!(
-                        out.status.code() == Some(crate::invoker::EXIT_USAGE)
-                            && text.contains(parser_text),
+                        out.status.code() == Some(EXIT_USAGE) && text.contains(parser_text),
                         "`--force` must be refused with {parser_text:?}; exit {:?}, output:\n{text}",
                         out.status.code()
                     );
@@ -2081,8 +2081,9 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
             .args(extra)
             .run();
         let stderr = out.stderr_str();
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
             "{command} {extra:?}: stderr:\n{stderr}"
         );
         assert!(
@@ -2101,7 +2102,11 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
             .arg(&fifo)
             .run();
         let stderr = out.stderr_str();
-        assert!(!out.status.success(), "{command}: stderr:\n{stderr}");
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
+            "{command}: stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains(&format!("{} is not a regular file", fifo.display())),
             "{command}: {stderr}"
@@ -2135,7 +2140,11 @@ fn inspect_pins_its_input_wherever_it_reads_it_twice() {
             .args(extra)
             .run();
         let stderr = out.stderr_str();
-        assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
+            "{extra:?}: stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains(&format!("{} is not a regular file", fifo.display())),
             "{extra:?}: {stderr}"
@@ -2177,7 +2186,11 @@ fn check_pins_its_input_when_it_composes_checks() {
             .args(extra)
             .run();
         let stderr = out.stderr_str();
-        assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
+            "{extra:?}: stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains(&format!("{} is not a regular file", fifo.display())),
             "{extra:?}: {stderr}"
@@ -2327,7 +2340,11 @@ mod check_composition {
                         "{cell}: every check must read the pinned file"
                     );
                 } else {
-                    assert!(!out.status.success(), "{cell}: must refuse");
+                    assert_eq!(
+                        out.status.code(),
+                        Some(crate::invoker::EXIT_FAILED),
+                        "{cell}: must refuse"
+                    );
                     assert!(
                         out.stderr_str().contains("the input was replaced"),
                         "{cell}: {}",

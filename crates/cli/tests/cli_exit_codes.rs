@@ -25,10 +25,9 @@
 use std::path::Path;
 
 use crate::common::{TestNode, write_test_pbf_sorted};
-use crate::invoker::{CliInvoker, EXIT_FAILED, EXIT_USAGE};
+use crate::invoker::{CliInvoker, EXIT_ANSWER_NEGATIVE, EXIT_FAILED, EXIT_USAGE};
 
 const EXIT_SUCCESS: i32 = 0;
-const EXIT_ANSWER_NEGATIVE: i32 = 1;
 
 fn write_two_nodes(path: &Path, second_lat: i32) {
     write_test_pbf_sorted(
@@ -645,8 +644,9 @@ fn inspect_show_rejects_every_other_mode_flag() {
             .arg("n1")
             .args(&extra)
             .run();
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_USAGE),
             "inspect --show {extra:?} must be rejected, not silently ignored; \
              stdout:\n{}\nstderr:\n{}",
             out.stdout_str(),
@@ -677,8 +677,9 @@ fn inspect_force_and_jobs_require_nodes() {
             .arg("--blocks")
             .args(&extra)
             .run();
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_USAGE),
             "inspect --blocks {extra:?} must be rejected: the flag reaches only \
              the --nodes scan; stdout:\n{}\nstderr:\n{}",
             out.stdout_str(),

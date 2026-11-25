@@ -24,6 +24,7 @@ use crate::common::{
     write_test_pbf_sorted,
 };
 use crate::invoker::CliInvoker;
+use crate::invoker::EXIT_FAILED;
 use pbfhogg::MemberId;
 
 #[derive(Default, Clone, Copy)]
@@ -1134,8 +1135,9 @@ fn unsorted_input_rejected() {
     );
 
     let out = run_diff_failing(&old, &new);
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "should reject unsorted; stderr:\n{}",
         out.stderr_str()
     );

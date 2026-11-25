@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::common::{generate_nodes, write_indexed_pbf};
+use crate::invoker::EXIT_FAILED;
 use crate::invoker::{CliInvoker, CliOutput};
 
 /// A sorted, indexed PBF of `count` nodes at scattered coordinates, so
@@ -73,8 +74,9 @@ fn error_text(out: &CliOutput) -> String {
 
 /// The run failed and its error report names `path`.
 fn assert_names(out: &CliOutput, path: &Path, what: &str) {
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "{what}: the run must fail; stderr:\n{}",
         out.stderr_str()
     );

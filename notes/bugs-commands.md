@@ -230,3 +230,39 @@ has ever been recorded, so whether that wall is the change, the mode, or the
 host is unknown. Next: one planet cell at `9bbd64df` to establish the mode's
 baseline, then a matched pair; if the change is the cost, it comes out or
 is made cheaper.
+
+## CMD-076 - The history time-filter's worker path has two untested shapes
+
+Reported by: the spar accounting of the parallel history time-filter
+change, from its scout's lateral and its implementer's report
+(2026-11-25); read from source, not run.
+
+The history path now selects and encodes on the decode workers and joins
+objects across blob seams in an ordered stitcher
+(`time_filter/mod.rs`, `HistoryBlobs` and `Stitch`). Two of its shapes
+have no test. `crates/lib/tests/cancel.rs` has one time-filter scenario,
+"cutoff after every timestamp", on a snapshot-path fixture, so no
+cancellation is ever delivered to the history workers or the stitcher
+while it holds a blob ending. And no test has a blob's alternative ending
+(the last block pre-encoded with the straddling object's candidate) cross
+a kind boundary inside that blob, because the fixture builders write one
+kind per block; the case was traced correct in the spar review, not run.
+Fix shape: a history cancellation scenario in `cancel.rs`, and a fixture
+with a mixed-kind blob whose last object straddles the seam.
+
+## CMD-077 - No test drives apply-changes' worker-side oversize refusal
+
+Reported by: the spar accounting of the apply-changes streamed re-cut,
+from its scout's lateral (2026-11-25); read from source, not run.
+
+`docs/cli/commands.md` (apply-changes) promises that an element which
+does not fit a block alone with its own strings fails the run (exit 2)
+with the oversize error and publishes nothing. The overflow tests
+(`crates/lib/tests/apply_changes_overflow.rs`) all apply; the one refusal
+test (`a_create_block_over_the_blob_limit_fails_the_merge_from_a_later_batch`
+in `apply_changes_create_runs.rs`, test hooks only) covers the drain's
+create path. Nothing asserts the refusal, or that no output is published,
+when it is raised on a worker, now that a deferred blob is planned and then
+streamed (`apply_changes/overflow.rs`). Fix shape: a modify whose single
+element exceeds the payload limit, asserting the typed error and an absent
+output.

@@ -26,6 +26,7 @@ use crate::common::adversarial::{
 };
 use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf};
 use crate::invoker::CliInvoker;
+use crate::invoker::EXIT_FAILED;
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -77,8 +78,9 @@ fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
         .arg(&output)
         .run();
 
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "renumber must refuse out-of-order blobs; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -113,8 +115,9 @@ fn renumber_unsorted_header_error_explains_renumber_requirement() {
         .arg(&output)
         .run();
 
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "renumber must reject an unsorted header; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -171,8 +174,9 @@ fn apply_changes_rejects_unsorted_header() {
         .arg(&output)
         .run();
 
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "apply-changes must reject an unsorted base header; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -317,8 +321,9 @@ fn altw_external_rejects_reversed_indexdata_range() {
         .arg("external")
         .run();
 
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "altw external must reject reversed indexdata; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -372,8 +377,9 @@ fn renumber_rejects_truncated_relation_blob_payload() {
         .arg(&output)
         .run();
 
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "renumber must reject a truncated relation payload; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -472,8 +478,7 @@ fn getparents_rejects_zero_full_scan_min_blobs() {
         .arg("-o")
         .arg(&output)
         .args(["--full-scan-min-blobs", "0", "n1"])
-        .assert_failure();
-    out.assert_stderr_contains("invalid value");
+        .assert_usage("invalid value");
     let stderr = out.stderr_str();
     assert!(
         !stderr.contains("never-opened"),
@@ -584,8 +589,9 @@ fn write_bad_string_pbf(path: &Path, bad: BadString, historical: bool) {
 
 fn assert_refused(out: &crate::invoker::CliOutput, needle: &str, context: &str) {
     let stderr = out.stderr_str();
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "{context}: a bad string index must be refused, not re-encoded as \"\"; stderr:\n{stderr}"
     );
     assert!(

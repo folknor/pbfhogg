@@ -27,6 +27,7 @@ use crate::common::{
     write_test_pbf_non_indexed,
 };
 use crate::invoker::{CliInvoker, CliOutput};
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
 // ---------------------------------------------------------------------------
@@ -162,8 +163,9 @@ fn run_altw_ignoring_missing(
 /// Assert a run refused because of unresolvable node references, on that
 /// guard's own wording rather than on "it failed somehow".
 fn assert_refused_for_missing_nodes(out: &CliOutput, context: &str) {
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "{context}: unresolvable way node refs must fail the run; stderr:\n{}",
         out.stderr_str(),
     );
@@ -209,8 +211,9 @@ fn out_of_domain_node_coordinates_are_refused_by_both_backends() {
             write_indexed_pbf(&input, &nodes, &ways, &[]);
 
             let out = run_altw(&input, &output, true, backend, false);
-            assert!(
-                !out.status.success(),
+            assert_eq!(
+                out.status.code(),
+                Some(EXIT_FAILED),
                 "an out-of-domain referenced node must fail the run; stderr:\n{}",
                 out.stderr_str(),
             );
@@ -1056,7 +1059,7 @@ fn altw_external_refuses_force_before_any_input() {
         .run();
     assert_eq!(
         out.status.code(),
-        Some(crate::invoker::EXIT_USAGE),
+        Some(EXIT_USAGE),
         "stderr:\n{}",
         out.stderr_str()
     );
@@ -1112,8 +1115,9 @@ fn altw_external_refuses_non_indexed_input() {
     );
 
     let out = run_altw(&input, &output, true, IndexBackend::External, false);
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "expected external-join to refuse a non-indexed PBF, but it succeeded; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -1143,8 +1147,9 @@ fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
 
     let out = run_altw(&input, &output, true, IndexBackend::External, false);
     let stderr = out.stderr_str();
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "external must refuse; stderr:\n{stderr}"
     );
     assert!(
@@ -1190,8 +1195,9 @@ fn altw_dense_index_type_rejected_with_migration_hint() {
         .arg("--force")
         .run();
 
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_USAGE),
         "expected --index-type dense to be rejected, but it succeeded; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
@@ -1592,8 +1598,9 @@ fn assert_external_refuses_and_sparse_joins(input: &Path, needle: &str, way_refs
         run_altw_ignoring_missing(input, &output, true, IndexBackend::External),
     ] {
         let stderr = out.stderr_str();
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
             "external must refuse; stderr:\n{stderr}"
         );
         assert!(
@@ -1666,8 +1673,9 @@ fn external_refuses_way_blobs_in_descending_order() {
     let output = dir.path().join("external.osm.pbf");
     let out = run_altw(&input, &output, true, IndexBackend::External, false);
     let stderr = out.stderr_str();
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "external must refuse; stderr:\n{stderr}"
     );
     assert!(
@@ -2024,8 +2032,9 @@ fn assert_both_backends_refuse(input: &Path, needle: &str) {
         let output = input.with_extension(format!("{}.out.pbf", backend.flag().unwrap()));
         let out = run_altw_ignoring_missing(input, &output, false, backend);
         let stderr = out.stderr_str();
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
             "{}: must refuse; stderr:\n{stderr}",
             backend.flag().unwrap()
         );
@@ -2156,8 +2165,9 @@ fn external_refuses_a_way_blob_descending_behind_a_mixed_sign_range() {
     let output = dir.path().join("external.osm.pbf");
     let out = run_altw(&input, &output, true, IndexBackend::External, false);
     let stderr = out.stderr_str();
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "external must refuse; stderr:\n{stderr}"
     );
     assert!(
@@ -2180,8 +2190,9 @@ fn external_refuses_a_node_blob_out_of_order_inside() {
     let output = dir.path().join("external.osm.pbf");
     let out = run_altw_ignoring_missing(&input, &output, true, IndexBackend::External);
     let stderr = out.stderr_str();
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "external must refuse; stderr:\n{stderr}"
     );
     assert!(

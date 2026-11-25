@@ -27,6 +27,7 @@ use crate::common::{
     way_ids_id_only as way_ids, write_multi_block_test_pbf, write_test_pbf,
 };
 use crate::invoker::CliInvoker;
+use crate::invoker::EXIT_USAGE;
 use pbfhogg::MemberId;
 
 /// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [--invert-match]
@@ -359,8 +360,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
         .arg("-o")
         .arg(&believed)
         .arg("boundary")
-        .assert_failure()
-        .assert_stderr_contains("claims node elements but the blob holds relation elements");
+        .assert_refused("claims node elements but the blob holds relation elements");
     assert!(!believed.exists(), "a refused run publishes nothing");
 
     // With --distrust-metadata every scan reads every blob and decides on
@@ -405,15 +405,14 @@ fn distrust_metadata_is_rejected_on_osc_input() {
     }
     let out = dir.path().join("out.osc.gz");
 
-    let failure = CliInvoker::new(&invocation_scratch)
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&osc)
         .arg("-o")
         .arg(&out)
         .arg("--distrust-metadata")
         .arg("amenity")
-        .assert_failure();
-    failure.assert_stderr_contains("carries no blob metadata");
+        .assert_usage("carries no blob metadata");
 
     // Passing counterpart: the same OSC run without the flag is accepted.
     CliInvoker::new(&invocation_scratch)
@@ -549,7 +548,11 @@ fn expressions_file_rejects_an_indented_type_prefix() {
         .arg("-e")
         .arg(&exprs)
         .run();
-    assert!(!out.status.success(), "an indented type prefix must fail");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_USAGE),
+        "an indented type prefix must fail"
+    );
     assert!(
         out.stderr_str().contains("contains spaces"),
         "stderr: {}",
@@ -1566,7 +1569,7 @@ fn a_blob_holding_another_kind_than_it_claims_is_refused() {
         for flag in flags {
             cli = cli.arg(*flag);
         }
-        let out = cli.arg("highway").assert_failure();
+        let out = cli.arg("highway").assert_failed();
         out.assert_stderr_contains("claims node elements but the blob holds way elements");
         assert!(!output.exists(), "{name}: a refused run published output");
     }

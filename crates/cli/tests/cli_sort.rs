@@ -17,6 +17,7 @@ use crate::common::{
     write_test_pbf_non_indexed,
 };
 use crate::invoker::CliInvoker;
+use crate::invoker::{EXIT_ANSWER_NEGATIVE, EXIT_FAILED};
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -1311,8 +1312,9 @@ fn sort_direct_io_feature_missing_error() {
         .arg("--force")
         .run();
 
-    assert!(
-        !run.status.success(),
+    assert_eq!(
+        run.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
         "sort --direct-io must fail without linux-direct-io feature",
     );
     let stderr = run.stderr_str();
@@ -1341,8 +1343,9 @@ fn sort_io_uring_feature_missing_error() {
         .arg("--force")
         .run();
 
-    assert!(
-        !run.status.success(),
+    assert_eq!(
+        run.status.code(),
+        Some(crate::invoker::EXIT_USAGE),
         "sort --io-uring must fail without linux-io-uring feature",
     );
     let stderr = run.stderr_str();
@@ -1372,7 +1375,7 @@ fn sort_refuses_non_leading_header_frames() {
             .arg(dir.path().join(format!("out-{insertion}.osm.pbf")))
             .arg("--force")
             .run();
-        assert!(!out.status.success(), "{}", out.stderr_str());
+        assert_eq!(out.status.code(), Some(EXIT_FAILED), "{}", out.stderr_str());
         assert!(out.stderr_str().contains("a second OSMHeader blob"));
     }
 }
@@ -1438,7 +1441,11 @@ fn sort_refuses_a_believed_claim_its_decoded_overlap_blob_contradicts() {
         .arg(&output)
         .arg("--force")
         .run();
-    assert!(!out.status.success(), "sort published a wrong answer");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
+        "sort published a wrong answer"
+    );
     out.assert_stderr_contains("claims node elements but the blob holds way elements");
     assert!(!output.exists(), "a refused sort published output");
 }
@@ -1648,7 +1655,9 @@ fn sort_distrust_metadata_replaces_false_tagdata() {
         .arg("check")
         .arg("--index")
         .arg(&plain)
-        .assert_failure();
+        .assert_exit(EXIT_ANSWER_NEGATIVE)
+        .assert_stdout_contains("tagdata omits")
+        .assert_stdout_contains("tagdata lists");
 
     let repaired = dir.path().join("repaired.osm.pbf");
     let out = CliInvoker::new(&invocation_scratch)
@@ -1898,6 +1907,5 @@ fn sort_refuses_a_rewritten_way_without_the_declared_locations() {
         .arg(&input)
         .arg("-o")
         .arg(&output)
-        .assert_failure()
-        .assert_stderr_contains("0 inline location(s)");
+        .assert_refused("0 inline location(s)");
 }

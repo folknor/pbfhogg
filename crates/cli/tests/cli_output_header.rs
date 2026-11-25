@@ -35,6 +35,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::invoker::{CliInvoker, CliOutput, subcommands};
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, HeaderBlock, MemberId};
@@ -1113,8 +1114,10 @@ fn run_row(
     match (row.expect)(fixture) {
         Outcome::Refused => {
             ensure!(
-                !out.status.success(),
-                "expected a refusal, the run succeeded"
+                out.status.code() == Some(EXIT_FAILED),
+                "expected a refusal (exit 2), got {:?}; stderr:\n{}",
+                out.status.code(),
+                out.stderr_str()
             );
             Ok(())
         }
@@ -1377,8 +1380,9 @@ fn an_unindexed_way_blob_cannot_break_a_declared_enrichment() {
     for extra in [&[][..], &["-t", "way"][..]] {
         let (args, outputs) = simple(&fx, "cat", std::slice::from_ref(&mixed), extra);
         let out = CliInvoker::new(&invocation_scratch).args(&args).run();
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
             "cat {extra:?} wrote a way blob without the enrichment its header declared"
         );
         assert!(
@@ -1502,8 +1506,7 @@ fn inspect_prints_the_replication_timestamp_as_utc_and_it_round_trips() {
     );
     CliInvoker::new(&invocation_scratch)
         .args(&args)
-        .assert_failure()
-        .assert_stderr_contains("expected UNIX seconds");
+        .assert_usage("expected UNIX seconds");
 }
 
 /// apply-changes drops the base's replication position, and a caller that
@@ -1586,7 +1589,11 @@ fn tags_filter_osc_mode_refuses_header_overrides() {
             .arg(&out)
             .args(flags)
             .run();
-        assert!(!run.status.success(), "{flags:?} was accepted in OSC mode");
+        assert_eq!(
+            run.status.code(),
+            Some(EXIT_USAGE),
+            "{flags:?} was accepted in OSC mode"
+        );
         assert!(run.stderr_str().contains("not valid in OSC mode"));
     }
 }

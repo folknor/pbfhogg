@@ -82,7 +82,7 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
     for args in runs {
         let out = CliInvoker::new(&invocation_scratch)
             .args(&args)
-            .assert_failure();
+            .assert_refused("is unusable");
         let stderr = out.stderr_str();
         assert!(stderr.contains("--tmp-dir"), "{args:?}: {stderr}");
         assert!(
@@ -107,12 +107,8 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
             std::ffi::OsStr::new("--tmp-dir"),
             tmp_arg,
         ])
-        .assert_failure();
+        .assert_usage("--tmp-dir is only valid with --format osc");
     let stderr = out.stderr_str();
-    assert!(
-        stderr.contains("--tmp-dir is only valid with --format osc"),
-        "{stderr}"
-    );
     assert!(!stderr.contains("no-such-input"), "{stderr}");
 }
 
@@ -131,7 +127,7 @@ fn a_tmp_dir_that_is_a_file_or_unwritable_is_refused() {
         .arg(output.as_os_str())
         .arg("--tmp-dir")
         .arg(file.as_os_str())
-        .assert_failure();
+        .assert_failed();
     assert!(
         out.stderr_str().contains("not a directory"),
         "{}",
@@ -153,7 +149,7 @@ fn a_tmp_dir_that_is_a_file_or_unwritable_is_refused() {
         .arg(output.as_os_str())
         .arg("--tmp-dir")
         .arg(locked.as_os_str())
-        .assert_failure();
+        .assert_failed();
     let stderr = out.stderr_str();
     drop(denial);
     assert!(stderr.contains("--tmp-dir"), "{stderr}");
@@ -191,7 +187,7 @@ fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
         args.extend(tmp_args);
         CliInvoker::new(&invocation_scratch)
             .args(&args)
-            .assert_failure();
+            .assert_failed();
         assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
         let beside: Vec<_> = names(&work);
         assert_eq!(
@@ -376,7 +372,7 @@ fn a_tmp_dir_inside_a_replaced_index_is_refused() {
         .arg("--overwrite")
         .arg("--tmp-dir")
         .arg(index.as_os_str())
-        .assert_failure();
+        .assert_failed();
     assert!(
         out.stderr_str().contains("inside the index output")
             || out.stderr_str().contains("not a geocode index"),
@@ -628,7 +624,7 @@ fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
         .arg("--output-dir")
         .arg(index.as_os_str())
         .arg("--allow-unindexed")
-        .assert_failure()
+        .assert_failed()
         .stderr_str();
     assert_eq!(occurrences(&stderr, &buckets), 1, "{stderr}");
     assert!(
@@ -680,7 +676,7 @@ fn an_index_holding_leftovers_is_not_replaced() {
         .arg(index.as_os_str())
         .arg("--allow-unindexed")
         .arg("--overwrite")
-        .assert_failure()
+        .assert_failed()
         .stderr_str();
     assert!(stderr.contains("cannot be replaced"), "{stderr}");
     assert!(stderr.contains(&backup.display().to_string()), "{stderr}");

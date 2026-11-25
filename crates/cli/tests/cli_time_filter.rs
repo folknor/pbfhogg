@@ -409,7 +409,7 @@ fn time_filter_refuses_metadata_stripped_input() {
         .arg("-o")
         .arg(&output)
         .arg("250")
-        .assert_failure();
+        .assert_failed();
     let stderr = out.stderr_str();
     assert!(
         stderr.contains("carries no timestamp"),
@@ -455,7 +455,7 @@ fn time_filter_refuses_a_dense_padding_slot() {
             .arg("-o")
             .arg(&output)
             .arg("250")
-            .assert_failure();
+            .assert_failed();
         let stderr = out.stderr_str();
         assert!(
             stderr.contains("node 2 carries no timestamp"),
@@ -521,7 +521,7 @@ fn time_filter_refuses_a_timestamp_whose_scaling_overflows() {
                 .arg("-o")
                 .arg(&output)
                 .arg("250")
-                .assert_failure();
+                .assert_failed();
             let stderr = out.stderr_str();
             assert!(
                 stderr.contains("node 2") && stderr.contains("overflows i64 milliseconds"),
@@ -821,7 +821,7 @@ fn assert_time_filter_refuses(input: &Path, needle: &str) -> String {
         .arg("-o")
         .arg(&output)
         .arg("1000")
-        .assert_failure();
+        .assert_failed();
     let stderr = out.stderr_str();
     assert!(
         stderr.contains(needle),

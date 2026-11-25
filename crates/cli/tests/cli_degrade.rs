@@ -19,7 +19,7 @@ use crate::common::{
     generate_nodes, generate_relations, generate_ways, read_header, read_normalized,
     write_multi_block_test_pbf,
 };
-use crate::invoker::CliInvoker;
+use crate::invoker::{CliInvoker, EXIT_FAILED, EXIT_USAGE};
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
@@ -997,7 +997,7 @@ fn degrade_rejects_contradictory_corruption_combinations() {
         for f in flags {
             inv = inv.arg(*f);
         }
-        inv.assert_failure().assert_stderr_contains(expect);
+        inv.assert_usage(expect);
     };
 
     // clap's own conflict refusal, before the input is opened.
@@ -1715,8 +1715,7 @@ fn degrade_unsort_and_unsort_intra_are_mutually_exclusive() {
         .arg(&output)
         .arg("--unsort")
         .arg("--unsort-intra")
-        .assert_failure()
-        .assert_stderr_contains("unsort-intra");
+        .assert_usage("unsort-intra");
 }
 
 /// `--unsort` output piped through `pbfhogg sort` recovers the original
@@ -2044,9 +2043,8 @@ fn degrade_requires_at_least_one_flag() {
         .arg(&input)
         .arg("-o")
         .arg(&output)
-        .assert_failure();
-    // A clap usage error naming the required group of transformation flags.
-    cli_output.assert_stderr_contains("required arguments were not provided");
+        // A clap usage error naming the required group of transformation flags.
+        .assert_usage("required arguments were not provided");
     assert_transformation_flags(&cli_output.stderr_str());
 }
 
@@ -2301,10 +2299,12 @@ fn degrade_drop_ids_validates_arguments_and_total() {
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_degrade_fixture(&input);
-    for (spec, message) in [
-        ("0:1", "N must be >= 1"),
-        ("10", "N:SEED"),
-        ("1000000:1", "input has only"),
+    // A malformed spec is the command line's fault (64); N above the
+    // input's distinct IDs is the data's (2).
+    for (spec, code, message) in [
+        ("0:1", EXIT_USAGE, "N must be >= 1"),
+        ("10", EXIT_USAGE, "N:SEED"),
+        ("1000000:1", EXIT_FAILED, "input has only"),
     ] {
         CliInvoker::new(&invocation_scratch)
             .arg("degrade")
@@ -2313,7 +2313,7 @@ fn degrade_drop_ids_validates_arguments_and_total() {
             .arg(&output)
             .arg("--drop-ids")
             .arg(spec)
-            .assert_failure()
+            .assert_exit(code)
             .assert_stderr_contains(message);
     }
 }
@@ -2363,8 +2363,7 @@ fn degrade_drop_ids_counts_repeated_ids_once() {
         .arg(dir.path().join("refused.osm.pbf"))
         .arg("--drop-ids")
         .arg("4:1")
-        .assert_failure()
-        .assert_stderr_contains("input has only 3");
+        .assert_refused("input has only 3");
 }
 
 /// Run one unsort mode over a history-shaped node stream (`ids` in input
@@ -2452,8 +2451,7 @@ fn degrade_rejects_zero_block_cap() {
         .arg("--unsort")
         .arg("--elements-per-blob")
         .arg("0")
-        .assert_failure()
-        .assert_stderr_contains("must be > 0");
+        .assert_usage("must be > 0");
 }
 
 /// A cap larger than the input must not drive builder preallocation.
@@ -2528,8 +2526,7 @@ fn degrade_unsort_intra_rejects_block_cap_one() {
         .arg("--unsort-intra")
         .arg("--elements-per-blob")
         .arg("1")
-        .assert_failure()
-        .assert_stderr_contains("--elements-per-blob >= 2");
+        .assert_usage("--elements-per-blob >= 2");
 }
 
 /// `--unsort --elements-per-blob 1` is rejected: single-element blobs of
@@ -2552,8 +2549,7 @@ fn degrade_unsort_rejects_block_cap_one() {
         .arg("--unsort")
         .arg("--elements-per-blob")
         .arg("1")
-        .assert_failure()
-        .assert_stderr_contains("--unsort needs --elements-per-blob >= 2");
+        .assert_usage("--unsort needs --elements-per-blob >= 2");
     assert!(!output.exists(), "a refused run must write no output");
 }
 
@@ -2737,7 +2733,7 @@ fn degrade_refuses_a_blob_whose_claimed_kind_is_false() {
                 .arg("-o")
                 .arg(&output)
                 .args(flags)
-                .assert_failure();
+                .assert_failed();
             out.assert_stderr_contains(&format!(
                 "blob indexdata claims {claimed} elements but the blob holds way elements"
             ));
@@ -2831,7 +2827,9 @@ fn degrade_corrupt_indexdata_refuses_a_blob_with_no_indexdata() {
             .arg("-o")
             .arg(dir.path().join("out.osm.pbf"))
             .arg(flag)
-            .arg("--force")
-            .assert_failure();
+            // Without `--force`: degrade's `--force` requires a decoding
+            // transformation, so with it this command line was a clap usage
+            // error that never reached the refusal under test.
+            .assert_refused("rewrite a readable indexdata, and this blob has none");
     }
 }

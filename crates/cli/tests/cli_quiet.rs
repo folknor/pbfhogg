@@ -20,6 +20,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::common::{TestWay, generate_nodes, write_test_pbf_sorted};
+use crate::invoker::EXIT_USAGE;
 use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg_test_scratch::TestScratch;
 
@@ -204,7 +205,7 @@ fn a_quiet_run_keeps_the_error_line() {
         );
     }
     let out = run(&quiet(&fx.args(&["sort"]), true));
-    assert_eq!(out.status.code(), Some(crate::invoker::EXIT_USAGE));
+    assert_eq!(out.status.code(), Some(EXIT_USAGE));
     assert!(
         !out.stderr.is_empty(),
         "a usage error must be printed under -q"
@@ -314,7 +315,7 @@ fn quiet_inspect_indexed_refuses_json() {
         let out = run(&quiet(&args, leading));
         assert_eq!(
             out.status.code(),
-            Some(crate::invoker::EXIT_USAGE),
+            Some(EXIT_USAGE),
             "{}: {}",
             place(leading),
             out.stderr_str()

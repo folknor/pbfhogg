@@ -25,6 +25,7 @@ use crate::common::{
     way_ids_with_coords as way_ids, write_multi_block_test_pbf, write_test_pbf,
     write_test_pbf_sorted,
 };
+use crate::invoker::EXIT_FAILED;
 use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
@@ -803,8 +804,9 @@ fn unsorted_input_rejected() {
     );
 
     let out = run_derive(&old, &new, &osc, false, false, Some(1));
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "should reject unsorted input; stderr:\n{}",
         out.stderr_str()
     );

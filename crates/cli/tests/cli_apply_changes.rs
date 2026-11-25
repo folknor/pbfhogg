@@ -39,6 +39,7 @@ use crate::common::{
     way_ids_with_coords as way_ids, write_test_pbf_sorted,
 };
 use crate::invoker::{CliInvoker, CliOutput};
+use crate::invoker::{EXIT_FAILED, EXIT_USAGE};
 use flate2::write::GzEncoder;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -1772,8 +1773,9 @@ fn merge_locations_on_ways_conflicting_duplicate_base_records_are_refused() {
                 ..ApplyOpts::default()
             },
         );
-        assert!(
-            !rejected.status.success(),
+        assert_eq!(
+            rejected.status.code(),
+            Some(EXIT_FAILED),
             "split={split} jobs={jobs:?}: conflicting duplicates must be refused. stderr:\n{}",
             rejected.stderr_str()
         );
@@ -1853,8 +1855,9 @@ fn merge_locations_on_ways_requires_base_feature() {
             ..ApplyOpts::default()
         },
     );
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "should fail without LocationsOnWays in base; stderr:\n{}",
         out.stderr_str(),
     );
@@ -2034,7 +2037,12 @@ fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
     write_osc(&osc, LOW_WAY_EDIT_OSC);
 
     let out = run_apply_changes(&base, &osc, &output, low_opts());
-    assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
+        "stderr:\n{}",
+        out.stderr_str()
+    );
     out.assert_stderr_contains("apply-changes: base blob");
     // The location is the walker's true blob ordinal (the header is blob 0),
     // not the pipeline's data-blob sequence number.
@@ -2073,7 +2081,12 @@ fn merge_locations_on_ways_refuses_a_joined_node_outside_the_domain() {
             &[(1, 0, 0), bad, (3, 500_000_000, 600_000_000)],
             &osc,
         );
-        assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
+            "stderr:\n{}",
+            out.stderr_str()
+        );
         out.assert_stderr_contains("node 2 has coordinates outside the geographic domain");
         assert!(!output.exists(), "failed merge must leave no output");
     }
@@ -3235,8 +3248,9 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
 </osmChange>"#,
     );
     let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "a stale change after a delete must be refused"
     );
     assert!(
@@ -3331,8 +3345,9 @@ fn merge_refuses_changes_older_than_the_base_version() {
             ),
         );
         let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_FAILED),
             "case {n}: a change older than the base must be refused"
         );
         assert!(
@@ -3489,7 +3504,11 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
         .arg(&combined_stale)
         .assert_success();
     let out = run_apply_changes(&base, &combined_stale, &output, ApplyOpts::default());
-    assert!(!out.status.success(), "a lower claim must still be refused");
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
+        "a lower claim must still be refused"
+    );
     assert!(
         out.stderr_str().contains("is lower than version 5"),
         "error must name the regression; stderr:\n{}",
@@ -3531,7 +3550,7 @@ fn merge_refuses_force_with_locations_on_ways_before_any_input() {
         .run();
     assert_eq!(
         out.status.code(),
-        Some(crate::invoker::EXIT_USAGE),
+        Some(EXIT_USAGE),
         "stderr:\n{}",
         out.stderr_str()
     );
@@ -3598,8 +3617,9 @@ fn merge_refuses_locations_on_ways_on_non_indexed() {
             ..ApplyOpts::default()
         },
     );
-    assert!(
-        !out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_FAILED),
         "must refuse --locations-on-ways on a non-indexed base; stderr:\n{}",
         out.stderr_str(),
     );

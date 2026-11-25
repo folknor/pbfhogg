@@ -8,7 +8,7 @@ use worker::{
     output, pbf_frames, process, reference, reference_cache, run, stream, test_support, tunables,
     verify_change_listing, verify_diff_detail, verify_diff_opl, verify_element_diff,
     verify_extract_simple, verify_extsort, verify_fileinfo, verify_getid_refs, verify_input_order,
-    verify_opl, verify_polygon, verify_reencode,
+    verify_opl, verify_polygon, verify_reencode, verify_signs,
 };
 
 const EXE: &str = env!("CARGO_BIN_EXE_pbfhogg-verify-test-worker");

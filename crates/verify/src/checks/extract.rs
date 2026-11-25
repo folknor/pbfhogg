@@ -35,7 +35,7 @@
 //! absolute value and pbfhogg by the signed ID, so membership is compared
 //! only where no sign can fold: an input holding a negative ID is refused
 //! before any run, and an osmium output holding a negative reference before
-//! its strategy's verdicts ([`refuse_negative_refs`]), each as the
+//! its strategy's verdicts ([`crate::verify_signs::refuse_folds`]), each as the
 //! verifier's error.
 //!
 //! Input order. pbfhogg branches on `Sort.Type_then_ID` among the input
@@ -330,8 +330,28 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         // Before any verdict of this arm, under the policy the diff reads:
         // a negative reference osmium wrote makes its membership a possible
         // magnitude fold, which the comparison cannot tell from a pbfhogg
-        // error.
-        refuse_negative_refs(harness, &osmium_out, policy, &osmium_label)?;
+        // error. The input's negative IDs were refused before any run, so
+        // only references are witnesses here.
+        //
+        // osmium complete_ways and smart record a matched way's outside refs
+        // signed into an unsigned ID set, so a negative one asks for an
+        // allocation no host serves and the run ends "Out of memory" with no
+        // output to read. For complete_ways that path is screened out here
+        // first: the strategies run simple first, simple matches a way
+        // exactly as complete_ways does (by `positive_ref`) and writes it with
+        // all its refs, so this refusal fires on simple's output before
+        // complete_ways runs. Smart also records the refs of ways it adds
+        // through multipolygon and boundary relations, which simple need not
+        // write; such a run reaches the harness's rule for osmium's
+        // allocation-failure exit (ENVIRONMENT, cause unknown), never a FAIL.
+        crate::verify_signs::refuse_folds(
+            harness,
+            &osmium_out,
+            policy,
+            &osmium_label,
+            "osmium extract",
+            crate::verify_signs::Witnesses::References,
+        )?;
         harness.judge_way_locations(
             &format!("pbfhogg extract --{strategy_name}"),
             pbf,
@@ -457,95 +477,6 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
     }
 
     Ok(membership_line(&membership, suffix, outdir))
-}
-
-/// The derived-summary kind of [`NegativeRefs`], versioned with its meaning.
-const NEGATIVE_REFS_KIND: &str = "extract-negative-refs 1";
-
-/// The first negative way node ref or relation member in a decoding, in
-/// file order, or none: a stored reading of one osmium output.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-struct NegativeRefs {
-    /// `(holder kind index, holder ID, referenced kind index, ref)`.
-    first: Option<(usize, i64, usize, i64)>,
-}
-
-/// Refuse the comparison when osmium's output at `osmium_out` holds a way
-/// referencing a negative node or a relation with a negative member.
-///
-/// With no negative element ID in the input (refused before any run), an
-/// osmium fold that changes a successful extract's answer needs a negative
-/// reference on an object osmium wrote: a dangling `n-2` matches `n2` through
-/// `positive_ref`, so the way or relation holding it is selected and written,
-/// possibly as a record both outputs share byte for byte (a boundary
-/// relation `n1,n-2` written by both, with osmium alone adding `n2`), and
-/// a relation parent found through a folded member is itself written,
-/// carrying it. So every record of the output is read, shared ones too, not
-/// only the differing ones. The reading is stored under the output's decoding
-/// key, so a warm rerun neither decodes nor scans.
-///
-/// osmium complete_ways and smart record a matched way's outside refs signed
-/// into an unsigned ID set, so a negative one asks for an allocation no host
-/// serves and the run ends "Out of memory" with no output to read. For
-/// complete_ways that path is screened out here first: the strategies run
-/// simple first, simple matches a way exactly as complete_ways does (by
-/// `positive_ref`) and writes it with all its refs, so this refusal fires on
-/// simple's output before complete_ways runs. Smart also records the refs of
-/// ways it adds through multipolygon and boundary relations, which simple
-/// need not write; such a run reaches the harness's rule for osmium's
-/// allocation-failure exit (ENVIRONMENT, cause unknown), never a FAIL.
-fn refuse_negative_refs(
-    harness: &mut Harness,
-    osmium_out: &Path,
-    policy: crate::opl_compare::Policy,
-    label: &str,
-) -> Result<(), Error> {
-    let key = crate::opl_compare::planned_keys(harness, &[osmium_out], policy)?
-        .and_then(|keys| keys.into_iter().next())
-        .map(|key| key.derived(NEGATIVE_REFS_KIND));
-    let stored = key
-        .as_ref()
-        .and_then(|key| harness.summary_of::<NegativeRefs>(key));
-    let reading = if let Some(stored) = stored {
-        harness.run.revalidate()?;
-        harness.checkpoint()?;
-        stored
-    } else {
-        crate::opl_compare::decoded(harness, (osmium_out, Origin::Other), policy, |h, opl| {
-            let mut first = None;
-            crate::verify_opl::scan_objects(opl, |o| {
-                if first.is_some() {
-                    return;
-                }
-                let holder = (o.kind.index(), o.id);
-                first = o
-                    .nodes
-                    .iter()
-                    .map(|&r| (OscKind::Node, r))
-                    .chain(o.members.iter().copied())
-                    .find(|&(_, r)| r < 0)
-                    .map(|(kind, r)| (holder.0, holder.1, kind.index(), r));
-            })?;
-            let reading = NegativeRefs { first };
-            // Stored only under the key this decoding was sealed under,
-            // after the scan read it to its end.
-            if let Some(key) = crate::opl_compare::decoding_key(h, opl) {
-                h.publish_summary_of(&key.derived(NEGATIVE_REFS_KIND), &reading)?;
-            }
-            Ok(reading)
-        })?
-    };
-    match reading.first {
-        None => Ok(()),
-        Some((holder_kind, holder, kind, id)) => {
-            const KINDS: [&str; 3] = ["node", "way", "relation"];
-            Err(Error::Tool(format!(
-                "{label}: {} {holder} references {} {id}; osmium extract matches a reference by \
-                 its absolute value and pbfhogg does not, so extract cannot be compared on it",
-                KINDS[holder_kind], KINDS[kind]
-            )))
-        }
-    }
 }
 
 /// What the simple strategy hands its relation adjudication.

@@ -51,6 +51,8 @@ pub(crate) mod verify_getid_refs;
 pub(crate) mod verify_input_order;
 #[path = "../src/verify_opl.rs"]
 pub(crate) mod verify_opl;
+#[path = "../src/verify_signs.rs"]
+pub(crate) mod verify_signs;
 
 #[path = "../src/verify_fileinfo.rs"]
 pub(crate) mod verify_fileinfo;

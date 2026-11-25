@@ -42,21 +42,13 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             (
                 "bad-cat",
                 checks::cat::run as checks::ReadCheck,
-                [
+                &[
                     "cat -t node diff",
                     "cat -t way diff",
                     "cat -t relation diff",
-                ],
+                ][..],
             ),
-            (
-                "bad-tags",
-                checks::tags_filter::run,
-                [
-                    "tags-filter --omit-referenced highway=primary diff",
-                    "tags-filter --omit-referenced amenity=restaurant diff",
-                    "tags-filter --omit-referenced w/highway=primary diff",
-                ],
-            ),
+            ("bad-tags", checks::tags_filter::run, &TAGS_FILTER_ARMS[..]),
         ] {
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
@@ -71,6 +63,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             assert_eq!(judged.failed, arms, "{name}: {fault}");
         }
     }
+    tags_filter_domain(&mut h, exe, &dir);
     kept_locations(&mut h, exe, &dir);
     std::fs::write(dir.join("fault"), "").unwrap();
     assert_eq!(
@@ -187,6 +180,113 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     );
 }
 
+/// The tags-filter comparisons a content or version fault fails, in order.
+const TAGS_FILTER_ARMS: [&str; 7] = [
+    "tags-filter --omit-referenced highway=primary diff",
+    "tags-filter --omit-referenced amenity=restaurant diff",
+    "tags-filter --omit-referenced w/highway=primary diff",
+    "tags-filter highway=primary diff",
+    "tags-filter r/type=route_master diff",
+    "tags-filter --remove-tags w/highway=primary diff",
+    "tags-filter --invert-match highway=primary diff",
+];
+
+/// The default-mode domain: a fold witness in osmium's default output (a
+/// negative reference or object ID), a history header, and pbfhogg's
+/// refusal of disagreeing repeats on input osmium finds repeating are each
+/// the verifier's error, never a FAIL; the same refusal on input without a
+/// repeat is pbfhogg's failure. Each case gets its own input marker, so no
+/// cached reference run or stored reading of an earlier case answers it.
+fn tags_filter_domain(h: &mut harness::Harness, exe: &Path, dir: &Path) {
+    for (fault, said) in [
+        ("negative-ref", "way 1 references node -2"),
+        ("negative-id", "holds way -3"),
+        ("history", "declares HistoricalInformation"),
+        ("repeats", "repeats an ID"),
+    ] {
+        let input = dir.join(format!("tags-{fault}.pbf"));
+        let required: &[&str] = if fault == "history" {
+            &["HistoricalInformation"]
+        } else {
+            &[]
+        };
+        fake_pbf::write_with(&input, required, &[SORTED], fault);
+        std::fs::write(dir.join("fault"), fault).unwrap();
+        h.run = run::Run::create(dir, exe, true).unwrap();
+        h.run.watch(&input).unwrap();
+        match checks::tags_filter::run(h, &input, true) {
+            Err(crate::error::Error::Tool(why)) => {
+                assert!(why.contains(said), "{fault}: {why}");
+            }
+            other => panic!("{fault}: expected a refusal, got {other:?}"),
+        }
+    }
+    let input = dir.join("tags-lone-refusal.pbf");
+    fake_pbf::write(&input, &[SORTED], "lone-refusal");
+    std::fs::write(dir.join("fault"), "lone-refusal").unwrap();
+    h.run = run::Run::create(dir, exe, true).unwrap();
+    h.run.watch(&input).unwrap();
+    let judged = super::judge(h, "lone-refusal", |h| {
+        checks::tags_filter::run(h, &input, true)
+    });
+    assert_eq!(judged.status, harness::CheckStatus::Failed, "{judged:?}");
+    std::fs::write(dir.join("fault"), "").unwrap();
+}
+
+/// Whether `args` is pbfhogg tags-filter in default mode.
+fn pbfhogg_default_tags_filter(args: &[&str]) -> bool {
+    args[0] == "tags-filter" && args.contains(&"--output") && !args.contains(&"--omit-referenced")
+}
+
+/// osmium fileinfo, whose report finds an ID repeated under the repeats
+/// fault, and pbfhogg's default-mode refusal of disagreeing repeats under
+/// the repeats and lone-refusal faults: the exit code when `args` is one.
+fn repeat_fault(args: &[&str], fault: &str) -> Option<i32> {
+    if args[0] == "fileinfo" {
+        let report = fake_pbf::fileinfo(3, 2, 1);
+        if fault == "repeats" {
+            print!(
+                "{}",
+                report.replace(
+                    r#""multiple_versions":false"#,
+                    r#""multiple_versions":true"#
+                )
+            );
+        } else {
+            print!("{report}");
+        }
+        return Some(0);
+    }
+    if matches!(fault, "repeats" | "lone-refusal") && pbfhogg_default_tags_filter(args) {
+        eprintln!(
+            "tags-filter without omit-referenced selects objects by ID, and the input repeats \
+             an ID whose records disagree about the expressions"
+        );
+        return Some(2);
+    }
+    None
+}
+
+/// Under the sign faults, osmium's default-mode tags-filter outputs also
+/// hold a fold witness, after the record opl_cat wrote to `out`.
+fn add_fold_witness(args: &[&str], fault: &str, out: &Path) {
+    let name = Path::new(args[1])
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !name.starts_with("osmium-") || name.ends_with("-R.osm.pbf") {
+        return;
+    }
+    let witness = match fault {
+        "negative-ref" => "w1 T Nn-2\n",
+        "negative-id" => "w-3 T N\n",
+        _ => return,
+    };
+    let mut opl = std::fs::read_to_string(out).unwrap();
+    opl.push_str(witness);
+    std::fs::write(out, opl).unwrap();
+}
+
 /// An input declaring LocationsOnWays whose first data blob is indexed
 /// (a believed node claim, so sort has no way blob to rewrite): cat and
 /// sort keep the declaration, so both outputs declare it and every
@@ -298,10 +398,13 @@ pub fn tool(args: &[OsString]) -> i32 {
     };
     if fake_pbf::is_opl_cat(&args) {
         fake_pbf::opl_cat(&args);
+        add_fold_witness(&args, &fault, output());
         return 0;
     }
+    if let Some(code) = repeat_fault(&args, &fault) {
+        return code;
+    }
     match args[0] {
-        "fileinfo" => print!("{}", fake_pbf::fileinfo(3, 2, 1)),
         "cat" | "tags-filter" => {
             if args.contains(&"--output") {
                 assert!(args.contains(&"--direct-io"));

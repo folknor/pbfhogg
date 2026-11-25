@@ -23,6 +23,7 @@ mod verify_input_order;
 mod verify_opl;
 mod verify_polygon;
 mod verify_reencode;
+mod verify_signs;
 
 mod argv;
 mod checks;

@@ -116,6 +116,17 @@ impl InputOrder {
     }
 }
 
+/// The policy [`compare_outputs`] first decodes the reference output
+/// `theirs` under, hinted from its header alone; a check reading the same
+/// output before the comparison uses it so the decoding is shared.
+pub(crate) fn reference_policy(theirs: &Path) -> Policy {
+    match pbf_frames::header(theirs, Origin::Other) {
+        Ok(header) if header.optional_feature("LocationsOnWays") => Policy::FULL,
+        Ok(_) => Policy::NO_LOCATIONS,
+        Err(_) => Policy::CONTENT,
+    }
+}
+
 /// Compare pbfhogg's output `ours` of `pbfhogg <label>` with osmium's
 /// `theirs` of `<osmium_label>`: osmium's must be in strict order or the
 /// comparison cannot be made (an error); pbfhogg's must be in strict order
@@ -148,11 +159,7 @@ pub(crate) fn compare_outputs(
     // the reference order is reported, where a content decode might have
     // reported it first. The comparison needs that richer decode whenever
     // pbfhogg's side also declares coordinates, so this is accepted.
-    let hint = match pbf_frames::header(theirs, Origin::Other) {
-        Ok(header) if header.optional_feature("LocationsOnWays") => Policy::FULL,
-        Ok(_) => Policy::NO_LOCATIONS,
-        Err(_) => Policy::CONTENT,
-    };
+    let hint = reference_policy(theirs);
     if !harness
         .check_sorted_as(osmium_label, (theirs, Origin::Other), hint)?
         .is_pass()

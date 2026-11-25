@@ -48,7 +48,7 @@ pbfhogg = { version = "0.6", path = "../lib", default-features = false, features
 serde_json.workspace = true
 # The request reader's Deserialize visitor (src/json.rs).
 serde = "1"
-hotpath = "0.32.1"
+hotpath = "0.33.0"
 # Only to read the ambient executor's effective size for the call context.
 rayon = "1.12.0"
 # getrlimit and setrlimit for the harness's own descriptor policy.

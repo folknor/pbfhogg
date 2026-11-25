@@ -599,7 +599,7 @@ suite because a later comparison cannot make that run complete.
 | `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim; an input holding an object more than once (a history header, or a repeat the reference sort's order scan finds) is `ERROR` |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
 | `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, the disjoint union of that subset and its complement in both orders, and merges with a window of the input's own blobs in both orders: element equality with the input, blob layout and summary counts against the plan predicted from both framings, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
-| `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |
+| `tags-filter` | `osmium tags-filter -R`; `osmium tags-filter`, `-t` and `-i` | three expressions with omitted references, then default mode on `highway=primary`, `r/type=route_master` (nested relation closure), `--remove-tags w/highway=primary` and `--invert-match highway=primary`, same content/order checks as cat; default arms refuse inputs where osmium's sign folding could differ (below) |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
 | `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
@@ -720,6 +720,19 @@ must carry no sort claim and are compared through sorted copies whose
 strict order excludes repeated IDs. With it, outputs must be strictly
 ordered and a reference sort claim requires pbfhogg's claim. Getparents
 refuses negative IDs and negative references osmium could fold.
+
+Tags-filter's default-mode arms (no `-R`) are compared only where osmium's
+selection by absolute value cannot differ from pbfhogg's by signed ID:
+before pbfhogg runs, each arm's osmium output is read, and an object with a
+negative ID or a negative way ref or relation member in it is a verifier
+error (the fold only adds records, and every fold leaves one of these in
+what osmium wrote). The `-R` arms run first and on any input. A
+`HistoricalInformation` header is refused before the first default arm,
+and a pbfhogg refusal of repeated IDs whose records disagree is a verifier
+error when osmium fileinfo finds an ID repeated in the input osmium read,
+a FAIL otherwise. On unindexed input the arms pbfhogg would refuse get
+`--force`; `--invert-match` and the `-R` arms naming every element type
+never read indexdata and take no `--force`.
 
 Check-refs reads pbfhogg's original input and osmium's sorted copy when
 needed. It accepts osmium exit 1 only with the complete final summary and

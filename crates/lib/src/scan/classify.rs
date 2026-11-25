@@ -1396,7 +1396,9 @@ impl<R, M: FnMut(usize, R) -> Result<()>> crate::ordered_pool::OrderedConsumer<R
 /// `merge` receives each entry's position in `schedule`, in order, and may
 /// fail: its error ends the run at once. Failures surface in schedule order
 /// (the lowest failing position's classify error, or the merge's own at its
-/// position), located as in [`parallel_classify_phase`]. The sliding
+/// position). A classify error is located as in [`parallel_classify_phase`];
+/// the merge's error is returned as the callback made it, never located by
+/// the library. The sliding
 /// `WILLNEED` advice tracks the window's edge on a thread of its own (see
 /// [`ClassifyConsumer`]): the first window before any worker starts, every
 /// later edge asynchronously, normally well ahead of the claims it covers

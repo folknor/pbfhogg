@@ -1,57 +1,44 @@
 # Diff
 
-## Diff between independent snapshots
-
 The pbfhogg CLI command is `diff` (single command). Its performance
 shape depends on the inputs: two PBFs with byte-level blob overlap
 (e.g. one derived from the other via `apply-changes`) trigger a
 byte-equal fast-path that skips decode for unchanged blobs; two
 independent snapshots (e.g. Geofabrik planets weeks apart) have no
-byte-level overlap and require full decode on both sides. This
-section captures the full-decode scenario.
+byte-level overlap and require full decode on both sides. Indexed
+inputs run the streaming work-unit engine; inputs without indexdata take
+the sequential element stream.
 
-Brokkr distinguishes the two input shapes via `brokkr diff` (which
-applies an OSC to the base first so the fast-path engages) vs
-`brokkr diff-snapshots` (which feeds two independent PBFs). Same
-pbfhogg CLI underneath; different measurement.
+The script benches split the two input shapes: `diff-pair` feeds two
+independent PBFs, `diff-applied` applies an OSC to the base first so the
+fast-path engages. Cells recorded before the script benches name the
+former typed commands, `brokkr diff-snapshots` and `brokkr diff`.
 
-### Planet (87 GB input, 93 GB output snapshot, 47-day apart)
+## Current baselines
 
-`from=base` is the 2026-02-23 planet; `to=20260411` is the
-corresponding April-11 snapshot registered under the planet dataset's
-snapshot key.
+### Persistent merge cursors (bygg, 2026-11-25, against `31c482e2`)
 
-Shard-based block-pair merge (`-j/--jobs N`, commit `06628d8`
-2026-04-20, `--bench 1`; sharding was opt-in via explicit `-j N` at
-measurement time, and became the default with `-j` defaulting to `0`
-in 0.5.0 - see CHANGELOG.md). Both text and `--format osc` paths
-parallelise over the same ID-range shard plan.
+The block-pair merge used to rebuild each side's element iterator every
+round and pass over its consumed prefix with `skip`, which rebuilds every
+skipped element (dense deltas and metadata included); a block outliving
+several of the peer's blocks was walked once per round. Each side now keeps
+a cursor across rounds, and a residual emitted single-sided hands that cursor
+to the sink. Planet base against `20260411`, `--iterations 1`, no `fstrim`;
+variant cells on the uncommitted tree.
 
-| UUID | Args | Wall | Peak anon RSS | vs sequential |
-|---|---|---:|---:|---:|
-| `22a5eb55` | `-j 16` (text, temp-file shape) | **227.5 s (3m48s)** | 586 MB | **9.5×** |
-| `cdcaa4f1` | `-j 16 --format osc` (commit `16e3694`, 2026-04-26) | **293.8 s (4m54s)** | n/a | **7.6×** |
+| Cell | Baseline | Variant |
+|---|---|---|
+| text `-c` | `ea4082f6` 1m49s | `810cced3` 1m50s |
+| osc, pair 1 (variant first) | `3d544246` 2m43s | `3fa788de` 2m29s |
+| osc, pair 2 (baseline first) | `88e76d15` 2m29s | `a07b3520` 2m31s |
 
-The "vs sequential" ratios divide the wall by the old single-threaded
-streaming engine's planet wall, which the tree no longer contains (one
-block-pair engine now serves every shard count, so the ratios cannot be
-re-measured at a later commit): 2134 s for text (recorded at commit
-`a9d430f2`) and 2225.6 s for `--format osc` (the same engine's recorded
-planet run; its commit is not named in the tree). Dividing these by the
-walls above gives 9.4 and 7.6, so the text ratio's printed 9.5 is
-approximate.
-
-Both paths stream shard output to per-shard scratch temp files
-(`BufWriter<File>`) and concatenate in shard order; peak anon is just
-in-flight decoded blocks. OSC's lower speedup is the serial
-`assemble_osc` gzip + concat of ~45 GB of XML fragments (32.8 s,
-~10 % of wall).
-
-Phase split (planet, both paths): NODE ~73 %, WAY ~26 %, REL rounding
-error. Walker phase ~15 s (pread-only via `HeaderWalker` with
-`posix_fadvise(RANDOM)`; disk read 45 GB → 2.6 GB). Shard balance on
-germany within 1.03× max/min. Avg cores on planet text `-j 16`: NODE
-14.7, WAY 12.9, REL 14.5 out of 16 (86-92 %).
+Text and the second OSC pair are within 2-3 %; the first OSC baseline cell
+is the slow outlier these cells show between runs. Node phase stays at about
+30 cores either way: on these two snapshots, blocks of similar size, the
+replay was not a measurable share. On a mismatched layout, denmark base
+against its `1k` snapshot (`--iterations 3`), baseline `47e899f1` 1.2 s,
+variant `2d7748ee` 1.0 s. No cost on normal input; the win is on inputs
+whose block boundaries differ in size.
 
 ### Unindexed `.osc.gz` assembly (bygg, 2026-11-04, at `80e0b8f0`)
 
@@ -128,7 +115,47 @@ probes also shows that no later blob is indexed; no inspect count is
 needed. This holds for revisions that carry the partial-index refusal
 (ruled 2026-10-26); an older `--commit` gets the front check only. The cells above predate the probe; their inputs were `pbf.raw` throughout.
 
-## Common lines cut by elements (bygg, 2026-11-09, against `71976fd7`)
+## History
+
+### Planet, shard-based block-pair merge (2026-04, retired engine)
+
+`from=base` is the 2026-02-23 planet (87 GB); `to=20260411` is the
+April-11 snapshot (93 GB) registered under the planet dataset's snapshot
+key. The engine measured here, an ID-range shard plan behind a header
+walk, was replaced by streaming work units in `587bfc12` (see "Planet,
+streaming work units" below).
+
+Shard-based block-pair merge (`-j/--jobs N`, commit `06628d8`
+2026-04-20, `--bench 1`; sharding was opt-in via explicit `-j N` at
+measurement time, and became the default with `-j` defaulting to `0`
+in 0.5.0 - see CHANGELOG.md). Both text and `--format osc` paths
+parallelised over the same ID-range shard plan.
+
+| UUID | Args | Wall | Peak anon RSS | vs sequential |
+|---|---|---:|---:|---:|
+| `22a5eb55` | `-j 16` (text, temp-file shape) | **227.5 s (3m48s)** | 586 MB | **9.5×** |
+| `cdcaa4f1` | `-j 16 --format osc` (commit `16e3694`, 2026-04-26) | **293.8 s (4m54s)** | n/a | **7.6×** |
+
+The "vs sequential" ratios divide the wall by the old single-threaded
+streaming engine's planet wall: 2134 s for text (recorded at commit
+`a9d430f2`) and 2225.6 s for `--format osc` (the same engine's recorded
+planet run; its commit is not named in the tree). Dividing these by the
+walls above gives 9.4 and 7.6, so the text ratio's printed 9.5 is
+approximate.
+
+Both paths streamed shard output to per-shard scratch temp files
+(`BufWriter<File>`) and concatenated in shard order; peak anon was just
+in-flight decoded blocks. OSC's lower speedup was the serial
+`assemble_osc` gzip + concat of ~45 GB of XML fragments (32.8 s,
+~10 % of wall).
+
+Phase split (planet, both paths): NODE ~73 %, WAY ~26 %, REL rounding
+error. Walker phase ~15 s (pread-only via `HeaderWalker` with
+`posix_fadvise(RANDOM)`; disk read 45 GB → 2.6 GB). Shard balance on
+germany within 1.03× max/min. Avg cores on planet text `-j 16`: NODE
+14.7, WAY 12.9, REL 14.5 out of 16 (86-92 %).
+
+### Common lines cut by elements (bygg, 2026-11-09, against `71976fd7`)
 
 `pbfhogg diff OLD NEW` without `-c` on Denmark indexed against its own
 `cat --dedupe` output: equal elements in different framing, so no blob
@@ -160,10 +187,10 @@ plans as before, so their units are unchanged.
 The planet `diff-snapshots` A/B of `2c12a955^` against `2c12a955` was not
 run: both arms are the sharded engine `587bfc12` replaced, and no code
 decision rides on it. The stored `brokkr diff` pair at those two commits
-(base against its apply-changes output, above) is a different workload
+(the section "Diff of a base against its apply-changes output") is a different workload
 and is not a substitute for it.
 
-## Text units hold pieces past a full channel (bygg, 2026-11-09, against `5432aac7`)
+### Text units hold pieces past a full channel (bygg, 2026-11-09, against `5432aac7`)
 
 The text diff's sink now hands output over in exact `DIFF_OUTPUT_CHUNK_BYTES`
 pieces and, once a unit's channel is full, holds further pieces in memory
@@ -190,7 +217,7 @@ in sends at the base; the variant's exact pieces cut that to 3.6 ms. The
 shape the mechanism exists for (many modified elements with long details, or
 both inputs framed past any cut) is in no dataset, so its gain is unmeasured.
 
-## Verbose sequence work budget (bygg, 2026-11-12, at `3b0e93f8`)
+### Verbose sequence work budget (bygg, 2026-11-12, at `3b0e93f8`)
 
 `diff-verbose-budget` script bench (`benches/diff/diff-verbose-budget.lua`):
 `--ways` modified ways of each of two 30,000-ref shapes, disjoint (out of
@@ -211,7 +238,7 @@ medians the removed in-process unit timing gave on 2026-11-10. The budget
 keeps a worst-case way in low milliseconds; `VERBOSE_SEQUENCE_DIFF_MAX_WORK`
 stays at `1 << 20`.
 
-## Equality relation chosen by the sink (bygg, 2026-11-15, against `a157ad55`)
+### Equality relation chosen by the sink (bygg, 2026-11-15, against `a157ad55`)
 
 Adding `diff --locations` moved the same-ID equality decision from a direct
 `content_equal` call to the merge sink's relation (`MergeSink::relation`,
@@ -231,7 +258,7 @@ The phase split of pair 2 (`sidecar --compare`) puts the node phase at
 the default path is unchanged. The `--locations` path itself was not
 measured.
 
-## Repeated IDs held at the pair boundary (bygg, 2026-11-19, against `eb8cd7b8`)
+### Repeated IDs held at the pair boundary (bygg, 2026-11-19, against `eb8cd7b8`)
 
 The pair merge holds a boundary ID whose peer block ran out (one compare
 and peek on a one-sided head in a decoded pair), never skips a mixed-sign
@@ -252,7 +279,7 @@ No cost on either form. The OSC variant is faster in both pairs, the first
 pair by more than noise; nothing in the change removes work, so that is
 read as drift, not a win.
 
-## Exact claims on every decoded block (bygg, 2026-11-19, against `1279349a`)
+### Exact claims on every decoded block (bygg, 2026-11-19, against `1279349a`)
 
 Every block an indexed diff decodes has its indexdata held exact and its
 elements in canonical order before it is clipped: the validator records
@@ -277,7 +304,7 @@ and the difference in the single-threaded write and assembly segment after
 21.5 s), which the change does not touch and whose bytes are the same.
 Read as noise in that segment, not a cost of the check.
 
-## OSC values held to the reader's domain (bygg, 2026-11-19, against `211442d5`)
+### OSC values held to the reader's domain (bygg, 2026-11-19, against `211442d5`)
 
 Each created or modified element that `--format osc` writes now goes through
 three checks: exact node coordinates with a geographic range check, exact
@@ -296,7 +323,7 @@ The signs disagree and every delta is under 2 %, so the change has no
 cost. The checks run only on elements that are printed, a small fraction of
 the elements compared.
 
-## XML 1.0 character check on written strings (bygg, 2026-11-19, against `29fd352a`)
+### XML 1.0 character check on written strings (bygg, 2026-11-19, against `29fd352a`)
 
 Every tag, role and user string `--format osc` writes is scanned once for
 characters XML 1.0 cannot carry, replacing the tab/LF/CR scan the escape
@@ -323,7 +350,7 @@ baseline 4m51s, 4m41s (`2cfba709`, `a0bacafd`), variant 4m38s, 4m36s
 (`f7a2f2d5`, `7903553f`). No cost. These cells ran the single exact scan;
 the landed fast-path pre-scan (see merge-changes.md) only removes work.
 
-## Visibility in derive's equality (bygg, 2026-11-23, against `7a32357d`)
+### Visibility in derive's equality (bygg, 2026-11-23, against `7a32357d`)
 
 `--format osc` judges a same-ID pair by content plus visibility: a pair
 whose content compares equal also reads each side's `visible` (a way or
@@ -339,38 +366,14 @@ relation `Info` parse, a dense slot field). Same workload as above,
 Signs disagree across pairs and every delta is within 2-3 %, so the change
 has no cost.
 
-## Persistent merge cursors (bygg, 2026-11-25, against `31c482e2`)
-
-The block-pair merge used to rebuild each side's element iterator every
-round and pass over its consumed prefix with `skip`, which rebuilds every
-skipped element (dense deltas and metadata included); a block outliving
-several of the peer's blocks was walked once per round. Each side now keeps
-a cursor across rounds, and a residual emitted single-sided hands that cursor
-to the sink. Planet base against `20260411`, `--iterations 1`, no `fstrim`;
-variant cells on the uncommitted tree.
-
-| Cell | Baseline | Variant |
-|---|---|---|
-| text `-c` | `ea4082f6` 1m49s | `810cced3` 1m50s |
-| osc, pair 1 (variant first) | `3d544246` 2m43s | `3fa788de` 2m29s |
-| osc, pair 2 (baseline first) | `88e76d15` 2m29s | `a07b3520` 2m31s |
-
-Text and the second OSC pair are within 2-3 %; the first OSC baseline cell
-is the slow outlier these cells show between runs. Node phase stays at about
-30 cores either way: on these two snapshots, blocks of similar size, the
-replay was not a measurable share. On a mismatched layout, denmark base
-against its `1k` snapshot (`--iterations 3`), baseline `47e899f1` 1.2 s,
-variant `2d7748ee` 1.0 s. No cost on normal input; the win is on inputs
-whose block boundaries differ in size.
-
-## Diff of a base against its apply-changes output (bygg, 2026-10-31)
+### Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run
 as `pbfhogg diff OLD NEW --suppress-common --output FILE` (so the
 byte-equal skip may fire), `--keep-cache`, `--bench 1` cells interleaved,
 no `fstrim` (not allowlisted). All rows exit 1 (the inputs differ).
 
-### Planet, default `-j` (one shard per core), OSC 4913
+#### Planet, default `-j` (one shard per core), OSC 4913
 
 | UUID | Commit | Wall | DIFF_SCAN (header walk) | Node phase peak anon |
 |---|---|---:|---:|---:|
@@ -398,7 +401,7 @@ gain, so it was not kept. The "new" input brokkr builds with
 apply-changes is 174 GB, not 92 GB: the two inputs total 266 GB, so the
 merge phases' 258 GB read was no over-read.
 
-### Planet, streaming work units (bygg, 2026-10-31)
+#### Planet, streaming work units (bygg, 2026-10-31)
 
 `4dbc2d47` (the engine landed in `587bfc12`) reads both inputs once as
 sequential streams cut into work units on the ordered pool; no header
@@ -430,7 +433,7 @@ planets) shares the engine:
 
 Text -10 %; osc within noise.
 
-### Derive units deflate and spill their own output (bygg, 2026-10-31)
+#### Derive units deflate and spill their own output (bygg, 2026-10-31)
 
 `diff-snapshots --from base --to 20260411 --format osc -j 16`, matched
 interleaved `--bench 1` cells, base `179f1b7e` (stored) against the
@@ -459,7 +462,7 @@ copy of compressed fragments instead of 8.2 s deflating 29 GB. The text
 form, which shares the engine but neither change, is neutral: `c12221f5`
 (`179f1b7e`) 146.3 s against 146.4 s unstored.
 
-### Single-sided stretches cut by claimed elements (bygg, 2026-10-31)
+#### Single-sided stretches cut by claimed elements (bygg, 2026-10-31)
 
 `diff-snapshots --from base --to 20260411 -j 16`, matched interleaved
 `--bench 1` cells in A B B A order, base `c7eed182` (stored, built by
@@ -490,7 +493,7 @@ the window formats them in parallel. Text -2.8 % wall and -0.27 GB
 peak, sign-consistent across both pairs; osc, whose spill already
 removed the shape, is neutral.
 
-### Europe, `-j 1`, OSC 4715
+#### Europe, `-j 1`, OSC 4715
 
 | UUID | Commit | Wall | DIFF_SCAN | Peak anon |
 |---|---|---:|---:|---:|

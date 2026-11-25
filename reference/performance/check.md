@@ -153,7 +153,7 @@ Both within noise: no cost.
 ## check --ids --full proves an ordered kind duplicate-free (bygg, 2026-11-08, against `cbdb79f0`)
 
 `--full` now runs the plain order scan first (which, until the 2026-11-18
-entry above, recorded negative IDs as `IdOutOfRange`); a kind in strict `osm_id_cmp` order cannot hold
+section "check handles negative IDs exactly", recorded negative IDs as `IdOutOfRange`); a kind in strict `osm_id_cmp` order cannot hold
 a duplicate and is final, and only a kind found out of order is read again
 with its pre-allocated `IdSet`. Planet `planet-20260223-reindexed.osm.pbf`
 (indexed, ordered), interleaved `--bench 1`, base `cbdb79f0` (stored,

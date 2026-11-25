@@ -2,7 +2,9 @@
 //!
 //! Four modes selected by CLI flags:
 //! - `--refs`: referential integrity (way refs, relation members) via [`refs::check_refs`].
-//! - `--ids --full`: ID uniqueness and ordering via [`verify_ids::verify_ids`].
+//! - `--ids`: ID ordering via [`verify_ids::verify_ids`], which proves
+//!   uniqueness only for a kind found ordered; `--full` adds the duplicate
+//!   pass that proves it for every kind.
 //! - `--index`: blob-level sidecar metadata (`indexdata`, `tagdata`) against
 //!   the blobs themselves, via [`index::check_index`]. Opt-in rather than part
 //!   of the default pair, because it decompresses the whole file.

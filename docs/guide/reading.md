@@ -80,7 +80,7 @@ if let Some(bbox) = reader.header().bbox() {
 
 ### for_each - sequential
 
-Decodes on the calling thread with no background I/O. Simplest interface, but 6x slower than pipelined on large files. Good for correctness baselines and small files.
+Decodes on the calling thread with no background I/O. Simplest interface, but much slower than pipelined on large files. Good for correctness baselines and small files.
 
 ```rust
 use pbfhogg::{ElementReader, Element};

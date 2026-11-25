@@ -21,8 +21,9 @@ consumer serialized on the calling thread.
 
 **Plain** (`into_blocks_pipelined` and friends): the decode pool
 produces `PrimitiveBlock`s and the consumer processes them directly.
-Callers today are the `read` bench's pipelined mode, `time-filter`
-history, and `build-geocode-index` pass 1.
+The `time-filter` history path is not one (it reads through
+`for_each_fused_blob`, below), nor is `build-geocode-index`, whose passes
+pread schedules cut from one header walk.
 
 **Fused** (`for_each_fused_block`, landed 2026-07-12, ADR-0009 in
 `decisions/0009-fused-command-transforms.md`): the per-block command

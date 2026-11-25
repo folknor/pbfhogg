@@ -80,7 +80,7 @@ Every command listed below runs on the full planet on normal hardware, within 28
 
 The largest temp files go to the output's parent directory (or `--tmp-dir`): `add-locations-to-ways --index-type external` (hundreds of GB at planet) and `diff --format osc` (its change XML: compressed, about the output's size, for a `.osc.gz` from indexed inputs; plain and several times larger otherwise). A text `diff` writes none at any `-j`: its output goes out as it is produced.
 
-History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface: no history dataset is configured or benchmarked, and the table above says nothing about it.
+History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface, and the table above says nothing about it. The only history input benchmarked is a two-version file merged by osmium from two planet snapshots (cells in [reference/performance/time-filter.md](reference/performance/time-filter.md)); no real multi-version history file is configured.
 
 Per-command phase breakdowns are in [reference/performance/README.md](reference/performance/README.md); per-command optimization arcs and retired phase breakdowns at older architectures are in [reference/performance/README.md](reference/performance/README.md). Note that recorded results always track the latest git head and may not match the released version.
 

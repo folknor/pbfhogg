@@ -53,12 +53,13 @@ impl DeriveChangesStats {
 
 /// Generate an OSC diff from two sorted PBF snapshots.
 ///
-/// Performs a merge-join by (type, id), over ID-range shards for indexed
-/// inputs (`parallelism`; the answer is the same at any shard count).
-/// Changes are buffered by action type and
-/// written as OsmChange XML, gzipped when the output name ends `.osc.gz` and
-/// plain when it ends `.osc` (any other name is refused before any work). Memory is bounded by the number of
-/// changed elements, not total input size.
+/// Performs a merge-join by (type, id), over streaming work units for
+/// indexed inputs (`parallelism` sets the worker count; the answer is the
+/// same at any count). Each unit's changes are appended to one temp file
+/// per action in unit order, then written as OsmChange XML, gzipped when
+/// the output name ends `.osc.gz` and plain when it ends `.osc` (any other
+/// name is refused before any work). Memory is bounded by the units and
+/// decoded blocks in flight, not total change count.
 ///
 /// `timestamp` overrides every emitted delete timestamp with the same Unix second.
 /// Pass `None` to omit delete timestamps. A value past

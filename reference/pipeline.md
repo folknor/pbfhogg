@@ -35,7 +35,7 @@ Used by most commands. See Sequential Read below for exceptions.
 
 ### Sequential Read
 
-Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling thread. ~6x slower than pipelined, but avoids cross-thread allocation/free churn.
+Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling thread. Much slower than pipelined on large files, since decode does not run in parallel, but avoids cross-thread allocation/free churn.
 
 Used by:
 - `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) - two files read in lockstep
@@ -389,11 +389,27 @@ tested per node.
 
 ### tags-filter
 
-Tag expression matching with dependency expansion:
-1. Build `BlobFilter` from union of tag keys
-2. Blob filter → pipelined decode → element matching
-3. Default: matched relations pull in member ways/nodes transitively (multi-pass)
-4. With `-R`: single pass, direct matches only
+Tag expression matching with dependency expansion. The default route
+(`tags_filter_two_pass`, `commands/tags_filter/mod.rs`):
+1. One header walk, the run's only one: it builds the pass-1 schedule
+   (blobs skipped by the tag-key `BlobFilter` against their indexdata and
+   tagdata) and records a catalog of every OsmData blob, from which every
+   later schedule is cut in memory.
+2. Pass 1 classifies the scheduled blobs on pread workers
+   (`parallel_classify_phase`), collecting direct node, way and relation
+   matches and the node refs of matched ways.
+3. When a relation matched, the relation closure
+   (`commands/relation_closure.rs`, shared with getid): at most two reads
+   of the relation blobs plus an in-memory worklist, whatever the nesting
+   depth.
+4. Only when the closure added member ways, a way-dependency walk over the
+   way blobs collects those ways' node refs.
+5. Pass 2 decodes the needed blobs on pread workers and writes the
+   included elements. Its schedule filters by kind only (an element can be
+   included without the matching tag key), and node blobs are read only
+   when some node is included.
+
+With `-R`: single pass, direct matches only.
 
 Also supports `--input-kind osc` for filtering OSC change files.
 
@@ -619,7 +635,7 @@ The input is pinned before the header read (see "One input, one file, across pas
 
 ### inspect
 
-Header-only scan (fast path on indexed PBFs - reads blob headers without decompression). Selective decode on demand for `--nodes`, `--blocks`, or element display.
+The report comes from one of two scans (`inspect/scan.rs`). The index-only walk reads blob headers without decompression and serves the whole report, `--blocks` included, from the blobs' indexdata; it runs unless `--locations`, `--extended` or `--distrust-metadata` is set, and falls back to the full-decode scan from the start when a data blob lacks indexdata. The full-decode scan reads the file once through the ordered read pipeline, summarizing each blob on the decode workers and folding the summaries in file order. `--nodes` is a separate read, `node_stats` on the classify pool over a node schedule.
 
 Pinning (see "One input, one file, across passes") is decided per library entry: the scan pins when its index-only walk may run, since a data blob without indexdata sends it back to the start for a full decode; a decode-only scan (`--extended`, `--locations`, `--distrust-metadata`) opens once and takes no pin; `node_stats` pins (indexdata probe, then schedule walk); the `--get` header route (`inspect::inspect_header`) opens once and takes `file.size` from that open's descriptor. The CLI pins once itself when `--nodes` joins the scanning report, and hands the pin to every call (`--indexed` is refused beside the report, so it never joins one).
 
@@ -1102,9 +1118,11 @@ the input path once per worker, and stamps a failure with
 `locate` applies only when the error has no location yet and applies as a unit,
 so the innermost, most precise site wins. A pipeline sequence number is never a
 location: it counts a filtered subset, not the file. Errors that came out of a
-caller-supplied callback are never located by the library. Pools whose work
-items are `(seq, offset, size)` schedules (the pread classify pools) carry only
-the frame offset or nothing; they do not invent a blob ordinal.
+caller-supplied callback are never located by the library. The pread classify
+pools schedule `ScheduledBlob`s: `ScheduledBlob::location` stamps the frame
+start, and the blob ordinal only when the schedule knew it. Pools whose work
+items carry only a frame offset (extract's `pread_execute`, altw external
+stage 4) stamp the offset alone. None invents a blob ordinal.
 
 **Size refusals of re-encoded blocks.** The pipelined writer frames a block
 on the executor and returns a framing failure as that slot's ordered result,

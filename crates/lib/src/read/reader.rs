@@ -202,8 +202,8 @@ impl<R: Read + Send> ElementReader<R> {
     /// except inside a group carrying several element fields, which is read in the order
     /// of [`PrimitiveBlock::elements`], not its field order.
     ///
-    /// This is **6x slower** than [`for_each_pipelined`](Self::for_each_pipelined) on large
-    /// files. Prefer `for_each_pipelined` for production workloads - it has the same
+    /// This decodes on the calling thread, so on large files it is much slower than
+    /// [`for_each_pipelined`](Self::for_each_pipelined). Prefer `for_each_pipelined` for production workloads - it has the same
     /// `FnMut` signature and file-order guarantee but overlaps I/O with parallel
     /// decompression. Use this method when you need simplicity (no `'static` bound on
     /// the reader) or as a correctness baseline for testing.

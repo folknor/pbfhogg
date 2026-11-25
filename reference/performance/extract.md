@@ -237,10 +237,10 @@ alloc 6.4 GB -> **2.0 GB (-69%)**; `parallel_classify_phase` fell from
 across all blobs and send once at scope exit - no per-blob allocation
 through the channel.
 
-#### Historical (sorted pass1 optimization, commit `37b7c19`)
+#### Historical (single-pass simple for sorted input, commit `1fea0b77`)
 
-Impact on simple: Denmark -14% (2625→2259ms), Japan -8%
-(12,619→11,643ms). Single-pass classification on sorted input
+Impact on simple, as recorded in that commit's message: Denmark -14%
+(2625→2277ms), Japan -8% (12,619→11,948ms). Single-pass classification on sorted input
 eliminates the second file read. Superseded by the parallel classify +
 raw frame passthrough architecture.
 

@@ -158,30 +158,6 @@ header is not cut (comment in `cat/repair.rs`); `flush_or_overflow` stays
 strict on an opted-in sink; the cut's search is sized by a monotone upper
 bound and may miss a partition, ending in the same typed refusal.
 
-## CMD-086 - The ordered classify pool's doc says the merge's error is located
-
-Reported by: the CMD-072/075/050 scout (2026-11-25); read from source.
-
-`parallel_classify_phase_ordered` (`scan/classify.rs`) documents its
-`merge` callback's failure as "located as in `parallel_classify_phase`",
-but `run_project_ordered` wraps only the worker closure in
-`input.locate_blob`; `ClassifyConsumer::consume` returns the merge's error
-as the callback made it, which matches the provenance rule that callback
-errors are never located by the library. The doc looks wrong, not the
-code; the location test drives only worker failures. Fix: correct the doc.
-
-## CMD-087 - pipeline.md says the pread classify pools carry no blob ordinal
-
-Reported by: the CMD-072/075/050 scout (2026-11-25); read from source, not
-verified against every pool.
-
-`reference/pipeline.md` "Provenance" says pools with `(seq, offset, size)`
-schedules carry only the frame offset or nothing. Since the classify pools
-moved to `ScheduledBlob`, `ScheduledBlob::location` carries the ordinal when
-the schedule has one, and a test asserts ordinal and offset. Extract's
-`pread_execute` and altw stage 4 still locate with the offset only. Fix:
-check each pool and reword the paragraph to what they do.
-
 ## CMD-060 - degrade --unsort may have slowed down, and is slow on planet
 
 Reported by: the CMD-056 follow-up measurement (2026-11-21, plantasjen).

@@ -161,6 +161,8 @@ Refused, no saving to win:
   measurable.
 - A per-launch subreaper shim, so that one launch's result can be consumed
   while an unrelated sibling still runs: only geocode's chains need that,
-  and its whole check takes about 9 s.
+  and its whole check is short (the denmark cells under Current baselines,
+  "geocode: one launch group for both builds", run 4.3-5.2 s warm and
+  11.3 s with a cold reference).
 - pbfhogg groups in getparents, check-ids, extract, tags-filter,
   inspect-tags and check-refs: each run takes a second or two at most.

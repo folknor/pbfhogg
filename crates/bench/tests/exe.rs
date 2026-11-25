@@ -353,6 +353,57 @@ fn a_sigterm_cancels_the_run_and_keeps_the_profile() {
     }
 }
 
+/// A profiled geocode-query of an instrumented build attributes the query
+/// work to the reader: `Reader::query` is counted once per query in the
+/// warm-up and in every timed round, not only the process wrapper.
+#[cfg(feature = "hotpath")]
+#[test]
+fn a_profiled_geocode_query_reports_reader_query() {
+    let scratch = crate::common::test_scratch();
+    let index = build_index(&scratch);
+    let report = scratch.path().join("report.json");
+    let report_text = report.display().to_string();
+    let ran = run(
+        &[
+            os("geocode-query"),
+            index.as_os_str(),
+            os("--bbox"),
+            os("12.4,55.6,12.6,55.8"),
+            os("--queries"),
+            os("50"),
+            os("--rounds"),
+            os("2"),
+        ],
+        &[
+            ("HOTPATH_OUTPUT_PATH", report_text.as_str()),
+            ("HOTPATH_OUTPUT_FORMAT", "json"),
+            ("HOTPATH_METRICS_SERVER_OFF", "true"),
+        ],
+        &scratch,
+        "profiled",
+    );
+    assert!(ran.status.success(), "{}", ran.stderr);
+    let text = std::fs::read(&report).expect("the profile report");
+    let doc: serde_json::Value = serde_json::from_slice(&text).expect("a JSON report");
+    let section = if cfg!(feature = "hotpath-alloc") {
+        "functions_alloc"
+    } else {
+        "functions_timing"
+    };
+    let data = doc[section]["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no {section}.data in {doc}"));
+    let query = data
+        .iter()
+        .find(|entry| {
+            entry["name"]
+                .as_str()
+                .is_some_and(|n| n.contains("geocode_index") && n.ends_with("::query"))
+        })
+        .unwrap_or_else(|| panic!("no Reader::query row in {doc}"));
+    assert_eq!(query["calls"].as_u64(), Some(150), "{query}");
+}
+
 /// A profiled merge of an instrumented build reports library functions,
 /// with calls counted and, under `hotpath-alloc`, bytes counted: the
 /// counting allocator is installed, not only the guard.

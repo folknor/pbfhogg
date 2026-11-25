@@ -45,6 +45,12 @@ pub(crate) fn build(
 /// per-query mean. The answers are not reported: an instrument measures,
 /// and whether the reader answers correctly is the geocode tests' question.
 ///
+/// This is serial, warm, uniform-in-box latency by design. Cold-page
+/// latency, address-dense loads and CLI throughput are other workloads,
+/// for an instrument of their own when a decision needs one; brokkr's
+/// `cold` preparation alone would not make these rounds cold, since open
+/// validation and the warm-up touch the pages first.
+///
 /// The warm-up and the timed rounds are each a marker pair on the FIFO,
 /// `GEOCODE_QUERY_WARMUP` and `GEOCODE_QUERY_ROUNDS`, so a bench can time
 /// or stop at either.
@@ -148,11 +154,13 @@ where
         return Err(crate::Failure::Cancelled);
     }
 
-    // Every pass keeps only a sink against the optimizer.
-    let mut sink = 0usize;
+    // Every answer, whole, goes to an opaque consumer: a sink over one
+    // field (it was the admin count) would leave the rest of the answer -
+    // address, street and interpolation assembly, string lookups included -
+    // free for fat LTO to drop.
     for (i, &(lat, lon)) in points.iter().enumerate() {
         let r = query(lat, lon).map_err(|e| failed("warm-up", i, e))?;
-        sink = sink.wrapping_add(r.admin.len());
+        std::hint::black_box(r);
     }
     markers.marker("GEOCODE_QUERY_WARMUP_END");
     if cancelled() {
@@ -172,7 +180,9 @@ where
         let start = Instant::now();
         for (i, &(lat, lon)) in points.iter().enumerate() {
             match query(lat, lon) {
-                Ok(r) => sink = sink.wrapping_add(r.admin.len()),
+                Ok(r) => {
+                    std::hint::black_box(r);
+                }
                 Err(e) => return Err(failed(&format!("timed round {}", round + 1), i, e)),
             }
         }
@@ -185,7 +195,6 @@ where
         return Err(crate::Failure::Cancelled);
     }
     markers.marker("GEOCODE_QUERY_ROUNDS_END");
-    std::hint::black_box(sink);
     Ok(Passes {
         round_ns,
         elapsed_ms,

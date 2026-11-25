@@ -130,9 +130,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.geocode-query]
 script_file = "../benches/build-geocode-index/geocode-query.lua"
 description = "Reverse geocoding query latency over fixed pseudo-random points, against an index the bench builds"
-version = 5
-date = 2026-11-24
+version = 6
+date = 2026-11-25
 changelog = [
+  { version = 6, date = 2026-11-25, note = "Every query's whole answer goes to black_box instead of a sum of admin counts, so fat LTO cannot drop address, street or interpolation assembly; Reader::query and its level, admin and interpolation searches carry hotpath scopes, so --hotpath and --alloc attribute the query work instead of only the process wrapper" },
   { version = 5, date = 2026-11-24, note = "The instrument samples the box as typed instead of quantizing its edges to decimicrodegrees first; points are unchanged for a box whose edges all lie on the 1e-7 grid, every configured dataset bbox among them, and a box finer than that no longer collapses to one point" },
   { version = 4, date = 2026-11-15, note = "The instrument no longer tallies or digests its answers in the warm-up round, which is inside the ranked child wall, and the bench no longer reads answer fields; only measurement fields are parsed and the workload echo checked" },
   { version = 3, date = 2026-11-14, note = "Runs the pbfhogg-bench instruments instead of the CLI: geocode-build builds the index through the library, geocode-query is the moved instrument, with the same evidence keys; a SIGTERM now cancels at a round boundary; the query child is profiled under --hotpath and --alloc. Revisions before pbfhogg-bench fail at the build" },

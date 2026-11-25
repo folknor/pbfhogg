@@ -20,7 +20,7 @@ Defects from the 2026-11-17 defect hunt in the dev-only crates:
 with `pbfhogg-harness`, and `pbfhogg-bench` with its Lua scripts. Every
 finding was made by one codex hunter per scope reading source at `63d4ec1d`.
 None was built, run or reproduced, and the bracketed priority is the hunter's
-own label. The geocode-query optimizer sink is recorded under BUG-028.
+own label.
 Entries are in no order of importance.
 
 ## TOOL-051 - verify field-policies locates its slice from input order

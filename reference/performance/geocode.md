@@ -550,6 +550,28 @@ u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
 
+### Whole answers black-boxed, query scopes under hotpath (bygg, 2026-11-25, variant uncommitted against `eb7ba68c`)
+
+The instrument passes each whole `ReverseResult` to `black_box` instead
+of summing admin counts, so fat LTO cannot drop the address, street and
+interpolation assembly; `Reader::query` and its level, admin and
+interpolation searches gained `hotpath` scopes, compiled out of timing
+builds (registry version 6). geocode-query, germany, country bbox
+`5.9,47.3,15.0,55.0`, 100k points, 3 rounds, two interleaved
+`--iterations 1` pairs (base built with `--commit HEAD`):
+
+| Cell | us per query (best) | rounds | open_ms |
+|---|---:|---|---:|
+| base `d8516de4` | 18.71 | 18.71, 18.71, 18.77 | 915 |
+| variant `5858f1f6` | 19.16 | 20.61, 19.98, 19.16 | 869 |
+| base `50c8ae66` | 18.69 | 18.72, 18.69, 18.86 | 918 |
+| variant `45f9aab2` | 18.84 | 20.63, 19.58, 18.84 | 880 |
+
+About 1.6 percent slower on the best round, under the noise band and not
+chased; that is no evidence the old sink let work be eliminated, only that
+it is no longer possible. The variant's first timed round ran slower in
+both pairs and the bases' did not; the best round is the figure compared.
+
 ### Segment projection framed by the integer longitude delta (bygg, 2026-11-24, variant uncommitted against `7f2024af`)
 
 The reader frames each street and interpolation segment from the integer

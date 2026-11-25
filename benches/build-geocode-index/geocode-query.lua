@@ -13,10 +13,16 @@
 -- The ranked wall is the query child's, so it includes process start, the
 -- index open and the warm-up round; the per-query figure to compare is
 -- record.child.us_per_query_best (fastest timed round's mean), with every
--- round's mean beside it. The answers are not judged or recorded.
+-- round's mean beside it. The answers are not judged or recorded; each
+-- whole answer goes to an opaque consumer so none of it is optimized away.
+-- What this measures is serial library query latency over uniform points
+-- whose pages the warm-up already touched: not cold-page latency, not an
+-- address-dense load, and not CLI throughput, which are other workloads.
 -- A query error in the warm-up or any timed round fails the instrument, so
 -- r:ok() fails the run: a revision whose queries fail never reads as faster.
--- Under --hotpath or --alloc the query child is profiled.
+-- Under --hotpath or --alloc the query child is profiled; Reader::query
+-- and its level, admin and interpolation searches carry the scopes, and
+-- the profile covers the warm-up as well as the timed rounds.
 --
 -- A --commit before the pbfhogg-bench package existed fails at the build.
 -- The bbox defaults to the dataset's bbox, which is host config; pass

@@ -41,20 +41,3 @@ rescuable), so whether `--clean` may refuse such a way, or must instead drop
 the declaration for that run, is a maintainer decision. The other droppers are
 deliberate: time-filter (not as of the cutoff), degrade (a fault tool),
 apply-changes without `--locations-on-ways` (cannot refresh them).
-
-## BUG-028 - Geocode query bench can be optimized away and measures warm uniform points
-
-Reported by: geocode.
-
-`crates/bench/src/geocode.rs` measures serial queries over a repeated, warmed,
-uniform-in-bbox set, so it says nothing about cold pages, address-heavy load or
-CLI throughput, and its optimizer sink consumes only `admin.len()`.
-
-Defect hunt 2026-11-17 (bench): both loops (`crates/bench/src/geocode.rs`)
-discard address, street and interpolation results and black-box only the
-accumulated `admin.len()`; with fat LTO those computations are unprotected
-against elimination. Not established that elimination happens; the hunter
-labels it a benchmark-validity concern, not a confirmed timing defect.
-Separately, the geocode-query script advertises `--hotpath` and `--alloc`, but
-neither the instrument nor `Reader::query` and its search helpers carries
-profiling scopes, so those modes measure only the process wrapper.

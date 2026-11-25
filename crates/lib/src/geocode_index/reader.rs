@@ -1025,6 +1025,12 @@ impl Reader {
     /// nothing. The answer is the nearest wherever in the radius it lies, not
     /// only in cells next to the query's. Internally iterates mmap'd entry
     /// lists without materializing Vecs.
+    ///
+    /// Profiled under `hotpath` with `search_level`, `search_admin_ranked`
+    /// and `resolve_interpolation`: each runs at most twice per query, so
+    /// the probe count is independent of how many cells a search visits.
+    /// `search_cell` is left unscoped for that reason.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn query(&self, lat: f64, lon: f64) -> std::result::Result<ReverseResult<'_>, QueryError> {
         let ctx = QueryContext::new(lat, lon)?;
         let mut best = BestTracker::new();
@@ -2002,6 +2008,7 @@ impl Reader {
     #[allow(clippy::too_many_arguments)]
     // The fine/coarse call sites pair already-open mmaps with their levels
     // and radii. A file-name descriptor alone cannot enforce that relationship.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn search_level<'a, S: SearchSink<'a>>(
         &'a self,
         ctx: &QueryContext,
@@ -2208,6 +2215,7 @@ impl Reader {
 
     /// Ranked admin: one per level, smallest area, ties to the lower polygon
     /// index ([`admin_ranks_before`]), over the query's own admin cell.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn search_admin_ranked<'a>(
         &'a self,
         ctx: &QueryContext,
@@ -2393,6 +2401,7 @@ impl Reader {
 
     // -- Interpolation helpers -----------------------------------------------
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn resolve_interpolation(
         &self,
         iw: InterpWay,

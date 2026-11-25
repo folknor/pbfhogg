@@ -379,7 +379,8 @@ Remaining open findings from the closed hunt.
   points whose answer lies just past the 3x3 block, with the +8 %
   walk-against-nine delta as its ceiling; land mixes are admin-bound.
   Measure on denmark `--bbox 8.0,54.5,13.0,57.8`, about 20.6 us per query
-  at `7dcabbcc`, admin digest `012d7edd851fd72f`, which must not change.
+  at `7dcabbcc`; answers must not change, which `pbfhogg-verify geocode`
+  judges now that the bench records no answer digest.
 
 ## Item/command-specific plans
 

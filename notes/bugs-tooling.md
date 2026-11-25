@@ -147,6 +147,30 @@ precedence and surface as a content difference blamed on pbfhogg. Traced
 from source only; derive emits new's versions, so whether real derives
 reach it is unchecked.
 
+## TOOL-060 - verify inspect-tags fails a NUL key instead of erroring
+
+Reported by: the spar accounting of the verify fixture chain, from a scout
+lateral (2026-11-25); read from source, not reproduced.
+
+reference/verify.md (inspect-tags) and the module doc of
+`crates/verify/src/checks/inspect_tags.rs` both say a pbfhogg key holding a
+NUL makes the check an error, not a verdict, because libosmium cannot count
+such a key. The code returns `Error::Failed`, which `conclude` in
+`crates/verify/src/harness.rs` reports as FAIL with exit 1, and the
+inspect-tags fixture's `nul` case pins `CheckStatus::Failed`. `Error`'s own
+doc puts an unsupported comparison domain under `Tool` (ERROR, exit 2). Either
+the return becomes `Error::tool` and the fixture case moves with it, or the
+two documents are reworded to say FAIL.
+
+## TOOL-061 - verify merge-changes argv takes an unused directory
+
+Reported by: the spar accounting of the verify fixture chain, from a scout
+lateral (2026-11-25).
+
+`argv` in `crates/verify/src/checks/merge_changes.rs` takes a `_dir: &Path`
+it never reads; every caller passes a directory for nothing. Drop the
+parameter.
+
 # From the 2026-11-21 verifier performance hunt
 
 Defects the performance hunters found while reading the code at `e8377a78`

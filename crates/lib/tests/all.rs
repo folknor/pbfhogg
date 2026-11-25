@@ -158,5 +158,6 @@ mod roundtrip_invariants;
 mod seal;
 mod tags_count;
 mod tags_filter_osc;
+mod time_filter;
 
 mod host_contract;

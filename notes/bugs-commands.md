@@ -177,37 +177,3 @@ has ever been recorded, so whether that wall is the change, the mode, or the
 host is unknown. Next: one planet cell at `9bbd64df` to establish the mode's
 baseline, then a matched pair; if the change is the cost, it comes out or
 is made cheaper.
-
-## CMD-076 - The history time-filter's worker path has two untested shapes
-
-Reported by: the spar accounting of the parallel history time-filter
-change, from its scout's lateral and its implementer's report
-(2026-11-25); read from source, not run.
-
-The history path now selects and encodes on the decode workers and joins
-objects across blob seams in an ordered stitcher
-(`time_filter/mod.rs`, `HistoryBlobs` and `Stitch`). Two of its shapes
-have no test. `crates/lib/tests/cancel.rs` has one time-filter scenario,
-"cutoff after every timestamp", on a snapshot-path fixture, so no
-cancellation is ever delivered to the history workers or the stitcher
-while it holds a blob ending. And no test has a blob's alternative ending
-(the last block pre-encoded with the straddling object's candidate) cross
-a kind boundary inside that blob, because the fixture builders write one
-kind per block; the case was traced correct in the spar review, not run.
-Fix shape: a history cancellation scenario in `cancel.rs`, and a fixture
-with a mixed-kind blob whose last object straddles the seam.
-
-## CMD-080 - No cancellation scenario covers multi-extract
-
-Reported by: the spar accounting of the shared multi-extract change, from
-its scout's lateral (2026-11-25).
-
-The extract entry of the cancellation registry in
-`crates/lib/tests/cancel.rs` states that polygons, complete-ways,
-multi-extract and cleaning are not exercised, and the harness
-`extract_scenarios` likewise. Multi-extract now runs a new worker engine
-(`extract/multi_dep.rs`, a classify pass per kind, a parent closure and an
-ordered write pass to every region's output) and the cleaned simple single
-pass, and neither has a scenario that trips the token mid-run and checks
-that nothing is published. Fix shape: a multi-extract cancellation
-scenario per route (simple, complete-ways, smart).

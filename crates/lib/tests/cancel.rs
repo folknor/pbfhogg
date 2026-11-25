@@ -82,6 +82,21 @@ impl Inputs {
             &[],
             100,
         );
+        // An unindexed file for the pair's unindexed single pass. Its ways
+        // reference nodes 1 to 5 and its nodes are 10001 to 10300, so every
+        // way blob misses in fact and is judged again after the pass. With
+        // references that resolve, whether a way blob is judged again
+        // depends on whether its node blob decoded first, so the run's
+        // checkpoint count would vary between replays and the ordinal
+        // sweep could not target them.
+        crate::common::write_multi_block_non_indexed_pbf(
+            &dir.path().join("raw.osm.pbf"),
+            &crate::common::generate_nodes(300, 10_001),
+            &crate::common::generate_ways(40, 1, 5, 1),
+            &[],
+            100,
+        );
+        write_history_pbf(&dir.path().join("history.osh.pbf"));
         #[cfg(feature = "commands")]
         crate::common::write_synthetic_indexed_input(&dir.path().join("geo.osm.pbf"));
         std::fs::write(
@@ -97,6 +112,83 @@ impl Inputs {
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
+}
+
+/// The cutoff of the history time-filter scenario: between the second and
+/// third version of every object in [`write_history_pbf`].
+const HISTORY_CUTOFF: i64 = 250;
+
+/// A sorted history file (`HistoricalInformation` declared): nodes 1 to 150
+/// with three versions each (at 100, 200 and 300 seconds; every third
+/// node's second version deleted), then ways 1 to 40 with two (at 100 and
+/// 300) over those nodes. Blobs hold 77 records, so objects straddle most
+/// seams and the history path holds blob endings across them; node and way
+/// IDs repeat across seams, so neither kind's ID ranges are disjoint (and
+/// multi-extract's simple route classifies and writes them in two passes).
+fn write_history_pbf(path: &Path) {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    const PER_BLOB: usize = 77;
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().sorted().historical().build().unwrap())
+        .unwrap();
+    let mut bb = BlockBuilder::new();
+    let mut in_blob = 0;
+    fn flush(
+        bb: &mut BlockBuilder,
+        in_blob: &mut usize,
+        writer: &mut PbfWriter<std::io::BufWriter<std::fs::File>>,
+    ) {
+        if let Some(bytes) = bb.take().unwrap() {
+            writer.write_primitive_block(bytes).unwrap();
+        }
+        *in_blob = 0;
+    }
+    let meta = |version: i32, timestamp: i64, visible: bool| Metadata {
+        version,
+        timestamp,
+        changeset: 7,
+        uid: 3,
+        user: "u",
+        visible,
+    };
+    for id in 1..=150_i64 {
+        let coord = i32::try_from(id * 1000).unwrap();
+        for (version, timestamp) in [(1, 100), (2, 200), (3, 300)] {
+            let visible = !(version == 2 && id % 3 == 0);
+            bb.add_node(
+                id,
+                coord,
+                coord,
+                [("name", "x")],
+                Some(&meta(version, timestamp, visible)),
+            );
+            in_blob += 1;
+            if in_blob == PER_BLOB {
+                flush(&mut bb, &mut in_blob, &mut writer);
+            }
+        }
+    }
+    flush(&mut bb, &mut in_blob, &mut writer);
+    for id in 1..=40_i64 {
+        for (version, timestamp) in [(1, 100), (2, 300)] {
+            bb.add_way(
+                id,
+                [("highway", "x")],
+                &[id, id + 1],
+                Some(&meta(version, timestamp, true)),
+            );
+            in_blob += 1;
+            if in_blob == PER_BLOB {
+                flush(&mut bb, &mut in_blob, &mut writer);
+            }
+        }
+    }
+    flush(&mut bb, &mut in_blob, &mut writer);
+    writer.flush().unwrap();
 }
 
 fn host_with(cancel: pbfhogg::host::Invocation, inputs: &Inputs) -> pbfhogg::host::Host {
@@ -344,6 +436,49 @@ fn check_ids(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfh
     .map(drop)
 }
 
+/// The default pair (IDs with full duplicate sets, and references with
+/// relation members) over `input`; the reference check's own error is the
+/// run's when the ID check completed.
+#[cfg(feature = "commands")]
+fn check_pair(i: &Inputs, input: &str, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    let pair = pbfhogg::check::pair::check_ids_and_refs(
+        &i.path(input),
+        &pbfhogg::check::verify_ids::VerifyIdsOptions {
+            max_errors: 0,
+            direct_io: false,
+            full: true,
+            type_filter: None,
+        },
+        &pbfhogg::check::refs::CheckRefsOptions {
+            direct_io: false,
+            check_relations: true,
+            show_ids: None,
+        },
+        host,
+    )?;
+    pair.refs.map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn check_pair_indexed(
+    i: &Inputs,
+    _: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    check_pair(i, "base.osm.pbf", host)
+}
+
+#[cfg(feature = "commands")]
+fn check_pair_unindexed(
+    i: &Inputs,
+    _: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    check_pair(i, "raw.osm.pbf", host)
+}
+
 #[cfg(feature = "commands")]
 fn check_locations(
     i: &Inputs,
@@ -436,6 +571,130 @@ fn extract_smart(
     host: &pbfhogg::host::Host,
 ) -> pbfhogg::Result<()> {
     extract(i, out, host, pbfhogg::extract::ExtractStrategy::Smart)
+}
+
+/// One shared multi-extract run over `input` to two overlapping boxes
+/// holding part of the fixture's nodes each.
+#[cfg(feature = "commands")]
+fn extract_multi(
+    i: &Inputs,
+    input: &str,
+    out: &Path,
+    host: &pbfhogg::host::Host,
+    strategy: pbfhogg::extract::ExtractStrategy,
+    clean: bool,
+) -> pbfhogg::Result<()> {
+    let regions = [
+        pbfhogg::extract::Region::Bbox(pbfhogg::extract::parse_bbox("0,0,0.015,0.015").unwrap()),
+        pbfhogg::extract::Region::Bbox(
+            pbfhogg::extract::parse_bbox("0.01,0.01,0.04,0.04").unwrap(),
+        ),
+    ];
+    let outputs = [out.join("a.osm.pbf"), out.join("b.osm.pbf")];
+    pbfhogg::extract::extract_multi(
+        &i.path(input),
+        &regions,
+        pbfhogg::OutputSet::files(
+            &outputs,
+            pbfhogg::Overwrite::Refuse,
+            &pbfhogg::host::Diagnostics::discard(),
+        )?,
+        strategy,
+        true,
+        &pbfhogg::cat::CleanAttrs {
+            version: clean,
+            ..Default::default()
+        },
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn multi_simple(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract_multi(
+        i,
+        "base.osm.pbf",
+        out,
+        host,
+        pbfhogg::extract::ExtractStrategy::Simple,
+        false,
+    )
+}
+
+#[cfg(feature = "commands")]
+fn multi_simple_cleaned(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract_multi(
+        i,
+        "base.osm.pbf",
+        out,
+        host,
+        pbfhogg::extract::ExtractStrategy::Simple,
+        true,
+    )
+}
+
+#[cfg(feature = "commands")]
+fn multi_simple_two_phase(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract_multi(
+        i,
+        "history.osh.pbf",
+        out,
+        host,
+        pbfhogg::extract::ExtractStrategy::Simple,
+        false,
+    )
+}
+
+#[cfg(feature = "commands")]
+fn multi_complete(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract_multi(
+        i,
+        "base.osm.pbf",
+        out,
+        host,
+        pbfhogg::extract::ExtractStrategy::CompleteWays,
+        false,
+    )
+}
+
+#[cfg(feature = "commands")]
+fn multi_smart(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract_multi(
+        i,
+        "base.osm.pbf",
+        out,
+        host,
+        pbfhogg::extract::ExtractStrategy::Smart,
+        false,
+    )
 }
 
 fn ids(specs: &[&str]) -> pbfhogg::getid::ElementIds {
@@ -678,6 +937,23 @@ fn time_filter(
     .map(drop)
 }
 
+fn time_filter_history(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    pbfhogg::time_filter::time_filter(
+        &i.path("history.osh.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        HISTORY_CUTOFF,
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
 /// Inventory ownership is by public library command module, not CLI spelling.
 /// Library tests cannot depend on pbfhogg-cli (which depends on this library).
 /// Modes are declared here rather than inferred from scenario display names.
@@ -724,6 +1000,8 @@ fn check_scenarios() -> Vec<Scenario> {
         light("index against payloads", check_index),
         light("IDs, full duplicate sets", check_ids),
         light("locations, LocationsOnWays input", check_locations),
+        light("default pair, indexed shared phases", check_pair_indexed),
+        light("default pair, unindexed single pass", check_pair_unindexed),
     ]
 }
 
@@ -740,6 +1018,17 @@ fn extract_scenarios() -> Vec<Scenario> {
     vec![
         light("single bbox, simple strategy", extract_simple),
         light("single bbox, smart strategy", extract_smart),
+        light("multi-extract, simple, fused per kind", multi_simple),
+        light(
+            "multi-extract, cleaned simple, fused per kind",
+            multi_simple_cleaned,
+        ),
+        light(
+            "multi-extract, simple, classify and write passes (IDs repeat across seams)",
+            multi_simple_two_phase,
+        ),
+        light("multi-extract, complete-ways", multi_complete),
+        light("multi-extract, smart", multi_smart),
     ]
 }
 
@@ -794,7 +1083,7 @@ fn registry_head() -> Vec<CommandCoverage> {
         tested(
             "check",
             check_scenarios(),
-            "Shown missing-reference IDs, violation caps, location agreement and store budgets are not exercised.",
+            "Shown missing-reference IDs, violation caps, location agreement, store budgets, and the unindexed pair's relations and duplicate rescan are not exercised.",
         ),
         tested(
             "degrade",
@@ -833,7 +1122,7 @@ fn registry_tail() -> Vec<CommandCoverage> {
         tested(
             "extract",
             extract_scenarios(),
-            "Polygons, complete-ways, multi-extract and cleaning are not exercised.",
+            "Polygons, complete-ways single extracts, cleaned single extracts and multi-extract's unsorted per-region fallback are not exercised.",
         ),
         tested(
             "getid",
@@ -898,8 +1187,14 @@ fn registry_tail() -> Vec<CommandCoverage> {
         ),
         tested(
             "time_filter",
-            vec![light("cutoff after every timestamp", time_filter)],
-            "Cutoffs that drop versions and nondefault write options are not exercised.",
+            vec![
+                light("snapshot path, cutoff after every timestamp", time_filter),
+                light(
+                    "history path, cutoff dropping versions across blob seams",
+                    time_filter_history,
+                ),
+            ],
+            "Snapshot cutoffs that drop elements and nondefault write options are not exercised.",
         ),
     ]
 }

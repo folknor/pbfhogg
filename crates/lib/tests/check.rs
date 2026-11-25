@@ -1896,3 +1896,104 @@ fn the_pair_reads_an_indexed_file_once() {
     assert_eq!(counters.get("checkrefs_way_blobs"), 1);
     assert_eq!(counters.get("checkrefs_relation_blobs"), 0);
 }
+
+/// One blob whose payload fails to decode, on each of the pair's routes
+/// (the indexed shared phases and the unindexed single pass): the failure
+/// belongs to every check consuming the blob, so each check reports what
+/// its own call reports. With every kind in the ID check the call fails,
+/// located at the blob; with the ID check filtered off the blob's kind, on
+/// indexed input the ID check completes and the reference check carries the
+/// failure, and on unindexed input the call still fails.
+///
+/// The blob's payload is corrupt rather than its read failed through a
+/// fault hook: a failed pread and a refused payload leave the classify
+/// worker as the same located error, on the same channel, into the same
+/// per-check attribution, so a read hook would test nothing more.
+#[test]
+fn the_pair_attributes_an_unreadable_blob_to_each_check_reading_it() {
+    use crate::common::adversarial;
+
+    let dir = crate::common::test_scratch();
+    let (nodes, ways, relations) = refs_fixture_elements();
+    let indexed = dir.path().join("indexed.osm.pbf");
+    write_test_pbf_sorted(&indexed, &nodes, &ways, &relations);
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    write_unindexed_blobs(
+        &unindexed,
+        &[
+            Blob::Nodes(&nodes),
+            Blob::Ways(&ways),
+            Blob::Relations(&relations),
+        ],
+    );
+    let host = crate::common::test_host();
+    let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
+        direct_io: false,
+        check_relations: true,
+        show_ids: None,
+    };
+    for (route, source) in [("indexed", &indexed), ("unindexed", &unindexed)] {
+        let bytes = std::fs::read(source).expect("read fixture");
+        let blobs = adversarial::locate_blobs(&bytes);
+        assert_eq!(blobs.len(), 4, "{route}: a header and one blob per kind");
+        for (blob, kind) in [(1, "nodes"), (2, "ways"), (3, "relations")] {
+            let path = dir.path().join(format!("{route}-{kind}.osm.pbf"));
+            let corrupt = adversarial::mutate_blob_payload(&bytes, blob, |payload| {
+                payload.truncate(payload.len() - 2);
+            });
+            std::fs::write(&path, corrupt).expect("write fixture");
+            assert_pair_matches_everywhere(&path);
+
+            let what = format!("{route}, unreadable {kind} blob");
+            let all = pbfhogg::check::verify_ids::VerifyIdsOptions {
+                max_errors: 0,
+                direct_io: false,
+                full: false,
+                type_filter: None,
+            };
+            let Err(e) = pbfhogg::check::pair::check_ids_and_refs(&path, &all, &refs_opts, &host)
+            else {
+                panic!("{what}: the pair ran past the blob");
+            };
+            let at = format!("blob {blob}, at byte offset {})", blobs[blob].frame_start);
+            assert!(
+                e.to_string().starts_with("wire format error: ") && e.to_string().ends_with(&at),
+                "{what}: not a decode refusal located at the blob: {e}"
+            );
+
+            // The ID check filtered to another kind. On indexed input it
+            // never reads the blob, so it completes and the reference
+            // check, which reads every kind, carries the failure. Unindexed,
+            // a blob's kind is known only once it decodes, so the ID check
+            // reads it too and the call fails as before.
+            let other = pbfhogg::TypeFilter {
+                nodes: kind != "nodes",
+                ways: false,
+                relations: kind == "nodes",
+            };
+            let filtered = pbfhogg::check::verify_ids::VerifyIdsOptions {
+                type_filter: Some(other),
+                ..all
+            };
+            let pair =
+                pbfhogg::check::pair::check_ids_and_refs(&path, &filtered, &refs_opts, &host);
+            if route == "unindexed" {
+                let Err(filtered) = pair else {
+                    panic!("{what}, filtered: the pair ran past the blob");
+                };
+                assert_eq!(filtered.to_string(), e.to_string(), "{what}, filtered");
+                continue;
+            }
+            let pair =
+                pair.unwrap_or_else(|e| panic!("{what}, filtered: the ID check failed: {e}"));
+            assert!(
+                pair.ids.complete().is_some(),
+                "{what}: the ID check stopped"
+            );
+            let Err(refs) = pair.refs else {
+                panic!("{what}: the reference check ran past the blob");
+            };
+            assert_eq!(refs.to_string(), e.to_string(), "{what}");
+        }
+    }
+}

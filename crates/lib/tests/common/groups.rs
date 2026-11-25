@@ -3,8 +3,8 @@
 //! order across them, several kinds in one group, empty groups and empty
 //! dense messages. Elements carry an ID and the least the validator asks of
 //! their kind (a node at 0,0, a way referencing node 1, a relation without
-//! members), no tags and no metadata, so the string table is the one empty
-//! entry.
+//! members), no tags and, except in [`versioned_block`], no metadata, so
+//! the string table is the one empty entry.
 
 use std::path::Path;
 
@@ -106,6 +106,58 @@ pub fn block(groups: &[&[Field<'_>]]) -> Vec<u8> {
         let mut group = Vec::new();
         for &field in *fields {
             encode_field(&mut group, field);
+        }
+        bytes_field(&mut out, 2, &group);
+    }
+    out
+}
+
+/// One element of a [`versioned_block`]: kind (`'n'`, `'w'` or `'r'`), ID,
+/// version, timestamp in seconds, visible.
+pub type Versioned = (char, i64, i32, i64, bool);
+
+/// A serialized `PrimitiveBlock` holding `groups` in order, each element a
+/// plain message (a node at 0,0, a way referencing node 1, a relation
+/// without members, no tags) carrying an `Info` with its version,
+/// timestamp, visibility and changeset 1, under the default date
+/// granularity. Unlike [`block`], its elements carry what time-filter
+/// requires; unlike `BlockBuilder`, one block may hold several kinds.
+pub fn versioned_block(groups: &[&[Versioned]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut table = Vec::new();
+    bytes_field(&mut table, 1, b"");
+    bytes_field(&mut out, 1, &table);
+    for elements in groups {
+        let mut group = Vec::new();
+        for &(kind, id, version, timestamp, visible) in *elements {
+            let mut info = Vec::new();
+            varint_field(&mut info, 1, u64::from(version.cast_unsigned()));
+            varint_field(&mut info, 2, timestamp.cast_unsigned());
+            varint_field(&mut info, 3, 1);
+            varint_field(&mut info, 6, u64::from(visible));
+            let mut element = Vec::new();
+            let field = match kind {
+                'n' => {
+                    varint_field(&mut element, 1, zigzag(id));
+                    bytes_field(&mut element, 4, &info);
+                    varint_field(&mut element, 8, 0);
+                    varint_field(&mut element, 9, 0);
+                    1
+                }
+                'w' => {
+                    varint_field(&mut element, 1, id.cast_unsigned());
+                    bytes_field(&mut element, 4, &info);
+                    packed_sint(&mut element, 8, &[1], true);
+                    3
+                }
+                'r' => {
+                    varint_field(&mut element, 1, id.cast_unsigned());
+                    bytes_field(&mut element, 4, &info);
+                    4
+                }
+                other => panic!("versioned_block: unknown kind {other:?}"),
+            };
+            bytes_field(&mut group, field, &element);
         }
         bytes_field(&mut out, 2, &group);
     }

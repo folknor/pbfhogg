@@ -102,8 +102,9 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
 - **The field policies are held to real data** by `field-policies`, the
   first check of the suite, which runs no pbfhogg. On a slice of the input
   built by osmium (the first IDs of each kind's first data blob, `getid -r`
-  for nodes and ways, plain `getid` for relations, `add-locations-to-ways`
-  over both), osmium's OPL decoding with metadata and coordinates is edited
+  for nodes and ways, plain `getid` for relations, one `osmium sort` of
+  both, since getid keeps the input's stored order, and
+  `add-locations-to-ways` over the sorted slice), osmium's OPL decoding with metadata and coordinates is edited
   one record and one field class at a time: version, timestamp, changeset,
   uid, user, a tag value, a tag boundary, a node coordinate, a way ref, an
   inline way-node coordinate, a member type, ref and role. Each edit is
@@ -1303,9 +1304,16 @@ kind, and rewrites only those, keeping both `Sort.Type_then_ID` and
 `osmium sort -f pbf,locations_on_ways=true`. Each rewritten blob is a run
 of its own, far under the sweep's pinned budget, so no real input reaches
 demotion with coordinates; `merge_pbf.rs` holds that path with a fixture
-whose every cursor is a sorted-view way cursor. `all` on this snapshot
-stops at its field-policies preflight, whose slice of an intra-unsorted
-input is not in strict order.
+whose every cursor is a sorted-view way cursor.
+
+On 2026-11-26, host bygg, at `b8eec311` plus the uncommitted change that
+sorts field-policies' slice before locating it (CLI xxh3-128
+`23bc6a7755fd75b292cb5dc67d73e025`): `all` on the Denmark `unsorted-intra`
+snapshot 24 of 24 PASS. Before that change the suite stopped at
+field-policies: `osmium getid` writes in the input's stored order, and the
+intra-blob swap sits among the first IDs the slice takes, so the slice was
+out of strict order (the cross-blob `unsorted` snapshot passed only because
+its swap lies past those IDs).
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

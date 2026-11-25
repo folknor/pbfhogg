@@ -7,8 +7,9 @@
 //! The slice: the first IDs of each kind's first data blob, read by the
 //! verifier's own frame reader; `osmium getid -r` of the node and way IDs
 //! (so every way brings its nodes), plain `osmium getid` of the relation IDs
-//! (so a boundary does not drag its whole geometry in), and `osmium
-//! add-locations-to-ways` over both, so ways carry real inline coordinates
+//! (so a boundary does not drag its whole geometry in), one `osmium sort` of
+//! both (getid keeps the input's stored order, which need not be strict),
+//! and `osmium add-locations-to-ways` over the sorted slice, so ways carry real inline coordinates
 //! and the header declares `LocationsOnWays`. That slice is decoded to OPL
 //! with metadata and coordinates, and osmium writes the OPL back to PBF
 //! twice: declared (`locations_on_ways=true`, the base) and undeclared. The
@@ -1039,13 +1040,31 @@ fn controls(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> 
             pbf.display()
         )));
     }
-    let slice = outdir.join("slice.osm.pbf");
-    let mut run = ToolRun::osmium("field-policies-altw.1")
-        .arg("add-locations-to-ways")
-        .args(&["-n", "--ignore-missing-nodes"]);
+    // `osmium getid` writes in the input's stored order, so on input whose
+    // content is out of order (an intra-blob swap among the first IDs, with
+    // or without a sort claim) the parts are too, and the strict walks of
+    // the controls refuse them. One sort of both parts orders the slice
+    // whatever the input or its header says, and puts every node before
+    // the ways add-locations-to-ways locates from them. The parts are
+    // disjoint (getid -r of node and way IDs follows ways to nodes only), so
+    // sorting adds no repeat; a repeat the input itself carries stays one,
+    // and the strict walk refuses it.
+    let sorted = outdir.join("slice-sorted.osm.pbf");
+    let mut sort = ToolRun::osmium("field-policies-sort.1").arg("sort");
     for part in &parts {
-        run = run.input(part, Origin::Other);
+        sort = sort.input(part, Origin::Other);
     }
+    let captured = harness.reference(
+        &sort.arg("-o").output(&sorted).arg("--overwrite"),
+        &outdir.join("slice-sort.stdout"),
+    )?;
+    harness.require_success(&captured, "osmium sort")?;
+
+    let slice = outdir.join("slice.osm.pbf");
+    let run = ToolRun::osmium("field-policies-altw.1")
+        .arg("add-locations-to-ways")
+        .args(&["-n", "--ignore-missing-nodes"])
+        .input(&sorted, Origin::Other);
     let captured = harness.reference(
         &run.arg("-o").output(&slice).arg("--overwrite"),
         &outdir.join("slice-altw.stdout"),

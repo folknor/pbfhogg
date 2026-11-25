@@ -43,17 +43,6 @@ single-kind blocks. A witness is a mixed-kind frame with ascending way IDs and
 inline coordinates under the declaration, so the restructuring alone is the reason
 to rewrite, asserting the tally and every way's own coordinates.
 
-## VER-159 - verify all cannot run on an intra-blob unsorted snapshot
-
-`pbfhogg-verify all --dataset denmark --snapshot unsorted-intra` stops at the
-field-policies preflight: the slice it takes with `osmium getid` keeps the input's
-order, and its OPL decoding refuses "an object at or below the previous one". The
-cross-blob `unsorted` snapshot passed `all` 24 of 24 on 2026-11-26, so its slice was
-in order; why the two differ is not established. The
-individual checks run (sort PASS on the `altw-keep-untagged` variant), but no
-suite-level run certifies the snapshot. Either the preflight sorts its slice, or
-the suite skips it with a reason for an input that claims no order.
-
 ## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 
 Every `fault_*_input` reference run asserts the exact transport of each pinned

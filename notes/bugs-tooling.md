@@ -23,24 +23,6 @@ None was built, run or reproduced, and the bracketed priority is the hunter's
 own label.
 Entries are in no order of importance.
 
-## TOOL-051 - verify field-policies locates its slice from input order
-
-Reported by: the spar accounting of the verify geocode input-order change,
-from its scout's lateral (2026-11-24); traced from source, not reproduced.
-
-`controls` in `crates/verify/src/checks/field_policies.rs` builds its slice
-with `osmium getid -r` (and plain `getid` for relations) from the input
-itself. It then runs `osmium add-locations-to-ways -n --ignore-missing-nodes`
-over the pieces, without the osmium-sorted copy that `InputOrder` gives every
-other check. `getid` keeps the input's order, and osmium locates a way only
-from nodes stored before it. On input without the `Sort.Type_then_ID`
-claim, a way stored before its nodes therefore comes out with undefined
-locations. No verdict turns wrong: the way-location and "between" controls
-just lose candidates and can end named as not exercised. But the module doc
-promises that only a class with no candidate record on the input is named
-that way. Reading the pieces from `InputOrder::of(..).reference_input`, as
-geocode now does, would keep that promise.
-
 ## TOOL-047 - A reference run over a pbfhogg output fails by presumption
 
 Reported by: the spar on the verifier's error classification (2026-11-24);

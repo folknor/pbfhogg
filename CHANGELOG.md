@@ -639,6 +639,18 @@
   keep refusing, and so does a repaired payload `cat --repair` frames
   under its input header.
 
+- **A block too large for one blob that cannot be cut is refused naming
+  the input it came from.** On every command that cuts such a block
+  (`sort`, `cat`, `extract`, `tags-filter`, `getid`, `getparents`,
+  `time-filter`, `add-locations-to-ways`, `renumber`), the remaining size
+  refusal used to come from the writer later, naming only the output; it
+  is now raised as the block is built, with the same text and exit `2`,
+  plus the input file and the blob ordinal or frame offset (for `sort` and
+  `cat --dedupe`, the input of the block's first element). Library
+  callers see `ErrorKind::BlobTooLarge` with that location attached.
+  Unsorted `extract --simple` also locates its decode failures at the
+  blob.
+
 - **`extract --simple` on unsorted indexed input is about twice as fast,
   and writes no node from a blob outside the region.** Each classify sweep
   now decodes only the blobs that claim its kind, and the write pass

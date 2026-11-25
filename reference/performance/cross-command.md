@@ -745,6 +745,17 @@ either: peak memory on oversized input, where a first cut repeats the
 block's string table in every piece and a queued task holds all its
 pieces.
 
+## The cut refuses an uncuttable block where it is built (bygg, 2026-11-25, against `27cb909f`)
+
+The cut's no-plan path now raises the writer's refusal itself; that is
+cold code, and nothing changes for a block that frames. The one per-element
+addition is the sort / `cat --dedupe` sweep recording the origin of the
+block it is filling (one predicted branch per element), so the sweep was
+measured: planet `copy-pbf --dedupe yes`, `--iterations 1`, which runs the
+sweep on all 50,816 overlap runs. Baseline `27cb909f` 3m24s (`572aeeb0`),
+variant uncommitted on the same base 3m21s (`89428ad5`, dirty). One pair,
+-1.5 %, inside noise; no further cells.
+
 ## History
 
 ### Multi-dataset throughput tables (commit-pinned)

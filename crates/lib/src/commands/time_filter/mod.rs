@@ -264,6 +264,10 @@ enum Tail {
     Visible(crate::Result<Vec<OwnedBlock>>),
 }
 
+/// A blob ending's blocks, or the refusal of their fit: carried until the
+/// stitcher knows whether that ending is written.
+type Ending = crate::Result<Vec<OwnedBlock>>;
+
 /// One input blob's share of the history snapshot.
 struct HistorySlice {
     at: BlobAt,
@@ -274,8 +278,9 @@ struct HistorySlice {
     edges: Option<Edges>,
     /// Blocks closed before the blob's last open block: unconditional.
     done: Vec<OwnedBlock>,
-    /// The last open block without the tail candidate.
-    open: Vec<OwnedBlock>,
+    /// The last open block without the tail candidate, or the refusal of
+    /// its fit, raised only if it is written (see `encode_endings`).
+    open: crate::Result<Vec<OwnedBlock>>,
     tail: Tail,
 }
 
@@ -308,8 +313,9 @@ impl crate::read::pipeline::DecodeTransform for HistoryBlobs<'_> {
 
 /// Blocks fitted to the blob limits as the builder closes them
 /// (`commands/split.rs`): a block over the payload limit is cut on its own
-/// bytes, and one the cut finds no plan for goes on whole for the writer to
-/// refuse.
+/// bytes, and one the cut finds no plan for is refused with the writer's
+/// typed size error, located at the input blob by the worker or, for a
+/// carried ending, by the stitcher.
 struct Fitted<'l> {
     blocks: Vec<OwnedBlock>,
     limits: &'l Limits,
@@ -336,15 +342,17 @@ impl crate::commands::BlockSink for Fitted<'_> {
 /// the candidate, so the open block's elements are encoded once and the clone
 /// holds exactly the state a re-encode of them from an empty builder would
 /// reach. It comes back as a result, not raised: a later blob may supersede
-/// the candidate, and then its encoding is not this run's concern. The
-/// unconditional blocks' errors come first.
+/// the candidate, and then its encoding is not this run's concern. The open
+/// block's flush comes back as a result too, since the stitcher writes it
+/// only when the candidate's ending is not chosen. The unconditional
+/// blocks' errors come first.
 fn encode_endings(
     block: &PrimitiveBlock,
     winners: &[usize],
     candidate: Option<usize>,
     done: &mut Fitted<'_>,
     open: &mut Fitted<'_>,
-) -> Result<Option<crate::Result<Vec<OwnedBlock>>>> {
+) -> Result<(crate::Result<()>, Option<Ending>)> {
     let mut bb = BlockBuilder::new();
     let mut wanted = winners.iter().copied().peekable();
     let mut bufs = EncodeBufs::default();
@@ -362,9 +370,13 @@ fn encode_endings(
         }
     }
     let fork = at_candidate.as_ref().map(|_| bb.clone());
-    flush_local(&mut bb, open)?;
+    // Carried, not raised: the open block is written only when the
+    // candidate does not take its place, and its flush runs the cut, which
+    // refuses a block it cannot fit; the ending with the candidate is a
+    // different block whose own fit decides for it.
+    let opened = flush_local(&mut bb, open);
     let (Some(element), Some(mut fork)) = (at_candidate, fork) else {
-        return Ok(None);
+        return Ok((opened, None));
     };
     let mut alt = Fitted {
         blocks: Vec::new(),
@@ -373,7 +385,7 @@ fn encode_endings(
     let ending = encode_kept(&element, &mut fork, &mut alt, &mut bufs)
         .and_then(|()| flush_local(&mut fork, &mut alt))
         .map(|()| alt.blocks);
-    Ok(Some(ending))
+    Ok((opened, Some(ending)))
 }
 
 fn element_visible(element: &Element<'_>) -> bool {
@@ -429,7 +441,7 @@ fn select_blob(
             stats,
             edges: None,
             done: Vec::new(),
-            open: Vec::new(),
+            open: Ok(Vec::new()),
             tail: Tail::None,
         });
     };
@@ -446,7 +458,7 @@ fn select_blob(
         Some((pos, true)) => Some(pos),
         _ => None,
     };
-    let ending = encode_endings(block, &winners, candidate, &mut done, &mut open)?;
+    let (opened, ending) = encode_endings(block, &winners, candidate, &mut done, &mut open)?;
     let tail = match (last.winner, ending) {
         (None, _) => Tail::None,
         (Some((_, false)), _) => Tail::Deleted,
@@ -470,7 +482,7 @@ fn select_blob(
             head_decided,
         }),
         done: done.blocks,
-        open: open.blocks,
+        open: opened.map(|()| open.blocks),
         tail,
     })
 }
@@ -596,7 +608,7 @@ enum Candidate {
 /// open group decides which of its two forms is right.
 struct Held {
     at: BlobAt,
-    open: Vec<OwnedBlock>,
+    open: crate::Result<Vec<OwnedBlock>>,
     alt: Option<crate::Result<Vec<OwnedBlock>>>,
 }
 
@@ -622,7 +634,9 @@ impl Stitch<'_> {
         let held = self.held.take();
         let blocks = match (held, with_candidate) {
             (None, false) => return Ok(()),
-            (Some(held), false) => held.open,
+            (Some(Held { at, open, .. }), false) => {
+                open.map_err(|e| locate_at(e, &self.source, at))?
+            }
             (
                 Some(Held {
                     at,
@@ -1460,6 +1474,48 @@ mod tests {
             s.dropped_no_snapshot_version,
         ];
         Ok((std::fs::read(&output).unwrap(), elements, stats))
+    }
+
+    /// A held blob's two endings each carry their own fit result: choosing
+    /// the candidate's ending writes it and drops the open block's refusal;
+    /// choosing the open block raises that refusal, located at the held
+    /// blob.
+    #[test]
+    fn a_held_ending_raises_its_fit_refusal_only_when_chosen() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("out.pbf");
+        let token = crate::host::Call::detached();
+        let mut writer = PbfWriter::new(
+            crate::file_writer::FileWriter::buffered_in(&path, &token).unwrap(),
+            Compression::default(),
+        );
+        let refusal =
+            || crate::error::new_blob_too_large(crate::error::OversizePart::Payload, 40, 32);
+        let at: BlobAt = (Some(3), Some(crate::ByteOffset(77)));
+        let mut stitch = Stitch {
+            writer: &mut writer,
+            source: std::sync::Arc::from(path.as_path()),
+            stats: TimeFilterStats::default(),
+            pending: None,
+            held: Some(Held {
+                at,
+                open: Err(refusal()),
+                alt: Some(Ok(Vec::new())),
+            }),
+        };
+        stitch.release(true).unwrap();
+        stitch.held = Some(Held {
+            at,
+            open: Err(refusal()),
+            alt: Some(Ok(Vec::new())),
+        });
+        let err = crate::test_support::assert_err_kind!(
+            stitch.release(false),
+            crate::ErrorKind::BlobTooLarge { .. }
+        );
+        assert_eq!(err.blob_index(), Some(3));
+        assert_eq!(err.byte_offset(), Some(crate::ByteOffset(77)));
+        assert_eq!(err.source_path(), Some(path.as_path()));
     }
 
     /// Claims are judged in whole seconds rounded down: a negative

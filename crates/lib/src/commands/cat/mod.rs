@@ -846,8 +846,8 @@ fn reencode_unclassifiable(
     }
     flush_local(&mut bb, &mut output)?;
     // A rebuilt block the writer would refuse as too large is cut between
-    // elements (`commands/split.rs`); one no plan fits stays whole and is
-    // refused when framed.
+    // elements (`commands/split.rs`); one no plan fits is refused there, and
+    // the caller locates it at the input blob.
     super::split::fit_blocks(&mut output, &super::split::Limits::new(compression))?;
     Ok((output, count))
 }

@@ -145,6 +145,7 @@ mod merge_pbf;
 mod non_indexed_parity;
 mod oracle_model;
 mod osc_parser_parity;
+mod oversize_location;
 #[cfg(target_os = "linux")]
 mod process_setup;
 mod proptests;

@@ -138,24 +138,18 @@ node of the blob. Also untested: that one overflow needing the
 whole-table plan leaves another overflow of the same blob its compact
 plan (`overflow.rs` `plan`).
 
-## CMD-050 - Owned-block re-encoders' uncuttable-block refusal names no input blob
+## CMD-050 - Peak memory of the oversize cut on oversized input is unmeasured
 
 Reported by: the CMD-049 implementer (2026-11-19); narrowed by spars
-(2026-11-24, 2026-11-25): every blob-local re-encoder now cuts an oversized
-block (`FramedBlocks::cutting`, multi-extract's `frame_region`,
-`split::fit_blocks`).
+(2026-11-24, 2026-11-25); the last made the cut refuse a block it finds no
+plan for on the spot, located at its input.
 
-On the owned-block routes (tags-filter, getid, getparents, cat `--type`
-fallback and unclassifiable rebuild, unsorted simple extract),
-`fit_blocks` hands a block no plan fits on whole, and the pipelined writer
-refuses it later with no input location, as CMD-075 describes for altw.
-Unsorted simple extract's pass-2 batch map (`process_extract_pass2_batch`)
-also locates none of its errors, the cut's included. The framing routes
-keep the original refusal at the worker. Fix shape: a strict no-plan
-outcome from the fit that returns the typed size error at the worker
-boundary, shared with CMD-072 and CMD-075. Unmeasured: peak memory on
-oversized input (a first cut repeats the string table in every piece and a
-queued task holds all its pieces).
+Every re-encoder cuts an oversized block (`commands/split.rs`), but no run
+has measured peak memory on input that triggers the cut: a first cut repeats
+the block's string table in every piece, and a queued worker task holds all
+of its pieces until the consumer writes them. Next: an input that forces the
+cut on many blobs, and the peak recorded in
+`reference/performance/cross-command.md`.
 
 Ruled, not open: no byte threshold in `can_add_*` or the
 `ensure_*_capacity_local` funnel; repack and degrade refuse an over-limit
@@ -164,38 +158,29 @@ header is not cut (comment in `cat/repair.rs`); `flush_or_overflow` stays
 strict on an opted-in sink; the cut's search is sized by a monotone upper
 bound and may miss a partition, ending in the same typed refusal.
 
-## CMD-072 - The sort / dedupe sweep's size refusal names no input
+## CMD-086 - The ordered classify pool's doc says the merge's error is located
 
-Reported by: the CMD-050 scout (2026-11-24); not run.
+Reported by: the CMD-072/075/050 scout (2026-11-25); read from source.
 
-`Sweep::emit_group` locates an `out.encode` failure at the member's input
-and frame, but a refusal raised when a block is framed (`Output::ship`,
-mid-run and at the final flush) carries no location, though the block holds
-elements of many inputs and blobs. After the oversize cut this is reached
-only by a single element too large for a blob or a missed partition. Fix
-shape: locate the refusal at the input and frame of the block's first or
-offending element.
+`parallel_classify_phase_ordered` (`scan/classify.rs`) documents its
+`merge` callback's failure as "located as in `parallel_classify_phase`",
+but `run_project_ordered` wraps only the worker closure in
+`input.locate_blob`; `ClassifyConsumer::consume` returns the merge's error
+as the callback made it, which matches the provenance rule that callback
+errors are never located by the library. The doc looks wrong, not the
+code; the location test drives only worker failures. Fix: correct the doc.
 
-## CMD-075 - add-locations-to-ways' writer-side size refusal names no input blob
+## CMD-087 - pipeline.md says the pread classify pools carry no blob ordinal
 
-Reported by: the spar accounting of the add-locations-to-ways cut, from
-its scout's lateral (2026-11-24); read from source, not run.
+Reported by: the CMD-072/075/050 scout (2026-11-25); read from source, not
+verified against every pool.
 
-The altw cut (`fit_output` in `altw/mod.rs`, over `fit_scanned`) runs in
-the pass-2 and stage-4 workers, so a failure inside the cut is located at
-the input blob. But a block for which the cut finds no plan (a single way
-too large for a blob, or a partition the size bound over-counts) is handed
-on whole, and the writer refuses it: `Pass2Consumer::consume`
-(`altw/passthrough.rs`), `S4Consumer::consume_inner`
-(`altw/external/stage4.rs`) and the unindexed fallback (`altw/mod.rs`) call
-`write_primitive_block_owned(block)?` with no `locate`, and the pipelined
-writer returns the framing failure as a later slot's ordered result, so the
-`BlobTooLarge` can surface on a later write or at `flush` and names no
-input blob. The history time-filter's `write_block` has the same shape
-(its pipelined callback locates order refusals at the input file only).
-Fix shape: carry the input blob's location with the block to the consumer,
-or check the whole-block hand-off where the cut already knows it found no
-plan, and locate the refusal there.
+`reference/pipeline.md` "Provenance" says pools with `(seq, offset, size)`
+schedules carry only the frame offset or nothing. Since the classify pools
+moved to `ScheduledBlob`, `ScheduledBlob::location` carries the ordinal when
+the schedule has one, and a test asserts ordinal and offset. Extract's
+`pread_execute` and altw stage 4 still locate with the offset only. Fix:
+check each pool and reword the paragraph to what they do.
 
 ## CMD-060 - degrade --unsort may have slowed down, and is slow on planet
 

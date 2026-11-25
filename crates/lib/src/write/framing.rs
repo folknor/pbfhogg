@@ -634,6 +634,45 @@ pub(crate) fn encoded_body_len(uncompressed: &[u8], compression: &Compression) -
     Ok(scratch.body_head.len() + payload)
 }
 
+/// Run every size check the writer applies when it frames an `OSMData`
+/// blob of `uncompressed` with these header fields, in the writer's order:
+/// the payload guard, the encoded body against the datasize cap, then the
+/// BlobHeader cap after the tagdata drop. `Ok` means the writer frames it;
+/// an error is the one the writer would return, part, size and limit
+/// included. Touches no writer metrics. For the cold path of a caller that
+/// found no way to cut a block and must refuse it where it knows the
+/// block's input, instead of leaving the writer to refuse it later with no
+/// input location.
+#[cold]
+pub(crate) fn check_data_frame(
+    uncompressed: &[u8],
+    compression: &Compression,
+    indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
+) -> Result<()> {
+    let body = encoded_body_len(uncompressed, compression)?;
+    if body as u64 >= MAX_BLOB_DATASIZE {
+        return Err(crate::error::new_blob_too_large(
+            OversizePart::Body,
+            body as u64,
+            MAX_BLOB_DATASIZE,
+        ));
+    }
+    let datasize = i32::try_from(body)
+        .map_err(|_| Error::internal(format!("blob datasize overflow: {body} bytes")))?;
+    let mut header = Vec::new();
+    encode_blob_header_into(
+        "OSMData",
+        datasize,
+        indexdata,
+        tagdata,
+        way_members,
+        &mut header,
+    )?;
+    Ok(())
+}
+
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
 fn compress_zlib(uncompressed: &[u8], level: ZlibLevel, scratch: &mut FrameScratch) -> Result<()> {
     let compressor = match &mut scratch.zlib_compressor {

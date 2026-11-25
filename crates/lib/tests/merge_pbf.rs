@@ -1511,6 +1511,70 @@ fn a_many_version_group_ships_block_by_block() {
     );
 }
 
+/// A zlib input blob may carry a payload of exactly the 32 MiB raw limit,
+/// which an uncompressed blob cannot hold (its body adds a field head under
+/// the same cap). Merged uncompressed with an overlapping input, the sweep
+/// re-encodes that node into a block no cut fits: the refusal is the
+/// writer's typed size error, located at the input and frame of the block's
+/// first element, not an unlocated failure of a later write.
+#[test]
+fn an_overlap_block_no_cut_fits_is_refused_at_its_first_input() {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+    // `MAX_BLOB_MESSAGE_SIZE`, the inclusive payload limit.
+    const RAW_LIMIT: usize = 32 << 20;
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let encode = |len: usize| {
+        let mut bb = BlockBuilder::new();
+        let v = "a".repeat(len);
+        bb.add_node(1, 0, 0, [("v", v.as_str())], None);
+        bb.take()
+            .expect("encode")
+            .expect("non-empty block")
+            .to_vec()
+    };
+    let probe = encode(RAW_LIMIT - 1024).len();
+    let payload = encode(RAW_LIMIT - 1024 + (RAW_LIMIT - probe));
+    assert_eq!(
+        payload.len(),
+        RAW_LIMIT,
+        "fixture: the payload is not at the limit"
+    );
+    let file = std::fs::File::create(&a).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+        .expect("write header");
+    writer.write_primitive_block(&payload).expect("write block");
+    writer.flush().expect("flush fixture");
+    write_node_blobs(&b, true, &[vec![1, 2]], |_| String::from("b"));
+
+    let (host, _counters) = recording_host(4);
+    let result = merge_pbf(
+        &[a.as_path(), b.as_path()],
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    );
+    let err = match result {
+        Ok(_) => panic!("the merge framed a block past the uncompressed limit"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::BlobTooLarge { .. }),
+        "not the size refusal: {}",
+        err.report()
+    );
+    assert_eq!(err.source_path(), Some(a.as_path()), "{}", err.report());
+    assert!(err.byte_offset().is_some(), "{}", err.report());
+    assert!(!output.exists());
+}
+
 /// Two inputs whose blobs each frame, overlapping in their ID ranges, so the
 /// sweep packs both into one count-cut output block past the 32 MiB payload
 /// limit. The block is cut on its bytes into blocks that fit, every node

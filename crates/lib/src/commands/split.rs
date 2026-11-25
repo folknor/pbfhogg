@@ -58,8 +58,13 @@
 //! legal partition. The search needs a piece's size to be monotone in both
 //! its ends; the first cut's sizes are exact, the re-encoding cut's an upper
 //! bound with that property, so it can miss a partition the bound
-//! over-counts. When neither finds a partition the block goes to the writer
-//! whole, which refuses it with its typed size error.
+//! over-counts. When neither finds a partition, [`fit_scanned`] refuses the
+//! block on the spot with the writer's own typed size error
+//! ([`Limits::check_whole`]), so the refusal is raised where the caller can
+//! still locate it at the input blob; handed on whole, the pipelined writer
+//! would refuse it as a later write's or the flush's result, naming no
+//! input. [`cut_lent`] leaves the refusal to its caller, which frames on the
+//! spot.
 //!
 //! # A cut block's indexes
 //!
@@ -142,6 +147,20 @@ impl Limits {
         }
         let body = crate::write::encoded_body_len(bytes, &self.compression)?;
         Ok((body as u64) < MAX_BLOB_DATASIZE)
+    }
+
+    /// Refuse `block` with the error the writer would raise framing it whole
+    /// (payload, body or BlobHeader, after the writer's tagdata drop), or
+    /// `Ok` when the writer frames it. The cold path of a block no cut fits.
+    #[cold]
+    pub(crate) fn check_whole(&self, block: &OwnedBlock) -> crate::Result<()> {
+        crate::write::check_data_frame(
+            &block.bytes,
+            &self.compression,
+            Some(block.index.serialize().as_slice()),
+            block.tagdata.as_deref(),
+            block.way_members.as_deref(),
+        )
     }
 }
 
@@ -491,10 +510,12 @@ pub(crate) fn plan<'b>(
 /// module documentation). `emit`'s second argument is what the caller
 /// holds besides the block it is given: 0 for a block passed whole, the
 /// cut block's length for a piece. A block the cut finds no fitting plan
-/// for goes to `emit` whole and the writer decides: it refuses with its
-/// typed size error a block over a hard limit, and frames one the cut's
-/// conservative bounds only suspected; a plan is chosen and checked before
-/// its first piece is emitted.
+/// for is refused here with the writer's typed size error, so a caller on
+/// a worker or holding the input's location locates it; only one the
+/// writer frames whole (cut for the way ceiling alone) goes to `emit`
+/// whole. A plan is chosen and checked before its first piece is emitted.
+/// An error can therefore come from the cut or from `emit`; a caller that
+/// locates them differently tells them apart in its `emit`.
 ///
 /// A block carrying a `pbfhogg.WayMembers-v1` payload (BlobHeader field 5,
 /// one bit per way in file order) is held to one more bound: the header
@@ -589,7 +610,17 @@ fn fit_scanned_cold(
         limits,
         emit,
     )?;
-    if chosen { Ok(()) } else { emit(block, 0) }
+    if chosen {
+        return Ok(());
+    }
+    // No plan: refuse here, where the caller still knows which input the
+    // block came from, with the writer's own error; a block handed on whole
+    // would be refused by the writer later, as another block's write or the
+    // flush, naming no input. Only a block the writer frames goes on whole:
+    // one the cut ran for because of the field-5 way ceiling alone, whose
+    // real header fits.
+    limits.check_whole(&block)?;
+    emit(block, 0)
 }
 
 /// Fit every block of `blocks` in place (see [`fit_scanned`]): the vector
@@ -597,7 +628,8 @@ fn fit_scanned_cold(
 /// the first block that does not, its pieces in its place. For a worker
 /// task that returns its owned blocks for a consumer to write, so the cut
 /// runs on the worker and a failure inside it is located with the task's
-/// input blob. A block no plan fits stays whole, for the writer to refuse.
+/// input blob. A block no plan fits is refused here, as [`fit_scanned`]
+/// says.
 pub(crate) fn fit_blocks(blocks: &mut Vec<OwnedBlock>, limits: &Limits) -> crate::Result<()> {
     let mut first = None;
     for (k, block) in blocks.iter().enumerate() {
@@ -935,14 +967,61 @@ mod tests {
         assert_eq!(seen, whole);
     }
 
+    /// No cut fits under the small limits, but the writer, held to the real
+    /// caps, frames the whole block, so it goes on whole.
     #[test]
-    fn a_block_with_no_fitting_plan_is_handed_on_whole() {
+    fn a_block_no_cut_fits_that_the_writer_frames_goes_on_whole() {
         let block = relations(&[(1, 10), (2, 2000)]);
         let bytes = block.bytes.clone();
         let out = fit_all(block, &small(1000));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.bytes, bytes);
         assert_eq!(out[0].1, 0);
+    }
+
+    /// A single element past the real payload limit has no plan, and is
+    /// refused by the cut itself with the writer's error, emitting nothing.
+    #[test]
+    fn a_block_no_cut_fits_is_refused_at_the_cut_with_the_writer_error() {
+        let limit = usize::try_from(MAX_BLOB_MESSAGE_SIZE).unwrap();
+        let block = relations(&[(1, limit + 1024)]);
+        let size = block.bytes.len() as u64;
+        let mut emitted = 0;
+        let result = fit_scanned(block, &Limits::new(Compression::None), |_, _| {
+            emitted += 1;
+            Ok(())
+        });
+        crate::test_support::assert_err_kind!(
+            result,
+            crate::ErrorKind::BlobTooLarge {
+                part: crate::error::OversizePart::Payload,
+                size: s,
+                limit: MAX_BLOB_MESSAGE_SIZE,
+            } if *s == size
+        );
+        assert_eq!(emitted, 0);
+    }
+
+    /// The whole-block check follows the writer's header rules: a field-5
+    /// bitmap whose header fits passes (the way ceiling alone is
+    /// conservative), one past the header cap is refused naming the bitmap,
+    /// and tagdata is dropped before that, as the writer drops it.
+    #[test]
+    fn the_whole_block_check_applies_the_header_rules() {
+        let mut block = relations(&[(1, 10)]);
+        let limits = Limits::new(Compression::None);
+        let header = usize::try_from(crate::read::blob_wire::MAX_BLOB_HEADER_SIZE).unwrap();
+        block.way_members = Some(vec![1; header - 100]);
+        block.tagdata = Some(vec![7; 2000]);
+        limits.check_whole(&block).unwrap();
+        block.way_members = Some(vec![1; header + 10]);
+        crate::test_support::assert_err_kind!(
+            limits.check_whole(&block),
+            crate::ErrorKind::BlobTooLarge {
+                part: crate::error::OversizePart::HeaderWayMembers,
+                ..
+            }
+        );
     }
 
     #[test]

@@ -35,8 +35,9 @@
 //! What it cannot find: a partition that needs the bytes the bound
 //! over-counts, one that exists only because index widths shrink, a cut
 //! inside a dense message it cannot read, and a compact table where one
-//! reference cannot be read. Those blocks go to the writer whole, and it
-//! refuses them.
+//! reference cannot be read. Those blocks are refused with the writer's
+//! typed size error where the cut runs (see the parent module, "Which
+//! cuts").
 
 use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 

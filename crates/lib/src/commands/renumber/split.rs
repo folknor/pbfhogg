@@ -41,7 +41,9 @@ pub(super) enum Numbering {
 
 /// `block` with its `index`, as one or more blocks the writer frames under
 /// `limits`. A block that frames comes back unchanged; one that cannot be
-/// cut comes back whole, for the writer to refuse.
+/// cut is refused here with the writer's typed size error: the whole
+/// block's when no cut exists, else that of the first raw-limit piece
+/// whose body passes the cap (what the writer would have been handed).
 pub(super) fn fit(
     block: Vec<u8>,
     index: BlobIndex,
@@ -51,33 +53,59 @@ pub(super) fn fit(
     if limits.frames(&block)? {
         return Ok(vec![(block, index)]);
     }
-    fit_cold(block, index, numbering, limits)
+    fit_cold(&block, index, numbering, limits)
 }
 
 #[cold]
 #[inline(never)]
 fn fit_cold(
-    block: Vec<u8>,
+    block: &[u8],
     index: BlobIndex,
     numbering: Numbering,
     limits: &Limits,
 ) -> crate::Result<Vec<(Vec<u8>, BlobIndex)>> {
     // No partition at the raw limit means none at the smaller sure limit.
-    let Some(pieces) = cut(&block, &index, numbering, limits.raw())? else {
-        return Ok(vec![(block, index)]);
+    let Some(pieces) = cut(block, &index, numbering, limits.raw())? else {
+        return Err(refusal(block, &index, limits));
     };
-    let mut all_frame = true;
-    for (bytes, _) in &pieces {
+    let mut failing = None;
+    for (k, (bytes, _)) in pieces.iter().enumerate() {
         if !limits.frames(bytes)? {
-            all_frame = false;
+            failing = Some(k);
             break;
         }
     }
-    if all_frame || limits.sure() >= limits.raw() {
+    let Some(failing) = failing else {
+        return Ok(pieces);
+    };
+    // A piece's body expands past the cap: cut where no body can.
+    if limits.sure() < limits.raw()
+        && let Some(pieces) = cut(block, &index, numbering, limits.sure())?
+    {
         return Ok(pieces);
     }
-    // A piece's body expands past the cap: cut where no body can.
-    Ok(cut(&block, &index, numbering, limits.sure())?.unwrap_or(pieces))
+    let (bytes, index) = &pieces[failing];
+    Err(refusal(bytes, index, limits))
+}
+
+/// The writer's refusal of a block renumber cannot cut, raised here so the
+/// stage locates it at the input blob instead of the pipelined writer
+/// refusing it later, naming no input (renumber writes no tagdata or
+/// field-5 payload).
+#[cold]
+fn refusal(bytes: &[u8], index: &BlobIndex, limits: &Limits) -> Error {
+    let block = crate::block_builder::OwnedBlock {
+        bytes: bytes.to_vec(),
+        index: *index,
+        tagdata: None,
+        way_members: None,
+    };
+    match limits.check_whole(&block) {
+        Err(e) => e,
+        Ok(()) => {
+            Error::internal("renumber cut: a block that does not frame passed the frame check")
+        }
+    }
 }
 
 /// A block's bytes with its index.
@@ -347,12 +375,30 @@ mod tests {
     }
 
     #[test]
-    fn an_element_that_cannot_fit_leaves_the_block_whole() {
+    fn an_element_that_cannot_fit_has_no_cut() {
         let b = block(&[vec![(3, way(1, 10)), (3, way(2, 200))]]);
         let idx = index(crate::ElementKind::Way, 1, 2, 2);
-        let pieces = fit_at(b.clone(), idx, Numbering::From(1), 100).unwrap();
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].0, b);
+        assert!(cut(&b, &idx, Numbering::From(1), 100).unwrap().is_none());
+    }
+
+    /// A block past the real payload limit that no cut fits is refused by
+    /// `fit` with the writer's own error, not handed on for the writer to
+    /// refuse later.
+    #[test]
+    fn a_block_no_cut_fits_is_refused_with_the_writer_error() {
+        let limit = usize::try_from(crate::read::blob_wire::MAX_BLOB_MESSAGE_SIZE).unwrap();
+        let b = block(&[vec![(3, way(1, limit + 1024))]]);
+        let size = b.len() as u64;
+        let idx = index(crate::ElementKind::Way, 1, 1, 1);
+        let limits = Limits::new(crate::write::compression::Compression::None);
+        crate::test_support::assert_err_kind!(
+            fit(b, idx, Numbering::From(1), &limits),
+            crate::ErrorKind::BlobTooLarge {
+                part: crate::error::OversizePart::Payload,
+                size: s,
+                ..
+            } if *s == size
+        );
     }
 
     #[test]

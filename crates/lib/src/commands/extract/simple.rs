@@ -226,24 +226,27 @@ fn extract_simple_two_pass(
             {
                 continue;
             }
-            blob.decompress_into(&mut decompress_buf)?;
-            let block = PrimitiveBlock::from_vec_with_scratch(
-                std::mem::take(&mut decompress_buf),
-                &mut st_scratch,
-                &mut gr_scratch,
-            )?;
-            release_scratch(&mut st_scratch);
-            release_scratch(&mut gr_scratch);
-            refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
-            classify_block_simple(
-                &block,
-                phase,
-                region,
-                &exact_bbox,
-                &mut bbox_node_ids,
-                &mut matched_way_ids,
-                &mut matched_relation_ids,
-            )?;
+            let mut classify = || -> Result<()> {
+                blob.decompress_into(&mut decompress_buf)?;
+                let block = PrimitiveBlock::from_vec_with_scratch(
+                    std::mem::take(&mut decompress_buf),
+                    &mut st_scratch,
+                    &mut gr_scratch,
+                )?;
+                release_scratch(&mut st_scratch);
+                release_scratch(&mut gr_scratch);
+                refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
+                classify_block_simple(
+                    &block,
+                    phase,
+                    region,
+                    &exact_bbox,
+                    &mut bbox_node_ids,
+                    &mut matched_way_ids,
+                    &mut matched_relation_ids,
+                )
+            };
+            classify().map_err(|e| blob.locate_error(source.as_ref(), e))?;
         }
     }
     host.invocation.marker("SIMPLE_UNSORTED_PASS1_END");
@@ -254,7 +257,10 @@ fn extract_simple_two_pass(
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader.leading_header()?;
-    let header = header_blob.to_headerblock()?;
+    let source = blob_reader.source().cloned();
+    let header = header_blob
+        .to_headerblock()
+        .map_err(|e| header_blob.locate_error(source.as_ref(), e))?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
@@ -302,12 +308,28 @@ fn extract_simple_two_pass(
         }
         batch.push(blob);
         if batch.len() >= EXTRACT_SIMPLE_BATCH_SIZE {
-            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;
+            process_extract_pass2_batch(
+                &batch,
+                source.as_ref(),
+                &ids,
+                clean,
+                &mut writer,
+                &mut stats,
+                host,
+            )?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;
+        process_extract_pass2_batch(
+            &batch,
+            source.as_ref(),
+            &ids,
+            clean,
+            &mut writer,
+            &mut stats,
+            host,
+        )?;
     }
 
     writer.flush()?;
@@ -915,6 +937,7 @@ fn settle_passthrough_candidates(
 /// worker. Results drain in batch order, so output stays in file order.
 fn process_extract_pass2_batch(
     batch: &[crate::blob::Blob],
+    source: Option<&std::sync::Arc<std::path::Path>>,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -929,21 +952,26 @@ fn process_extract_pass2_batch(
             .map_init(
                 || (BlockBuilder::new(), Vec::new(), Vec::new()),
                 |(bb, st_scratch, gr_scratch), blob| {
-                    let mut decompress_buf: Vec<u8> = Vec::new();
-                    blob.decompress_into(&mut decompress_buf)?;
-                    let block = PrimitiveBlock::from_vec_with_scratch(
-                        decompress_buf,
-                        st_scratch,
-                        gr_scratch,
-                    )?;
-                    release_scratch(st_scratch);
-                    release_scratch(gr_scratch);
-                    let mut output: Vec<OwnedBlock> = Vec::new();
-                    let block_stats =
-                        extract_block_pass2(&block, ids, clean, None, bb, &mut output)?;
-                    flush_local(bb, &mut output)?;
-                    crate::commands::split::fit_blocks(&mut output, &limits)?;
-                    Ok((output, block_stats))
+                    let mut task = || -> BatchResult {
+                        let mut decompress_buf: Vec<u8> = Vec::new();
+                        blob.decompress_into(&mut decompress_buf)?;
+                        let block = PrimitiveBlock::from_vec_with_scratch(
+                            decompress_buf,
+                            st_scratch,
+                            gr_scratch,
+                        )?;
+                        release_scratch(st_scratch);
+                        release_scratch(gr_scratch);
+                        let mut output: Vec<OwnedBlock> = Vec::new();
+                        let block_stats =
+                            extract_block_pass2(&block, ids, clean, None, bb, &mut output)?;
+                        flush_local(bb, &mut output)?;
+                        crate::commands::split::fit_blocks(&mut output, &limits)?;
+                        Ok((output, block_stats))
+                    };
+                    // Every failure of the work on one blob, the cut's
+                    // refusal of a block it cannot fit included, names it.
+                    task().map_err(|e| blob.locate_error(source, e))
                 },
             )
             .collect()

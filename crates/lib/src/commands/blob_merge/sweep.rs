@@ -452,6 +452,10 @@ struct Member {
 /// The run's builder and the chunk it is filling.
 struct Output<'s> {
     bb: BlockBuilder,
+    /// (input, frame offset) of the first element of the block open in
+    /// `bb`, where a size refusal of that block is located (see
+    /// [`Output::ship`]); `None` before the run's first element.
+    origin: Option<(usize, u64)>,
     filled: Vec<OwnedBlock>,
     chunk: Chunk,
     chunk_bytes: usize,
@@ -550,7 +554,20 @@ impl Output<'_> {
     /// boundary.
     ///
     /// [`OVERLAP_RUN_CHUNK_BYTES`]: crate::tunables::OVERLAP_RUN_CHUNK_BYTES
-    fn ship(&mut self, emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>) -> Result<()> {
+    ///
+    /// The filled blocks are the one block begun at `origin`'s element (the
+    /// sweep ships as soon as a block fills). A size refusal, by the cut of
+    /// a block no plan fits or by its framing, is located with `origin`:
+    /// the input and frame of the block's first element, since the block
+    /// gathers elements of many inputs and blobs and the bytes past the
+    /// limit belong to none of them alone. A cut piece's own refusal names
+    /// the same place, its parent block's start. Failures of the send are
+    /// not the input's and stay unlocated.
+    fn ship(
+        &mut self,
+        emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>,
+        origin: &dyn Fn(crate::Error) -> crate::Error,
+    ) -> Result<()> {
         let filled: usize = self.filled.iter().map(|b| b.bytes.len()).sum();
         self.staged_high_water = self
             .staged_high_water
@@ -562,6 +579,7 @@ impl Output<'_> {
             // input blob framed; one that would is cut on its own bytes
             // into blocks that fit (`commands/split.rs`), framed here one
             // at a time while the cut block is still held.
+            let mut emit_failed = false;
             crate::commands::split::fit_scanned(block, &limits, |block, held| {
                 if held > 0 {
                     self.staged_high_water = self.staged_high_water.max(
@@ -569,21 +587,26 @@ impl Output<'_> {
                             .saturating_add(self.chunk_bytes),
                     );
                 }
-                self.pack(block, emitter)
-            })?;
+                let packed = self.pack(block, emitter, origin);
+                emit_failed = packed.is_err();
+                packed
+            })
+            .map_err(|e| if emit_failed { e } else { origin(e) })?;
         }
         Ok(())
     }
 
     /// Frame one block and pack its frame into the chunk, sending full
-    /// chunks.
+    /// chunks. A framing failure is located with `origin` (see
+    /// [`ship`](Self::ship)).
     fn pack(
         &mut self,
         block: OwnedBlock,
         emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>,
+        origin: &dyn Fn(crate::Error) -> crate::Error,
     ) -> Result<()> {
         let limit = crate::tunables::OVERLAP_RUN_CHUNK_BYTES;
-        frame_owned(block, self.compression, self.metrics, &mut self.pieces)?;
+        frame_owned(block, self.compression, self.metrics, &mut self.pieces).map_err(origin)?;
         let mut pieces = std::mem::take(&mut self.pieces);
         for piece in pieces.drain(..) {
             let cap = piece.capacity();
@@ -715,6 +738,16 @@ impl Sweep<'_, '_> {
         self.sources[source].locate_at(offset, e)
     }
 
+    /// Locate a shipped block's size refusal at its first element's input
+    /// and frame (see [`Output::ship`]).
+    #[cold]
+    fn locate_origin(&self, origin: Option<(usize, u64)>, e: crate::Error) -> crate::Error {
+        match origin {
+            Some((source, offset)) => self.locate(source, offset, e),
+            None => e,
+        }
+    }
+
     /// Sweep the run: see the module docs.
     ///
     /// [`checkpoint`](Self::checkpoint) runs before each blob is read and
@@ -727,6 +760,7 @@ impl Sweep<'_, '_> {
         let mut counts = RunCounts::default();
         let mut out = Output {
             bb: BlockBuilder::new(),
+            origin: None,
             filled: Vec::new(),
             chunk: Vec::new(),
             chunk_bytes: 0,
@@ -786,7 +820,8 @@ impl Sweep<'_, '_> {
             self.maybe_demote(&mut merge)?;
         }
         crate::commands::flush_local(&mut out.bb, &mut out.filled)?;
-        out.ship(self.emitter)?;
+        let origin = out.origin;
+        out.ship(self.emitter, &|e| self.locate_origin(origin, e))?;
         out.send(self.emitter)?;
         counts.pinned_high_water = merge.pinned_high_water;
         counts.demoted = merge.demoted;
@@ -947,13 +982,20 @@ impl Sweep<'_, '_> {
         }
         let mut encoded = 0usize;
         for member in merge.group.drain(..) {
+            let here = (member.tie.0, member.tie.1);
             out.encode(&member.item)
-                .map_err(|e| self.locate(member.tie.0, member.tie.1, e))?;
+                .map_err(|e| self.locate(here.0, here.1, e))?;
             counts.elements += 1;
             // Ship each block as it fills, so a group spanning several
             // blocks stages one at a time (see the module docs, "Memory").
+            // A capacity flush runs before the element is added, so the
+            // element begins the new block and the filled one began at the
+            // origin held so far.
             if !out.filled.is_empty() {
-                out.ship(self.emitter)?;
+                let shipped = out.origin.replace(here);
+                out.ship(self.emitter, &|e| self.locate_origin(shipped, e))?;
+            } else if out.origin.is_none() {
+                out.origin = Some(here);
             }
             encoded += 1;
             if encoded >= crate::tunables::SWEEP_CHECKPOINT_REMOVALS {

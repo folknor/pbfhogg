@@ -123,13 +123,14 @@ where
             result
         },
         &mut ConsumeFn(|_, item: Rewritten| {
-            order.admit(item.span).map_err(|e| {
+            let at = |e: crate::Error| {
                 e.locate(crate::error::Location::new(
                     Some(source),
                     Some(item.blob_index),
                     Some(crate::ByteOffset(item.frame_offset)),
                 ))
-            })?;
+            };
+            order.admit(item.span).map_err(at)?;
             if let Some((bytes, index)) = item.block {
                 let t = crate::counters::Stopwatch::start();
                 // Deliberately write no tagdata: terminal renumber output is not
@@ -149,8 +150,11 @@ where
                     // The block may be past what the writer frames: `split`
                     // checks it and cuts it between elements if so, one input
                     // blob still one result for the order check and the totals.
-                    for (bytes, index) in super::split::fit(bytes, index, item.numbering, &limits)?
-                    {
+                    // A block no cut fits is refused there, located here at
+                    // its input blob.
+                    let pieces =
+                        super::split::fit(bytes, index, item.numbering, &limits).map_err(at)?;
+                    for (bytes, index) in pieces {
                         write(bytes, index)?;
                     }
                 }

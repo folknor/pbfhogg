@@ -1106,6 +1106,23 @@ caller-supplied callback are never located by the library. Pools whose work
 items are `(seq, offset, size)` schedules (the pread classify pools) carry only
 the frame offset or nothing; they do not invent a blob ordinal.
 
+**Size refusals of re-encoded blocks.** The pipelined writer frames a block
+on the executor and returns a framing failure as that slot's ordered result,
+observed by a later write or the flush, and a write error names the output,
+never an input. So a block the writer would refuse must not reach it: the
+shared oversize cut (`commands/split.rs`, `fit_scanned`, `fit_blocks`, and
+renumber's `split::fit`) refuses a block it finds no plan for on the spot,
+with the error the writer would raise (`write::check_data_frame`: payload,
+body, then BlobHeader after the tagdata drop), and passes on whole only a
+block the writer frames. The cut runs where the block is built, so the
+refusal is located like any other failure of that blob's work: by the pool
+on a worker, by the sequential caller's `locate`, by renumber's consumer at
+the item's blob, and by the history stitcher at the held blob for an ending
+it carries. The sort / `cat --dedupe` sweep frames on its own thread and
+locates a refusal at the input and frame of the refused block's first
+element, since the block gathers many inputs' elements. `FramedBlocks`
+frames inside the worker and keeps the writer's refusal there.
+
 **Exit codes.** The CLI picks exit `3` by walking the error chain for
 `ErrorKind::PlatformUnsupported`, through context, `io::Error` carriers and
 `External` wrappers, not by matching text. A command that runs several stages

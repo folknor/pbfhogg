@@ -95,6 +95,17 @@ topology refusals (the old search refused 3 on budget). Verdict: costs
 more than noise and drops 307 more relations; held uncommitted for the
 maintainer's decision.
 
+### Building points take the short longitude arc (bygg, 2026-11-25, variant uncommitted against `236e4ddc`)
+
+Pass 2b places a building at the raw node mean when its longitude span is
+under half a turn, and otherwise averages in a frame lifted by a full turn
+or gives no point; the change adds one span scan per building way. Planet,
+full build, `--iterations 1`, interleaved A B A B, baseline built with
+`--commit HEAD`, no trim. Walls: base 113 s (`52687338`), variant 111 s
+(`c0a4990e`), base 116 s (`f775a489`), variant 115 s (`1b343e78`).
+`GEOCODE_PASS2B` in the second pair: base 5.43 s, variant 5.65 s, inside
+noise. Verdict: neutral.
+
 ### Missing way nodes never join their neighbours (bygg, 2026-11-19, variant uncommitted against `80774411`)
 
 Pass 2b resolves each way's refs in one loop that records where a run of

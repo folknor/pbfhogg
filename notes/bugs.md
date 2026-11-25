@@ -42,19 +42,6 @@ the declaration for that run, is a maintainer decision. The other droppers are
 deliberate: time-filter (not as of the cutoff), degrade (a fault tool),
 apply-changes without `--locations-on-ways` (cannot refresh them).
 
-## BUG-027 - Geocode building placement is a vertex mean
-
-Reported by: geocode.
-
-Building address placement averages resolved way coordinates including the
-repeated closing vertex, can fall outside a concave building, and averages near
-longitude zero across the antimeridian. Flagged to preserve during rewrites
-unless placement semantics change.
-
-Defect hunt 2026-11-17 (geocode-builder) observed the antimeridian case
-(`builder/pass2.rs` arithmetic longitude mean) and classes it as a surprising
-consequence of the documented mean-of-nodes policy, not a contract defect.
-
 ## BUG-028 - Geocode query bench can be optimized away and measures warm uniform points
 
 Reported by: geocode.

@@ -24,7 +24,8 @@ were added to `notes/bugs.md` instead of being filed here: builder tag
 truncation (since fixed: block validation refuses a tag string index past
 the table), candidate
 ranking ties (since fixed: candidates rank by the query's total order) and
-building placement at the antimeridian (BUG-027).
+building placement at the antimeridian (since fixed: the mean is taken on the
+shorter longitude arc).
 Entries are in no order of importance.
 
 ## GEO-027 - Zero search radii disable every distance match

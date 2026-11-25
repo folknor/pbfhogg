@@ -917,6 +917,14 @@
 
 ### Fixed
 
+- **`build-geocode-index` places a building across the antimeridian
+  beside it.** Its node longitudes used to be averaged as plain numbers,
+  so such a building's address landed near longitude 0, on the far side
+  of the planet. The mean is now taken on the shorter arc, and a building
+  spanning half a turn of longitude or more gives no address point. Every
+  other building is placed exactly as before; rebuild an index to pick
+  this up.
+
 - **`apply-changes`' summary reports percentiles over every output data
   frame.** The `Blob sizes` line sampled only passthrough frames, so a
   run's rewritten and created frames never moved it. It is now

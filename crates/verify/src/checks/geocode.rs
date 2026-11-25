@@ -66,7 +66,9 @@
 //! address or street way with a node osmium could not locate (the model
 //! would have to guess how the builder shortens it), any modelled
 //! coordinate within 10 degrees of the antimeridian or beyond 85 degrees of
-//! latitude, and a street segment spanning half a turn of longitude or more
+//! latitude (for a building address, any of its nodes as well as the mean), a
+//! building way spanning half a turn of longitude or more, and a street
+//! segment spanning half a turn of longitude or more
 //! (the model does not unwrap longitude; the reader takes the shorter way). libosmium cuts a string
 //! at a NUL byte where pbfhogg answers it whole, so a tag value or a
 //! member role holding one
@@ -203,13 +205,18 @@ fn rad(e7: i64) -> f64 {
 }
 
 impl Model {
-    fn widen(&mut self, lat: i32, lon: i32) -> Result<(), String> {
+    fn in_domain(lat: i32, lon: i32) -> Result<(), String> {
         if lat.abs() > 850_000_000 || lon.abs() > 1_700_000_000 {
             return Err(format!(
                 "coordinate {lat},{lon} (decimicrodegrees) is outside the modelled domain \
                  (latitude within 85 degrees, longitude 10 degrees clear of the antimeridian)"
             ));
         }
+        Ok(())
+    }
+
+    fn widen(&mut self, lat: i32, lon: i32) -> Result<(), String> {
+        Self::in_domain(lat, lon)?;
         let e = self.extent.get_or_insert((lat, lon, lat, lon));
         *e = (e.0.min(lat), e.1.min(lon), e.2.max(lat), e.3.max(lon));
         Ok(())
@@ -674,6 +681,24 @@ fn model_record(model: &mut Model, r: &Record<'_>) -> Result<(), String> {
                     )
                 })?;
             if is_building && !coords.is_empty() {
+                // The builder averages a footprint across the antimeridian in
+                // a lifted frame and gives none to one spanning half a turn;
+                // the model does neither, so it judges only footprints whose
+                // every node is in the domain and whose raw longitude span is
+                // under half a turn, where both take the raw mean.
+                for &(lat, lon) in &coords {
+                    Model::in_domain(lat, lon)?;
+                }
+                let (lo, hi) = coords.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+                    (lo.min(i64::from(c.1)), hi.max(i64::from(c.1)))
+                });
+                if hi - lo >= 1_800_000_000 {
+                    return Err(format!(
+                        "{}: building way spans half a turn of longitude or more, outside \
+                         the compared domain",
+                        r.id
+                    ));
+                }
                 let count = i64::try_from(coords.len()).map_err(|_| "way too long")?;
                 let (sum_lat, sum_lon) = coords.iter().fold((0_i64, 0_i64), |s, c| {
                     (s.0 + i64::from(c.0), s.1 + i64::from(c.1))

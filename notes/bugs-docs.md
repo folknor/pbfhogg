@@ -287,3 +287,17 @@ declared, and splice outputs (apply-changes, renumber) carry it
 undeclared, so the guide should tell a caller to check
 `HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.
 
+## DOC-058 - pipeline.md's passthrough ratios mix byte and blob units
+
+Reported by: the spar accounting of the apply-changes byte-total change,
+from its scout's lateral (2026-11-25).
+
+`reference/pipeline.md` "Merge passthrough ratios (measured)" gives
+Denmark and Germany as "~92% passthrough, ~8% rewrite" and "~82% / ~18%"
+with no unit, and planet as a source-blob count ("43,670 of 50,816
+rewritten (86%)"). The apply-changes summary prints both a source-blob
+count and a byte share, which differ at planet (about 86 % of blobs
+against about 92 % of bytes in one recorded apply-diff run), and the byte
+share now has a third, created, part. Each figure should name its unit and
+carry its commit and host.
+

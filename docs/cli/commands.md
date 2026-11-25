@@ -2576,8 +2576,14 @@ every query point the cell is assigned, so it is accepted without a
 point-in-polygon test.
 
 An address point is a node, or a `building` way whose nodes are all
-present (at the mean of its nodes), with `addr:housenumber` and a non-empty `addr:street`, a non-empty
-`addr:place`, or both. `addr:place` is OSM's tag for an address that
+present, with `addr:housenumber` and a non-empty `addr:street`, a
+non-empty `addr:place`, or both. A building is placed at the mean of its
+way's node coordinates, truncated toward zero in decimicrodegrees, a
+repeated closing node counted again; the mean is not guaranteed to lie
+inside a concave footprint. Longitude is averaged on the shorter arc: a
+building across the antimeridian is placed beside it, not near
+longitude 0, and a building spanning half a turn of longitude or more
+gives no address point. `addr:place` is OSM's tag for an address that
 belongs to a place rather than a street; a query answers it in the
 address's `place` field, and `street` stays empty unless the address also
 names one. An empty value is no name, so an address whose only names are

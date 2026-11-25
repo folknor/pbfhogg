@@ -1347,6 +1347,50 @@ fn a_missing_mid_way_node_splits_the_street_and_refuses_the_building() {
     );
 }
 
+/// A building across the antimeridian is placed beside it, on the short arc,
+/// and no stray point lands near longitude 0 at its latitude.
+#[test]
+fn a_building_across_the_antimeridian_is_placed_beside_it() {
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![
+        node(1, -170_000_000, 1_799_999_000),
+        node(2, -170_000_000, -1_799_999_000),
+        node(3, -170_001_000, -1_799_999_000),
+        node(4, -170_001_000, 1_799_999_000),
+    ];
+    let ways = vec![TestWay {
+        id: 11,
+        refs: vec![1, 2, 3, 4, 1],
+        tags: vec![
+            ("building", "yes"),
+            ("addr:housenumber", "7"),
+            ("addr:street", "Dateline Street"),
+        ],
+        meta: None,
+    }];
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &ways);
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open");
+
+    let beside = reader.query(-17.00004, 179.99998).expect("valid query");
+    let addr = beside
+        .address
+        .expect("the building answers beside the seam");
+    assert_eq!(addr.house_number, "7");
+    let greenwich = reader.query(-17.00004, 0.0).expect("valid query");
+    assert!(
+        greenwich.address.is_none(),
+        "no address point near longitude 0: {:?}",
+        greenwich.address
+    );
+}
+
 /// A boundary ring with a node missing from its middle is not closed over the
 /// gap into a smaller ring: the relation contributes no area, and a query
 /// inside the shortcut ring answers no admin level.

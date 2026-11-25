@@ -539,7 +539,8 @@ fn resolve_way_into(
         }
     }
 
-    // Building addresses (centroid) - main thread interns + streams.
+    // Building addresses (placed by `building_point`) - main thread interns
+    // + streams.
     // The classifier saw presence; an address whose names are all empty is
     // no address point.
     // An incomplete footprint has no "mean of its nodes": the mean of the
@@ -550,23 +551,8 @@ fn resolve_way_into(
     } else {
         None
     };
-    if let Some((street, place)) = building_names {
-        // This is the arithmetic mean of every resolved way coordinate. An
-        // explicitly closed way counts its first vertex twice, and the mean
-        // can fall outside a concave footprint. Replacing it with an area
-        // centroid or an interior point changes stored address coordinates
-        // and therefore query results; those methods also differ for concave
-        // or malformed geometry. Keep the current placement until the
-        // building-address point policy specifies which result is intended.
-        let (sum_lat, sum_lon) = coords.iter().fold((0i64, 0i64), |acc, &(lat, lon)| {
-            (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
-        });
-        #[allow(clippy::cast_possible_wrap)]
-        let count = coords.len().max(1) as i64;
-        #[allow(clippy::cast_possible_truncation)]
-        let clat = (sum_lat / count) as i32;
-        #[allow(clippy::cast_possible_truncation)]
-        let clon = (sum_lon / count) as i32;
+    let building_point = building_names.and_then(|names| Some((names, building_point(coords)?)));
+    if let Some(((street, place), (clat, clon))) = building_point {
         let text = &mut state.text;
         let point = FlatAddrPoint {
             lat_e7: clat,
@@ -1053,10 +1039,105 @@ pub(super) fn run_pass2(
     })
 }
 
+/// Where a complete building footprint's address point is stored, as
+/// `(lat_e7, lon_e7)`, or `None` for a footprint without one.
+///
+/// The point is the arithmetic mean of every ref's coordinate, truncated
+/// toward zero: an explicitly closed way counts its first vertex twice, and
+/// the mean can fall outside a concave footprint. Both are deliberate. The
+/// index answers nearest-address queries over footprints metres wide, so the
+/// bias is metres, while an area centroid or interior point would move every
+/// stored building point and with it the exact-coordinate interpolation
+/// anchors; neither is a placement guarantee the contract makes.
+///
+/// Longitude is averaged in a frame where the footprint spans less than half
+/// a turn. Raw longitudes are used when their span is below 180 degrees, which
+/// keeps every such footprint, `-180` spellings included, exactly as it was.
+/// Otherwise negative longitudes are lifted by a full turn, so a footprint
+/// across the antimeridian averages near 180 degrees rather than near 0, and
+/// the result is folded back. A footprint that spans half a turn or more in
+/// both frames has no unique short arc and gets no address point.
+fn building_point(coords: &[(i32, i32)]) -> Option<(i32, i32)> {
+    const HALF_TURN: i64 = crate::geo::LON_FULL_TURN_E7 / 2;
+    fn span(lons: impl Iterator<Item = i64>) -> i64 {
+        let (lo, hi) = lons.fold((i64::MAX, i64::MIN), |(lo, hi), l| (lo.min(l), hi.max(l)));
+        hi - lo
+    }
+    fn lift(lon: i32) -> i64 {
+        let lon = i64::from(lon);
+        if lon < 0 {
+            lon + crate::geo::LON_FULL_TURN_E7
+        } else {
+            lon
+        }
+    }
+    if coords.is_empty() {
+        return None;
+    }
+    let raw = span(coords.iter().map(|&(_, lon)| i64::from(lon))) < HALF_TURN;
+    if !raw && span(coords.iter().map(|&(_, lon)| lift(lon))) >= HALF_TURN {
+        return None;
+    }
+    let (sum_lat, sum_lon) = coords.iter().fold((0i64, 0i64), |acc, &(lat, lon)| {
+        let lon = if raw { i64::from(lon) } else { lift(lon) };
+        (acc.0 + i64::from(lat), acc.1 + lon)
+    });
+    let count = i64::try_from(coords.len()).ok()?;
+    let lon = sum_lon / count;
+    let lon = if raw {
+        lon
+    } else {
+        crate::geo::normalize_longitude_e7(lon)
+    };
+    Some((
+        i32::try_from(sum_lat / count).ok()?,
+        i32::try_from(lon).ok()?,
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn building_point_keeps_the_raw_mean_off_the_antimeridian() {
+        // The closing vertex counts again, and truncation is toward zero.
+        let ring = [(10, -100), (11, -101), (10, -103), (10, -100)];
+        assert_eq!(building_point(&ring), Some((10, -101)));
+        // Every ref at -180 keeps that spelling.
+        let west = [(0, -1_800_000_000), (1, -1_800_000_000)];
+        assert_eq!(building_point(&west), Some((0, -1_800_000_000)));
+    }
+
+    #[test]
+    fn building_point_averages_across_the_antimeridian_on_the_short_arc() {
+        let ring = [
+            (-170_000_000, 1_799_999_000),
+            (-170_000_000, -1_799_999_000),
+            (-170_001_000, -1_799_999_000),
+            (-170_001_000, 1_799_999_000),
+            (-170_000_000, 1_799_999_000),
+        ];
+        // Lifted: three refs at 1_799_999_000, two at 1_800_001_000.
+        assert_eq!(building_point(&ring), Some((-170_000_400, 1_799_999_800)));
+        let east_of_seam = [(0, -1_799_999_000), (0, -1_799_999_000), (0, 1_799_999_999)];
+        // Lifted mean 1_800_000_666 folds to -1_799_999_334.
+        assert_eq!(building_point(&east_of_seam), Some((0, -1_799_999_334)));
+    }
+
+    #[test]
+    fn building_point_refuses_a_footprint_without_a_short_arc() {
+        assert_eq!(building_point(&[(0, 0), (0, 1_800_000_000)]), None);
+        let wide = [
+            (0, -1_000_000_000),
+            (0, 0),
+            (0, 1_000_000_000),
+            (0, -1_000_000_000),
+        ];
+        assert_eq!(building_point(&wide), None);
+        assert_eq!(building_point(&[]), None);
+    }
 
     #[test]
     fn duplicate_coordinates_agree_or_fail_in_either_order() {

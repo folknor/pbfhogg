@@ -116,28 +116,6 @@ removes it and emits no replacement `@user`. This contradicts ADR-0010's
 emitted-name rule. If reserving the whole namespace is intended, the
 documented rule should say so.
 
-## CMD-085 - No test drives the plain retry of a lone surviving base node
-
-Reported by: the apply-changes lone-node plain retry (2026-11-25); read
-from source, not run.
-
-The overflow plan retries a lone bare node plain
-(`overflow.rs` `Planner::lone`), and for a surviving base node that goes
-through `write_base_node_bare_plain_local` and
-`BlockBuilder::add_node_raw_bare_plain` (subset translation, index checks,
-key index zero kept). The two tests in `apply_changes_overflow.rs` drive
-only OSC nodes (a create on the drain, a modify on the worker). The case
-the retry exists for, a plain-source metadata-less node alone in a block
-within bytes of the limit, needs a base file whose node is a plain `Node`
-without `Info`, which no public builder route writes (`add_node_partial`
-writes a bare node dense). Fix shape: a fixture writer that emits such a
-block (or a unit test of `add_node_raw_bare_plain` under identity and
-subset seeds checking the decoded node, tagdata with an empty key, bbox
-and ID range), plus the merge-level case with a diff touching another
-node of the blob. Also untested: that one overflow needing the
-whole-table plan leaves another overflow of the same blob its compact
-plan (`overflow.rs` `plan`).
-
 ## CMD-050 - Peak memory of the oversize cut on oversized input is unmeasured
 
 Reported by: the CMD-049 implementer (2026-11-19); narrowed by spars

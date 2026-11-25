@@ -58,7 +58,9 @@
 //! refused: such a node, which the rewrite writes dense, is tried once more
 //! as a plain `Node` without `Info`, which claims the same and is a few
 //! bytes smaller alone (a plain-source survivor would otherwise outgrow the
-//! block it came from). A node with metadata is not retried: a plain `Info`
+//! block it came from: dense, each empty tag key, index zero in a plain
+//! node, moves to a fresh slot for the empty string, which past 127 strings
+//! is wider). A node with metadata is not retried: a plain `Info`
 //! keeps its dense claims only through a conversion over every metadata
 //! state, and is not always smaller (a negative timestamp).
 //!

@@ -514,6 +514,245 @@ fn a_lone_bare_modify_past_the_limit_dense_is_written_plain() {
     lone_bare_node_is_written_plain("modify", 25, &[]);
 }
 
+fn put_varint(out: &mut Vec<u8>, value: u64) {
+    crate::common::adversarial::write_varint(out, value);
+}
+
+fn put_bytes(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    put_varint(out, (field << 3) | 2);
+    put_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn put_uint(out: &mut Vec<u8>, field: u64, value: u64) {
+    put_varint(out, field << 3);
+    put_varint(out, value);
+}
+
+/// A plain `Node` at 0,0 with raw `tags` and, when given, an `Info` of
+/// version 1 and every other field the dense route needs (empty user).
+fn plain_node(id: i64, tags: &[(u32, u32)], info: bool) -> Vec<u8> {
+    let mut node = Vec::new();
+    put_uint(&mut node, 1, ((id << 1) ^ (id >> 63)).cast_unsigned());
+    if !tags.is_empty() {
+        let (mut keys, mut vals) = (Vec::new(), Vec::new());
+        for &(k, v) in tags {
+            put_varint(&mut keys, u64::from(k));
+            put_varint(&mut vals, u64::from(v));
+        }
+        put_bytes(&mut node, 2, &keys);
+        put_bytes(&mut node, 3, &vals);
+    }
+    if info {
+        let mut i = Vec::new();
+        for (field, value) in [(1, 1), (2, 1_600_000_000), (3, 7), (4, 3), (5, 0)] {
+            put_uint(&mut i, field, value);
+        }
+        put_bytes(&mut node, 4, &i);
+    }
+    put_uint(&mut node, 8, 0);
+    put_uint(&mut node, 9, 0);
+    node
+}
+
+/// A serialized block of one plain group holding `nodes` over `strings`.
+fn plain_block(strings: &[&str], nodes: &[Vec<u8>]) -> Vec<u8> {
+    let mut table = Vec::new();
+    for s in strings {
+        put_bytes(&mut table, 1, s.as_bytes());
+    }
+    let mut group = Vec::new();
+    for n in nodes {
+        put_bytes(&mut group, 1, n);
+    }
+    let mut out = Vec::new();
+    put_bytes(&mut out, 1, &table);
+    put_bytes(&mut out, 2, &group);
+    out
+}
+
+/// A base of one indexed node blob, `build(len)` with its large value `len`
+/// bytes long, sized so the blob's payload is `payload` bytes. Every
+/// length lies in one varint width, so the size moves byte for byte with
+/// `len`.
+fn write_sized_base(path: &Path, payload: usize, build: impl Fn(&str) -> Vec<u8>) -> String {
+    let probe = 1 << 24;
+    let overhead = build(&"V".repeat(probe)).len() - probe;
+    let large = "V".repeat(payload - overhead);
+    let block = build(&large);
+    assert_eq!(block.len(), payload);
+    crate::common::frame_fixture_blocks(path, &[block], crate::common::FixtureFraming::INDEXED);
+    large
+}
+
+/// Every tag of node `id` in `path`, in order, and whether it was written
+/// as a plain `Node` with no `Info`; panics if it was written dense.
+fn plain_bare_tags(path: &Path, id: i64) -> Vec<(String, String)> {
+    let mut found = None;
+    for blob in BlobReader::from_path(path).unwrap() {
+        if let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() {
+            for element in block.elements() {
+                match element {
+                    Element::Node(n) if n.id() == id => {
+                        assert!(n.info().version().is_none(), "node {id} claims a version");
+                        found = Some(
+                            n.tags()
+                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                                .collect(),
+                        );
+                    }
+                    Element::DenseNode(n) if n.id() == id => {
+                        panic!("node {id} was written dense")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    found.unwrap_or_else(|| panic!("node {id} is missing"))
+}
+
+/// The case the plain retry exists for on the worker: a surviving
+/// metadata-less plain node whose tags use key index zero (the empty key).
+/// Dense, each such key moves to a fresh slot for the empty string, past
+/// a few hundred strings two bytes wide where zero took one, so the node
+/// that fit its source block beside another no longer fits dense alone.
+/// The diff touches the other node, so the blob is rewritten; node 25
+/// overflows alone and is written plain, every tag kept in order.
+#[test]
+fn a_lone_bare_survivor_that_outgrows_its_block_dense_is_written_plain() {
+    const MAX: usize = 32 << 20;
+    const TAGS: u32 = 300;
+    let dir = crate::common::test_scratch();
+    let (base, osc, output) = (
+        dir.path().join("base.osm.pbf"),
+        dir.path().join("diff.osc"),
+        dir.path().join("out.osm.pbf"),
+    );
+    let values: Vec<String> = (0..TAGS).map(|i| format!("v{i}")).collect();
+    // Slots: 0 "", 1 "note", 2 the large value, 3.. the values.
+    let mut tags: Vec<(u32, u32)> = (0..TAGS).map(|i| (0, 3 + i)).collect();
+    tags.push((1, 2));
+    let large = write_sized_base(&base, MAX - 64, |large| {
+        let mut strings = vec!["", "note", large];
+        strings.extend(values.iter().map(String::as_str));
+        plain_block(
+            &strings,
+            &[plain_node(24, &[], false), plain_node(25, &tags, false)],
+        )
+    });
+    write_osc(&osc, &[], &[(24, Some("touched"))]);
+    merge(&base, &osc, &output);
+
+    let mut expected: Vec<(String, String)> =
+        values.iter().map(|v| (String::new(), v.clone())).collect();
+    expected.push(("note".to_owned(), large));
+    assert_eq!(plain_bare_tags(&output, 25), expected);
+    assert_eq!(
+        node_notes(&output).first(),
+        Some(&(24, "touched".to_owned()))
+    );
+    let c = read_all_elements_id_only(&output);
+    assert_eq!(node_ids_id_only(&c), vec![24, 25]);
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
+}
+
+/// Overflow plans are chosen per overflow. One blob, two overflows: tiny
+/// node 1 beside a large create (the first-pass block carries the source
+/// table, so with it the large value of node 5), and node 5 beside the
+/// grown node 7. Node 5 has metadata (no plain retry) and empty-key tags:
+/// under the whole table its empty key is the source's spare empty slot,
+/// one byte wide; under a compact subset that slot is unused and the empty
+/// string lands past three thousand strings, two bytes wide, so node 5 fits
+/// alone only with the whole table. The second overflow falls back to it;
+/// the first keeps its compact plan, so the large value is written once,
+/// in node 5's block, not again beside node 1.
+#[test]
+fn an_overflow_needing_the_whole_table_leaves_another_its_compact_plan() {
+    const MAX: usize = 32 << 20;
+    const TAGS: u32 = 3000;
+    let dir = crate::common::test_scratch();
+    let (base, osc, output) = (
+        dir.path().join("base.osm.pbf"),
+        dir.path().join("diff.osc"),
+        dir.path().join("out.osm.pbf"),
+    );
+    let values: Vec<String> = (0..TAGS).map(|i| format!("v{i}")).collect();
+    // Slots: 0 "", 1 a spare "", 2 "note", 3 the large value, 4.. the values.
+    let mut tags: Vec<(u32, u32)> = (0..TAGS).map(|i| (0, 4 + i)).collect();
+    tags.push((2, 3));
+    let large = write_sized_base(&base, MAX - 1500, |large| {
+        let mut strings = vec!["", "", "note", large];
+        strings.extend(values.iter().map(String::as_str));
+        plain_block(
+            &strings,
+            &[
+                plain_node(1, &[], false),
+                plain_node(5, &tags, true),
+                plain_node(7, &[], false),
+            ],
+        )
+    });
+    let created = value('c');
+    let grown: String = std::iter::repeat_n('g', 3000).collect();
+    write_osc(
+        &osc,
+        &[(2, Some(&created)), (3, None)],
+        &[(7, Some(&grown))],
+    );
+    merge(&base, &osc, &output);
+
+    let mut holding_large = Vec::new();
+    let mut node5_tags = None;
+    for blob in BlobReader::from_path(&output).unwrap() {
+        if let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() {
+            let has_large = (0..block.string_table_len())
+                .any(|i| block.string_table_entry(i) == Some(large.as_str()));
+            let ids: Vec<i64> = block
+                .elements()
+                .filter_map(|e| match e {
+                    Element::DenseNode(n) => Some(n.id()),
+                    Element::Node(n) => Some(n.id()),
+                    _ => None,
+                })
+                .collect();
+            for element in block.elements() {
+                if let Element::DenseNode(n) = &element
+                    && n.id() == 5
+                {
+                    assert!(n.info().is_some(), "node 5 keeps its metadata");
+                    node5_tags = Some(
+                        n.tags()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            if has_large {
+                holding_large.push(ids);
+            }
+        }
+    }
+    assert_eq!(holding_large, vec![vec![5]], "the large value's blocks");
+    let mut expected: Vec<(String, String)> =
+        values.iter().map(|v| (String::new(), v.clone())).collect();
+    expected.push(("note".to_owned(), large));
+    assert_eq!(node5_tags, Some(expected));
+    assert_eq!(
+        node_notes(&output)
+            .into_iter()
+            .map(|(id, v)| (id, v.len()))
+            .filter(|&(id, _)| id != 5)
+            .collect::<Vec<_>>(),
+        vec![(2, created.len()), (7, grown.len())]
+    );
+    let c = read_all_elements_id_only(&output);
+    assert_eq!(node_ids_id_only(&c), vec![1, 2, 3, 5, 7]);
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
+}
+
 /// Two large creates past the last base node blob are one create run of
 /// the drain, between small creates on either side.
 #[test]

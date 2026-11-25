@@ -4127,6 +4127,92 @@ mod tests {
         );
     }
 
+    /// The plain retry of a bare node writes a plain `Node` without `Info`
+    /// under either seed: its tags read back as the strings their source
+    /// indices named, a key index of zero stays zero (the empty key, which
+    /// a dense node would move to a fresh slot), a subset seed moves the
+    /// slots past the dropped string down, and the block's index and
+    /// tagdata cover every node written.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn a_bare_plain_raw_node_keeps_its_strings_under_both_seeds() {
+        let big = "x".repeat(1 << 12);
+        let source = source_table(&["", &big, "k", "v"]);
+        let used = [true, false, true, true];
+        for subset in [false, true] {
+            let mut bb = BlockBuilder::new();
+            if subset {
+                bb.pre_seed_subset_string_table(&source, &used)
+                    .expect("pre-seed");
+            } else {
+                bb.pre_seed_string_table(&source).expect("pre-seed");
+            }
+            bb.add_node_raw_bare_plain(5, -20, 30, [(0, 3), (2, 3), (2, 0)].into_iter())
+                .expect("in range");
+            bb.add_node_raw_bare_plain(9, 40, -10, [(2, 3)].into_iter())
+                .expect("in range");
+            let owned = bb.take_owned().expect("encode").expect("one block");
+            let block = PrimitiveBlock::from_vec(owned.bytes.clone()).expect("valid output");
+            let has_big =
+                (0..block.string_table_len()).any(|i| block.string_table_entry(i) == Some(&big));
+            assert_eq!(has_big, !subset, "subset {subset}: the unused string");
+            let (k_slot, v_slot) = if subset { (1, 2) } else { (2, 3) };
+            let nodes: Vec<(i64, Vec<(u32, u32)>, Vec<(String, String)>)> = block
+                .elements()
+                .map(|e| match e {
+                    crate::Element::Node(n) => {
+                        assert!(n.info().version().is_none(), "no Info claimed");
+                        (
+                            n.id(),
+                            n.raw_tags().collect(),
+                            n.tags()
+                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                                .collect(),
+                        )
+                    }
+                    _ => panic!("subset {subset}: expected a plain node"),
+                })
+                .collect();
+            let s = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+            assert_eq!(
+                nodes,
+                [
+                    (
+                        5,
+                        vec![(0, v_slot), (k_slot, v_slot), (k_slot, 0)],
+                        vec![s("", "v"), s("k", "v"), s("k", "")]
+                    ),
+                    (9, vec![(k_slot, v_slot)], vec![s("k", "v")]),
+                ],
+                "subset {subset}"
+            );
+            assert_eq!(
+                (owned.index.kind, owned.index.min_id, owned.index.max_id),
+                (crate::ElementKind::Node, 5, 9),
+                "subset {subset}"
+            );
+            assert_eq!(owned.index.count, 2, "subset {subset}");
+            assert_eq!(
+                owned.index.bbox,
+                Some(crate::blob_meta::BlobBbox {
+                    min_lat: -20,
+                    max_lat: 40,
+                    min_lon: -10,
+                    max_lon: 30,
+                }),
+                "subset {subset}"
+            );
+            let tagdata = owned.tagdata.as_deref().expect("tagged block has tagdata");
+            let keys = crate::blob_meta::TagIndex::deserialize(tagdata)
+                .expect("readable tagdata")
+                .keys()
+                .to_vec();
+            assert_eq!(keys.len(), 2, "subset {subset}: keys {keys:?}");
+            assert!(keys.iter().any(|k| k.is_empty()), "subset {subset}");
+            assert!(keys.iter().any(|k| &**k == b"k"), "subset {subset}");
+        }
+    }
+
     /// A copied `Info` user is judged as the reader resolves it: the last
     /// varint user field wins, so an earlier bad one it overrides passes and
     /// a later bad one is refused; a user field of another wire type is not

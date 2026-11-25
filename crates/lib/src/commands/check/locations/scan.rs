@@ -325,13 +325,13 @@ fn next_delta(cursor: &mut Cursor<'_>, acc: &mut i64, err: fn() -> Error) -> Res
 /// streaming, so events before the fault have already been delivered when
 /// the error returns; every caller abandons the run on it. A blob claiming
 /// ways that holds an element of another kind is a kind contradiction,
-/// raised once the whole block is walked.
+/// raised once the whole block is walked. Returns the block's kinds.
 pub(super) fn scan_ways(
     block: &[u8],
     claim: Option<ElementKind>,
     groups: &mut Groups,
     mut sink: impl FnMut(&WayEvent) -> Result<()>,
-) -> Result<()> {
+) -> Result<Kinds> {
     let framing = block_top(block, groups)?;
     let mut ordinal: u64 = 0;
     let mut block_kinds = Kinds::default();
@@ -392,7 +392,7 @@ pub(super) fn scan_ways(
             found,
         ));
     }
-    Ok(())
+    Ok(block_kinds)
 }
 
 #[cfg(test)]

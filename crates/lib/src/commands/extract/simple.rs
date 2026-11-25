@@ -602,13 +602,13 @@ fn simple_nodes_two_phase(
                     ValidateScratch::default(),
                 )
             },
-            |position, decompressed, (tuples, group_starts, validate)| {
+            |position, decompressed, (tuples, group_starts, validate), gate| {
                 tuples.clear();
                 let kinds =
                     crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
                 // The scanner reads only nodes, so ways or relations under a
                 // node claim are ones it would never see.
-                kinds.refuse_under(node_schedule_ref[position].kind)?;
+                let admitted = gate.admit(kinds)?;
                 // Classification is the same for every blob, candidate or
                 // not, so verification can never change which nodes are
                 // selected.
@@ -623,7 +623,7 @@ fn simple_nodes_two_phase(
                 } else {
                     None
                 };
-                Ok((matching, verified))
+                Ok((admitted, (matching, verified)))
             },
             |position, (matching_ids, verified): (Vec<i64>, Option<u64>)| {
                 for id in matching_ids {
@@ -691,13 +691,12 @@ fn simple_ways_two_phase(
         let classify_schedule = scheduled(way_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
         let bbox_ids_ref = bbox_node_ids;
-        let way_schedule_ref = way_schedule;
         crate::scan::classify::parallel_scan_blobs_raw(
             &classify_input,
             &classify_schedule,
             None,
             || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-            |position, decompressed, (refs_buf, group_starts)| {
+            |_position, decompressed, (refs_buf, group_starts), gate| {
                 let mut matching: Vec<i64> = Vec::new();
                 let kinds = crate::scan::way::scan_way_refs(
                     decompressed,
@@ -711,8 +710,7 @@ fn simple_ways_two_phase(
                 )?;
                 // The scanner reads only ways, so nodes or relations under a
                 // way claim are ones it would never see.
-                kinds.refuse_under(way_schedule_ref[position].kind)?;
-                Ok(matching)
+                Ok((gate.admit(kinds)?, matching))
             },
             |_position, matching_ids: Vec<i64>| {
                 for id in matching_ids {

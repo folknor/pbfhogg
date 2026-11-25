@@ -879,7 +879,7 @@ fn prepass(
         &walk.prepass.blobs,
         None,
         KeyWorker::default,
-        |pos, block, worker| -> Result<PrepassBlob> {
+        |pos, block, worker, gate| {
             validate_block(block, &mut worker.validate)?;
             let blob = facts[pos].blob;
             let mut local = Details::new(cap);
@@ -914,7 +914,9 @@ fn prepass(
             out.kinds = kinds;
             shards.flush(batch);
             out.details = local.finish();
-            Ok(out)
+            // Unchecked entries: the gate admits; the kinds are judged as
+            // findings from `out.kinds`.
+            Ok((gate.admit(kinds)?, out))
         },
         |pos, blob| {
             report.nodes += blob.nodes;
@@ -946,16 +948,16 @@ fn key_refs(
         &ways.blobs,
         None,
         KeyWorker::default,
-        |pos, block, worker| -> Result<()> {
+        |pos, block, worker, gate| {
             let KeyWorker { groups, batch, .. } = worker;
-            scan_ways(block, facts[pos].claim, groups, |event| {
+            let kinds = scan_ways(block, facts[pos].claim, groups, |event| {
                 if let WayEvent::Ref { node_id, .. } = *event {
                     shards.add(batch, node_id);
                 }
                 Ok(())
             })?;
             shards.flush(batch);
-            Ok(())
+            Ok((gate.admit(kinds)?, ()))
         },
         |_pos, ()| {},
         host,
@@ -1049,16 +1051,16 @@ impl RunCtx<'_> {
             &blobs,
             None,
             Groups::new,
-            |_pos, block, groups| -> Result<()> {
-                scan_nodes(block, groups, |_ordinal, id, coord| {
+            |_pos, block, groups, gate| {
+                let kinds = scan_nodes(block, groups, |_ordinal, id, coord| {
                     if in_partition(id, range)
                         && let Some(rank) = keys.numeric_rank_if_set(id)
                     {
                         store.join_node(slot_index(rank, first_rank), coord);
                     }
                     Ok(())
-                })
-                .map(drop)
+                })?;
+                Ok((gate.admit(kinds)?, ()))
             },
             |_pos, ()| {},
             host,
@@ -1087,7 +1089,7 @@ impl RunCtx<'_> {
             &self.ways.blobs,
             None,
             KeyWorker::default,
-            |pos, block, worker| -> Result<WayBlob> {
+            |pos, block, worker, gate| {
                 let ctx = WayCtx {
                     keys: self.keys,
                     store,
@@ -1105,7 +1107,7 @@ impl RunCtx<'_> {
                 let mut out = WayBlob::default();
                 let mut local = Details::new(cap);
                 let mut way = (0_u64, 0_i64);
-                scan_ways(block, ctx.facts.claim, &mut worker.groups, |event| {
+                let kinds = scan_ways(block, ctx.facts.claim, &mut worker.groups, |event| {
                     match *event {
                         WayEvent::Way {
                             ordinal,
@@ -1132,7 +1134,7 @@ impl RunCtx<'_> {
                     Ok(())
                 })?;
                 out.details = local.finish();
-                Ok(out)
+                Ok((gate.admit(kinds)?, out))
             },
             |_pos, blob| {
                 report.ways += blob.ways;

@@ -427,11 +427,10 @@ fn resolve_thread_count(threads: Option<usize>, resources: &dyn crate::host::Res
 /// materialisation) or a `HeaderWalker` `BlobHeaderMeta` (which already
 /// parses `index` up-front and holds raw `tagdata` bytes).
 ///
-/// It applies the kind and tag-key rules only and ignores `filter.node_bbox`,
-/// though `BlobFilter::uses_index` counts a bbox as index-backed. That is
-/// harmless today: only extract builds a bbox filter, and it consults
-/// `wants_index` itself; its callers here (`tags_filter`, `tags_count`) never
-/// set one. A caller that passes a bbox filter must apply the bbox itself.
+/// The index rule is `BlobFilter::wants_index`, the one the pipelined reader
+/// and extract apply, so a node bbox prunes here exactly as it does there;
+/// the tag rule follows it. A blob without indexdata reaches the tag rule
+/// only.
 ///
 /// Lives here rather than in `tags_filter` because the tag index is a
 /// schedule-building concern: `tags_count` reaches the same blobs through
@@ -446,20 +445,10 @@ pub(crate) fn blob_filter_check(
     let Some(filter) = filter else {
         return (false, false);
     };
-    if let Some(idx) = index {
-        let dominated = matches!(
-            idx.kind,
-            crate::ElementKind::Node if !filter.want_nodes
-        ) || matches!(
-            idx.kind,
-            crate::ElementKind::Way if !filter.want_ways
-        ) || matches!(
-            idx.kind,
-            crate::ElementKind::Relation if !filter.want_relations
-        );
-        if dominated {
-            return (true, false);
-        }
+    if let Some(idx) = index
+        && !filter.wants_index(idx)
+    {
+        return (true, false);
     }
     if filter.has_tag_filter()
         && let Some(bytes) = tagdata
@@ -1585,16 +1574,28 @@ fn run_project_ordered<S, R: Send, M: FnMut(usize, R) -> Result<()>>(
 /// dropping per-blob StringTable parse + `(u32, u32)` scratch
 /// allocations onto the hot path for nothing.
 ///
-/// Builds no `PrimitiveBlock`, so it records no kind set and enforces no
-/// entry's kind claim: a raw walker that wants the refusal checks the group
-/// field tags it already reads (as `check --locations` does).
+/// Builds no `PrimitiveBlock`, so the walker's scanner records the kinds it
+/// met, and the pool makes the walker judge them: `classify` receives a
+/// [`KindGate`] holding the entry's enforced claim and can only succeed by
+/// returning the [`Admitted`] that [`KindGate::admit`] issues for this blob.
+/// The walker admits the scanner's kind set right after the scan, before any
+/// tally, store write or follow-up check, so a lying blob is refused as a kind
+/// contradiction and touches nothing shared. Under `KindClaims::Unchecked`
+/// the gate admits every set (`check --locations` judges kinds itself).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     input: &InputFile,
     schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(usize, &[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
+    classify: impl for<'b> Fn(
+        usize,
+        &[u8],
+        &mut S,
+        KindGate<'b>,
+    ) -> crate::error::Result<(Admitted<'b>, R)>
+    + Send
+    + Sync,
     mut merge: impl FnMut(usize, R),
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
@@ -1610,8 +1611,13 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
             // outlier blob does not pin its size in the worker for the rest
             // of the phase (read/decompress.rs, "Retention policy"). A pool
             // would add nothing here: the caller only borrows the bytes.
-            let result = crate::blob::decompress_blob_raw(raw, decompress_buf)
-                .and_then(|()| classify(position, decompress_buf, state));
+            let result = crate::blob::decompress_blob_raw(raw, decompress_buf).and_then(|()| {
+                let gate = KindGate {
+                    claim: schedule[position].claim(),
+                    brand: std::marker::PhantomData,
+                };
+                classify(position, decompress_buf, state, gate).map(|(_, r)| r)
+            });
             crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
             result
         },
@@ -1622,6 +1628,38 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
         host,
         &host.invocation.metrics().unordered,
     )
+}
+
+/// Invariant brand tying a [`KindGate`] to the [`Admitted`] it issues, so a
+/// token cannot outlive or stand in for another blob's admission.
+type Brand<'b> = std::marker::PhantomData<fn(&'b ()) -> &'b ()>;
+
+/// One raw blob's enforced kind claim, handed to a
+/// [`parallel_scan_blobs_raw`] walker. Built only by the pool.
+#[derive(Clone, Copy)]
+pub(crate) struct KindGate<'b> {
+    claim: Option<crate::ElementKind>,
+    brand: Brand<'b>,
+}
+
+/// Proof that this blob's scanned kinds were judged against its claim.
+/// Constructible only through [`KindGate::admit`].
+pub(crate) struct Admitted<'b> {
+    _brand: Brand<'b>,
+}
+
+impl<'b> KindGate<'b> {
+    /// Refuse `kinds` when they contradict the entry's enforced claim
+    /// (`IndexdataMismatch` with the `KindContradiction`, located at the blob
+    /// by the pool); otherwise admit the blob. Pass the set the scanner
+    /// returned, not one built by hand.
+    #[inline]
+    pub(crate) fn admit(self, kinds: crate::element_kind::ElementKindSet) -> Result<Admitted<'b>> {
+        kinds.refuse_under(self.claim)?;
+        Ok(Admitted {
+            _brand: std::marker::PhantomData,
+        })
+    }
 }
 
 /// Raises an accumulate run's stop flag if its worker unwinds, so a panic
@@ -2068,6 +2106,48 @@ mod tests {
                 "accumulate projection",
             );
         }
+    }
+
+    /// The schedule's filter check applies a node bbox as `wants_index` does:
+    /// a node blob claimed outside the box is skipped, one inside or without
+    /// a bbox claim is kept, and a way blob is never judged by the box.
+    #[test]
+    fn the_blob_filter_check_applies_a_node_bbox() {
+        use crate::blob_meta::{BlobBbox, BlobFilter, BlobIndex};
+        let filter = BlobFilter::new(true, true, true).with_node_bbox(BlobBbox::new(
+            500_000_000,
+            520_000_000,
+            100_000_000,
+            120_000_000,
+        ));
+        let index = |kind, bbox| BlobIndex {
+            kind,
+            min_id: 1,
+            max_id: 2,
+            count: 2,
+            bbox,
+        };
+        let outside = Some(BlobBbox::new(0, 10, 0, 10));
+        let inside = Some(BlobBbox::new(
+            510_000_000,
+            511_000_000,
+            110_000_000,
+            111_000_000,
+        ));
+        let check = |idx: BlobIndex| super::blob_filter_check(Some(&idx), None, Some(&filter));
+        assert_eq!(
+            check(index(crate::ElementKind::Node, outside)),
+            (true, false)
+        );
+        assert_eq!(
+            check(index(crate::ElementKind::Node, inside)),
+            (false, false)
+        );
+        assert_eq!(check(index(crate::ElementKind::Node, None)), (false, false));
+        assert_eq!(
+            check(index(crate::ElementKind::Way, outside)),
+            (false, false)
+        );
     }
 
     /// An unindexed blob carries no claim even under `Refuse`: it comes back
@@ -2544,9 +2624,7 @@ mod tests {
             &schedule[3..4],
             Some(1),
             || (),
-            |_position, _bytes, ()| -> crate::Result<()> {
-                Err(crate::Error::invalid_data("forced failure"))
-            },
+            |_position, _bytes, (), _gate| Err(crate::Error::invalid_data("forced failure")),
             |_, ()| {},
             &host,
         )

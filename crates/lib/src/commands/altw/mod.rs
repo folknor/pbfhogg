@@ -1148,7 +1148,6 @@ fn collect_way_referenced_node_ids(
         crate::scan::classify::KindClaims::Refuse,
         host,
     )?;
-    let schedule_ref = &schedule;
     let mut referenced = IdSet::new();
     // Prepass needs two independent facts: whether an ID has been seen at
     // all, and whether it was referenced again (a closed ring's repeated last
@@ -1172,7 +1171,7 @@ fn collect_way_referenced_node_ids(
         &schedule,
         None,
         || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-        |position, decompressed, (refs_buf, group_starts)| {
+        |_position, decompressed, (refs_buf, group_starts), gate| {
             let mut refs_vec: Vec<i64> = Vec::new();
             let kinds = crate::scan::way::scan_way_refs(
                 decompressed,
@@ -1193,8 +1192,7 @@ fn collect_way_referenced_node_ids(
             // claim would be copied through the reframe unindexed and
             // unscanned. The way claim's range and count are checked where
             // the reframe counts them (`passthrough::decode_one`).
-            kinds.refuse_under(schedule_ref[position].claim())?;
-            Ok(refs_vec)
+            Ok((gate.admit(kinds)?, refs_vec))
         },
         |_seq, refs_vec| {
             let t_union = crate::counters::Stopwatch::start();

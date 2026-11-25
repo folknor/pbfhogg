@@ -83,12 +83,3 @@ labels it a benchmark-validity concern, not a confirmed timing defect.
 Separately, the geocode-query script advertises `--hotpath` and `--alloc`, but
 neither the instrument nor `Reader::query` and its search helpers carries
 profiling scopes, so those modes measure only the process wrapper.
-
-## BUG-029 - Scan helpers that look complete but are not
-
-Reported by: indexdata.
-
-`blob_filter_check` (`scan/classify.rs`) accepts a `BlobFilter` but ignores its
-bbox; `parallel_scan_blobs_raw` does not enforce the schedule's kind claim.
-Callers compensate today; the hunter calls these API hazards, not demonstrated
-wrong results.

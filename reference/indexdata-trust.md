@@ -72,8 +72,14 @@ builders and `ScheduledBlob::from_meta` / `at_frame` take
 `KindClaims::Refuse` or `KindClaims::Unchecked` (an `Unchecked` is a phase
 that believes its claims unchecked), and the pipelined reader takes
 `ElementReader::refusing_kind_claims`. The block-building pools and the
-pipelined decode step make the check; a raw-bytes walker builds no block and
-checks the group fields it reads itself, as `check --locations` does.
+pipelined decode step make the check. The raw-bytes pool
+(`parallel_scan_blobs_raw`) builds no block, so it hands each walker a
+`KindGate` carrying the entry's enforced claim, and the walker can only
+succeed by returning the token the gate issues once it has admitted the kind
+set its scanner recorded; walkers admit right after the scan, before any
+tally or shared write. `check --locations` runs that pool over `Unchecked`
+entries, where the gate admits every set, and judges kinds in its own
+scanner.
 
 In `check --refs`, `check --ids` and (through its own raw scanner)
 `check --locations` a contradiction stops the check rather than refuses the
@@ -298,10 +304,6 @@ Believed and unchecked, with no wrong answer worth a refusal:
   sign is valid for every kind
   ([ADR-0028](../decisions/0028-negative-ids-are-handled-like-any-other-id.md)).
   An index whose bytes do not parse at all counts as absent (above).
-- `BlobFilter` with a node bbox is index-backed (`uses_index`), but the
-  classify-phase filter check (`blob_filter_check`) applies only the kind
-  and tag-key rules. Only extract builds a bbox filter, and it applies the
-  bbox itself, so no command skips or keeps a blob wrongly because of it.
 - `degrade --corrupt-indexdata` and `--corrupt-indexdata-kind` refuse a
   blob whose indexdata does not parse, since there is nothing to corrupt.
 

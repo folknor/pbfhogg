@@ -314,7 +314,6 @@ pub(super) fn build_node_index_sparse(
             Some(crate::ElementKind::Node),
             host,
         )?;
-    let schedule_ref = &schedule;
     let claims_ref = &claims;
 
     // Per-blob rank-span accounting: on sorted inputs each blob's
@@ -342,10 +341,10 @@ pub(super) fn build_node_index_sparse(
         &schedule,
         None,
         || -> Scratch { (Vec::new(), Vec::new()) },
-        |position, decompressed, (tuples, group_starts)| -> crate::error::Result<()> {
+        |position, decompressed, (tuples, group_starts), gate| {
             tuples.clear();
             let kinds = crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
-            kinds.refuse_under(schedule_ref[position].claim())?;
+            let admitted = gate.admit(kinds)?;
             let mut walk = crate::blob_meta::ClaimWalk::new(
                 claims_ref[position].as_ref(),
                 crate::blob_meta::Order::Free,
@@ -374,7 +373,7 @@ pub(super) fn build_node_index_sparse(
                 c.rank_span_slots
                     .fetch_add(blob_max_rank - blob_min_rank + 1, Ordering::Relaxed);
             }
-            Ok(())
+            Ok((admitted, ()))
         },
         |_seq, ()| {},
         host,

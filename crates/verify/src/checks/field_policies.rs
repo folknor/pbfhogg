@@ -995,6 +995,10 @@ fn run_between(
 /// anything about pbfhogg, so a failure to build or judge a control is a
 /// verifier error; an interrupt, an unsettled launch and an environment
 /// outcome keep their meaning.
+///
+/// No fixture test drives this run with fake tools, by design: its logic
+/// is proven by its real-data runs on the configured datasets
+/// (`reference/verify.md`, "Decoding summaries").
 pub fn run(harness: &mut Harness, pbf: &Path, _direct_io: bool) -> Result<Option<String>, Error> {
     match controls(harness, pbf) {
         Err(Error::Failed(why)) => Err(Error::tool(format!(

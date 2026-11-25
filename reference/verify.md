@@ -510,6 +510,12 @@ Retention keeps the most recently used `SUMMARY_RETAIN`
 summaries (`crates/verify/src/tunables.rs`) after a normally concluded run;
 a zero budget, and `clean-references`, keep none.
 
+A check's own logic is proven by its real-data runs on the configured
+datasets (denmark, germany). A fixture test that drives a check's run
+with fake tools is owed only where the check has failed silently before,
+or where its judging is subtle enough to hide a wrong verdict on real
+data. Some checks deliberately have no such fixture; their `run` says so.
+
 `brokkr run pbfhogg-verify -- clean-references` removes completed entries and
 old staging/trash without needing a pbfhogg executable, dataset or reference
 tool. It uses the same config and scratch selection as verification.

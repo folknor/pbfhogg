@@ -458,6 +458,10 @@ fn derive_cases(
 /// Run check --ids cross-validation: pbfhogg check --ids, plain and --full,
 /// against osmium fileinfo and the framing, on the input, its derived
 /// copies and the fixed fixtures (module doc).
+///
+/// No fixture test drives this run with fake tools, by design: its logic
+/// is proven by its real-data runs on the configured datasets
+/// (`reference/verify.md`, "Decoding summaries").
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("check-ids")?;
     let mut gaps: Vec<String> = Vec::new();

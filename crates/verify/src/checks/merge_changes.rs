@@ -805,6 +805,10 @@ fn judge_fixture(harness: &mut Harness, outdir: &Path, fixture: &Fixture) -> Res
 
 /// Cross-validate pbfhogg merge-changes on the change files `oscs`, in
 /// order, and on the fixtures.
+///
+/// No fixture test drives this run with fake tools, by design: its logic
+/// is proven by its real-data runs on the configured datasets
+/// (`reference/verify.md`, "Decoding summaries").
 pub fn run(harness: &mut Harness, oscs: &[PathBuf]) -> Result<Option<String>, Error> {
     if oscs.is_empty() {
         return Err(Error::Failed(

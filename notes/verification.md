@@ -31,20 +31,17 @@ join requests only stage 1, so two joins on one unit overlapping after stage 1 p
 test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
 `Grant` and `Fixed`) are light by convention.
 
-## VER-135 - sort's rewrite of a LocationsOnWays way blob has no real-data witness
+## VER-135 - sort's intra-blob repair of a LocationsOnWays way blob has no witness
 
-sort and `cat --dedupe` re-encode a rewritten way with its coordinates when every
-input declares `LocationsOnWays`, and the verifier expects the declaration kept, so
-the osmium comparison reads every rewritten coordinate. The shared sweep is
-witnessed on real data by the `cat --dedupe` self-merge of Denmark
-`altw-keep-untagged` (reference/verify.md), but sort's own rewrite (overlap
-component, internally unsorted or restructured way blob on a `LocationsOnWays` input)
-is witnessed by CLI tests only: no configured dataset both declares
-`LocationsOnWays` and makes sort rewrite a way blob. No producer makes one:
-re-encoding `degrade` drops the declaration, and `cat A A` keeps it but duplicates
-every identity, which the strict element comparison and order check refuse. A
-witness needs overlapping way blobs with disjoint identities that keep inline
-coordinates and true indexdata.
+sort's cross-blob overlap rewrite on a declaring input is witnessed on real data
+by the Denmark `unsorted` snapshot's `altw-keep-untagged` variant (sparse
+add-locations-to-ways of the `degrade --unsort` file; reference/verify.md).
+Residue: an internally unsorted way blob on a declaring input (sort's sorted-views
+cursors and demotion with coordinates) has neither a configured real-data input nor
+a CLI test; `cli_sort.rs` covers only overlap under a sort claim. A candidate
+producer is the same sparse add-locations-to-ways run over a `degrade
+--unsort-intra` output, unverified: whether it keeps the intra-blob inversion is
+not established.
 
 ## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 

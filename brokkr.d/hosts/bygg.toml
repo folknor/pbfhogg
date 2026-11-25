@@ -103,6 +103,14 @@ xxhash = "bc689783cd03289cfb173072dbe1df82"
 [bygg.datasets.denmark.snapshot.unsorted.pbf.indexed.expect]
 check-ids = "violations"
 
+# LocationsOnWays twin of the unsorted snapshot: `add-locations-to-ways
+# --index-type sparse --keep-untagged-nodes` of the indexed file above, which
+# keeps its cross-blob overlap pair per kind, so `sort` rewrites a real way
+# blob of a declaring input. Registered by hand with the hash `brokkr env` prints.
+[bygg.datasets.denmark.snapshot.unsorted.pbf.altw-keep-untagged]
+file = "denmark-unsorted-altw-keep-untagged.osm.pbf"
+xxhash = "1210ccccf94c23a59f1dcff50e78845d"
+
 [bygg.datasets.denmark.snapshot.ways-only]
 download_date = "2026-10-27"
 

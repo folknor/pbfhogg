@@ -1272,8 +1272,23 @@ PASS (every blob copied) and `cat --dedupe` PASS. The dedupe self-merge
 rewrites every real way blob, so its element comparison, which read
 coordinates because both files declare them, is the real-data witness of
 the sweep re-encoding ways with their coordinates. sort's own rewrite
-branches share that sweep and are witnessed by CLI tests
-(`crates/cli/tests/cli_sort.rs`).
+branches share that sweep; the CLI tests in `crates/cli/tests/cli_sort.rs`
+cover only overlapping way blobs under a `Sort.Type_then_ID` claim
+(coordinates kept, a way without them refused).
+
+On 2026-11-26, host bygg, at `4d16e7eb` (CLI xxh3-128
+`23bc6a7755fd75b292cb5dc67d73e025`): sort on the Denmark `unsorted`
+snapshot's `altw-keep-untagged` variant PASS, the real-data witness of sort
+rewriting a way blob of a declaring input. The variant is
+`add-locations-to-ways --index-type sparse --keep-untagged-nodes` of the
+snapshot's indexed file (a `degrade --unsort` output): it declares
+`LocationsOnWays` and no sort claim, is indexed, every way carries inline
+coordinates, and way IDs are not monotonic, so the `degrade --unsort`
+cross-blob overlap survives in every kind. pbfhogg sort on it scans every
+blob and rewrites 6 blobs in overlap runs, the way pair among them; the
+element comparison read coordinates against `osmium sort -f
+pbf,locations_on_ways=true`. Intra-blob disorder on a declaring input has
+no real-data witness: no configured input has it.
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

@@ -287,3 +287,16 @@ declared, and splice outputs (apply-changes, renumber) carry it
 undeclared, so the guide should tell a caller to check
 `HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.
 
+## DOC-060 - DEVIATIONS.md justifies cat's LocationsOnWays rule by copying alone
+
+Reported by: the spar accounting of the cat --dedupe mixed-declaration
+item, from a scout lateral (2026-11-26); read from source.
+
+DEVIATIONS.md's cat header-reconciliation entry declares `LocationsOnWays`
+"when every input declares it, since every way blob is copied with its
+coordinates", then says "This holds for every cat path, `--dedupe`
+included". `cat --dedupe` re-encodes the way blobs in its overlap runs
+(with their coordinates when every input declares, from refs alone
+otherwise), so the stated reason covers only copied blobs. The rule is
+right; the justification should name the re-encode too.
+

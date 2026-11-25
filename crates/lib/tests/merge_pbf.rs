@@ -1433,6 +1433,125 @@ fn sorted_views_are_charged_to_the_run() {
     );
 }
 
+/// The inline coordinates the sorted-tails way fixture gives ref `r`. No node
+/// records exist, so a sort that looked coordinates up instead of carrying
+/// the way's own would have nothing to find.
+fn tail_way_location(r: i64) -> (i32, i32) {
+    let lat = i32::try_from(r % 900_000_000).expect("lat fits");
+    let lon = i32::try_from((r * 7) % 1_800_000_000).expect("lon fits");
+    (lat, lon - 900_000_000)
+}
+
+/// Demotion with coordinates: an input declaring `LocationsOnWays` and no
+/// order, whose way blobs each hold a dense run of IDs written descending
+/// plus one ID far past every other blob's. Every blob descends, so every
+/// cursor of the one overlap run reads through sorted views, and each is
+/// down to its tail when the next opens; the blocks together pass the
+/// sweep's budget, so the demoted cursors are sorted-view way cursors owned
+/// with their inline coordinates. The output keeps every way's own
+/// coordinates and the declaration.
+#[test]
+fn sorted_view_way_cursors_are_demoted_with_their_locations() {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+    const BLOBS: i64 = 12;
+    const DENSE: i64 = 8_000;
+    const TAIL: i64 = 1 << 40;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("way-tails.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let refs_of = |id: i64| -> Vec<i64> { vec![id * 2, id * 2 + 1] };
+
+    let file = std::fs::File::create(&input).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+    let header = HeaderBuilder::new()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    let mut payloads = Vec::new();
+    for blob in 0..BLOBS {
+        let base = 1 + blob * DENSE;
+        let ids: Vec<i64> = (base..base + DENSE).rev().chain([TAIL + blob]).collect();
+        let cap = std::num::NonZeroUsize::new(ids.len()).expect("non-empty blob");
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap, 8_000);
+        for &id in &ids {
+            let refs = refs_of(id);
+            let locs: Vec<(i32, i32)> = refs.iter().map(|&r| tail_way_location(r)).collect();
+            // Distinct per way, so the string table cannot share them.
+            let v = format!("{id:0>1000}");
+            bb.add_way_with_locations(id, [("v", v.as_str())], &refs, &locs, None);
+        }
+        let bytes = bb.take().expect("encode").expect("non-empty block");
+        payloads.push(u64::try_from(bytes.len()).expect("length"));
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush fixture");
+    drop(writer);
+    let largest = *payloads.iter().max().expect("a blob");
+    assert!(
+        largest < PINNED_BYTES / 2,
+        "fixture: a {largest}-byte block"
+    );
+    assert!(
+        payloads.iter().sum::<u64>() > PINNED_BYTES + largest,
+        "fixture: the blocks fit the budget without demotion"
+    );
+
+    let (host, counters) = recording_host(4);
+    let stats = pbfhogg::commands::sort::sort(
+        input.as_path(),
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("sort: {}", e.report()));
+    let expected: Vec<i64> = (1..=BLOBS * DENSE).chain(TAIL..TAIL + BLOBS).collect();
+    assert_eq!(stats.ways, u64::try_from(expected.len()).expect("count"));
+    assert_eq!(counters.get("sort_overlap_runs"), 1, "one overlap run");
+    assert!(
+        counters.get("overlap_run_demoted_cursors") > 0,
+        "no cursor was demoted"
+    );
+
+    assert!(
+        crate::common::read_header(&output).has_locations_on_ways(),
+        "declaration dropped"
+    );
+    let mut seen = Vec::new();
+    for blob in pbfhogg::BlobReader::from_path(&output).expect("open output") {
+        let blob = blob.expect("blob");
+        let pbfhogg::BlobDecode::OsmData(block) = blob.decode().expect("decode") else {
+            continue;
+        };
+        for element in block.elements() {
+            let pbfhogg::Element::Way(w) = element else {
+                continue;
+            };
+            let refs: Vec<i64> = w.refs().collect();
+            assert_eq!(refs, refs_of(w.id()), "way {} refs", w.id());
+            let locs: Vec<(i32, i32)> = w
+                .node_locations()
+                .map(|l| {
+                    (
+                        l.decimicro_lat().expect("representable"),
+                        l.decimicro_lon().expect("representable"),
+                    )
+                })
+                .collect();
+            let want: Vec<(i32, i32)> =
+                refs_of(w.id()).into_iter().map(tail_way_location).collect();
+            assert_eq!(locs, want, "way {} coordinates", w.id());
+            seen.push(w.id());
+        }
+    }
+    assert!(
+        seen == expected,
+        "the sort is not the fixture's ways in order"
+    );
+}
+
 /// One node in very many versions, the same versions in both inputs: in
 /// reverse order in the first, ascending in the second (a blob may hold one
 /// ID's versions in any order). The merge writes every version once, in

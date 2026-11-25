@@ -1236,4 +1236,77 @@ mod tests {
         .expect("open");
         assert_eq!(drain(&mut cursor).expect("drain"), vec![0, -1, 2, 3]);
     }
+
+    /// A way block written descending, every way with the inline location
+    /// `(id, -id)` per ref except `bare`, which has refs only.
+    fn way_block_descending(ids: &[i64], bare: i64) -> PrimitiveBlock {
+        let mut bb = BlockBuilder::new();
+        for &id in ids.iter().rev() {
+            let refs = [id * 10, id * 10 + 1];
+            if id == bare {
+                bb.add_way(id, [], &refs, None);
+            } else {
+                let i = i32::try_from(id).expect("small id");
+                bb.add_way_with_locations(id, [], &refs, &[(i, -i), (i, -i)], None);
+            }
+        }
+        let bytes = bb.take().expect("take").expect("block").to_vec();
+        PrimitiveBlock::from_vec(bytes).expect("decode")
+    }
+
+    /// Pull a sorted-view way cursor over 1..=16 until it is demotable.
+    fn mostly_pulled_way_cursor(bare: i64) -> Cursor {
+        let ids: Vec<i64> = (1..=16).collect();
+        let mut cursor = Cursor::open(
+            way_block_descending(&ids, bare),
+            ElementKind::Way,
+            None,
+            true,
+            (0, 0),
+        )
+        .expect("open");
+        for _ in 0..14 {
+            cursor.head.take().expect("head");
+            cursor.advance().expect("advance");
+        }
+        assert!(cursor.demotable(), "14 of 16 pulled is mostly consumed");
+        cursor
+    }
+
+    /// Demoting a sorted-view way cursor under `keep_locations` owns its
+    /// head and its queued tail with their inline coordinates.
+    #[test]
+    fn a_demoted_sorted_way_cursor_keeps_its_locations() {
+        let mut cursor = mostly_pulled_way_cursor(0);
+        cursor.demote(true).expect("demote");
+        assert!(cursor.owner.is_none(), "block released");
+        let mut tail = Vec::new();
+        while let Some(head) = cursor.head.take() {
+            let Item::Way(w) = head else {
+                panic!("an owned way");
+            };
+            let i = i32::try_from(w.id).expect("small id");
+            assert_eq!(w.refs, vec![w.id * 10, w.id * 10 + 1]);
+            assert_eq!(w.locations, vec![(i, -i), (i, -i)], "way {}", w.id);
+            tail.push(w.id);
+            cursor.advance().expect("advance");
+        }
+        assert_eq!(tail, vec![15, 16]);
+    }
+
+    /// Under `keep_locations` a queued tail way with refs and no inline
+    /// coordinates is refused at demotion; without it the way is owned
+    /// plain.
+    #[test]
+    fn demotion_under_keep_locations_refuses_a_way_without_them() {
+        let mut keep = mostly_pulled_way_cursor(16);
+        crate::test_support::assert_err_kind!(
+            keep.demote(true),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("0 inline location(s)"),
+            "way 16 has refs and no inline coordinates"
+        );
+        let mut plain = mostly_pulled_way_cursor(16);
+        plain.demote(false).expect("demote");
+        assert_eq!(drain(&mut plain).expect("drain"), vec![15, 16]);
+    }
 }

@@ -31,17 +31,28 @@ join requests only stage 1, so two joins on one unit overlapping after stage 1 p
 test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
 `Grant` and `Fixed`) are light by convention.
 
-## VER-135 - sort's intra-blob repair of a LocationsOnWays way blob has no witness
+## VER-158 - sort's restructured way blocks with inline coordinates have no witness
 
-sort's cross-blob overlap rewrite on a declaring input is witnessed on real data
-by the Denmark `unsorted` snapshot's `altw-keep-untagged` variant (sparse
-add-locations-to-ways of the `degrade --unsort` file; reference/verify.md).
-Residue: an internally unsorted way blob on a declaring input (sort's sorted-views
-cursors and demotion with coordinates) has neither a configured real-data input nor
-a CLI test; `cli_sort.rs` covers only overlap under a sort claim. A candidate
-producer is the same sparse add-locations-to-ways run over a `degrade
---unsort-intra` output, unverified: whether it keeps the intra-blob inversion is
-not established.
+A block no single index describes (several kinds, or one kind no single index
+covers) becomes one `restructured` entry per kind, and `Sweep::open` reads it
+through sorted views exactly as it reads an internally unsorted blob, so on an input
+declaring `LocationsOnWays` its ways are re-encoded with their coordinates. No test
+or configured input drives that: `cli_cat.rs`'s restructured fixtures carry no
+declaration, and the declaring sort tests (`cli_sort.rs`, `merge_pbf.rs`) use
+single-kind blocks. A witness is a mixed-kind frame with ascending way IDs and
+inline coordinates under the declaration, so the restructuring alone is the reason
+to rewrite, asserting the tally and every way's own coordinates.
+
+## VER-159 - verify all cannot run on an intra-blob unsorted snapshot
+
+`pbfhogg-verify all --dataset denmark --snapshot unsorted-intra` stops at the
+field-policies preflight: the slice it takes with `osmium getid` keeps the input's
+order, and its OPL decoding refuses "an object at or below the previous one". The
+cross-blob `unsorted` snapshot passed `all` 24 of 24 on 2026-11-26, so its slice was
+in order; why the two differ is not established. The
+individual checks run (sort PASS on the `altw-keep-untagged` variant), but no
+suite-level run certifies the snapshot. Either the preflight sorts its slice, or
+the suite skips it with a reason for an input that claims no order.
 
 ## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 

@@ -111,6 +111,27 @@ check-ids = "violations"
 file = "denmark-unsorted-altw-keep-untagged.osm.pbf"
 xxhash = "1210ccccf94c23a59f1dcff50e78845d"
 
+# Intra-blob twin of the unsorted snapshot: `degrade --unsort-intra` of the
+# primary indexed file, one internal ID inversion per kind and no cross-blob
+# overlap. Its altw-keep-untagged variant is `add-locations-to-ways
+# --index-type sparse --keep-untagged-nodes` of the indexed file, which keeps
+# the inversion, so `sort` rewrites an internally unsorted way blob of a
+# declaring input through sorted views. Both registered by hand with the
+# hashes `brokkr env` prints.
+[bygg.datasets.denmark.snapshot.unsorted-intra]
+download_date = "2026-11-26"
+
+[bygg.datasets.denmark.snapshot.unsorted-intra.pbf.indexed]
+file = "denmark-unsorted-intra-with-indexdata.osm.pbf"
+xxhash = "d8e40c1d13222c555ec336a2853a6e0b"
+
+[bygg.datasets.denmark.snapshot.unsorted-intra.pbf.indexed.expect]
+check-ids = "violations"
+
+[bygg.datasets.denmark.snapshot.unsorted-intra.pbf.altw-keep-untagged]
+file = "denmark-unsorted-intra-altw-keep-untagged.osm.pbf"
+xxhash = "e6b3ef50e408c27b602242d7d813071e"
+
 [bygg.datasets.denmark.snapshot.ways-only]
 download_date = "2026-10-27"
 

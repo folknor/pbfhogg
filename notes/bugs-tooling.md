@@ -171,6 +171,31 @@ lateral (2026-11-25).
 it never reads; every caller passes a directory for nothing. Drop the
 parameter.
 
+## TOOL-062 - Two bench scripts say snapshot promotion awaits a closed ticket
+
+Reported by: the spar accounting of the sort LocationsOnWays witness item,
+from a scout lateral (2026-11-26); read from source.
+
+The headers of `benches/degrade/perturb-pbf.lua` and
+`benches/repack/reencode-pbf.lua`, and their version-1 changelog notes in
+`brokkr.d/benches.toml`, say snapshot promotion is omitted because it needs
+an output-promotion API brokkr has not shipped. That ticket is closed and
+the path exists: `brokkr run pbfhogg -- ...` then `pbfhogg-datasets
+promote`. Benches deliberately do not promote, so the omission stands;
+the reason given is stale. `perturb-pbf` also exposes only `--unsort` of
+degrade's perturbations, not `--unsort-intra` or `--drop-ids`.
+
+## TOOL-063 - The Denmark chained and twin snapshots carry no pin
+
+Reported by: the spar accounting of the sort LocationsOnWays witness item,
+from a scout lateral (2026-11-26); seen in `brokkr env` output.
+
+`brokkr.d/hosts/bygg.toml` registers `denmark.snapshot.chained` and
+`denmark.snapshot.twin` with a file and no `xxhash`, so `brokkr env`
+reports "no hash configured" and the sort benches recorded on them
+(reference/performance/sort.md) ran on unpinned inputs. Add the hashes
+`brokkr env` computes.
+
 # From the 2026-11-21 verifier performance hunt
 
 Defects the performance hunters found while reading the code at `e8377a78`

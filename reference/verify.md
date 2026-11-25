@@ -1287,8 +1287,25 @@ coordinates, and way IDs are not monotonic, so the `degrade --unsort`
 cross-blob overlap survives in every kind. pbfhogg sort on it scans every
 blob and rewrites 6 blobs in overlap runs, the way pair among them; the
 element comparison read coordinates against `osmium sort -f
-pbf,locations_on_ways=true`. Intra-blob disorder on a declaring input has
-no real-data witness: no configured input has it.
+pbf,locations_on_ways=true`. The intra-blob case is the next entry.
+
+On 2026-11-26, host bygg, at `eca4a67e` plus the uncommitted change that
+registered it (CLI xxh3-128 `23bc6a7755fd75b292cb5dc67d73e025`): sort on
+the Denmark `unsorted-intra` snapshot's `altw-keep-untagged` variant PASS
+(`--variant altw-keep-untagged`; the default `indexed` variant is the
+undeclaring `degrade --unsort-intra` file), the real-data witness of sort
+rewriting an internally unsorted way blob of a declaring input through
+sorted views. The variant is sparse `add-locations-to-ways
+--keep-untagged-nodes` of the snapshot's indexed file; sparse keeps the
+inversion, so pbfhogg sort reports 3 blobs internally unsorted, one per
+kind, and rewrites only those, keeping both `Sort.Type_then_ID` and
+`LocationsOnWays`; the element comparison read coordinates against
+`osmium sort -f pbf,locations_on_ways=true`. Each rewritten blob is a run
+of its own, far under the sweep's pinned budget, so no real input reaches
+demotion with coordinates; `merge_pbf.rs` holds that path with a fixture
+whose every cursor is a sorted-view way cursor. `all` on this snapshot
+stops at its field-policies preflight, whose slice of an intra-unsorted
+input is not in strict order.
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

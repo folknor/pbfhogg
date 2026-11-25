@@ -1892,6 +1892,125 @@ fn sort_rewrite_keeps_inline_way_locations() {
     assert_eq!(ways, vec![1, 2, 3, 4]);
 }
 
+/// A way's ID, refs and inline coordinates.
+type LowWay = (i64, Vec<i64>, Vec<(i32, i32)>);
+
+/// The fixture's records for the intra-blob case: way ID, refs, and the
+/// inline coordinates written beside them. The coordinates are not those of
+/// any node record (refs 50 and up have no node at all), so an output that
+/// recomputed them from nodes would differ.
+fn intra_low_ways() -> Vec<LowWay> {
+    [5i64, 2, 4, 1, 3]
+        .into_iter()
+        .map(|id| {
+            let refs = vec![id * 10, id * 10 + 45];
+            let base = i32::try_from(id).expect("small id") * 333;
+            (id, refs, vec![(base + 1, -base), (-base, base + 2)])
+        })
+        .collect()
+}
+
+/// Write a PBF declaring `LocationsOnWays` and no order whose one way blob
+/// holds [`intra_low_ways`] out of ID order, the way blob ranges overlapping
+/// nothing: the intra-blob shape, which sort reads through sorted views. A
+/// way listed in `refs_only` has no coordinates.
+fn write_intra_unsorted_low_ways(path: &Path, refs_only: &[i64]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = HeaderBuilder::new()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for id in 10..=49 {
+        let (lat, lon) = low_location(id);
+        bb.add_node(id, lat, lon, std::iter::empty::<(&str, &str)>(), None);
+    }
+    writer
+        .write_primitive_block(bb.take().expect("take").expect("nodes"))
+        .expect("write block");
+    for (id, refs, locs) in intra_low_ways() {
+        if refs_only.contains(&id) {
+            bb.add_way(id, [("highway", "residential")], &refs, None);
+        } else {
+            bb.add_way_with_locations(id, [("highway", "residential")], &refs, &locs, None);
+        }
+    }
+    writer
+        .write_primitive_block(bb.take().expect("take").expect("ways"))
+        .expect("write block");
+    writer.flush().expect("flush");
+}
+
+/// An internally unsorted way blob of an input declaring `LocationsOnWays`
+/// is rewritten in ID order with each way's own inline coordinates, and the
+/// output claims both the order and the declaration.
+#[test]
+fn sort_intra_blob_rewrite_keeps_inline_way_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("intra.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_intra_unsorted_low_ways(&input, &[]);
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+    out.assert_stderr_contains("1 blobs internally unsorted");
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("which the output does not declare"),
+        "sort warned of a loss: {stderr}"
+    );
+    let header = read_header(&output);
+    assert!(header.has_locations_on_ways());
+    assert!(header.is_sorted());
+    let mut ways = Vec::new();
+    for blob in pbfhogg::BlobReader::from_path(&output).expect("open") {
+        let blob = blob.expect("blob");
+        let pbfhogg::BlobDecode::OsmData(block) = blob.decode().expect("decode") else {
+            continue;
+        };
+        for element in block.elements() {
+            if let pbfhogg::Element::Way(w) = element {
+                let locs: Vec<(i32, i32)> = w
+                    .node_locations()
+                    .map(|l| {
+                        (
+                            l.decimicro_lat().expect("representable"),
+                            l.decimicro_lon().expect("representable"),
+                        )
+                    })
+                    .collect();
+                ways.push((w.id(), w.refs().collect::<Vec<i64>>(), locs));
+            }
+        }
+    }
+    let mut want = intra_low_ways();
+    want.sort_by_key(|(id, _, _)| *id);
+    assert_eq!(ways, want);
+}
+
+/// The intra-blob rewrite refuses a way with refs and no coordinates in an
+/// input declaring `LocationsOnWays`, as the overlap rewrite does.
+#[test]
+fn sort_intra_blob_rewrite_refuses_a_way_without_the_declared_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("intra.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_intra_unsorted_low_ways(&input, &[4]);
+    CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_refused("0 inline location(s)");
+}
+
 /// A rewritten way with refs and no coordinates, in an input declaring
 /// `LocationsOnWays`, is refused: re-encoding it would write a way the kept
 /// declaration misdescribes.

@@ -30,7 +30,8 @@
 //!    diff removed, or survivors alternating with large OSC values, no
 //!    longer carry the dead string into every frame. Where the compact
 //!    strategy ends in a framing refusal (a single element), the whole-table
-//!    one plans every overflow again: survivors' blocks carry the source
+//!    one plans that overflow again, the others keeping their compact
+//!    plans: survivors' blocks carry the source
 //!    table as in the first pass, an attempt starts unseeded so OSC elements
 //!    before the first survivor go into a block without it, and a block of
 //!    an attempt that still overflows is planned again on its own, halved
@@ -53,14 +54,28 @@
 //!    frames) is an internal error. At most the stream's few frames are in
 //!    flight, so the blob's output is never resident, however large.
 //!
-//! What this does not cure, and stays a loud refusal before publication: an
-//! element that does not fit a block alone with only its own strings,
-//! refused with that element's own framing error. Halving is not an
-//! exhaustive search either: a block's size depends on the elements beside
-//! it (a string another element interned first lands at a narrower index,
-//! a compact seed is in source-slot order, dense deltas and the compressed
-//! body change with neighbours), so a partition can exist that halving does
-//! not find, which needs blocks within bytes of the limit.
+//! A single operation that overflows is a node without metadata or it is
+//! refused: such a node, which the rewrite writes dense, is tried once more
+//! as a plain `Node` without `Info`, which claims the same and is a few
+//! bytes smaller alone (a plain-source survivor would otherwise outgrow the
+//! block it came from). A node with metadata is not retried: a plain `Info`
+//! keeps its dense claims only through a conversion over every metadata
+//! state, and is not always smaller (a negative timestamp).
+//!
+//! What this does not cure, and stays a loud refusal before publication: a
+//! single element that overflows in every form tried, refused with its
+//! ordinary form's framing error. That is not a minimum: a string table in
+//! another order (compact seeds are in source-slot order, other strings in
+//! first-use order) can give its most used strings narrower indices.
+//! Halving is not an exhaustive search either: a block's size depends on
+//! the elements beside it (a string another element interned first lands
+//! at a narrower index, dense deltas and the compressed body change with
+//! neighbours), so a partition can exist that halving does not find, which
+//! needs blocks within bytes of the limit. An exact search over cut
+//! positions was refused: with sizes not monotone in a piece's ends it is
+//! a real encode of every span, quadratic in an overflow's operations at up
+//! to a blob limit each, which turns a loud refusal into an effective hang
+//! on a crafted diff.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -77,7 +92,10 @@ use crate::writer::Compression;
 
 use super::Result;
 use super::descriptor::StreamMsg;
-use super::element_writes::{BaseWrites, RefreshScratch, SourceSeed, mark_used_slots};
+use super::element_writes::{
+    BaseWrites, RefreshScratch, SourceSeed, add_osc_node_bare_plain, base_node_is_bare,
+    mark_used_slots, osc_node_is_bare, write_base_node_bare_plain_local,
+};
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::refresh::StaleProbe;
@@ -294,6 +312,9 @@ pub(super) enum Plan {
     Attempt {
         ops: Range<usize>,
         strategy: Strategy,
+        /// The attempt is one bare node (no metadata) written as a plain
+        /// `Node`, the retry of a lone node that overflowed dense.
+        bare_plain: bool,
         children: Vec<Plan>,
     },
     /// Consecutive pieces, together covering a range.
@@ -324,10 +345,13 @@ impl Plan {
     }
 }
 
-/// Plan every recorded overflow, in order: the compact strategy for all,
-/// or, where it ends in a framing refusal, the whole-table one for all,
-/// which refuses only what the whole-table recovery refused before the
-/// compact one existed.
+/// Plan every recorded overflow, in order, each on its own: the compact
+/// strategy, or, where that ends in a framing refusal, the whole-table one
+/// for that overflow alone. Plans are independent (every attempt starts a
+/// fresh builder over its own operations), so one overflow that needs the
+/// whole table does not cost another the compact plan it found. Where both
+/// strategies refuse, the whole-table refusal is returned. Any other error
+/// of a trial is returned as it is.
 pub(super) fn plan(
     inputs: Inputs<'_>,
     ops: &[Op<'_>],
@@ -341,18 +365,13 @@ pub(super) fn plan(
         scratch,
         tx,
     };
-    let compact = overflows
+    overflows
         .iter()
-        .map(|o| planner.compact(o.ops.clone()))
-        .collect::<Result<Vec<_>>>();
-    match compact {
-        Ok(plans) => Ok(plans),
-        Err(e) if is_block_overflow(&e) => overflows
-            .iter()
-            .map(|o| planner.whole(o.ops.clone()))
-            .collect(),
-        Err(e) => Err(e),
-    }
+        .map(|o| match planner.compact(o.ops.clone()) {
+            Err(e) if is_block_overflow(&e) => planner.whole(o.ops.clone()),
+            planned => planned,
+        })
+        .collect()
 }
 
 struct Planner<'p, 'a> {
@@ -364,7 +383,12 @@ struct Planner<'p, 'a> {
 
 impl Planner<'_, '_> {
     /// One trial of `range`: the blocks that overflowed.
-    fn trial(&mut self, range: Range<usize>, strategy: Strategy) -> Result<Vec<Overflow>> {
+    fn trial(
+        &mut self,
+        range: Range<usize>,
+        strategy: Strategy,
+        bare_plain: bool,
+    ) -> Result<Vec<Overflow>> {
         let mut sink = RewriteSink::trial(
             FramedBlocks::new(*self.inputs.compression, self.inputs.metrics),
             range.start,
@@ -374,6 +398,7 @@ impl Planner<'_, '_> {
             self.ops,
             range,
             strategy,
+            bare_plain,
             self.scratch,
             &mut sink,
             self.tx,
@@ -381,21 +406,45 @@ impl Planner<'_, '_> {
         Ok(sink.overflows)
     }
 
+    /// A single operation that overflowed under `strategy`: retried as a
+    /// plain `Node` when it is a bare node, kept if that fits, otherwise
+    /// refused with `error`, the refusal of its ordinary form.
+    fn lone(&mut self, at: usize, strategy: Strategy, error: Error) -> Result<Plan> {
+        let op = self
+            .ops
+            .get(at)
+            .ok_or_else(|| Error::internal("apply-changes overflow plan outside its operations"))?;
+        if !op_is_bare_node(op, self.inputs.diff)? {
+            return Err(error);
+        }
+        if !self.trial(at..at + 1, strategy, true)?.is_empty() {
+            return Err(error);
+        }
+        Ok(Plan::Attempt {
+            ops: at..at + 1,
+            strategy,
+            bare_plain: true,
+            children: Vec::new(),
+        })
+    }
+
     /// The compact plan of `range`: kept whole if nothing in it overflowed,
     /// otherwise each half planned the same way with its own strings, so a
     /// single element is tried with exactly its own. A single element that
-    /// still overflows is refused with its framing error.
+    /// still overflows is retried plain if it is a bare node
+    /// ([`lone`](Self::lone)), else refused with its framing error.
     fn compact(&mut self, range: Range<usize>) -> Result<Plan> {
-        let overflows = self.trial(range.clone(), Strategy::Compact)?;
+        let overflows = self.trial(range.clone(), Strategy::Compact, false)?;
         let Some(first) = overflows.into_iter().next() else {
             return Ok(Plan::Attempt {
                 ops: range,
                 strategy: Strategy::Compact,
+                bare_plain: false,
                 children: Vec::new(),
             });
         };
         if range.len() == 1 {
-            return Err(first.error);
+            return self.lone(range.start, Strategy::Compact, first.error);
         }
         let mid = range.start + range.len() / 2;
         Ok(Plan::Seq(vec![
@@ -408,15 +457,16 @@ impl Planner<'_, '_> {
     /// then each block of it that overflowed planned again on its own, or
     /// halved when it was the whole attempt.
     fn whole(&mut self, range: Range<usize>) -> Result<Plan> {
-        let overflows = self.trial(range.clone(), Strategy::WholeTable)?;
+        let overflows = self.trial(range.clone(), Strategy::WholeTable, false)?;
         if let [only] = overflows.as_slice()
             && only.ops == range
         {
             if range.len() == 1 {
-                return Err(overflows.into_iter().next().map_or_else(
+                let error = overflows.into_iter().next().map_or_else(
                     || Error::internal("apply-changes overflow plan lost its refusal"),
                     |o| o.error,
-                ));
+                );
+                return self.lone(range.start, Strategy::WholeTable, error);
             }
             let mid = range.start + range.len() / 2;
             return Ok(Plan::Seq(vec![
@@ -431,8 +481,20 @@ impl Planner<'_, '_> {
         Ok(Plan::Attempt {
             ops: range,
             strategy: Strategy::WholeTable,
+            bare_plain: false,
             children,
         })
+    }
+}
+
+/// Whether `op` is a node written with no metadata (an OSC node without
+/// any, or a survivor whose source carries none), the only kind of single
+/// operation [`Planner::lone`] retries in plain form.
+fn op_is_bare_node(op: &Op<'_>, diff: &SortedDiff) -> Result<bool> {
+    match op {
+        Op::Osc(ElementKind::Node, i) => Ok(osc_node_is_bare(&diff.node(*i))),
+        Op::Osc(..) => Ok(false),
+        Op::Base(element) => base_node_is_bare(element),
     }
 }
 
@@ -443,12 +505,15 @@ impl Planner<'_, '_> {
 /// under a subset (marked over these operations' survivors) it starts
 /// seeded when any survivor is among them, so OSC elements and survivors
 /// share blocks. Stats and refresh counts are discarded: the first pass
-/// counted these elements.
+/// counted these elements. Under `bare_plain` the range is one bare node,
+/// written as a plain `Node` without `Info`.
+#[allow(clippy::too_many_arguments)]
 fn write_attempt<S: OpSink>(
     inputs: Inputs<'_>,
     ops: &[Op<'_>],
     range: Range<usize>,
     strategy: Strategy,
+    bare_plain: bool,
     scratch: &mut RefreshScratch,
     sink: &mut S,
     tx: &StreamTx<'_>,
@@ -479,6 +544,29 @@ fn write_attempt<S: OpSink>(
             SourceSeed::Subset(&used)
         }
     };
+    if bare_plain {
+        let [op] = ops else {
+            return Err(Error::internal(
+                "apply-changes: a plain retry was planned for more than one operation",
+            ));
+        };
+        tx.check()?;
+        match op {
+            Op::Osc(ElementKind::Node, i) => {
+                add_osc_node_bare_plain(&mut bb, &inputs.diff.node(*i));
+            }
+            Op::Base(element) => {
+                write_base_node_bare_plain_local(&mut bb, sink, element, inputs.block, seed)?;
+            }
+            Op::Osc(..) => {
+                return Err(Error::internal(
+                    "apply-changes: a plain retry was planned for a way or relation",
+                ));
+            }
+        }
+        sink.op_written();
+        return flush_local(&mut bb, sink);
+    }
     let mut stats = MergeStats::new();
     let mut base_writes = BaseWrites::new(inputs.block, inputs.probe, scratch);
     base_writes.seed = seed;
@@ -619,13 +707,23 @@ fn emit(
         Plan::Attempt {
             ops: range,
             strategy,
+            bare_plain,
             children,
         } => {
             let (mine, below) = scratches.split_first_mut().ok_or_else(|| {
                 Error::internal("apply-changes: a deferred blob's plan outran its scratch")
             })?;
             let mut sink = EmitSink::new(inputs, ops, children, below, tx, range.start);
-            write_attempt(inputs, ops, range.clone(), *strategy, mine, &mut sink, tx)?;
+            write_attempt(
+                inputs,
+                ops,
+                range.clone(),
+                *strategy,
+                *bare_plain,
+                mine,
+                &mut sink,
+                tx,
+            )?;
             *frame_ns += sink.finish()?;
             Ok(())
         }

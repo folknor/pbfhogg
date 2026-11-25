@@ -392,6 +392,128 @@ fn two_large_inline_creates_apply() {
     crate::common::assert_sorted_file(&output);
 }
 
+/// A metadata-less OSC node (no `version` attribute) `id` whose `note`
+/// value is `len` bytes, as a create or a modify.
+fn write_bare_osc(path: &Path, action: &str, id: i64, len: usize) {
+    let v: String = std::iter::repeat_n('z', len).collect();
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n<{action}>\n\
+         <node id=\"{id}\" lat=\"1.0\" lon=\"2.0\"><tag k=\"note\" v=\"{v}\"/></node>\n\
+         </{action}>\n</osmChange>\n"
+    );
+    std::fs::write(path, xml).unwrap();
+}
+
+/// The merge's oversize refusal: its part and size.
+fn refusal(base: &Path, osc: &Path, output: &Path) -> (pbfhogg::OversizePart, u64) {
+    let opts = pbfhogg::apply_changes::MergeOptions {
+        write: pbfhogg::write::WriteOptions {
+            compression: pbfhogg::writer::Compression::None,
+            ..pbfhogg::write::WriteOptions::default()
+        },
+        locations_on_ways: None,
+        parallelism: pbfhogg::Parallelism::Auto,
+        allow_version_regression: false,
+    };
+    let Err(err) = pbfhogg::apply_changes::merge(
+        base,
+        osc,
+        crate::common::out(output),
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    ) else {
+        panic!("the probe merge must refuse its oversize node")
+    };
+    assert!(!output.exists(), "a refused merge published its output");
+    match err.kind() {
+        pbfhogg::ErrorKind::BlobTooLarge { part, size, .. } => (*part, *size),
+        _ => panic!("expected an oversize refusal, got {err}"),
+    }
+}
+
+/// A lone metadata-less node one byte past the limit dense, which a plain
+/// `Node` without `Info` (two bytes smaller alone) fits, is written plain.
+/// Its dense size is read from two probe refusals: one far over the payload
+/// limit gives the payload's overhead over the value, one at exactly the
+/// payload limit the body's over the payload (uncompressed, the body is the
+/// payload plus its field head). Every length lies
+/// in one varint width, so sizes move byte for byte with the value.
+fn lone_bare_node_is_written_plain(action: &str, id: i64, skip: &[i64]) {
+    const MAX: u64 = 32 << 20;
+    let dir = crate::common::test_scratch();
+    let (base, osc, output) = (
+        dir.path().join("base.osm.pbf"),
+        dir.path().join("diff.osc"),
+        dir.path().join("out.osm.pbf"),
+    );
+    write_base(&base, &[], skip);
+
+    let far = MAX + 1000;
+    write_bare_osc(&osc, action, id, usize::try_from(far).unwrap());
+    let (part, size) = refusal(&base, &osc, &output);
+    assert_eq!(part, pbfhogg::OversizePart::Payload);
+    let at_limit = far - (size - MAX);
+    write_bare_osc(&osc, action, id, usize::try_from(at_limit).unwrap());
+    let (part, body) = refusal(&base, &osc, &output);
+    assert_eq!(
+        part,
+        pbfhogg::OversizePart::Body,
+        "a payload at the limit frames past the body"
+    );
+    let len = at_limit - (body - MAX) + 1;
+    write_bare_osc(&osc, action, id, usize::try_from(len).unwrap());
+    merge(&base, &osc, &output);
+
+    let mut found = None;
+    for blob in BlobReader::from_path(&output).unwrap() {
+        if let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() {
+            for element in block.elements() {
+                match element {
+                    Element::Node(n) if n.id() == id => {
+                        let tags: Vec<(String, usize)> =
+                            n.tags().map(|(k, v)| (k.to_owned(), v.len())).collect();
+                        assert!(
+                            n.info().version().is_none(),
+                            "the plain node claims no version"
+                        );
+                        found = Some(tags);
+                    }
+                    Element::DenseNode(n) if n.id() == id => {
+                        panic!("node {id} was written dense one byte past the limit")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        Some(vec![("note".to_owned(), usize::try_from(len).unwrap())])
+    );
+    let c = read_all_elements_id_only(&output);
+    let mut expected: Vec<i64> = (1..=50).filter(|i| !skip.contains(i)).collect();
+    if !expected.contains(&id) {
+        expected.push(id);
+        expected.sort_unstable();
+    }
+    assert_eq!(node_ids_id_only(&c), expected);
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
+}
+
+/// On the drain's create runs: a create past the last base node blob.
+#[test]
+fn a_lone_bare_create_past_the_limit_dense_is_written_plain() {
+    lone_bare_node_is_written_plain("create", 100, &[]);
+}
+
+/// On the worker's planned rewrite: a modify inside the base blob.
+#[test]
+fn a_lone_bare_modify_past_the_limit_dense_is_written_plain() {
+    lone_bare_node_is_written_plain("modify", 25, &[]);
+}
+
 /// Two large creates past the last base node blob are one create run of
 /// the drain, between small creates on either side.
 #[test]

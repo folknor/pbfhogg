@@ -337,8 +337,11 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
 /// into smaller blocks that carry only the strings they use, the walk's own
 /// refusal is returned, and then `open` sends the blob's item with a frame
 /// stream and the blob is written again, each frame sent as it is framed.
-/// Only a single element that overflows even with its own strings alone
-/// fails the rewrite, with its framing error; a recorded overflow outranks
+/// A plan fails the rewrite, with a single element's framing error, where
+/// that element overflows alone with its own strings in every form tried
+/// (a bare node is retried plain), or where halving finds no fitting cut
+/// although one exists; see the `overflow.rs` module doc for what the plan
+/// does not search. A recorded overflow outranks
 /// any later error of the walk, as it would have had it been returned at
 /// its flush. Nothing of a blob refused before `open` leaves the worker; a
 /// failure while streaming leaves part of the blob in the output, which is

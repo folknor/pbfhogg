@@ -2289,12 +2289,16 @@ side, is written as more blocks rather than refused. A re-cut first writes
 blocks that carry only the strings their own elements use, so a surviving
 element that grew past its source (refreshed `--locations-on-ways`
 coordinates, say) is not held back by a large string the changes removed;
-where that fails it tries again with blocks that carry the source table. An
-element that does not fit a block alone with its own strings fails the run
-(exit 2) with the oversize error and publishes nothing. The re-cut halves a
-piece that does not fit, so it can miss a cut that fits only within bytes
-of the limit (a block's size depends on its neighbours' strings); that also
-fails with the oversize error. There is no limit on how large one input
+where that fails it tries again with blocks that carry the source table. A
+node without metadata that does not fit a block alone in the usual dense form
+is tried once more as a plain node, which claims the same and is a few bytes
+smaller. An element that does not fit a block alone in the forms tried, with
+its own strings, fails the run (exit 2) with the oversize error and publishes
+nothing; a node with metadata keeps its ordinary encoding and gets no plain
+retry, and another order of an element's strings could sometimes have fit. The re-cut halves a piece that does not
+fit, so it can miss a cut that fits only within bytes of the limit (a block's
+size depends on its neighbours' strings); that also fails with the oversize
+error. There is no limit on how large one input
 blob's output may grow: a large string shared by many changed elements that
 must be cut apart is written once per block, however many blocks that takes
 (a blob whose output is that large is written twice, the second time

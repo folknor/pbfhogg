@@ -987,6 +987,22 @@ impl BlockBuilder {
         }
     }
 
+    /// Add a node with no metadata as a plain `Node` message with no `Info`,
+    /// where [`add_node_partial`](Self::add_node_partial) would write it
+    /// dense. Both forms claim exactly the same (no metadata, the same tags
+    /// and position); a lone plain node is a few bytes smaller. Only
+    /// apply-changes' overflow recovery uses it, to retry a lone node that
+    /// overflowed the blob limit dense.
+    pub(crate) fn add_node_bare_plain<'t>(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) {
+        self.add_plain_node(id, decimicro_lat, decimicro_lon, tags, None);
+    }
+
     /// Add a node routed `NodeRoute::Partial` to the optional dense run.
     #[allow(clippy::cast_possible_wrap)]
     fn add_optional_node<'t>(
@@ -2006,6 +2022,59 @@ impl BlockBuilder {
             self.raw_tags_scratch = tags;
             return Ok(());
         }
+        self.push_raw_plain_node(id, decimicro_lat, decimicro_lon, tags, Some(meta));
+        Ok(())
+    }
+
+    /// Add a raw node with no metadata as a plain `Node` message with no
+    /// `Info`, where [`add_node_raw`](Self::add_node_raw) and
+    /// [`add_node_raw_partial`](Self::add_node_raw_partial) would write it
+    /// dense; indices are translated and checked as those check them, and
+    /// a tag key index of zero stays zero. Both forms claim the same; a lone
+    /// plain node is a few bytes smaller. Only apply-changes' overflow
+    /// recovery uses it, for a lone surviving node that overflowed dense.
+    pub(crate) fn add_node_raw_bare_plain(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        raw_tags: impl Iterator<Item = (u32, u32)>,
+    ) -> Result<()> {
+        if !self.can_add_node() {
+            return Err(self.raw_refusal(BlockType::DenseNodes, id));
+        }
+        // Cold (a retry after an overflow), so the tags take a vector of
+        // their own rather than the builder's scratch.
+        let raw_tags: Vec<(u32, u32)> = match self.subset_len() {
+            Some(len) => self.translate_node_tags(id, raw_tags, len)?,
+            None => raw_tags.collect(),
+        };
+        let seeded = self.seeded_len()?;
+        for &(key_sid, val_sid) in &raw_tags {
+            if !index_in(key_sid, seeded) {
+                let e = bad_unsigned_sid("node", id, "tag key", key_sid);
+                return Err(self.refuse_raw_index(e));
+            }
+            if !index_in(val_sid, seeded) {
+                let e = bad_unsigned_sid("node", id, "tag value", val_sid);
+                return Err(self.refuse_raw_index(e));
+            }
+        }
+        self.block_type = Some(BlockType::DenseNodes);
+        self.push_raw_plain_node(id, decimicro_lat, decimicro_lon, raw_tags, None);
+        Ok(())
+    }
+
+    /// Append a plain `Node` of checked raw `tags` to the pending plain
+    /// group, with an `Info` of `meta`'s present fields, or none for `None`.
+    fn push_raw_plain_node(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        tags: Vec<(u32, u32)>,
+        meta: Option<&RawPartialMetadata>,
+    ) {
         // Seal first: sealing a run with metadata encodes its DenseInfo
         // through `packed_scratch`, which would overwrite the staged keys.
         self.seal_dense_run();
@@ -2025,8 +2094,10 @@ impl BlockBuilder {
             encode_bytes_field(&mut self.elem_scratch, 2, &self.packed_scratch);
             encode_bytes_field(&mut self.elem_scratch, 3, &self.packed_vals_scratch);
         }
-        super::encode::encode_raw_partial_info(&mut self.info_scratch, meta);
-        encode_bytes_field(&mut self.elem_scratch, 4, &self.info_scratch);
+        if let Some(meta) = meta {
+            super::encode::encode_raw_partial_info(&mut self.info_scratch, meta);
+            encode_bytes_field(&mut self.elem_scratch, 4, &self.info_scratch);
+        }
         for (field, value) in [(8, decimicro_lat), (9, decimicro_lon)] {
             protohoggr::encode_tag(&mut self.elem_scratch, field, protohoggr::WIRE_VARINT);
             protohoggr::encode_varint(
@@ -2038,7 +2109,6 @@ impl BlockBuilder {
         self.track_coords(decimicro_lat, decimicro_lon);
         self.track_id(id);
         self.count += 1;
-        Ok(())
     }
 
     /// Add a raw node with checked tags, none with key index zero, to the

@@ -116,30 +116,27 @@ removes it and emits no replacement `@user`. This contradicts ADR-0010's
 emitted-name rule. If reserving the whole namespace is intended, the
 documented rule should say so.
 
-## CMD-049 - apply-changes still refuses a few elements that fit a block
+## CMD-085 - No test drives the plain retry of a lone surviving base node
 
-Reported by: the derive OSC domain item (2026-11-19); narrowed 2026-11-19
-after overflow recovery landed (an overflowing output block is re-cut,
-`apply_changes/overflow.rs` and `stream_output.rs::settle`), and again
-2026-11-24 after the replay's blocks began carrying only the strings their
-survivors use, with the whole-table replay as fallback; and 2026-11-25
-after the replay budget was removed (deferred blobs are planned, then
-written again with each frame streamed to the drain).
+Reported by: the apply-changes lone-node plain retry (2026-11-25); read
+from source, not run.
 
-What recovery does not cure, a loud refusal before publication, only for
-blocks within bytes of 32 MiB. Halving is not an exhaustive search: a
-block's size depends on its neighbours (a string an earlier element
-interned lands at a narrower index, compact seeds are in source-slot
-order, dense deltas and the compressed body change), so a fitting
-partition can exist that halving misses, in either direction. And a lone
-node goes dense where plain would be about two bytes smaller (counted from
-the wire layout, not measured): `add_node_partial` for metadata-less OSC
-nodes on the worker replay, the drain's create runs (`stream_output.rs`
-`settle`, `-j 1` included) and rebuilt base nodes (`add_node_raw_partial`).
-Fix shape, from the spar: a cold fallback over a rejected span only, either
-reachability over cut positions (fitting contiguous spans as edges, no
-monotonicity assumed) or a singleton retry in plain form through an explicit
-builder route, judged by the real framing check, on both recovery paths.
+The overflow plan retries a lone bare node plain
+(`overflow.rs` `Planner::lone`), and for a surviving base node that goes
+through `write_base_node_bare_plain_local` and
+`BlockBuilder::add_node_raw_bare_plain` (subset translation, index checks,
+key index zero kept). The two tests in `apply_changes_overflow.rs` drive
+only OSC nodes (a create on the drain, a modify on the worker). The case
+the retry exists for, a plain-source metadata-less node alone in a block
+within bytes of the limit, needs a base file whose node is a plain `Node`
+without `Info`, which no public builder route writes (`add_node_partial`
+writes a bare node dense). Fix shape: a fixture writer that emits such a
+block (or a unit test of `add_node_raw_bare_plain` under identity and
+subset seeds checking the decoded node, tagdata with an empty key, bbox
+and ID range), plus the merge-level case with a diff touching another
+node of the blob. Also untested: that one overflow needing the
+whole-table plan leaves another overflow of the same blob its compact
+plan (`overflow.rs` `plan`).
 
 ## CMD-050 - Blob-local re-encoders still refuse a rebuilt block past the limit
 

@@ -43,7 +43,9 @@ use crate::tunables::APPLY_CHANGES_CREATE_BATCH_BLOCKS;
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 
 use super::Result;
-use super::element_writes::{add_osc_node, add_osc_relation, add_osc_way};
+use super::element_writes::{
+    add_osc_node, add_osc_node_bare_plain, add_osc_relation, add_osc_way, osc_node_is_bare,
+};
 use super::loc_mode::LocMode;
 use super::stats::MergeStats;
 use super::upsert_cursors::UpsertCursors;
@@ -289,6 +291,7 @@ fn encode_and_frame(
         )));
     }
     let added = run.len() as u64;
+    let lone = (run.len() == 1).then_some(run.start);
     for i in run {
         // Content already past the blob limit: this block cannot be framed,
         // so stop copying the run into it and let `write_run` cut it
@@ -322,7 +325,41 @@ fn encode_and_frame(
             ElementKind::Relation => add_osc_relation(bb, &diff.relation(i)),
         }
     }
-    let frame = bb.lend_encoded(|block| {
+    match frame_block(bb, compression, metrics)? {
+        Some(Err(overflow)) => {
+            // A lone node without metadata that overflowed dense is tried
+            // once more as a plain `Node` without `Info`: the same claims,
+            // a few bytes smaller (see `overflow.rs` for why a node with
+            // metadata is not retried). Its ordinary form's refusal stands
+            // if that overflows too.
+            if let Some(i) = lone
+                && kind == ElementKind::Node
+                && osc_node_is_bare(&diff.node(i))
+            {
+                add_osc_node_bare_plain(bb, &diff.node(i));
+                return match frame_block(bb, compression, metrics)? {
+                    Some(Ok(frame)) => Ok((Some(frame), added)),
+                    Some(Err(_)) => Err(overflow),
+                    None => Err(crate::error::Error::internal(
+                        "apply-changes: a plain retry of a create framed nothing",
+                    )),
+                };
+            }
+            Err(overflow)
+        }
+        Some(Ok(frame)) => Ok((Some(frame), added)),
+        None => Ok((None, added)),
+    }
+}
+
+/// Frame the block in `bb`: `Some(Err)` for one over the PBF blob limits,
+/// which leaves the builder empty, `None` for an empty builder.
+fn frame_block(
+    bb: &mut BlockBuilder,
+    compression: &Compression,
+    metrics: &crate::write::metrics::WriterMetrics,
+) -> Result<Option<Result<Vec<u8>>>> {
+    bb.lend_encoded(|block| {
         let indexdata = block.index.serialize();
         // No WayMembers, as `take_owned` gives none: the same frame the
         // writer's own framing job made of these blocks.
@@ -340,12 +377,7 @@ fn encode_and_frame(
             Err(error) if crate::commands::is_block_overflow(&error) => Ok(Err(error)),
             framed => framed.map(Ok),
         }
-    })?;
-    match frame {
-        Some(Err(overflow)) => Err(overflow),
-        Some(Ok(frame)) => Ok((Some(frame), added)),
-        None => Ok((None, added)),
-    }
+    })
 }
 
 /// Write every upsert of `kind` from the cursor on and advance the cursor

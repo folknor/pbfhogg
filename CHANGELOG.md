@@ -869,6 +869,15 @@
 
 ### Fixed
 
+- **`apply-changes` writes a lone metadata-less node plain when dense
+  would not fit a block.** A node without metadata that overflows the
+  32 MiB block limit alone in the dense form is retried as a plain node,
+  which claims the same and is a few bytes smaller; before, such a node
+  (including an untouched plain node from the input, rewritten dense)
+  failed the run (exit `2`). And one oversized output block that needs
+  the source string table no longer costs the other oversized blocks of
+  the same input blob their smaller re-cut.
+
 - **A bbox edge's exponent is never capped.** `extract` and `export` bbox
   edges saturated their exponent at 100000, so a mantissa padded with
   more digits than that (`1` with 100001 zeros, then `e-100001`, exactly

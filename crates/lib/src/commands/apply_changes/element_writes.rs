@@ -38,6 +38,35 @@ pub(super) fn add_osc_node(bb: &mut BlockBuilder, node: &crate::osc::CompactNode
     );
 }
 
+/// Whether an OSC node carries no metadata, so that it can be written as a
+/// plain `Node` without `Info` claiming exactly what its dense form does.
+pub(super) fn osc_node_is_bare(node: &crate::osc::CompactNodeRef<'_>) -> bool {
+    node.metadata()
+        .is_none_or(|m| m == crate::block_builder::PartialMetadata::default())
+}
+
+/// [`add_osc_node`] for a bare node (`osc_node_is_bare`), written plain:
+/// the overflow recovery's retry of a lone node that overflowed dense.
+///
+/// The retry is limited to nodes without metadata on purpose. A node with
+/// metadata goes dense with claims a plain `Info` reproduces only through a
+/// conversion over every metadata state (a versioned slot's implied
+/// visibility, the changeset sentinel, versionless padding columns), and
+/// plain is not always smaller then (a negative timestamp is ten bytes in
+/// `Info`, one in a dense delta). That trade, a new way to change a claim
+/// for a window of a few bytes below the blob limit, was refused.
+pub(super) fn add_osc_node_bare_plain(
+    bb: &mut BlockBuilder,
+    node: &crate::osc::CompactNodeRef<'_>,
+) {
+    bb.add_node_bare_plain(
+        node.id(),
+        node.decimicro_lat(),
+        node.decimicro_lon(),
+        node.tags(),
+    );
+}
+
 /// Add an OSC way to `bb`, with inline locations when `locs` is present.
 ///
 /// An id absent from `locs` gets `(0, 0)`. That is only reachable when the
@@ -221,6 +250,57 @@ pub(super) fn write_base_node_local<O: BlockSink + ?Sized>(
         node.raw_tags(),
         meta.as_ref(),
     )
+}
+
+/// Write a surviving base node with no metadata as a plain `Node` without
+/// `Info`, the overflow recovery's retry of a lone survivor that overflowed
+/// dense (a plain-source node the rewrite would otherwise make a few bytes
+/// larger than the block it came from). Only for a node
+/// [`base_node_is_bare`] accepts; see `add_osc_node_bare_plain` for why a
+/// node with metadata is not retried.
+pub(super) fn write_base_node_bare_plain_local<O: BlockSink + ?Sized>(
+    bb: &mut BlockBuilder,
+    output: &mut O,
+    element: &crate::Element<'_>,
+    block: &PrimitiveBlock,
+    seed: SourceSeed<'_>,
+) -> Result<()> {
+    if !base_node_is_bare(element)? {
+        return Err(crate::error::Error::internal(
+            "apply-changes: a plain retry was planned for an element that is not a bare node",
+        ));
+    }
+    ensure_node_capacity_local(bb, output)?;
+    ensure_seeded(bb, output, block, seed)?;
+    match element {
+        crate::Element::DenseNode(dn) => bb.add_node_raw_bare_plain(
+            dn.id(),
+            dn.decimicro_lat()?,
+            dn.decimicro_lon()?,
+            dn.raw_tags()
+                .map(|(k, v)| (k.cast_unsigned(), v.cast_unsigned())),
+        ),
+        crate::Element::Node(n) => {
+            bb.add_node_raw_bare_plain(n.id(), n.decimicro_lat()?, n.decimicro_lon()?, n.raw_tags())
+        }
+        crate::Element::Way(_) | crate::Element::Relation(_) => Err(crate::error::Error::internal(
+            "apply-changes: a plain retry was planned for a way or relation",
+        )),
+    }
+}
+
+/// Whether surviving base `element` is a node the rewrite writes with no
+/// metadata, so that a plain `Node` without `Info` claims what its dense
+/// form does.
+pub(super) fn base_node_is_bare(element: &crate::Element<'_>) -> Result<bool> {
+    Ok(match element {
+        crate::Element::DenseNode(dn) => dense_node_raw_metadata(dn)?.is_none(),
+        crate::Element::Node(n) => {
+            element_raw_partial_metadata(crate::ElementKind::Node, n.id(), &n.info())?
+                .is_none_or(|m| m == crate::block_builder::RawPartialMetadata::default())
+        }
+        crate::Element::Way(_) | crate::Element::Relation(_) => false,
+    })
 }
 
 /// What the raw writers of one source block's surviving base ways and

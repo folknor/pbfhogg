@@ -187,11 +187,12 @@ dropped queue releases a pipeline parked in its send.
 
 ### `time-filter` history path
 
-- **Surface:** plain (`for_each_pipelined`)
+- **Surface:** fused (`for_each_fused_blob`, with `HistoryBlobs`)
 - **Path:** `crates/lib/src/commands/time_filter/mod.rs`, history mode
 - **Scale:** history PBF scan; every element touched
-- **Per-block work:** medium - timestamp compare, `PendingGroup`
-  latest-version tracking, re-encode survivors through `BlockBuilder`
+- **Per-block work:** on the decode worker: version selection, encoding of
+  the objects the blob closes, two endings for the object it leaves open;
+  the ordered consumer only joins objects across blob seams and writes
 
 ### `read` bench, pipelined mode
 

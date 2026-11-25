@@ -1469,27 +1469,23 @@ orphan detection and per-kind shift and overflow for missing refs.
 
 Kind: strong hypothesis.
 
-## PERF-051 - History time-filter selects and rebuilds on one thread
+## PERF-051 - time-filter selects on full decode
 
 Reported by: pipeline, copy.
 
-Mechanism: `time_filter_history` decodes in parallel then groups, selects,
-clones and re-encodes on the calling thread; every version before the cutoff is
-cloned into `OwnedElement`, replacing the last candidate.
+Mechanism: both paths now select and encode on the decode workers, but each
+blob is still fully decoded (every element's tags, refs and members) before
+selection reads only identity, version, timestamp and visibility; the history
+path also walks the block a second time to encode winners, and a third for
+its last block's alternative ending when the blob's last object has a visible
+candidate.
 
-Redesign: workers validate local key and version order, reduce interior
-`(kind, id)` groups, encode their survivors, and return first and last group
-summaries (ordering, counts, last eligible candidate); an ordered stitcher
-reconciles boundary groups, including groups spanning many blobs, and places
-winners before the next partition's frames; selection reads identity, version,
-timestamp and visibility, full content only for winners. Snapshot time-filter
-already filters on workers; its gain is projection and encoded selection.
+Redesign: a projection that reads the selection fields only, then encodes
+winners from the projected positions (encoded selection, copying unchanged
+fields rather than rebuilding them; see PERF-007).
 
-Risks: groups across arbitrary blobs, strict version checks, missing
-timestamps, deletion accounting, malformed superseded versions still validated
-(user and role indices) without copying.
-
-Kind: high-conviction full rewrite.
+Kind: hypothesis; the history rewrite is read-bound on bygg's planet
+`history2` snapshot, so the payoff is in CPU, not wall, there.
 
 ## PERF-052 - getid with references scans whole kinds
 

@@ -3,10 +3,12 @@
 //!
 //! A block can pass the blob payload limit while every input blob it came
 //! from framed: renumber's id splice widens varints,
-//! add-locations-to-ways splices coordinates into every way, and a command
+//! add-locations-to-ways splices coordinates into every way, a command
 //! that packs records from many input blobs into one builder cut by count
-//! (the history `time-filter`, the `sort` / `cat --dedupe` overlap sweep)
-//! can gather more bytes than one blob holds. A block carrying a field-5
+//! (the `sort` / `cat --dedupe` overlap sweep) can gather more bytes than
+//! one blob holds, and the history `time-filter` re-encodes each input
+//! blob's survivors, plus the version of an object straddling its end,
+//! under a string table and metadata encoding of its own. A block carrying a field-5
 //! way-member bitmap is also cut to keep its BlobHeader under its cap (see
 //! [`fit_scanned`]). The block's own bytes are the
 //! record of what it holds, so nothing is retained to recover it: the cut

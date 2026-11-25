@@ -876,6 +876,29 @@ fn history_path_refuses_versions_out_of_order() {
     }
 }
 
+/// An object's versions are checked across a blob seam as within a blob,
+/// against the last record's version whether or not it was at or before
+/// the cutoff, and the refusal names the blob holding the version that
+/// fails to ascend (blob 0 is the header).
+#[test]
+fn history_path_refuses_versions_out_of_order_across_a_blob_seam() {
+    let dir = crate::common::test_scratch();
+    for (name, left) in [("eligible", 100), ("past the cutoff", 2000)] {
+        let input = dir.path().join(format!("history-seam-{left}.osm.pbf"));
+        write_node_blocks(
+            &input,
+            true,
+            true,
+            &[&[(5, 1, 100), (7, 2, left)], &[(7, 2, 3000)]],
+        );
+        let stderr = assert_time_filter_refuses(&input, "node 7 has version 2 after version 2");
+        assert!(
+            stderr.contains(", blob 2, at byte offset"),
+            "{name}: {stderr}"
+        );
+    }
+}
+
 /// The snapshot path filters each block on its own and carries the sorted
 /// claim into the output: a descent across blocks or inside one is refused
 /// as unsorted, and an object twice in a non-history file (both occurrences

@@ -606,6 +606,15 @@
 
 ### Changed
 
+- **History `time-filter` runs on every core.** A history input's versions
+  are now selected and encoded on the read's decode workers; only objects
+  whose versions straddle a blob boundary are joined in order. A planet-sized
+  history file fell from about 20 minutes to about 3. Output is the same
+  elements, but blocks now follow the input blobs (each input blob's
+  survivors in blocks of up to 8000) instead of being packed across them.
+  Only a surviving version's payload is read, so a bad user or role string
+  index on a superseded version is no longer refused. An order or version
+  refusal now names the blob it was found in.
 - **A bare `check` reads an indexed file once.** The ID and reference
   checks used to read every node and way blob each; they now share one
   header walk and one read per blob, each check still reporting, stopping

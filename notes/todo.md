@@ -301,12 +301,11 @@ are removed; git history keeps them. Detail stays in notes/.
   notes/time-filter-optimization.md, retired to git history). The
   2026-07-13 scope decision: history-file support is functional but
   outside the 1.0 planet-validation surface - weakest demand signal in
-  the roadmap, no history dataset configured, every bench to date
-  measured a near-no-op. Re-entry trigger: a real history consumer
-  appears; then a europe history variant in the brokkr host config, a bench of the
-  actual multi-version workload, and the parallel history path (workers
-  emit per-block winners plus head/tail partial groups, consumer
-  stitches across blob seams). Also gated: adaptive passthrough via a
+  the roadmap. The parallel history path (workers select and encode per
+  blob, an ordered stitcher joins objects across blob seams) has landed,
+  benched on bygg's `planet` snapshot `history2`, a two-version history
+  merged by osmium from two planet snapshots; a real multi-version history
+  file is still not configured anywhere. Also gated: adaptive passthrough via a
   ~20-line all-survive shadow counter (prior attempt measured 0.63 %
   all-survive on europe vs ~14 % break-even - only recent cutoffs
   qualify), and a blob-level timestamp-range index (format bump, only

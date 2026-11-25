@@ -333,14 +333,6 @@ impl OwnedMetadata {
         }
     }
 
-    /// Visibility, absent read as visible (the PBF default).
-    pub(crate) fn visible(&self) -> bool {
-        match self {
-            Self::Dense { visible, .. } => *visible,
-            Self::Plain { visible, .. } => visible.unwrap_or(true),
-        }
-    }
-
     /// The metadata as the builder takes it: `Ok` dense metadata with its
     /// columns for a dense node, `Err` partial metadata for a plain element.
     pub(crate) fn as_borrowed(
@@ -418,18 +410,6 @@ impl OwnedElement {
             Self::Way(w) => w.id,
             Self::Relation(r) => r.id,
         }
-    }
-
-    pub(crate) fn metadata(&self) -> Option<&OwnedMetadata> {
-        match self {
-            Self::Node(n) => n.metadata.as_ref(),
-            Self::Way(w) => w.metadata.as_ref(),
-            Self::Relation(r) => r.metadata.as_ref(),
-        }
-    }
-
-    pub(crate) fn visible(&self) -> bool {
-        self.metadata().is_none_or(OwnedMetadata::visible)
     }
 }
 

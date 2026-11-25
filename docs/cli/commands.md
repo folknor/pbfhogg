@@ -2189,11 +2189,16 @@ a way whose node moved after the cutoff would carry the later position,
 against the node version the snapshot keeps or a node it drops. Run
 `add-locations-to-ways` on the output to locate its ways as of the cutoff.
 
-A history input's surviving versions, gathered from many input blobs, are
-written in new blocks of up to 8000 elements. One that would be too large
-for a blob is cut as `sort` cuts an overlap block (see [sort](#sort)), with
-the same remaining refusals. A snapshot input is filtered blob by blob, and
-an output blob too large for the format is still refused (exit 2).
+A history input is filtered blob by blob: each input blob's surviving
+versions are written in new blocks of up to 8000 elements, an object whose
+versions straddle a blob boundary written with the blob that holds its
+surviving version. A block that would be too large for a blob is cut as
+`sort` cuts an overlap block (see [sort](#sort)), with the same remaining
+refusals. Only the surviving versions' payloads are read: a superseded
+version is judged by its ID, version, timestamp and visibility, so a bad
+user or role string index on it is not refused. A snapshot input is
+filtered blob by blob too, and an output blob too large for the format is
+still refused (exit 2).
 
 | Flag | Description |
 |------|-------------|

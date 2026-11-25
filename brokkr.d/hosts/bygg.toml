@@ -543,5 +543,16 @@ download_date = "2026-07-10"
 file = "planet-8k-reindexed.osm.pbf"
 xxhash = "8055a8ce2618e9762c4798c8e26e7278"
 
+[bygg.datasets.planet.snapshot.history2]
+download_date = "2026-11-25"
+# A two-version history file for time-filter's history path: `osmium merge`
+# of pbf.raw and snapshot 20260411's pbf.raw (objects equal in both kept
+# once), written as .osh.pbf with --output-header=sorting=Type_then_ID, so
+# it declares HistoricalInformation and Sort.Type_then_ID. No indexdata.
+
+[bygg.datasets.planet.snapshot.history2.pbf.raw]
+file = "planet-history-2snap.osh.pbf"
+xxhash = "2ddabda24ca9bbc244d8dadb78763154"
+
 [bygg.datasets.planet.expect.diff-snapshots]
 "7facb6386ff18bba38b176ee720fec62+e7f431ab422a0ccdb75d270528ac3e2e" = "differs"

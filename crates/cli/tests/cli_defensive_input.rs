@@ -598,10 +598,108 @@ fn assert_refused(out: &crate::invoker::CliOutput, needle: &str, context: &str) 
     );
 }
 
+/// A history file whose version 1 of node 1 and of relation 1 (one block
+/// each) carries the bad reference `bad` picks, and whose version 2 of each
+/// (next block, timestamp 200) is sound.
+fn write_superseded_bad_string_pbf(path: &Path, bad: BadString) {
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(path).expect("create input"),
+        Compression::default(),
+    );
+    let header = HeaderBuilder::new().sorted().historical();
+    writer
+        .write_header(&header.build().expect("header"))
+        .expect("write header");
+    let info_at = |version: u64, timestamp: u64, user_sid: u64| {
+        let mut info = Vec::new();
+        for (field, value) in [(1, version), (2, timestamp), (3, 1), (4, 1), (5, user_sid)] {
+            varint_field(field, value, &mut info);
+        }
+        info
+    };
+    let block_of = |field: u64, element: &[u8]| {
+        let mut group = Vec::new();
+        bytes_field(field, element, &mut group);
+        let mut block = Vec::new();
+        bytes_field(1, &[10, 0], &mut block); // string table: just ""
+        bytes_field(2, &group, &mut block);
+        block
+    };
+    for (version, timestamp, sound) in [(1, 100, false), (2, 200, true)] {
+        let user_sid = if !sound && matches!(bad, BadString::User) {
+            9
+        } else {
+            0
+        };
+        let mut node = Vec::new();
+        varint_field(1, 2, &mut node); // id 1, zigzag
+        bytes_field(4, &info_at(version, timestamp, user_sid), &mut node);
+        varint_field(8, u64::try_from(LAT).expect("lat") * 2, &mut node);
+        varint_field(9, u64::try_from(LON).expect("lon") * 2, &mut node);
+        writer
+            .write_primitive_block(&block_of(1, &node))
+            .expect("node block");
+    }
+    for (version, timestamp, sound) in [(1, 100, false), (2, 200, true)] {
+        let role_sid: u8 = if !sound && matches!(bad, BadString::Role) {
+            9
+        } else {
+            0
+        };
+        let mut relation = Vec::new();
+        varint_field(1, 1, &mut relation); // id 1
+        bytes_field(4, &info_at(version, timestamp, 0), &mut relation);
+        bytes_field(8, &[role_sid], &mut relation); // roles_sid
+        bytes_field(9, &[2], &mut relation); // memids: node 1, zigzag delta
+        bytes_field(10, &[0], &mut relation); // types: node
+        writer
+            .write_primitive_block(&block_of(4, &relation))
+            .expect("relation block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// The history time-filter reads a superseded version's identity, version,
+/// timestamp and visibility only: a bad user or role string index on a
+/// version a later blob supersedes never reaches the output and is not
+/// refused, while the same index on the version that survives is (see
+/// `bad_user_and_role_string_indices_are_refused_on_reencode`).
+#[test]
+fn history_time_filter_does_not_resolve_superseded_strings() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    for (i, bad) in [BadString::User, BadString::Role].into_iter().enumerate() {
+        let input = dir
+            .path()
+            .join(format!("superseded-bad-string-{i}.osm.pbf"));
+        write_superseded_bad_string_pbf(&input, bad);
+        let output = dir.path().join(format!("superseded-{i}.osm.pbf"));
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("time-filter")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("250")
+            .run();
+        assert!(
+            out.status.success(),
+            "superseded bad string must not refuse; stderr:\n{}",
+            out.stderr_str()
+        );
+        assert!(
+            out.stderr_str().contains("2 elements written"),
+            "stderr:\n{}",
+            out.stderr_str()
+        );
+    }
+}
+
 /// The re-encoding conversions refuse a user or role string index past the
 /// block's string table instead of writing an empty user or role: on the
-/// borrowed path (time-filter snapshot, cat --clean), the owned path
-/// (time-filter history) and even when the user is being cleaned away.
+/// borrowed path (time-filter snapshot, cat --clean), the history path
+/// (where the version is the object's survivor, encoded on a worker and
+/// refused at its own blob once a later blob shows it survives) and even
+/// when the user is being cleaned away.
 #[test]
 fn bad_user_and_role_string_indices_are_refused_on_reencode() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -627,6 +725,16 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
                 needle,
                 &format!("time-filter historical={historical}"),
             );
+            if historical {
+                // Node 1 is in blob 1, relation 1 in blob 2 (0 is the header).
+                let blob = if matches!(bad, BadString::User) { 1 } else { 2 };
+                let at = format!(", blob {blob}, at byte offset");
+                assert!(
+                    out.stderr_str().contains(&at),
+                    "the refusal names the survivor's blob; stderr:\n{}",
+                    out.stderr_str()
+                );
+            }
         }
         let input = dir.path().join("bad-string.osm.pbf");
         write_bad_string_pbf(&input, bad, false);

@@ -5,10 +5,10 @@
 //!
 //! Two paths, picked from the header's `HistoricalInformation` required
 //! feature flag:
-//! - **History input**: sequential pending-group state machine on a
-//!   parallel-decode reader. Version selection needs cross-element peek,
-//!   and within-group versions can straddle blob boundaries, which rules
-//!   out trivial per-block parallelism.
+//! - **History input**: decode workers select and encode each blob's
+//!   versions, deciding every object the blob closes; an ordered stitcher
+//!   joins the objects whose versions straddle blob boundaries, without
+//!   touching an element. Output blocks are per input blob.
 //! - **Snapshot input**: parallel per-block filter. Each (kind, id) appears
 //!   in exactly one block, so blocks are independent.
 //!
@@ -33,12 +33,9 @@ use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_sorted, writer_from_header,
 };
-use crate::block_builder::{BlockBuilder, MemberData};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::commands::split::Limits;
-use crate::owned::{
-    OwnedElement, add_owned_node, add_owned_relation, add_owned_way, dense_node_metadata,
-    element_metadata, read_dense_node, read_node, read_relation, read_way,
-};
+use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::scan::classify::{build_classify_schedule, parallel_classify_phase_ordered};
 use crate::write::WriteOptions;
@@ -46,6 +43,7 @@ use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
 
 /// Statistics from a `time-filter` snapshot operation.
+#[derive(Default)]
 pub struct TimeFilterStats {
     pub versions_seen: u64,
     pub versions_before_cutoff: u64,
@@ -68,15 +66,6 @@ impl TimeFilterStats {
 
         Ok(())
     }
-}
-
-struct PendingGroup {
-    kind: ElementKind,
-    id: i64,
-    /// The version of the group's latest record, which the next record of
-    /// the same object must exceed.
-    last_version: Option<i32>,
-    latest: Option<OwnedElement>,
 }
 
 /// Filter history PBF to a snapshot at `cutoff_timestamp` (UNIX seconds).
@@ -216,8 +205,558 @@ pub(crate) fn time_filter_to(
 }
 
 // ---------------------------------------------------------------------------
-// History path: pending-group state machine on a parallel-decode reader.
+// History path: per-blob selection on the decode workers, ordered stitch.
 // ---------------------------------------------------------------------------
+//
+// One object's versions are contiguous under the sorted claim, so within a
+// blob every group but the last is closed by the next one, and every group
+// but the first opened in this blob. A decode worker therefore decides and
+// encodes every interior group itself, and the first group too when it has
+// a version at or before the cutoff in this blob: the group ends here, so
+// that version supersedes anything an earlier blob held. What it cannot
+// decide is the last group, which a later blob may continue, and a first
+// group with no eligible version here, whose winner (if any) an earlier blob
+// holds. The ordered stitcher on the calling thread joins those across blob
+// seams, a group spanning any number of blobs included, and touches no
+// element: it compares keys and versions, counts, and picks which of two
+// pre-encoded endings of the held blob to write.
+//
+// Selection reads identity, version, timestamp and visibility only; a
+// version's payload is encoded only when it is the object's winner (or, for
+// the last group, its blob's candidate). A superseded version's user and
+// role string indices are therefore not resolved, so a bad index there is no
+// longer refused: those fields never reach the output, and the dense
+// metadata deltas are still accumulated by the iterator, so no later
+// record's value depends on the skipped lookup. Speed on normal input
+// outranks refusing a malformed record the answer does not contain.
+
+/// Where a blob sits in the input, for locating a refusal the stitcher
+/// raises about it.
+type BlobAt = (Option<u64>, Option<crate::ByteOffset>);
+
+/// A blob's first or last record: its object's place in the sorted order and
+/// that record's version.
+#[derive(Clone, Copy)]
+struct Edge {
+    key: OrderKey,
+    version: Option<i32>,
+}
+
+/// The edges of a blob holding at least one element.
+struct Edges {
+    first: Edge,
+    last: Edge,
+    /// The blob holds one object only: its first group is its last.
+    single: bool,
+    /// The first group (when it is not the last) had a version at or before
+    /// the cutoff in this blob, so the worker decided and counted it.
+    head_decided: bool,
+}
+
+/// The last group's candidate in its blob: its last version at or before
+/// the cutoff.
+enum Tail {
+    None,
+    Deleted,
+    /// Visible: the blob's ending with the candidate appended, carried as a
+    /// result because a later blob may supersede it, and then its encoding
+    /// is not this run's concern.
+    Visible(crate::Result<Vec<OwnedBlock>>),
+}
+
+/// One input blob's share of the history snapshot.
+struct HistorySlice {
+    at: BlobAt,
+    /// Records seen and at or before the cutoff, plus the outcomes of the
+    /// groups the worker decided.
+    stats: TimeFilterStats,
+    /// `None` for a blob holding no element.
+    edges: Option<Edges>,
+    /// Blocks closed before the blob's last open block: unconditional.
+    done: Vec<OwnedBlock>,
+    /// The last open block without the tail candidate.
+    open: Vec<OwnedBlock>,
+    tail: Tail,
+}
+
+/// The decode-worker side of the history path.
+struct HistoryBlobs<'l> {
+    cutoff: i64,
+    limits: &'l Limits,
+}
+
+impl crate::read::pipeline::DecodeTransform for HistoryBlobs<'_> {
+    type Out = HistorySlice;
+    const PARSE_INDEXDATA: bool = false;
+
+    fn apply(
+        &self,
+        blob: &crate::blob::Blob,
+        decode: crate::read::pipeline::Decoder<'_>,
+    ) -> Option<crate::Result<HistorySlice>> {
+        if blob.get_type() != crate::blob::BlobType::OsmData {
+            return None;
+        }
+        let at = (blob.blob_index(), blob.offset());
+        Some(
+            decode
+                .block()
+                .and_then(|block| select_blob(&block, self.cutoff, self.limits, at)),
+        )
+    }
+}
+
+/// Blocks fitted to the blob limits as the builder closes them
+/// (`commands/split.rs`): a block over the payload limit is cut on its own
+/// bytes, and one the cut finds no plan for goes on whole for the writer to
+/// refuse.
+struct Fitted<'l> {
+    blocks: Vec<OwnedBlock>,
+    limits: &'l Limits,
+}
+
+impl crate::commands::BlockSink for Fitted<'_> {
+    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
+        if let Some(block) = bb.take_owned()? {
+            let blocks = &mut self.blocks;
+            crate::commands::split::fit_scanned(block, self.limits, |piece, _| {
+                blocks.push(piece);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Encode the elements of `block` at `positions` (ascending) into `bb`,
+/// flushing into `output`. Returns the index into `positions` of the first
+/// element of the block left open in `bb`.
+fn encode_positions(
+    block: &PrimitiveBlock,
+    positions: impl Iterator<Item = usize>,
+    bb: &mut BlockBuilder,
+    output: &mut Fitted<'_>,
+) -> Result<usize> {
+    let mut positions = positions.enumerate().peekable();
+    let mut open_from = 0;
+    let mut bufs = EncodeBufs::default();
+    for (pos, element) in block.elements().enumerate() {
+        let Some(&(nth, wanted)) = positions.peek() else {
+            break;
+        };
+        if pos != wanted {
+            continue;
+        }
+        positions.next();
+        if bb.is_empty() || !can_take(bb, &element) {
+            open_from = nth;
+        }
+        encode_kept(&element, bb, output, &mut bufs)?;
+    }
+    Ok(open_from)
+}
+
+/// Whether `bb` can take `element` without closing its block.
+fn can_take(bb: &BlockBuilder, element: &Element<'_>) -> bool {
+    match element {
+        Element::DenseNode(_) | Element::Node(_) => bb.can_add_node(),
+        Element::Way(_) => bb.can_add_way(),
+        Element::Relation(_) => bb.can_add_relation(),
+    }
+}
+
+fn element_visible(element: &Element<'_>) -> bool {
+    match element {
+        Element::DenseNode(dn) => dense_visible(dn),
+        Element::Node(n) => node_visible(n),
+        Element::Way(w) => way_visible(w),
+        Element::Relation(r) => relation_visible(r),
+    }
+}
+
+/// One group's state during a blob's selection pass.
+struct Group {
+    key: OrderKey,
+    last_version: Option<i32>,
+    /// Position and visibility of its last version at or before the cutoff.
+    winner: Option<(usize, bool)>,
+}
+
+/// One blob's selection pass: what it decided, and its edges.
+struct Selection {
+    stats: TimeFilterStats,
+    /// Positions of the decided visible winners, ascending.
+    winners: Vec<usize>,
+    first: Option<Edge>,
+    /// The blob's last group, still open.
+    last: Option<Group>,
+    head_decided: bool,
+    /// Whether any group closed in the blob (it holds more than one object).
+    closed_any: bool,
+}
+
+/// Select one blob's versions and encode what it decides; see the section
+/// comment above.
+#[hotpath::measure]
+fn select_blob(
+    block: &PrimitiveBlock,
+    cutoff: i64,
+    limits: &Limits,
+    at: BlobAt,
+) -> crate::Result<HistorySlice> {
+    let Selection {
+        stats,
+        winners,
+        first,
+        last,
+        head_decided,
+        closed_any,
+    } = select(block, cutoff)?;
+    let (Some(first), Some(last)) = (first, last) else {
+        return Ok(HistorySlice {
+            at,
+            stats,
+            edges: None,
+            done: Vec::new(),
+            open: Vec::new(),
+            tail: Tail::None,
+        });
+    };
+
+    let mut bb = BlockBuilder::new();
+    let mut done = Fitted {
+        blocks: Vec::new(),
+        limits,
+    };
+    let open_from = encode_positions(block, winners.iter().copied(), &mut bb, &mut done)?;
+    let mut open = Fitted {
+        blocks: Vec::new(),
+        limits,
+    };
+    flush_local(&mut bb, &mut open)?;
+
+    let tail = match last.winner {
+        None => Tail::None,
+        Some((_, false)) => Tail::Deleted,
+        Some((pos, true)) => {
+            // The open block's survivors again, then the candidate, with the
+            // usual kind and count checks: the alternative ending.
+            let reopened = winners[open_from..]
+                .iter()
+                .copied()
+                .chain(std::iter::once(pos));
+            let mut alt = Fitted {
+                blocks: Vec::new(),
+                limits,
+            };
+            let ending = encode_positions(block, reopened, &mut bb, &mut alt)
+                .and_then(|_| flush_local(&mut bb, &mut alt))
+                .map(|()| alt.blocks);
+            Tail::Visible(ending)
+        }
+    };
+
+    Ok(HistorySlice {
+        at,
+        stats,
+        edges: Some(Edges {
+            first,
+            last: Edge {
+                key: last.key,
+                version: last.last_version,
+            },
+            single: !closed_any,
+            head_decided,
+        }),
+        done: done.blocks,
+        open: open.blocks,
+        tail,
+    })
+}
+
+/// The selection pass over one blob: identity, version, timestamp and
+/// visibility only.
+fn select(block: &PrimitiveBlock, cutoff: i64) -> crate::Result<Selection> {
+    let mut stats = TimeFilterStats::default();
+    let mut winners: Vec<usize> = Vec::new();
+    let mut first: Option<Edge> = None;
+    let mut head_decided = false;
+    let mut closed_any = false;
+    let mut group: Option<Group> = None;
+
+    // Decide a closed group: written, deleted or without an eligible
+    // version. The first group with no eligible version is the stitcher's.
+    let mut close = |g: &Group, is_first: bool, stats: &mut TimeFilterStats| match g.winner {
+        Some((pos, true)) => {
+            winners.push(pos);
+            stats.elements_written += 1;
+            true
+        }
+        Some((_, false)) => {
+            stats.dropped_deleted += 1;
+            true
+        }
+        None => {
+            if !is_first {
+                stats.dropped_no_snapshot_version += 1;
+            }
+            false
+        }
+    };
+
+    for (pos, element) in block.elements().enumerate() {
+        let (kind, id, timestamp, version) = element_identity_and_timestamp(&element)?;
+        stats.versions_seen += 1;
+        let key = order_key(kind, id);
+        // The grouping believes the sorted header: an object whose versions
+        // are not contiguous, or come back after its group closed, would be
+        // written twice, and within a group the versions must ascend for the
+        // last one at or before the cutoff to be the right one.
+        let continues = match group.as_mut() {
+            None => false,
+            Some(g) => match key.cmp(&g.key) {
+                std::cmp::Ordering::Less => return Err(order_violation(kind, id, g.key)),
+                std::cmp::Ordering::Equal => {
+                    match (g.last_version, version) {
+                        (Some(previous), Some(next)) if next > previous => {}
+                        (previous, next) => {
+                            return Err(version_violation(kind, id, previous, next));
+                        }
+                    }
+                    g.last_version = version;
+                    true
+                }
+                std::cmp::Ordering::Greater => false,
+            },
+        };
+        if !continues {
+            if let Some(g) = group.take() {
+                let decided = close(&g, !closed_any, &mut stats);
+                if !closed_any {
+                    head_decided = decided;
+                }
+                closed_any = true;
+            }
+            if first.is_none() {
+                first = Some(Edge { key, version });
+            }
+            group = Some(Group {
+                key,
+                last_version: version,
+                winner: None,
+            });
+        }
+        if timestamp <= cutoff {
+            stats.versions_before_cutoff += 1;
+            if let Some(g) = group.as_mut() {
+                g.winner = Some((pos, element_visible(&element)));
+            }
+        }
+    }
+
+    Ok(Selection {
+        stats,
+        winners,
+        first,
+        last: group,
+        head_decided,
+        closed_any,
+    })
+}
+
+/// Locate a refusal the stitcher raises about the blob at `at`.
+#[cold]
+fn locate_at(
+    e: crate::Error,
+    source: &std::sync::Arc<std::path::Path>,
+    at: BlobAt,
+) -> crate::Error {
+    e.locate_blob(crate::error::Location::new(Some(source), at.0, at.1))
+}
+
+/// The open group at a blob seam.
+struct Pending {
+    key: OrderKey,
+    /// Its last record's version, which the next record must exceed.
+    last_version: Option<i32>,
+    /// Its last version at or before the cutoff so far. A visible one is
+    /// the alternative ending of the held blob.
+    candidate: Candidate,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Candidate {
+    None,
+    Deleted,
+    Visible,
+}
+
+/// The ending of the latest blob with output, not yet written because the
+/// open group decides which of its two forms is right.
+struct Held {
+    at: BlobAt,
+    open: Vec<OwnedBlock>,
+    alt: Option<crate::Result<Vec<OwnedBlock>>>,
+}
+
+/// The ordered consumer of the history path.
+struct Stitch<'w> {
+    writer: &'w mut PbfWriter<crate::file_writer::FileWriter>,
+    source: std::sync::Arc<std::path::Path>,
+    stats: TimeFilterStats,
+    pending: Option<Pending>,
+    held: Option<Held>,
+}
+
+impl Stitch<'_> {
+    fn write(&mut self, blocks: Vec<OwnedBlock>) -> Result<()> {
+        for block in blocks {
+            self.writer.write_primitive_block_owned(block)?;
+        }
+        Ok(())
+    }
+
+    /// Write the held ending, with the candidate when `with_candidate`.
+    fn release(&mut self, with_candidate: bool) -> Result<()> {
+        let held = self.held.take();
+        let blocks = match (held, with_candidate) {
+            (None, false) => return Ok(()),
+            (Some(held), false) => held.open,
+            (
+                Some(Held {
+                    at,
+                    alt: Some(ending),
+                    ..
+                }),
+                true,
+            ) => ending.map_err(|e| locate_at(e, &self.source, at))?,
+            (_, true) => {
+                return Err(crate::Error::internal(
+                    "time-filter: a visible candidate without its blob's ending",
+                ));
+            }
+        };
+        self.write(blocks)
+    }
+
+    /// The open group has ended: count it once and write the held ending.
+    fn resolve(&mut self) -> Result<()> {
+        let Some(pending) = self.pending.take() else {
+            return self.release(false);
+        };
+        match pending.candidate {
+            Candidate::Visible => self.stats.elements_written += 1,
+            Candidate::Deleted => self.stats.dropped_deleted += 1,
+            Candidate::None => self.stats.dropped_no_snapshot_version += 1,
+        }
+        self.release(pending.candidate == Candidate::Visible)
+    }
+
+    fn absorb(&mut self, slice: HistorySlice) -> Result<()> {
+        let HistorySlice {
+            at,
+            stats,
+            edges,
+            done,
+            open,
+            tail,
+        } = slice;
+        self.stats.versions_seen += stats.versions_seen;
+        self.stats.versions_before_cutoff += stats.versions_before_cutoff;
+        self.stats.elements_written += stats.elements_written;
+        self.stats.dropped_deleted += stats.dropped_deleted;
+        self.stats.dropped_no_snapshot_version += stats.dropped_no_snapshot_version;
+        let Some(edges) = edges else {
+            return Ok(());
+        };
+        let candidate = match &tail {
+            Tail::None => Candidate::None,
+            Tail::Deleted => Candidate::Deleted,
+            Tail::Visible(_) => Candidate::Visible,
+        };
+        let alt = match tail {
+            Tail::Visible(ending) => Some(ending),
+            Tail::None | Tail::Deleted => None,
+        };
+
+        let joins = match self.pending.as_mut() {
+            None => false,
+            Some(p) => {
+                let (kind, id) = key_identity(edges.first.key);
+                match edges.first.key.cmp(&p.key) {
+                    std::cmp::Ordering::Less => {
+                        return Err(locate_at(
+                            order_violation(kind, id, p.key),
+                            &self.source,
+                            at,
+                        ));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        match (p.last_version, edges.first.version) {
+                            (Some(previous), Some(next)) if next > previous => {}
+                            (previous, next) => {
+                                return Err(locate_at(
+                                    version_violation(kind, id, previous, next),
+                                    &self.source,
+                                    at,
+                                ));
+                            }
+                        }
+                        true
+                    }
+                    std::cmp::Ordering::Greater => false,
+                }
+            }
+        };
+
+        if joins && edges.single {
+            // The whole blob continues the open group, which stays open: it
+            // holds nothing decided, and a candidate here supersedes the
+            // held one.
+            if let Some(p) = self.pending.as_mut() {
+                p.last_version = edges.last.version;
+                if candidate != Candidate::None {
+                    p.candidate = candidate;
+                }
+            }
+            if candidate != Candidate::None {
+                self.release(false)?;
+                if let Some(ending) = alt {
+                    self.held = Some(Held {
+                        at,
+                        open,
+                        alt: Some(ending),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        if joins && edges.head_decided {
+            // The worker decided and counted the joined group from its own
+            // later version: the held candidate is superseded.
+            self.pending = None;
+            self.release(false)?;
+        } else {
+            // The group open at the seam ends before this blob's output (a
+            // joined first group with no eligible version here ends with
+            // what the earlier blobs held).
+            self.resolve()?;
+            if !joins && !edges.single && !edges.head_decided {
+                self.stats.dropped_no_snapshot_version += 1;
+            }
+        }
+
+        self.write(done)?;
+        self.pending = Some(Pending {
+            key: edges.last.key,
+            last_version: edges.last.version,
+            candidate,
+        });
+        self.held = Some(Held { at, open, alt });
+        Ok(())
+    }
+}
 
 #[hotpath::measure]
 fn time_filter_history(
@@ -227,118 +766,31 @@ fn time_filter_history(
     input: &std::path::Path,
     invocation: &crate::host::Recorder,
 ) -> Result<TimeFilterStats> {
-    // The pipelined element callback knows no blob, so an order refusal it
-    // raises is located with the input.
-    let at_input = |e: crate::Error| e.locate(crate::error::Location::in_file(input));
-    let mut bb = BlockBuilder::new();
     let limits = Limits::new(writer.compression());
-    let mut stats = TimeFilterStats {
-        versions_seen: 0,
-        versions_before_cutoff: 0,
-        elements_written: 0,
-        dropped_deleted: 0,
-        dropped_no_snapshot_version: 0,
+    let mut stitch = Stitch {
+        writer,
+        source: std::sync::Arc::from(input),
+        stats: TimeFilterStats::default(),
+        pending: None,
+        held: None,
     };
-    let mut pending: Option<PendingGroup> = None;
-    let mut flush_error: Result<()> = Ok(());
 
     invocation.marker("TIMEFILTER_HISTORY_START");
-    // Parallel decode via the 3-stage pipelined reader (IO -> rayon decode ->
-    // reorder). Element order across blocks is preserved by the reorder
-    // stage, which is load-bearing: the pending-group state machine below
-    // depends on sorted traversal to know when a group ends. Re-encode and
-    // group selection run sequentially on this thread.
-    //
-    // Hot-path timing lives in `#[cfg_attr(feature = "hotpath",
-    // hotpath::measure)]` on the inner helpers - run with `--hotpath` for a
-    // per-function breakdown. Release builds pay zero cost for that
-    // attribute. Don't re-add per-element Instant::now() here: Japan scale
-    // is 344 M elements and the time-source overhead alone doubled wall in
-    // an earlier iteration of this instrumentation.
-    reader.for_each_pipelined(|element| {
-        if flush_error.is_err() {
-            return;
-        }
-        let (kind, id, timestamp, version) = match element_identity_and_timestamp(&element) {
-            Ok(v) => v,
-            Err(e) => {
-                flush_error = Err(e);
-                return;
-            }
-        };
-        stats.versions_seen += 1;
-
-        // The grouping below believes the sorted header: an object whose
-        // versions are not contiguous, or come back after its group was
-        // flushed, would be written twice. One key compare against the
-        // pending group refuses it, and within a group the versions must
-        // ascend for the last one at or before the cutoff to be the right
-        // one.
-        let group_changed = match pending.as_mut() {
-            None => false,
-            Some(g) => match order_key(kind, id).cmp(&order_key(g.kind, g.id)) {
-                std::cmp::Ordering::Less => {
-                    flush_error = Err(at_input(order_violation(kind, id, order_key(g.kind, g.id))));
-                    return;
-                }
-                std::cmp::Ordering::Equal => {
-                    match (g.last_version, version) {
-                        (Some(previous), Some(next)) if next > previous => {}
-                        (previous, next) => {
-                            flush_error =
-                                Err(at_input(version_violation(kind, id, previous, next)));
-                            return;
-                        }
-                    }
-                    g.last_version = version;
-                    false
-                }
-                std::cmp::Ordering::Greater => true,
-            },
-        };
-        if group_changed
-            && let Some(group) = pending.take()
-            && let Err(e) = flush_group(group, &mut bb, writer, &limits, &mut stats)
-        {
-            flush_error = Err(e);
-            return;
-        }
-
-        if pending.is_none() {
-            pending = Some(PendingGroup {
-                kind,
-                id,
-                last_version: version,
-                latest: None,
-            });
-        }
-
-        // Unconditional overwrite on each matching version is correct
-        // under the OSM history-file convention: versions within a
-        // `(kind, id)` group arrive in ascending-version order (the
-        // same convention PBF history files ship with). The "latest
-        // element whose timestamp <= cutoff" is therefore the last one
-        // we see during the forward scan. A history file with versions
-        // out of order, repeated or absent within one object is refused
-        // above.
-        if timestamp <= cutoff_timestamp {
-            stats.versions_before_cutoff += 1;
-            if let Some(group) = pending.as_mut() {
-                match clone_owned_element(&element) {
-                    Ok(owned) => group.latest = Some(owned),
-                    Err(e) => flush_error = Err(e),
-                }
-            }
-        }
-    })?;
-    flush_error?;
-
-    if let Some(group) = pending.take() {
-        flush_group(group, &mut bb, writer, &limits, &mut stats)?;
-    }
-    write_block(&mut bb, writer, &limits)?;
+    // Element order across blobs is the reader's, which the stitcher's
+    // seam checks depend on. Don't add per-element `Instant::now()` timing
+    // to the selection: Japan scale is 344 M elements and the time-source
+    // overhead alone doubled wall in an earlier iteration of this
+    // instrumentation; run with `--hotpath` instead.
+    reader.for_each_fused_blob(
+        HistoryBlobs {
+            cutoff: cutoff_timestamp,
+            limits: &limits,
+        },
+        |slice| stitch.absorb(slice),
+    )?;
+    stitch.resolve()?;
     invocation.marker("TIMEFILTER_HISTORY_END");
-    Ok(stats)
+    Ok(stitch.stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +951,6 @@ fn snapshot_gate(
 }
 
 #[hotpath::measure]
-#[allow(clippy::too_many_lines)]
 fn filter_block_snapshot(
     block: &PrimitiveBlock,
     cutoff_timestamp: i64,
@@ -507,16 +958,8 @@ fn filter_block_snapshot(
     output: &mut impl crate::commands::BlockSink,
     bounds: &mut Option<(OrderKey, OrderKey)>,
 ) -> crate::Result<TimeFilterStats> {
-    let mut stats = TimeFilterStats {
-        versions_seen: 0,
-        versions_before_cutoff: 0,
-        elements_written: 0,
-        dropped_deleted: 0,
-        dropped_no_snapshot_version: 0,
-    };
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+    let mut stats = TimeFilterStats::default();
+    let mut bufs = EncodeBufs::default();
 
     for element in block.elements() {
         stats.versions_seen += 1;
@@ -541,105 +984,101 @@ fn filter_block_snapshot(
                 *last = key;
             }
         }
-        match &element {
-            Element::DenseNode(dn) => {
-                let Some(()) = snapshot_gate(
-                    dense_timestamp(dn),
-                    ("node", dn.id()),
-                    dense_visible(dn),
-                    cutoff_timestamp,
-                    &mut stats,
-                )?
-                else {
-                    continue;
-                };
-                ensure_node_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(dn.tags());
-                let meta = dense_node_metadata(dn)?;
-                bb.add_node_dense(
-                    dn.id(),
-                    dn.decimicro_lat()?,
-                    dn.decimicro_lon()?,
-                    tags_buf.iter().copied(),
-                    meta.as_ref(),
-                );
-                stats.elements_written += 1;
-            }
-            Element::Node(n) => {
-                let Some(()) = snapshot_gate(
-                    node_timestamp(n),
-                    ("node", n.id()),
-                    node_visible(n),
-                    cutoff_timestamp,
-                    &mut stats,
-                )?
-                else {
-                    continue;
-                };
-                ensure_node_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(n.tags());
-                let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                bb.add_node_partial(
-                    n.id(),
-                    n.decimicro_lat()?,
-                    n.decimicro_lon()?,
-                    tags_buf.iter().copied(),
-                    meta.as_ref(),
-                );
-                stats.elements_written += 1;
-            }
-            Element::Way(w) => {
-                let Some(()) = snapshot_gate(
-                    way_timestamp(w),
-                    ("way", w.id()),
-                    way_visible(w),
-                    cutoff_timestamp,
-                    &mut stats,
-                )?
-                else {
-                    continue;
-                };
-                ensure_way_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(w.tags());
-                refs_buf.clear();
-                refs_buf.extend(w.refs());
-                let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                // Refs only, never the inline coordinates: they are not as of
-                // the cutoff (see `time_filter_to`, where the header drops
-                // the declaration).
-                bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
-                stats.elements_written += 1;
-            }
-            Element::Relation(r) => {
-                let Some(()) = snapshot_gate(
-                    relation_timestamp(r),
-                    ("relation", r.id()),
-                    relation_visible(r),
-                    cutoff_timestamp,
-                    &mut stats,
-                )?
-                else {
-                    continue;
-                };
-                ensure_relation_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(r.tags());
-                r.members_into(&mut members_buf)?;
-                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                bb.add_relation_partial(
-                    r.id(),
-                    tags_buf.iter().copied(),
-                    &members_buf,
-                    meta.as_ref(),
-                );
-                stats.elements_written += 1;
-            }
-        }
+        let (ts, visible) = match &element {
+            Element::DenseNode(dn) => (dense_timestamp(dn), dense_visible(dn)),
+            Element::Node(n) => (node_timestamp(n), node_visible(n)),
+            Element::Way(w) => (way_timestamp(w), way_visible(w)),
+            Element::Relation(r) => (relation_timestamp(r), relation_visible(r)),
+        };
+        let Some(()) = snapshot_gate(
+            ts,
+            (kind.as_str(), id),
+            visible,
+            cutoff_timestamp,
+            &mut stats,
+        )?
+        else {
+            continue;
+        };
+        encode_kept(&element, bb, output, &mut bufs)?;
+        stats.elements_written += 1;
     }
     Ok(stats)
+}
+
+/// Reused scratch for [`encode_kept`], borrowing from one block.
+#[derive(Default)]
+struct EncodeBufs<'a> {
+    tags: Vec<(&'a str, &'a str)>,
+    refs: Vec<i64>,
+    members: Vec<MemberData<'a>>,
+}
+
+/// Encode a kept element from its borrowed form into `bb`, closing the
+/// builder's block into `output` first when it cannot take the element.
+/// Shared by both paths: a snapshot survivor and a history winner are
+/// written alike.
+#[inline]
+fn encode_kept<'a>(
+    element: &Element<'a>,
+    bb: &mut BlockBuilder,
+    output: &mut (impl crate::commands::BlockSink + ?Sized),
+    bufs: &mut EncodeBufs<'a>,
+) -> crate::Result<()> {
+    match element {
+        Element::DenseNode(dn) => {
+            ensure_node_capacity_local(bb, output)?;
+            bufs.tags.clear();
+            bufs.tags.extend(dn.tags());
+            let meta = dense_node_metadata(dn)?;
+            bb.add_node_dense(
+                dn.id(),
+                dn.decimicro_lat()?,
+                dn.decimicro_lon()?,
+                bufs.tags.iter().copied(),
+                meta.as_ref(),
+            );
+        }
+        Element::Node(n) => {
+            ensure_node_capacity_local(bb, output)?;
+            bufs.tags.clear();
+            bufs.tags.extend(n.tags());
+            let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
+            bb.add_node_partial(
+                n.id(),
+                n.decimicro_lat()?,
+                n.decimicro_lon()?,
+                bufs.tags.iter().copied(),
+                meta.as_ref(),
+            );
+        }
+        Element::Way(w) => {
+            ensure_way_capacity_local(bb, output)?;
+            bufs.tags.clear();
+            bufs.tags.extend(w.tags());
+            bufs.refs.clear();
+            bufs.refs.extend(w.refs());
+            let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
+            // Refs only, never the inline coordinates: they are not as of
+            // the cutoff (see `time_filter_to`, where the header drops the
+            // declaration).
+            bb.add_way_partial(w.id(), bufs.tags.iter().copied(), &bufs.refs, meta.as_ref());
+        }
+        Element::Relation(r) => {
+            ensure_relation_capacity_local(bb, output)?;
+            bufs.tags.clear();
+            bufs.tags.extend(r.tags());
+            r.members_into(&mut bufs.members)?;
+            let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
+            bb.add_relation_partial(
+                r.id(),
+                bufs.tags.iter().copied(),
+                &bufs.members,
+                meta.as_ref(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn dense_visible(dn: &DenseNode<'_>) -> bool {
@@ -657,78 +1096,6 @@ fn way_visible(w: &Way<'_>) -> bool {
 
 fn relation_visible(r: &Relation<'_>) -> bool {
     r.info().visible()
-}
-
-#[hotpath::measure]
-fn flush_group(
-    group: PendingGroup,
-    bb: &mut BlockBuilder,
-    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    limits: &Limits,
-    stats: &mut TimeFilterStats,
-) -> Result<()> {
-    match group.latest {
-        None => {
-            stats.dropped_no_snapshot_version += 1;
-        }
-        Some(owned) if !owned.visible() => {
-            stats.dropped_deleted += 1;
-        }
-        Some(owned) => {
-            write_owned_element(bb, writer, limits, owned)?;
-            stats.elements_written += 1;
-        }
-    }
-    Ok(())
-}
-
-#[hotpath::measure]
-fn write_owned_element(
-    bb: &mut BlockBuilder,
-    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    limits: &Limits,
-    elem: OwnedElement,
-) -> Result<()> {
-    match elem {
-        OwnedElement::Node(n) => {
-            if !bb.can_add_node() {
-                write_block(bb, writer, limits)?;
-            }
-            add_owned_node(bb, &n);
-        }
-        OwnedElement::Way(w) => {
-            if !bb.can_add_way() {
-                write_block(bb, writer, limits)?;
-            }
-            add_owned_way(bb, &w);
-        }
-        OwnedElement::Relation(r) => {
-            if !bb.can_add_relation() {
-                write_block(bb, writer, limits)?;
-            }
-            add_owned_relation(bb, &r);
-        }
-    }
-    Ok(())
-}
-
-/// Write the builder's block, if it holds one. The block gathers the
-/// survivors of many input blobs, cut by count, so it can pass the blob
-/// payload limit while every input blob framed; one that would is cut on
-/// its own bytes before it reaches the writer (`commands/split.rs`), whose
-/// framing runs later on its executor where an overflow could no longer
-/// be recovered.
-fn write_block(
-    bb: &mut BlockBuilder,
-    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    limits: &Limits,
-) -> Result<()> {
-    if let Some(block) = bb.take_owned()? {
-        crate::commands::split::fit_scanned(block, limits, |piece, _| {
-            writer.write_primitive_block_owned(piece)
-        })?;
-    }
-    Ok(())
 }
 
 /// One element's identity for the history path: kind, ID, timestamp (which
@@ -902,18 +1269,6 @@ fn require_timestamp(ts: Option<crate::Result<i64>>, kind: &str, id: i64) -> cra
     })
 }
 
-#[hotpath::measure]
-fn clone_owned_element(element: &Element<'_>) -> crate::Result<OwnedElement> {
-    Ok(match element {
-        Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)?),
-        Element::Node(n) => OwnedElement::Node(read_node(n)?),
-        // Without inline coordinates on purpose: they are not as of the
-        // cutoff (see `time_filter_to`).
-        Element::Way(w) => OwnedElement::Way(read_way(w)?),
-        Element::Relation(r) => OwnedElement::Relation(read_relation(r)?),
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -976,7 +1331,17 @@ mod tests {
     ];
 
     fn write_fixture(path: &Path, history: bool, claims: &[Claim]) {
-        let blobs = if history { HISTORY } else { SNAPSHOT };
+        write_blobs(
+            path,
+            history,
+            if history { HISTORY } else { SNAPSHOT },
+            claims,
+        );
+    }
+
+    /// `blobs` as one block each, the header declaring the input sorted (and
+    /// a history file when `history`).
+    fn write_blobs(path: &Path, history: bool, blobs: &[&[Version]], claims: &[Claim]) {
         assert_eq!(blobs.len(), claims.len());
         let file = std::fs::File::create(path).unwrap();
         let mut writer = PbfWriter::new(
@@ -1162,11 +1527,89 @@ mod tests {
         }
     }
 
-    /// History survivors gathered from blobs that each frame can make one
-    /// count-cut output block past the payload limit; it is cut into blocks
-    /// that fit, every survivor kept, in order, each block indexed.
+    /// An object whose versions span many blobs is decided once across the
+    /// seams, whichever blob holds its last version at or before the
+    /// cutoff: one opening it after a decided object, single-object blobs
+    /// that replace, delete or leave its candidate, and a closing blob
+    /// whose first record is past the cutoff, followed by another object.
+    /// It is written in its own place in the order, counted once.
     #[test]
-    fn a_history_block_past_the_payload_limit_is_cut() {
+    fn an_object_spanning_many_blobs_is_decided_once() {
+        use Claim::Honest as H;
+        let dir = crate::path_guard::tests::scratch();
+        let opening: &[Version] = &[('w', 5, 1, 100, true), ('w', 7, 1, 100, true)];
+        let replace: &[Version] = &[('w', 7, 2, 200, true)];
+        let delete: &[Version] = &[('w', 7, 3, 220, false)];
+        let restore: &[Version] = &[('w', 7, 4, 240, true)];
+        let later: &[Version] = &[('w', 7, 5, 245, true)];
+        let past: &[Version] = &[('w', 7, 6, 300, true)];
+        let closing: &[Version] = &[('w', 7, 7, 400, true), ('w', 8, 1, 100, true)];
+        /// Name, input blobs, expected output, expected stats.
+        type Case<'a> = (&'a str, &'a [&'a [Version]], &'a [Written], [u64; 5]);
+        let cases: &[Case<'_>] = &[
+            (
+                "replaced, deleted, restored",
+                &[opening, replace, delete, restore, past, closing],
+                &[('w', 5, 1), ('w', 7, 4), ('w', 8, 1)],
+                [8, 6, 3, 0, 0],
+            ),
+            (
+                "deleted last",
+                &[opening, replace, delete, past, closing],
+                &[('w', 5, 1), ('w', 8, 1)],
+                [7, 5, 2, 1, 0],
+            ),
+            (
+                "opening version kept",
+                &[opening, past, closing],
+                &[('w', 5, 1), ('w', 7, 1), ('w', 8, 1)],
+                [5, 3, 3, 0, 0],
+            ),
+            (
+                "superseded in the next blob",
+                &[opening, replace, later, closing],
+                &[('w', 5, 1), ('w', 7, 5), ('w', 8, 1)],
+                [6, 5, 3, 0, 0],
+            ),
+            (
+                "decided by the closing blob",
+                &[opening, &[('w', 7, 2, 200, true), ('w', 8, 1, 100, true)]],
+                &[('w', 5, 1), ('w', 7, 2), ('w', 8, 1)],
+                [4, 4, 3, 0, 0],
+            ),
+            (
+                "deleted by the closing blob",
+                &[opening, &[('w', 7, 2, 200, false), ('w', 8, 1, 100, true)]],
+                &[('w', 5, 1), ('w', 8, 1)],
+                [4, 4, 2, 1, 0],
+            ),
+            (
+                "no version at the cutoff",
+                &[
+                    &[('w', 5, 1, 100, true), ('w', 7, 1, 300, true)],
+                    past,
+                    closing,
+                ],
+                &[('w', 5, 1), ('w', 8, 1)],
+                [5, 2, 2, 0, 1],
+            ),
+        ];
+        for (i, &(name, blobs, expected, stats)) in cases.iter().enumerate() {
+            let input = dir.path().join(format!("seams-{i}.pbf"));
+            write_blobs(&input, true, blobs, &vec![H; blobs.len()]);
+            let got = run(&input).unwrap_or_else(|e| panic!("{name}: {}", e.report()));
+            assert_eq!(got.1, expected, "{name}");
+            assert_eq!(got.2, stats, "stats: {name}");
+        }
+    }
+
+    /// History survivors near the payload limit, one per input blob, each
+    /// the candidate of its blob's last object: every one is written, in
+    /// order, each output block fitted to the limit and indexed from its own
+    /// contents. (Output blocks are per input blob, so these never share a
+    /// block; the cut itself is the shared one `commands/split.rs` tests.)
+    #[test]
+    fn large_history_survivors_are_written_fitted_and_indexed() {
         const LARGE: usize = 13 << 20;
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("large.pbf");

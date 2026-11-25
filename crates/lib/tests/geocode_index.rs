@@ -326,9 +326,9 @@ fn write_synthetic_admin_with_hole_input(path: &Path) {
     );
 }
 
-/// A single admin polygon large enough to span many admin S2 cells, so the
-/// builder's pass-3 centroid flood-fill flags genuinely-interior cells (their
-/// centers lie strictly inside the polygon). Used to pin that the interior
+/// A single admin polygon large enough to span many admin S2 cells. Pass 3
+/// seeds its flood fill from every non-edge neighbor of an edge cell whose
+/// center lies inside the polygon. This fixture checks that the interior
 /// flag decides containment only in its own cell: a query just outside the
 /// boundary must not be attributed to the polygon via an adjacent
 /// interior-flagged cell.

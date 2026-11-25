@@ -287,15 +287,3 @@ declared, and splice outputs (apply-changes, renumber) carry it
 undeclared, so the guide should tell a caller to check
 `HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.
 
-## DOC-059 - A geocode test comment describes the retired centroid flood-fill seed
-
-Reported by: the geocode building placement scout (2026-11-25), left
-unacted by its implementer.
-
-The doc comment on the synthetic admin fixture in
-`crates/lib/tests/geocode_index.rs` says "the builder's pass-3 centroid
-flood-fill flags genuinely-interior cells". The vertex-mean seed was
-replaced in 0b0ae3d5: `pass3.rs` `admin_cells_for_polygon` now seeds the
-fill from every inside neighbour of every edge cell, and its own comment
-says so. The test comment should describe the current seeding.
-

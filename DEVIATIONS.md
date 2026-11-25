@@ -961,7 +961,9 @@ descending) the two pick the same record. They differ where a later version
 carries an earlier timestamp: osmium can then write two records of one
 object (v1 at 100, v2 at 300, v3 at 200, cutoff 250 keeps v1 and v3), while
 pbfhogg writes one, v3. And pbfhogg refuses input osmium accepts:
-descending, repeated or absent versions. The refusal is deliberate - such a
+descending, repeated or absent versions between two records of one object
+(an object with a single record and no version is accepted and selected by
+its timestamp). The refusal is deliberate - such a
 file has no single version at the cutoff, and a snapshot carrying two
 records of one ID is not a snapshot.
 

@@ -500,7 +500,7 @@ subject is the merge itself, always merge.
 Summaries are neither read nor written under `--fresh-reference`, which
 also bypasses reference-run hits. The fixture tests choose per fixture:
 those whose fake osmium answers every decode from the operand's bytes
-(apply, change, dedupe, extract, getid, read, refs) run with the cache and
+(apply, change, dedupe, extract, geocode, getid, read, refs) run with the cache and
 summaries live, so they reach the summary-decided paths; the encoding
 fixture runs fresh because its fake decodes by file name and a fault side
 file, and the diff fixture because its cached reference runs (derive-changes

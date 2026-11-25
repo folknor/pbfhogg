@@ -29,6 +29,8 @@ mod dedupe_fixture;
 mod extract_fixture;
 #[path = "fake_pbf.rs"]
 pub(crate) mod fake_pbf;
+#[path = "geocode_fixture.rs"]
+mod geocode_fixture;
 #[path = "getid_fixture.rs"]
 mod getid_fixture;
 #[path = "../src/harness.rs"]
@@ -117,6 +119,13 @@ fn main() {
             .any(|a| a.to_string_lossy().contains("boundary-fixture"))
     {
         boundary_tool(&args);
+    } else if args[1..].iter().any(|a| {
+        Path::new(a)
+            .ancestors()
+            .any(|p| p.file_name().is_some_and(|n| n == "geocode-fixture"))
+    }) && role != "driver"
+    {
+        std::process::exit(geocode_fixture::tool(&args[1..]));
     } else if args[1..].iter().any(|a| {
         Path::new(a)
             .ancestors()
@@ -218,37 +227,24 @@ fn driver(role: &str, dir: &Path) {
         apply_fixture::driver(lifecycle, &exe, dir, fault);
         no_children();
         return;
-    } else if role == "encoding" {
-        encoding_fixture::driver(lifecycle, &exe, dir);
-        no_children();
-        return;
-    }
-    if role == "extract" {
-        extract_fixture::driver(lifecycle, &exe, dir);
-        no_children();
-        return;
     }
     if role == "change" {
         change_fixture::driver(lifecycle, &exe, dir);
         return;
     }
-    if role == "read" {
-        read_fixture::driver(lifecycle, &exe, dir);
-        no_children();
-        return;
-    }
-    if role == "dedupe" {
-        dedupe_fixture::driver(lifecycle, &exe, dir);
-        no_children();
-        return;
-    }
-    if role == "getid" {
-        getid_fixture::driver(lifecycle, &exe, dir);
-        no_children();
-        return;
-    }
-    if role == "refs" {
-        refs_fixture::driver(lifecycle, &exe, dir);
+    // The check fixtures: each owns its scratch root and ends childless.
+    type Fixture = fn(process::Lifecycle, &Path, &Path);
+    let fixtures: [(&str, Fixture); 7] = [
+        ("encoding", encoding_fixture::driver),
+        ("extract", extract_fixture::driver),
+        ("read", read_fixture::driver),
+        ("dedupe", dedupe_fixture::driver),
+        ("geocode", geocode_fixture::driver),
+        ("getid", getid_fixture::driver),
+        ("refs", refs_fixture::driver),
+    ];
+    if let Some((_, fixture)) = fixtures.iter().find(|(name, _)| *name == role) {
+        fixture(lifecycle, &exe, dir);
         no_children();
         return;
     }

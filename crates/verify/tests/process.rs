@@ -95,6 +95,17 @@ fn verifier_getid_removeid() {
 }
 
 #[test]
+fn verifier_geocode_check() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        tunables::TEST_HANG_BOUND,
+        tunables::TEST_REPORT_GRACE,
+        "geocode verifier behaviour",
+    );
+    let scratch = pbfhogg_test_scratch::scratch();
+    run_worker("geocode", scratch.path());
+}
+
+#[test]
 fn verifier_extract_checks() {
     let _bound = pbfhogg_test_scratch::HangBound::arm(
         tunables::TEST_HANG_BOUND,

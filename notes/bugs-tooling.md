@@ -147,17 +147,17 @@ precedence and surface as a content difference blamed on pbfhogg. Traced
 from source only; derive emits new's versions, so whether real derives
 reach it is unchecked.
 
-## TOOL-057 - No fixture test drives the geocode verify check
+## TOOL-059 - Five verify checks have no fixture driving their run
 
-Reported by: the spar accounting of the verifier reference-order change,
-from its scout's lateral (2026-11-25).
+Reported by: the geocode fixture spar (2026-11-25), confirmed by codex.
 
-Every other verify check has a fake-osmium fixture test under
-`crates/verify/tests`; nothing there drives `checks::geocode::run`. Its
-whole flow (the grouped pair of index builds, the two osmium chains, query
-writing and both admin bands) and the exit tolerances `build_indexes` names
-are exercised only by real-data runs on denmark. Add a fixture test with a
-fake osmium and a small admin fixture.
+No test under `crates/verify/tests` drives the production `run` of
+`merge_changes`, `getparents`, `inspect_tags`, `check_ids` or
+`field_policies`; they have helper-level unit tests only, and the
+executable fixture in `process.rs` drives `sort`, not these. Their flow,
+verdict names and exit judging are exercised only by real-data runs. Each
+wants a fake-tool fixture with one fault per verdict, as
+`crates/verify/tests/geocode_fixture.rs` and `getid_fixture.rs` do.
 
 # From the 2026-11-21 verifier performance hunt
 

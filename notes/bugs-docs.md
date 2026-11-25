@@ -286,3 +286,4 @@ makes field 20 authoritative only where `pbfhogg.SharedNodePins-v1` is
 declared, and splice outputs (apply-changes, renumber) carry it
 undeclared, so the guide should tell a caller to check
 `HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.
+

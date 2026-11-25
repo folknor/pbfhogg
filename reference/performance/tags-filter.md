@@ -1,5 +1,24 @@
 # Tags Filter
 
+### Substring keys prune on tagdata; pass 2 skips node blobs with no node included (bygg, 2026-11-25, `c5898bd3` + change)
+
+A non-empty substring key (`*foo`, `*foo*`) now skips a blob whose stored
+key set holds no key containing it, instead of disabling tag pruning; pass 2
+reads node blobs only when some node is included. Planet
+`w/*wikipedia`, `--iterations 1`, one matched pair:
+
+| Arm | UUID | Wall | Pass-1 tag-index skips |
+|---|---|---|---|
+| `c5898bd3` | `dbd451f9` | 51.17 s | 0 of 17,529 |
+| change | `6b6e20bb` | 51.22 s | 17 of 17,529 |
+
+Neutral, identical counts: `wikipedia` is a substring of some key in almost
+every way blob. The gain is for rarer substrings; common queries
+(`w/highway=primary`, `r/type=route`) take neither new skip and their cost
+is one extra `Option` test per blob header. The node-blob skip fires only on
+queries whose matches and dependencies include no node, so no planet cell
+was run for it.
+
 ### Relation closure in two reads (bygg, 2026-11-24, `2a367d6a` + change)
 
 Default tags-filter's relation closure moved from a fixed point (every

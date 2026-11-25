@@ -409,6 +409,10 @@ pub struct BlobFilter {
     /// Required tag key prefixes for blob-level filtering. Blobs whose tag
     /// index contains no key starting with any prefix are skipped.
     pub(crate) required_tag_prefixes: Option<Box<[Box<[u8]>]>>,
+    /// Required non-empty tag key substrings for blob-level filtering.
+    /// Blobs whose tag index contains no key containing any substring are
+    /// skipped.
+    pub(crate) required_tag_substrings: Option<Box<[Box<[u8]>]>>,
 }
 
 impl BlobFilter {
@@ -421,6 +425,7 @@ impl BlobFilter {
             node_bbox: None,
             required_tag_keys: None,
             required_tag_prefixes: None,
+            required_tag_substrings: None,
         }
     }
 
@@ -520,9 +525,27 @@ impl BlobFilter {
         self
     }
 
+    /// Add required tag key substrings for blob-level tag filtering.
+    ///
+    /// Blobs whose tag index contains no key containing any of these
+    /// substrings are skipped. An empty substring passes every blob (see
+    /// [`Self::wants_tag_index`]); callers do not pass one.
+    pub(crate) fn with_required_tag_substrings(mut self, substrings: Vec<String>) -> Self {
+        self.required_tag_substrings = Some(
+            substrings
+                .into_iter()
+                .map(|s| s.into_bytes().into_boxed_slice())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        self
+    }
+
     /// Returns true if a tag-based blob filter is configured.
     pub(crate) fn has_tag_filter(&self) -> bool {
-        self.required_tag_keys.is_some() || self.required_tag_prefixes.is_some()
+        self.required_tag_keys.is_some()
+            || self.required_tag_prefixes.is_some()
+            || self.required_tag_substrings.is_some()
     }
 
     /// Returns true if the blob's tag index contains any required key or prefix.
@@ -546,6 +569,11 @@ impl BlobFilter {
         }
         if let Some(ref prefixes) = self.required_tag_prefixes
             && (prefixes.iter().any(|p| p.is_empty()) || tag_index.has_any_prefix(prefixes))
+        {
+            return true;
+        }
+        if let Some(ref substrings) = self.required_tag_substrings
+            && (substrings.iter().any(|s| s.is_empty()) || tag_index.has_any_substring(substrings))
         {
             return true;
         }

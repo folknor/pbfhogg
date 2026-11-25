@@ -1253,35 +1253,40 @@ by text. Medium-confidence: partition-owner counting instead of mutex shards.
 
 Kind: high conviction.
 
-## PERF-043 - tags-filter two-pass dependency scans beyond the relation closure
+## PERF-043 - tags-filter decodes every way blob twice on relation queries
 
 Reported by: tags, framing, decode, indexdata.
 
-The relation closure itself is done: it now takes at most two relation reads
-(shared `commands/relation_closure.rs` with getid), planet `r/type=route`
-closure span 3.9 to 0.9 s, about 5 % of wall (reference/performance/
-tags-filter.md, 2026-11-24). What remains, all unmeasured:
+On a query whose relation closure pulls in member ways, the way-dependency
+walk (`collect_way_node_dependencies`) decodes every way blob to collect
+member-way node refs, then pass 2 decodes every way blob again to emit the
+selected ways. Planet `r/type=route` (bygg, 2026-11-24): WAYDEPS 9.3 s of
+55.5 s, pass 2 38.4 s. Removing the second decode while keeping input-order
+output needs the selected ways' output held until node selection is
+complete, because nodes are written before ways. Two shapes:
 
-- `collect_way_node_dependencies` scans the whole way schedule for the member
-  ways (WaySpans projection was already measured at 2.3 %, under the floor;
-  routing requested way IDs to blobs is the untried shape).
-- Matched ways decode refs in pass 1 classification and again in pass 2.
-- `CatalogEntry` keeps kind but drops `min_id` / `max_id`, so
-  `IdSet::any_in_numeric_range` cannot prune the way-deps or pass-2
-  schedules; closure members scatter over the ID space, so expect little.
-- Pass 2 schedules node blobs (`BlobFilter::new(true, ..)`) even when every
-  node inclusion set is empty.
-- Substring and wildcard keys disable key-based blob filtering in pass 1,
-  though the stored key set could answer conservatively.
-- The closure's second read scans every relation blob; a replay of only the
-  blobs that hold reached IDs (positions recorded in read 1, every record
-  of a repeated ID kept) would save it for sparse nested queries.
-- One consumer inserts every reference (PERF-025).
+- Stage re-encoded ways in a spool during the walk, emit nodes, drain the
+  spool, then relations. Output-way volume is sub-GB for route queries and
+  most of the planet's ways under `--invert-match`, so a general spool is
+  on disk, which changes the scratch contract in docs/cli/commands.md
+  (tags-filter takes no scratch today). Needs the maintainer's ruling.
+- Write `header | ways | nodes` into the output staging file the command
+  already owns, then rotate the two byte ranges in place before appending
+  relations and publishing. No separate scratch, but the rotation rereads
+  and rewrites the node output; needs a writer change.
 
-Invert-match at planet (closure over nearly every relation) was not
-re-measured after the change.
+Either must keep the per-record counts the `matched_records` check uses,
+fall back for unknown kinds, and stay correct under `--distrust-metadata`.
+A relation-first ordering that merges direct-way classification with the
+member-way walk saves no read on `r/type=route` (pass 1 skips way blobs
+there) and helps only mixed queries.
 
-Kind: local changes, low to moderate conviction.
+Also open: invert-match at planet was not re-measured after the two-read
+closure; ID-range pruning of the way-deps and pass-2 schedules was not
+pursued on a density hypothesis (see the `CatalogEntry` doc), without a
+zero-hit blob count per kind. Single-consumer insertion is PERF-025.
+
+Kind: redesign, moderate conviction.
 
 ## PERF-044 - tags-filter OSC formats every element before deciding to keep it
 

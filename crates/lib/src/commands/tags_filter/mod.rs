@@ -23,12 +23,15 @@ use super::Result;
 ///
 /// # Key matchers that constrain nothing
 ///
-/// The blob-level filter can only express "this blob's tag index contains one
-/// of these exact keys, or a key under one of these prefixes". A
-/// [`StringMatcher::Substring`] key (`*:name`) or a
-/// [`StringMatcher::Always`] key (`*`) fits neither, and there is no
-/// conservative approximation of a substring in a key-set membership test. An
-/// expression carrying one therefore disables tag-level blob filtering
+/// The blob-level filter expresses "this blob's tag index contains one of
+/// these exact keys, a key under one of these prefixes, or a key containing
+/// one of these substrings". A non-empty [`StringMatcher::Substring`] key
+/// (`*:name`) is the last of these: the stored key set is complete apart from
+/// the empty key old writers dropped, and the empty key contains no non-empty
+/// substring. An [`StringMatcher::Always`] key (`*`) or an empty substring
+/// (`**`) matches the empty key too, which a stored key set cannot rule out
+/// (see `BlobFilter::wants_tag_index`). An expression carrying one of those
+/// therefore disables tag-level blob filtering
 /// **entirely** - keys and prefixes contributed by the *other* expressions
 /// included, since the filter's semantics are a union and skipping a blob on
 /// the union would skip blobs the unconstrained expression could still match.
@@ -44,6 +47,7 @@ pub(crate) fn blob_filter_from_expressions(expressions: &[Expression]) -> Option
     let mut need_relations = false;
     let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut substrings: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut key_unconstrained = false;
 
     for expr in expressions {
@@ -61,6 +65,9 @@ pub(crate) fn blob_filter_from_expressions(expressions: &[Expression]) -> Option
             StringMatcher::Prefix(prefix) => {
                 prefixes.insert(prefix.clone());
             }
+            StringMatcher::Substring(sub) if !sub.is_empty() => {
+                substrings.insert(sub.clone());
+            }
             StringMatcher::Substring(_) | StringMatcher::Always => {
                 key_unconstrained = true;
             }
@@ -70,10 +77,11 @@ pub(crate) fn blob_filter_from_expressions(expressions: &[Expression]) -> Option
     if key_unconstrained {
         keys.clear();
         prefixes.clear();
+        substrings.clear();
     }
 
     let all_types = need_nodes && need_ways && need_relations;
-    let has_tag_filter = !keys.is_empty() || !prefixes.is_empty();
+    let has_tag_filter = !keys.is_empty() || !prefixes.is_empty() || !substrings.is_empty();
 
     if all_types && !has_tag_filter {
         return None;
@@ -85,6 +93,9 @@ pub(crate) fn blob_filter_from_expressions(expressions: &[Expression]) -> Option
     }
     if !prefixes.is_empty() {
         filter = filter.with_required_tag_prefixes(prefixes.into_iter().collect());
+    }
+    if !substrings.is_empty() {
+        filter = filter.with_required_tag_substrings(substrings.into_iter().collect());
     }
     Some(filter)
 }
@@ -1046,8 +1057,16 @@ fn tags_filter_two_pass(
     let blob_filter: Option<BlobFilter> = if invert || distrust_metadata {
         None
     } else {
+        // Node blobs are read only when some node is included, as osmium's
+        // `get_needed_types` does: a query whose matches and dependencies
+        // hold no node (no match at all, or relations without node members
+        // or member ways) skips every node blob instead of decoding it to
+        // write nothing.
+        let has_included_node = !(matched_node_ids.is_empty()
+            && way_dep_node_ids.is_empty()
+            && relation_dep_node_ids.is_empty());
         Some(BlobFilter::new(
-            true,
+            has_included_node,
             has_included_way,
             has_included_relation,
         ))
@@ -1247,6 +1266,13 @@ fn tags_filter_two_pass(
 /// relation ID contributes the members of each of its records. A reached
 /// ID the file does not hold contributes nothing.
 ///
+/// The second read scans every relation blob. Replaying only the blobs that
+/// hold reached IDs (positions recorded in read 1, every record of a
+/// repeated ID kept) was not built: the whole closure, both reads and the
+/// walk, measured 0.9 s of a 55.5 s planet `r/type=route` run (bygg,
+/// 2026-11-24), so even a free replay sits under the 2-3 % noise floor on
+/// that workload.
+///
 /// Provenance stays with pass 2: a direct match keeps its direct
 /// attribution however it was reached, a way already in `direct_way_ids`
 /// never becomes a member way (its refs were collected in pass 1), and
@@ -1362,6 +1388,15 @@ fn collect_relation_member_closure(
 /// `None` for an unindexed blob. Positions are not kept: each phase's
 /// schedule is cut from the catalog in file order and its pool numbers it
 /// from zero, while the entry keeps the blob's file ordinal and offsets.
+///
+/// The indexdata `min_id` / `max_id` are not kept, so no schedule is pruned
+/// by `IdSet::any_in_numeric_range` as getid's is. Not pursued on a
+/// hypothesis, not a measurement: at planet `r/type=route` (bygg,
+/// 2026-11-24) the closure pulls in 22.7 M member ways and 258 M nodes,
+/// about 1,300 member ways per way blob on average, scattered by ID, so few
+/// if any way or node blobs are expected to hold none. Range pruning would
+/// also add a trust dependency on the range claim, covering every blob a
+/// repeated ID may occupy. Count zero-hit blobs per kind before revisiting.
 #[derive(Clone, Copy)]
 struct CatalogEntry {
     blob: crate::scan::classify::ScheduledBlob,
@@ -1521,11 +1556,20 @@ mod tests {
             vec!["addr:"]
         );
 
-        // A substring key matcher constrains nothing expressible, so the
-        // whole tag filter goes - `highway` included. Without this, widening
-        // the matcher to accept `*:name` would have made it skip every blob
-        // whose index lacks a literal `highway` key.
-        let f = filter_for(&["highway=primary", "*:name"]);
+        // A non-empty substring key joins the union beside the exact key: a
+        // blob passes on either, so `highway` stays a criterion only
+        // together with `:name`.
+        let f = filter_for(&["highway=primary", "*:name"]).expect("filter");
+        assert_eq!(sorted_keys(f.required_tag_keys.as_deref()), vec!["highway"]);
+        assert_eq!(
+            sorted_keys(f.required_tag_substrings.as_deref()),
+            vec![":name"]
+        );
+
+        // An empty substring (`**`) matches the empty key, which stored
+        // tagdata cannot rule out, so the whole tag filter goes - `highway`
+        // included - since the filter is a union.
+        let f = filter_for(&["highway=primary", "**"]);
         assert!(
             f.is_none(),
             "no type narrowing and no expressible tag key leaves nothing to filter on"
@@ -1533,17 +1577,17 @@ mod tests {
 
         // Same, but with a type narrowing worth keeping: the blob filter
         // survives for its type bits while the tag keys are dropped.
-        let f = filter_for(&["n/highway=primary", "n/*:name"]).expect("filter");
+        let f = filter_for(&["n/highway=primary", "n/**"]).expect("filter");
         assert!(f.want_nodes);
         assert!(!f.want_ways);
         assert!(
-            f.required_tag_keys.is_none() && f.required_tag_prefixes.is_none(),
-            "a substring key matcher must not leave `highway` behind as a blob-skip criterion"
+            !f.has_tag_filter(),
+            "an empty substring key must not leave `highway` behind as a blob-skip criterion"
         );
 
         // And a bare `*` key is the same story.
         let f = filter_for(&["n/amenity", "n/*"]).expect("filter");
-        assert!(f.required_tag_keys.is_none());
+        assert!(!f.has_tag_filter());
     }
 
     #[test]

@@ -182,6 +182,17 @@ impl TagIndex {
             idx < self.keys.len() && self.keys[idx].starts_with(prefix)
         })
     }
+
+    /// Returns `true` if any key in this tag index contains any of the given
+    /// byte substrings. A linear scan of the key set; for UTF-8 keys and
+    /// substrings this agrees with `str::contains`.
+    pub fn has_any_substring(&self, substrings: &[Box<[u8]>]) -> bool {
+        substrings.iter().any(|sub| {
+            self.keys
+                .iter()
+                .any(|k| sub.is_empty() || k.windows(sub.len()).any(|w| w == sub.as_ref()))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +460,27 @@ mod tests {
         assert!(ti.has_any_prefix(&[b"high"[..].into()]));
         assert!(!ti.has_any_prefix(&[b"building"[..].into()]));
         assert!(!ti.has_any_prefix(&[]));
+    }
+
+    #[test]
+    fn wants_tag_index_substring_skips_only_blobs_whose_keys_lack_it() {
+        let filter = BlobFilter::new(true, true, true)
+            .with_required_tag_substrings(vec![":name".to_string()]);
+        let with = TagIndex {
+            keys: vec![b"highway"[..].into(), b"old:name"[..].into()],
+        };
+        let without = TagIndex {
+            keys: vec![b"highway"[..].into(), b"name"[..].into()],
+        };
+        assert!(filter.wants_tag_index(&with));
+        assert!(!filter.wants_tag_index(&without));
+        // Union with an exact key: either passes the blob.
+        let union = BlobFilter::new(true, true, true)
+            .with_required_tag_keys(vec!["highway".to_string()])
+            .with_required_tag_substrings(vec![":name".to_string()]);
+        assert!(union.wants_tag_index(&without));
+        let empty = TagIndex { keys: vec![] };
+        assert!(!union.wants_tag_index(&empty));
     }
 
     #[test]

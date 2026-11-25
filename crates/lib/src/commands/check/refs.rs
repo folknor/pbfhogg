@@ -379,7 +379,12 @@ pub(super) fn replay_nodes(
 ) -> Result<(u64, Vec<i64>)> {
     let mut count: u64 = 0;
     let mut overflow = Vec::new();
-    scratch.each(bytes, |_, id| {
+    // The scratch may hold other kinds' IDs too (the default pair's
+    // unindexed pass records relation IDs for the ID check beside them).
+    scratch.each(bytes, |kind, id| {
+        if kind != ElementKind::Node {
+            return Ok(());
+        }
         if !node_ids.try_insert_atomic(id) {
             overflow.push(id);
         }
@@ -682,11 +687,100 @@ enum Judged<R> {
 }
 
 /// What the combined phase found in one unindexed blob.
-struct UnindexedBlobResult {
+pub(super) struct UnindexedBlobResult {
     node_count: u64,
     node_overflow: Vec<i64>,
     ways: Judged<WayBlobResult>,
     relations: Judged<RelBlobResult>,
+}
+
+/// Judge one accepted unindexed blob for the combined phase: its node IDs
+/// (from `ids`, other kinds there skipped) inserted, its ways and (from
+/// `relations`, recorded only under `check_relations`) relations judged
+/// against the sets as they stand, each judgement with a miss marked to be
+/// made again. The one rule both the reference check alone and the default
+/// pair apply to an unindexed blob.
+pub(super) fn judge_unindexed(
+    ids: &IdScratch,
+    ways: &[WaySpan],
+    relations: &[RelationSpan],
+    bytes: &[u8],
+    sets: &Sets,
+    judge: Judge,
+) -> Result<UnindexedBlobResult> {
+    let (node_count, node_overflow) = replay_nodes(ids, bytes, &sets.nodes)?;
+    let ways = if ways.is_empty() {
+        Judged::Absent
+    } else {
+        let r = judge_ways(ways, bytes, sets, judge)?;
+        if r.missing_node_ref_occurrences > 0 {
+            Judged::Again
+        } else {
+            Judged::Final(r)
+        }
+    };
+    let relations = if !judge.check_relations || relations.is_empty() {
+        Judged::Absent
+    } else {
+        let r = judge_relations(relations, bytes, sets, judge)?;
+        if r.missing_node_member_occurrences + r.missing_way_ref_occurrences > 0 {
+            Judged::Again
+        } else {
+            Judged::Final(r)
+        }
+    };
+    Ok(UnindexedBlobResult {
+        node_count,
+        node_overflow,
+        ways,
+        relations,
+    })
+}
+
+/// The blobs of an unindexed file whose way or relation judgement the
+/// combined phase dropped, by blob position, gathered by its serial merge.
+#[derive(Default)]
+pub(super) struct Again {
+    ways: Vec<usize>,
+    relations: Vec<usize>,
+}
+
+impl Again {
+    /// Merge blob `seq`'s combined-phase result into `tally`, noting the
+    /// judgements to make again.
+    pub(super) fn merge(
+        &mut self,
+        seq: usize,
+        r: UnindexedBlobResult,
+        tally: &mut Tally,
+        judge: Judge,
+        host: &crate::host::Entered<'_>,
+    ) {
+        tally.merge_nodes(r.node_count, r.node_overflow, host);
+        match r.ways {
+            Judged::Absent => {}
+            Judged::Final(w) => tally.merge_ways(w, judge, host),
+            Judged::Again => self.ways.push(seq),
+        }
+        match r.relations {
+            Judged::Absent => {}
+            Judged::Final(rel) => tally.merge_relations(rel, judge, host),
+            Judged::Again => self.relations.push(seq),
+        }
+    }
+
+    /// The way and relation blobs to read again, completion order back to
+    /// file order, which the next phases' read-ahead advice coalesces.
+    pub(super) fn into_schedules(
+        self,
+        blobs: &[ScheduledBlob],
+    ) -> (Vec<ScheduledBlob>, Vec<ScheduledBlob>) {
+        let again = |mut positions: Vec<usize>| -> Vec<ScheduledBlob> {
+            positions.sort_unstable();
+            positions.into_iter().map(|p| blobs[p]).collect()
+        };
+        (again(self.ways), again(self.relations))
+    }
 }
 
 /// The combined phase of an unindexed file (see `check_refs`, "Unindexed
@@ -701,8 +795,7 @@ fn unindexed_phase(
     tally: &mut Tally,
     host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<ScheduledBlob>, Vec<ScheduledBlob>)> {
-    let mut ways_again: Vec<usize> = Vec::new();
-    let mut relations_again: Vec<usize> = Vec::new();
+    let mut again = Again::default();
     parallel_project_phase(
         file,
         blobs,
@@ -726,57 +819,12 @@ fn unindexed_phase(
                         .then(|| RelationSpans::new(&mut *relations)),
                 )
             })?;
-            let bytes = accepted.bytes();
-            let (node_count, node_overflow) = replay_nodes(ids, bytes, &sets.nodes)?;
-            let ways = if ways.is_empty() {
-                Judged::Absent
-            } else {
-                let r = judge_ways(ways, bytes, sets, judge)?;
-                if r.missing_node_ref_occurrences > 0 {
-                    Judged::Again
-                } else {
-                    Judged::Final(r)
-                }
-            };
-            let relations = if relations.is_empty() {
-                Judged::Absent
-            } else {
-                let r = judge_relations(relations, bytes, sets, judge)?;
-                if r.missing_node_member_occurrences + r.missing_way_ref_occurrences > 0 {
-                    Judged::Again
-                } else {
-                    Judged::Final(r)
-                }
-            };
-            Ok(UnindexedBlobResult {
-                node_count,
-                node_overflow,
-                ways,
-                relations,
-            })
+            judge_unindexed(ids, ways, relations, accepted.bytes(), sets, judge)
         },
-        |seq, r| {
-            tally.merge_nodes(r.node_count, r.node_overflow, host);
-            match r.ways {
-                Judged::Absent => {}
-                Judged::Final(w) => tally.merge_ways(w, judge, host),
-                Judged::Again => ways_again.push(seq),
-            }
-            match r.relations {
-                Judged::Absent => {}
-                Judged::Final(rel) => tally.merge_relations(rel, judge, host),
-                Judged::Again => relations_again.push(seq),
-            }
-        },
+        |seq, r| again.merge(seq, r, tally, judge, host),
         host,
     )?;
-    // Completion order back to file order, which the next phases' read-ahead
-    // advice coalesces.
-    let again = |mut positions: Vec<usize>| -> Vec<ScheduledBlob> {
-        positions.sort_unstable();
-        positions.into_iter().map(|p| blobs[p]).collect()
-    };
-    Ok((again(ways_again), again(relations_again)))
+    Ok(again.into_schedules(blobs))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -846,12 +894,44 @@ pub(super) fn check_refs_inner(
     // comparisons; this sample is inert unless the invocation has a sink.
     crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_nodes");
 
+    let result = later_phases(
+        &shared_file,
+        &mut sets,
+        tally,
+        judge,
+        node_blobs,
+        unindexed_blobs,
+        &way_schedule,
+        &rel_schedule,
+        host,
+    )?;
+    host.invocation.marker("CHECKREFS_SCAN_END");
+    Ok(result)
+}
+
+/// The reference check from the point `node_ids` is complete: the way
+/// phase over `way_schedule` (an indexed file's way blobs, or the unindexed
+/// blobs whose way judgement was dropped), the relation phase likewise under
+/// `check_relations`, and the report. `node_blobs` and `unindexed_blobs` are
+/// what the first phase read, for the counters.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn later_phases(
+    shared_file: &InputFile,
+    sets: &mut Sets,
+    mut tally: Tally,
+    judge: Judge,
+    node_blobs: u64,
+    unindexed_blobs: u64,
+    way_schedule: &[ScheduledBlob],
+    rel_schedule: &[ScheduledBlob],
+    host: &crate::host::Entered<'_>,
+) -> Result<RefCheckResult> {
     // ------------------------------------------------------------------
     // Phase 2 - way scan. Workers read the complete `node_ids`, optionally
     // write `way_ids`, and collect per-blob missing-ref vecs.
     // ------------------------------------------------------------------
     host.invocation.marker("CHECKREFS_WAYS_START");
-    way_phase(&shared_file, &way_schedule, &sets, judge, &mut tally, host)?;
+    way_phase(shared_file, way_schedule, sets, judge, &mut tally, host)?;
     sets.ways.merge(std::mem::take(&mut tally.way_overflow));
     host.invocation.marker("CHECKREFS_WAYS_END");
     // Brokkr stores named counters generically and reports changes in sidecar
@@ -870,7 +950,7 @@ pub(super) fn check_refs_inner(
     };
     if judge.check_relations {
         host.invocation.marker("CHECKREFS_RELATIONS_START");
-        relation_phase(&shared_file, &rel_schedule, &sets, judge, &mut tally, host)?;
+        relation_phase(shared_file, rel_schedule, sets, judge, &mut tally, host)?;
         sets.relations
             .merge(std::mem::take(&mut tally.relation_overflow));
         host.invocation.marker("CHECKREFS_RELATIONS_END");
@@ -885,9 +965,7 @@ pub(super) fn check_refs_inner(
         way: way_schedule.len() as u64,
         relation: relation_blobs,
     };
-    let result = finish(tally, &sets, judge, &blobs, host);
-    host.invocation.marker("CHECKREFS_SCAN_END");
-    Ok(result)
+    Ok(finish(tally, sets, judge, &blobs, host))
 }
 
 /// The report of a reference check whose phases have all run and merged

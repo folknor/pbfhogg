@@ -1032,9 +1032,10 @@ claims, cheaply - is [`inspect`](#inspect)'s job.
 
 Validate PBF integrity along four independent axes, selected by flag. With no
 flag, the ID and referential integrity checks both run. Together they read
-an indexed file once: each blob is decompressed and validated once for both
-checks, and each check still reports, stops or fails on its own, exactly as
-when run alone. On an unindexed file they read it in turn.
+the file once, indexed or not: each blob is decompressed and validated once
+for both checks, and each check still reports, stops or fails on its own,
+exactly as when run alone. On an unindexed file the referential check reads
+again only the blobs it re-reads when run alone.
 
 `--index` and `--locations` are selectors like the other two but are
 deliberately **not** in the default set: each decompresses every blob in the

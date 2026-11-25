@@ -660,6 +660,11 @@
   Only a surviving version's payload is read, so a bad user or role string
   index on a superseded version is no longer refused. An order or version
   refusal now names the blob it was found in.
+- **A bare `check` reads an unindexed file once too.** The ID and
+  reference checks used to read an unindexed file in turn; one pass now
+  validates each blob once for both, the reference check re-reading only
+  the blobs it re-reads alone. Unindexed planet fell from about 37-42 s to
+  21 s.
 - **A bare `check` reads an indexed file once.** The ID and reference
   checks used to read every node and way blob each; they now share one
   header walk and one read per blob, each check still reporting, stopping

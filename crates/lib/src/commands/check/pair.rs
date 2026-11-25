@@ -1,5 +1,5 @@
 //! The default pair of `check`: the ID check and the reference check over
-//! one read of an indexed file.
+//! one read of the file.
 //!
 //! Run as two calls ([`verify_ids`](super::verify_ids::verify_ids) then
 //! [`check_refs`](super::refs::check_refs)), the pair walks the header chain
@@ -46,11 +46,19 @@
 //!
 //! # Unindexed input
 //!
-//! An unindexed file is checked by the two checks' own engines in turn,
-//! each reading the file once (the reference check reading again only the
-//! blobs its combined phase could not judge). Folding them into one pass
-//! is possible (one projection carrying node and relation IDs, way spans
-//! and group kinds) and not done yet.
+//! An unindexed file is read once for both checks: every blob validated
+//! once through one projection carrying the node IDs (and, without
+//! `check_relations`, the relation IDs the ID check selects), the way spans,
+//! the relation spans under `check_relations` and the group kinds the ID
+//! check's type order is judged from. Each accepted blob is judged by the ID
+//! check as its own unindexed pass judges it and by the reference check
+//! through the rule its combined phase applies (`refs::judge_unindexed`);
+//! the reference check then reads again only the blobs whose judgement it
+//! dropped, and finishes, before `--full`'s duplicate pass. Failures are
+//! attributed as in the indexed phases. What the two checks see of
+//! completion order (which failure a check meets first, which capped
+//! `--show-ids` details it retains) is a draw some run of the two calls
+//! could also make.
 //!
 //! # Why `--index` is not in the pair
 //!
@@ -69,7 +77,8 @@ use super::refs::{
     WayBlobResult,
 };
 use super::verify_ids::{
-    self, BlobVerifyResult, KINDS, KindJudge, Scanned, VerifyIdsOptions, VerifyIdsReport,
+    self, BlobVerifyResult, GroupKinds, KINDS, KindJudge, KindSpans, Scanned, VerifyIdsOptions,
+    VerifyIdsReport,
 };
 use super::{CheckOutcome, StoppedCheck};
 use crate::ElementKind;
@@ -79,7 +88,7 @@ use crate::read::input::{InputSource, PinnedInput};
 use crate::read::project_ids::{
     IdScratch, KindIds, RelationSpan, RelationSpans, WaySpan, WaySpans,
 };
-use crate::scan::classify::{KindSchedules, parallel_project_phase};
+use crate::scan::classify::{KindSchedules, ScheduledBlob, parallel_project_phase};
 
 /// The outcomes of [`check_ids_and_refs`]: each check's own, as the two
 /// separate calls would have returned them. The ID check's error ends the
@@ -213,10 +222,29 @@ fn pair_inner(
         }
     };
 
-    if let KindSchedules::Unindexed(_) = schedules {
-        drop(file);
+    if let KindSchedules::Unindexed(blobs) = &schedules {
+        let (scanned, refs) = unindexed_pass(
+            &file,
+            blobs,
+            max_ids,
+            &mut ids_stopped,
+            ids_opts,
+            judge,
+            host,
+        )?;
+        let ids = ids_outcome(
+            ids_stopped,
+            front,
+            scanned,
+            &file,
+            &schedules,
+            max_ids,
+            &pin,
+            ids_opts,
+            host,
+        )?;
         host.invocation.marker("CHECKPAIR_SCAN_END");
-        return unindexed_in_turn(&pin, ids_stopped, ids_opts, refs_opts, host);
+        return Ok(PairOutcome { ids, refs });
     }
     let KindSchedules::Indexed {
         nodes,
@@ -398,28 +426,56 @@ fn pair_inner(
         }
     };
 
-    let ids = match (ids_stopped, front) {
-        (Some(stopped), _) => CheckOutcome::Stopped(stopped),
-        (None, None) => {
-            return Err(crate::Error::internal(
-                "check pair: no front probe for a live ID check",
-            ));
-        }
+    let ids = ids_outcome(
+        ids_stopped,
+        front,
+        scanned,
+        &file,
+        &schedules,
+        max_ids,
+        &pin,
+        ids_opts,
+        host,
+    )?;
+    host.invocation.marker("CHECKPAIR_SCAN_END");
+    Ok(PairOutcome { ids, refs })
+}
+
+/// The ID check's outcome once its scan is merged into `scanned` and the
+/// reference check's sets are gone: stopped, or `--full`'s duplicate pass
+/// and the report.
+#[allow(clippy::too_many_arguments)]
+fn ids_outcome(
+    ids_stopped: Option<StoppedCheck>,
+    front: Option<(bool, bool)>,
+    mut scanned: Scanned,
+    file: &crate::read::input::InputFile,
+    schedules: &KindSchedules,
+    max_ids: [i64; 3],
+    pin: &PinnedInput,
+    ids_opts: &VerifyIdsOptions,
+    host: &crate::host::Entered<'_>,
+) -> Result<CheckOutcome<VerifyIdsReport>> {
+    match (ids_stopped, front) {
+        (Some(stopped), _) => Ok(CheckOutcome::Stopped(stopped)),
+        (None, None) => Err(crate::Error::internal(
+            "check pair: no front probe for a live ID check",
+        )),
         (None, Some((header_sorted, indexed))) => {
             let duplicates = if ids_opts.full {
                 CheckOutcome::stop_on_finding(verify_ids::duplicate_pass(
                     &mut scanned,
-                    &file,
-                    &schedules,
+                    file,
+                    schedules,
                     max_ids,
-                    &pin,
+                    pin,
                     ids_opts.max_errors,
                     host,
                 ))?
             } else {
                 CheckOutcome::Complete(())
             };
-            match duplicates {
+            Ok(match duplicates {
                 CheckOutcome::Complete(()) => {
                     CheckOutcome::Complete(scanned.into_report(ids_opts.max_errors).into_report(
                         header_sorted,
@@ -428,11 +484,9 @@ fn pair_inner(
                     ))
                 }
                 CheckOutcome::Stopped(stopped) => CheckOutcome::Stopped(stopped),
-            }
+            })
         }
-    };
-    host.invocation.marker("CHECKPAIR_SCAN_END");
-    Ok(PairOutcome { ids, refs })
+    }
 }
 
 /// The start and end markers of each shared phase, indexed by ordinal.
@@ -513,21 +567,232 @@ fn judge_blob(
     })
 }
 
-/// An unindexed file: the ID check's engine, then the reference check's,
-/// each on the pin, attributed as the two calls attribute them.
-fn unindexed_in_turn(
-    pin: &PinnedInput,
-    ids_stopped: Option<StoppedCheck>,
+/// What one unindexed blob yields: the ID check's per-kind judgements and
+/// group spans where it is live, the reference check's combined-phase
+/// result (or its judgement failure) where it is live.
+struct UnindexedPairBlob {
+    ids: Option<([BlobVerifyResult; 3], KindSpans<usize>)>,
+    refs: Option<Result<refs::UnindexedBlobResult>>,
+}
+
+/// An unindexed file (module documentation, "Unindexed input"): one pass
+/// over every blob for both checks, then the reference check's re-reads of
+/// the judgements it dropped and its report. Returns the ID check's merged
+/// scan (empty where it is stopped, which `ids_stopped` then says) and the
+/// reference check's outcome; an error is the ID check's, ending the call.
+#[allow(clippy::too_many_lines)]
+fn unindexed_pass(
+    file: &crate::read::input::InputFile,
+    blobs: &[ScheduledBlob],
+    max_ids: [i64; 3],
+    ids_stopped: &mut Option<StoppedCheck>,
     ids_opts: &VerifyIdsOptions,
-    refs_opts: &CheckRefsOptions,
+    judge: Judge,
     host: &crate::host::Entered<'_>,
-) -> Result<PairOutcome> {
-    let ids = match ids_stopped {
-        Some(stopped) => CheckOutcome::Stopped(stopped),
-        None => {
-            CheckOutcome::stop_on_finding(verify_ids::verify_ids_inner(pin.into(), ids_opts, host))?
+) -> Result<(Scanned, Result<CheckOutcome<RefCheckResult>>)> {
+    let type_filter = TypeFilter::or_all(ids_opts.type_filter);
+    let limit = verify_ids::effective_error_limit(ids_opts.max_errors);
+    let mut scanned = Scanned {
+        type_order: Vec::new(),
+        type_order_total: 0,
+        kinds: [None, None, None],
+    };
+    let mut refs = match Sets::allocate(file, max_ids, judge) {
+        Ok(sets) => RefsState::Live {
+            sets,
+            tally: Tally::default(),
+        },
+        Err(error) => RefsState::Done(Err(error)),
+    };
+    let ids_reads = ids_stopped.is_none();
+    let refs_reads = refs.is_live();
+    if !ids_reads && !refs_reads {
+        let RefsState::Done(outcome) = refs else {
+            return Err(crate::Error::internal(
+                "check pair: reference state changed",
+            ));
+        };
+        return Ok((scanned, outcome));
+    }
+
+    // What the one projection records, fixed for the pass from who reads
+    // it: node IDs for either check, way spans for the reference check's
+    // judgement and the ID check's way IDs, relation spans under
+    // `check_relations`, and otherwise the relation IDs the ID check
+    // selects through the ID projection.
+    let ids_selects = |kind| ids_reads && verify_ids::selects(&type_filter, kind);
+    let relation_spans = refs_reads && judge.check_relations;
+    let way_spans = refs_reads || ids_selects(ElementKind::Way);
+    let mut id_kinds = crate::element_kind::ElementKindSet::default();
+    if refs_reads || ids_selects(ElementKind::Node) {
+        id_kinds.add(ElementKind::Node);
+    }
+    if ids_selects(ElementKind::Relation) && !relation_spans {
+        id_kinds.add(ElementKind::Relation);
+    }
+
+    host.invocation.marker("CHECKPAIR_UNINDEXED_START");
+    let mut per_kind: [Vec<Option<BlobVerifyResult>>; 3] = std::array::from_fn(|_| {
+        if ids_reads {
+            (0..blobs.len()).map(|_| None).collect()
+        } else {
+            Vec::new()
+        }
+    });
+    let mut spans: KindSpans<(usize, usize)> = [None; 3];
+    let mut again = refs::Again::default();
+    let mut refs_failed: Option<crate::Error> = None;
+    let refs_dead = AtomicBool::new(false);
+    let phase = {
+        let (sets, mut tally) = match &mut refs {
+            RefsState::Live { sets, tally } => (Some(&*sets), Some(tally)),
+            RefsState::Done(_) => (None, None),
+        };
+        let refs_dead = &refs_dead;
+        let ids_selects = &ids_selects;
+        parallel_project_phase(
+            file,
+            blobs,
+            None,
+            PairScratch::default,
+            |_, buffer, scratch| -> Result<UnindexedPairBlob> {
+                let PairScratch {
+                    ids,
+                    ways,
+                    relations,
+                } = scratch;
+                ways.clear();
+                relations.clear();
+                let (((KindIds { .. }, _), (_, groups)), accepted) = buffer.project(|_, _| {
+                    (
+                        (
+                            KindIds::new(id_kinds, &mut *ids),
+                            way_spans.then(|| WaySpans::new(None, &mut *ways)),
+                        ),
+                        (
+                            relation_spans.then(|| RelationSpans::new(&mut *relations)),
+                            GroupKinds::default(),
+                        ),
+                    )
+                })?;
+                let bytes = accepted.bytes();
+                let ids_blob = if ids_reads {
+                    let mut judges = KINDS.map(KindJudge::new);
+                    ids.each(bytes, |kind, id| {
+                        if ids_selects(kind) {
+                            judges[usize::from(kind.ordinal())].push(id, None);
+                        }
+                        Ok(())
+                    })?;
+                    if ids_selects(ElementKind::Way) {
+                        for way in ways.iter() {
+                            judges[1].push(way.id, None);
+                        }
+                    }
+                    if ids_selects(ElementKind::Relation) && relation_spans {
+                        for relation in relations.iter() {
+                            judges[2].push(relation.id, None);
+                        }
+                    }
+                    Some((judges.map(|j| j.r), groups.spans))
+                } else {
+                    None
+                };
+                let refs_blob = sets
+                    .filter(|_| !refs_dead.load(Ordering::Relaxed))
+                    .map(|sets| refs::judge_unindexed(ids, ways, relations, bytes, sets, judge));
+                Ok(UnindexedPairBlob {
+                    ids: ids_blob,
+                    refs: refs_blob,
+                })
+            },
+            |seq, blob| {
+                if let Some((results, groups)) = blob.ids {
+                    for (slots, r) in per_kind.iter_mut().zip(results) {
+                        slots[seq] = Some(r);
+                    }
+                    verify_ids::fold_group_spans(&mut spans, seq, groups);
+                }
+                let (Some(tally), Some(result)) = (tally.as_deref_mut(), blob.refs) else {
+                    return;
+                };
+                if refs_failed.is_some() {
+                    return;
+                }
+                match result {
+                    Ok(r) => again.merge(seq, r, tally, judge, host),
+                    Err(error) => {
+                        refs_dead.store(true, Ordering::Relaxed);
+                        refs_failed = Some(file.locate_blob(&blobs[seq], error));
+                    }
+                }
+            },
+            host,
+        )
+    };
+    host.invocation.marker("CHECKPAIR_UNINDEXED_END");
+    host.invocation
+        .counter("checkpair_physical_blobs", blobs.len() as u64);
+
+    // The reference check's own failure came first, whatever ended the
+    // pass after it.
+    if let Some(error) = refs_failed {
+        refs = RefsState::Done(Err(error));
+    }
+    if let Err(error) = phase {
+        match StoppedCheck::from_error(&error) {
+            Some(stopped) => {
+                if refs.is_live() {
+                    refs = RefsState::Done(Ok(CheckOutcome::Stopped(stopped.clone())));
+                }
+                if ids_reads {
+                    *ids_stopped = Some(stopped);
+                }
+            }
+            None if ids_reads => return Err(error),
+            None => {
+                if refs.is_live() {
+                    refs = RefsState::Done(Err(error));
+                }
+            }
+        }
+    } else if ids_reads {
+        verify_ids::check_type_order(
+            &spans,
+            &mut scanned.type_order,
+            &mut scanned.type_order_total,
+            limit,
+        );
+        for (kind, per_blob) in KINDS.into_iter().zip(per_kind) {
+            if verify_ids::selects(&type_filter, kind) {
+                scanned.kinds[usize::from(kind.ordinal())] =
+                    Some(verify_ids::merge_kind(per_blob, kind, limit)?);
+            }
+        }
+    }
+
+    // The reference check's re-reads and report; its sets are gone before
+    // the ID check's duplicate pass allocates.
+    let refs = match refs {
+        RefsState::Done(outcome) => outcome,
+        RefsState::Live {
+            mut sets,
+            mut tally,
+        } => {
+            sets.nodes.merge(std::mem::take(&mut tally.node_overflow));
+            let (way_again, relation_again) = again.into_schedules(blobs);
+            CheckOutcome::stop_on_finding(refs::later_phases(
+                file,
+                &mut sets,
+                tally,
+                judge,
+                0,
+                blobs.len() as u64,
+                &way_again,
+                &relation_again,
+                host,
+            ))
         }
     };
-    let refs = CheckOutcome::stop_on_finding(refs::check_refs_inner(pin.into(), refs_opts, host));
-    Ok(PairOutcome { ids, refs })
+    Ok((scanned, refs))
 }

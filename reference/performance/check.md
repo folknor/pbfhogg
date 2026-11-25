@@ -1,5 +1,34 @@
 # Check
 
+## A bare check reads an unindexed file once (bygg, 2026-11-25, against `0dccb796`)
+
+Before: on an unindexed file `check::pair` ran the ID check's engine and
+then the reference check's, each walking the header chain and reading every
+blob (the pair's own walk discarded). After: one walk and one
+`parallel_project_phase` over every blob, one projection for both checks;
+the reference check's re-reads of dropped judgements and the `--full`
+duplicate pass follow as before.
+
+`brokkr bench --iterations 1 default-integrity --dataset planet --variant raw`
+(`planet-20260223.osm.pbf`), interleaved, variant measured uncommitted on
+`0dccb796` (stored as dirty rows):
+
+| Arm | UUID | Wall |
+|---|---|---:|
+| base `0dccb796` | `555d1e7d` | 41.5 s |
+| fused | `e4fa4059` | 21.1 s |
+| base `0dccb796` | `1d50bb2d` | 36.8 s |
+| fused | `85686a66` | 21.1 s |
+
+Sidecar `85686a66`: `CHECKPAIR_UNINDEXED` 21,045 ms; the way re-read
+phase and deferred resolve under 1 ms each (no blob re-read).
+
+The node replay now skips IDs of other kinds (the pass's ID scratch may
+hold relation IDs), a branch the indexed node phases also take. Indexed
+default pair, same commit, interleaved: base `0e379bb2` 28.1 s (first
+after the unindexed cells) and `4670a74b` 21.0 s; variant `4c3d3db7`
+21.9 s and `6a27f41f` 21.2 s. Neutral.
+
 ## A bare check reads an indexed file once (bygg, 2026-11-24, against `3c729629`)
 
 `check` with no selector (`--ids` with `--refs`) used to be two library

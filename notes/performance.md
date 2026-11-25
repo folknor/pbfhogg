@@ -1303,29 +1303,6 @@ serial inflate.
 
 Kind: unmeasured, moderate conviction.
 
-## PERF-045 - Unindexed check pair and combined inspect modes read twice
-
-Reported by: check.
-
-The indexed default pair (`--ids` with `--refs`) reads once through
-`check::pair` (planet about -45 %, reference/performance/check.md). Residue:
-
-- On an unindexed file `check::pair` runs the two engines in turn, so the
-  file is read twice. One combined pass is possible: a projection carrying
-  node IDs (and relation IDs when `--check-relations` is off), way spans,
-  relation spans under `--check-relations` and `GroupKinds`, with
-  `replay_nodes` filtering by kind, then the reference check's re-reads.
-- `run_inspect` runs the report and node statistics as separate calls with
-  `--nodes` plus a report flag. node_stats requires indexdata and the report
-  may be index-only, so sharing payload work applies only to the full-decode
-  report.
-
-Ruled out, with the reasoning at the code: folding `--index` into the pair
-(pair.rs module doc: it would inherit the claim routing and partial-index
-stop it judges), and replacing `unindexed_phase`'s whole-judgement re-read
-with deferred unresolved requests (refs.rs "Unindexed input"; sorted
-unindexed planet re-reads 2 of 50,816 blobs).
-
 ## PERF-046 - Location checking rereads every way blob per partition
 
 Reported by: check.

@@ -1778,6 +1778,90 @@ fn the_pair_reports_each_check_as_its_own_call_on_order_and_headers() {
     assert_pair_matches_everywhere(&unsupported);
 }
 
+/// The unindexed pass the pair shares between its checks: negative IDs and
+/// references ahead of their targets in any blob order, and an unknown
+/// member type, which fails the reference check alone, each reported as the
+/// two calls report them.
+#[test]
+fn the_pair_reports_each_check_as_its_own_call_on_unindexed_input() {
+    use crate::common::adversarial;
+
+    let dir = crate::common::test_scratch();
+    let nodes = [node(-5), node(1), node(6)];
+    let ways = [way(-10, &[-5, 1]), way(11, &[-6])];
+    let rels = [
+        relation(-3, MemberId::Way(-10)),
+        relation(3, MemberId::Relation(-3)),
+    ];
+    let (n, w, r) = (
+        Blob::Nodes(&nodes),
+        Blob::Ways(&ways),
+        Blob::Relations(&rels),
+    );
+    for (name, order) in [
+        ("sorted", vec![n, w, r]),
+        ("reversed", vec![r, w, n]),
+        ("ways-first", vec![w, r, n]),
+    ] {
+        let path = dir.path().join(format!("{name}.osm.pbf"));
+        write_unindexed_blobs(&path, &order);
+        assert_pair_matches_everywhere(&path);
+    }
+
+    let unknown = dir.path().join("unknown-member.osm.pbf");
+    let member = [relation(3, MemberId::Node(99))];
+    write_unindexed_blobs(&unknown, &[n, w, Blob::Relations(&member)]);
+    let bytes = std::fs::read(&unknown).expect("read fixture");
+    let last = adversarial::locate_blobs(&bytes).len() - 1;
+    let mutated = adversarial::set_relation_last_member_type(&bytes, last, 0, 7);
+    std::fs::write(&unknown, mutated).expect("write fixture");
+    assert_pair_matches_everywhere(&unknown);
+}
+
+/// The pair reads each blob of an unindexed file once for both checks; the
+/// reference check reads again only the blob whose way misses in fact.
+#[test]
+fn the_pair_reads_an_unindexed_file_once() {
+    let dir = crate::common::test_scratch();
+    let (nodes, ways, relations) = refs_fixture_elements();
+    let path = dir.path().join("unindexed.osm.pbf");
+    write_unindexed_blobs(
+        &path,
+        &[
+            Blob::Nodes(&nodes),
+            Blob::Ways(&ways),
+            Blob::Relations(&relations),
+        ],
+    );
+    let counters = std::sync::Arc::new(Counters::default());
+    let mut host = crate::common::test_host();
+    host.invocation = pbfhogg::host::Invocation::with_sink(
+        std::sync::Arc::clone(&counters) as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    let ids_opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        max_errors: 0,
+        direct_io: false,
+        full: false,
+        type_filter: None,
+    };
+    let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
+        direct_io: false,
+        check_relations: false,
+        show_ids: None,
+    };
+    let pair = pbfhogg::check::pair::check_ids_and_refs(&path, &ids_opts, &refs_opts, &host)
+        .expect("the pair runs");
+    assert!(pair.ids.complete().is_some());
+    assert!(pair.refs.expect("refs runs").complete().is_some());
+    assert_eq!(counters.get("checkpair_physical_blobs"), 3);
+    assert_eq!(counters.get("checkrefs_unindexed_blobs"), 3);
+    assert_eq!(counters.get("checkrefs_node_blobs"), 0);
+    // Way 11 misses n99 in fact; way 10 may also have raced the node blob,
+    // but both are in the one way blob.
+    assert_eq!(counters.get("checkrefs_way_blobs"), 1);
+    assert_eq!(counters.get("checkrefs_relation_blobs"), 0);
+}
+
 /// The pair reads each blob of an indexed file once, the node and way blobs
 /// for both checks; the reference check's counters still describe what it
 /// consumed.

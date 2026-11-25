@@ -750,11 +750,7 @@ fn unindexed_pass(
                 settle_overflow(overflow, &mut r, host);
                 slots[seq] = Some(r);
             }
-            for (span, group) in spans.iter_mut().zip(groups) {
-                if let Some((first, last)) = group {
-                    widen(span, (seq, first), (seq, last));
-                }
-            }
+            fold_group_spans(&mut spans, seq, groups);
         },
         host,
     )?;
@@ -775,6 +771,20 @@ fn widen<K: Ord + Copy>(span: &mut Option<(K, K)>, first: K, last: K) {
         None => (first, last),
         Some((lo, hi)) => (lo.min(first), hi.max(last)),
     });
+}
+
+/// Fold blob `seq`'s [`GroupKinds`] spans into the file's `(blob, group)`
+/// spans, in whatever order the blobs complete.
+pub(super) fn fold_group_spans(
+    spans: &mut KindSpans<(usize, usize)>,
+    seq: usize,
+    groups: KindSpans<usize>,
+) {
+    for (span, group) in spans.iter_mut().zip(groups) {
+        if let Some((first, last)) = group {
+            widen(span, (seq, first), (seq, last));
+        }
+    }
 }
 
 /// The frame offsets of a claimed schedule's first and last blob.
@@ -800,9 +810,9 @@ pub(super) fn schedule_span(
 /// read under the blob's place in the file, expose to [`check_type_order`].
 /// What a hook records is provisional, read only once the blob is accepted.
 #[derive(Default)]
-struct GroupKinds {
+pub(super) struct GroupKinds {
     group: usize,
-    spans: KindSpans<usize>,
+    pub(super) spans: KindSpans<usize>,
 }
 
 impl crate::read::block::GroupProjection for GroupKinds {

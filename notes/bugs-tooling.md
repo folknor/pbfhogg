@@ -182,6 +182,18 @@ writing and both admin bands) and the exit tolerances `build_indexes` names
 are exercised only by real-data runs on denmark. Add a fixture test with a
 fake osmium and a small admin fixture.
 
+## TOOL-058 - No cancellation or fault test drives the default check pair
+
+Reported by: the scout of the unindexed check pair fusion (2026-11-25).
+
+`crates/lib/tests/cancel.rs` has scenarios for `check_refs` and
+`check_ids` but none for `check::pair::check_ids_and_refs`, and no
+`fault_*.rs` test arms a fault inside it, although the pair now owns two
+routes of its own (the indexed shared phases and the unindexed single
+pass), each with its own per-check failure attribution. The bare `check`
+is covered only through the CLI pin-replacement tests. Add a cancel
+scenario per route and a fault test that fails one blob's read on each.
+
 # From the 2026-11-21 verifier performance hunt
 
 Defects the performance hunters found while reading the code at `e8377a78`

@@ -5340,7 +5340,20 @@ fn run_inspect(
         host,
     )?;
 
-    // --nodes combined with other flags: run node stats, printed below
+    // --nodes combined with other flags: run node stats, printed below.
+    //
+    // A full-decode report beside --nodes reads the payload twice, on
+    // purpose. Sharing that read would still need everything node stats
+    // owns: its admission (unindexed refused without --force, a partial
+    // index refused at its walk), its schedule of node-claimed blobs with
+    // their claims checked (the report never routes by claim, so it counts
+    // a node hidden in a way-claimed blob that node stats skips, and accepts
+    // a node-claimed blob holding a way that node stats refuses), and its
+    // -j-sized pool. The report's ordered pipeline would have to hand each
+    // node blob to that pool as an owned replay record or a retained
+    // decompressed buffer, with a slow node pool throttling the report, and
+    // node errors deferred behind the report's. For a combination no
+    // workload or bench runs, that is not worth it.
     let node_report = if nodes {
         Some(pbfhogg::inspect::node_stats::node_stats(
             input, direct_io, force, jobs, host,

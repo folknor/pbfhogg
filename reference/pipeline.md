@@ -330,7 +330,7 @@ geographic domain) are skipped and counted, not errored.
 Descriptor-first streaming pipeline applying an OSC diff to a sorted PBF (`crates/lib/src/commands/apply_changes/`). OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index, defined in `crates/lib/src/osc/parse.rs`), which is then turned into `SortedDiff` (`crates/lib/src/osc/sorted.rs`) for the run: per kind the upserted IDs sorted in OSM order with their record offsets, and the deleted IDs sorted, beside the unchanged arenas. The parse-time hash indexes, deleted sets, version floors and interner lookup are dropped there; every stage reads the diff in ID order (binary search for overlap, forward cursors in the workers and the drain), except the `--locations-on-ways` refresh probe below, whose lookups follow way refs and so binary-search the sorted node lists.
 
 Stages:
-1. **Scanner** (`scanner.rs`) - walks blob headers, emits a `BlobDescriptor` per blob classified as `Passthrough` or `Candidate` using indexdata + `SortedDiff::range_overlaps`. Indexdata fast-path skips ~92% of blobs at Denmark scale.
+1. **Scanner** (`scanner.rs`) - walks blob headers, emits a `BlobDescriptor` per blob classified as `Passthrough` or `Candidate` using indexdata + `SortedDiff::range_overlaps`. Indexdata lets the scanner pass through blobs whose ranges miss the diff without decoding them.
 2. **Workers** (`streaming.rs`, `rewrite_block.rs`) - pull candidate descriptors, perform precise overlap check, rewrite and frame each output block as it completes (the blob's frames leave as one item), or demote to false-positive passthrough. A rewritten output block is pre-seeded with its source block's whole string table (survivors copy their string indices) and cut at the element cap, so it can pass the 32 MiB payload limit when OSC strings join a large table; such a block's framing refusal is recorded with the operations it held, and a blob whose held frames pass `APPLY_CHANGES_REWRITE_RETAIN_BYTES` stops holding them. Either defers the blob (`overflow.rs`). After the walk each recorded overflow is planned by trial writes whose frames are dropped as framed: first into blocks whose table holds only the source strings that piece's survivors use, their indices translated (`BlockBuilder::pre_seed_subset_string_table`), halved and recollected while a piece still overflows; and, should that end in a single element's framing refusal, that overflow (only that one; the others keep their compact plans) again with whole-table blocks from a fresh, unseeded builder, halved the same way, so the replay refuses nothing the whole-table pass alone recovers. A single node without metadata that overflows dense under either strategy is tried once more as a plain `Node` without `Info` (same claims, a few bytes smaller alone), and the plan records that form so the second writing repeats it. Then the walk's own refusal is returned, so a refused blob sends nothing; otherwise the worker sends the blob's item carrying a frame stream (`RewrittenFrames::Stream`, `APPLY_CHANGES_REWRITE_STREAM_FRAMES` deep) and writes the blob again, sending each frame as it is framed and writing each overflow's plan in its place. The drain reads the stream when the item is the head; the worker checks the token and the failure slot before every operation and frame, and keeps the stream's sender in a slot outside its unwind boundary, dropped only after a failure is published, so a stream that closes without its end always has a published cause. No head waits on a streaming worker: candidates are dequeued in seq order, so every earlier seq is held by another producer. The drain's create runs, which carry no source table, cut an overflowing block in halves (`stream_output.rs::settle`), writing each piece as it is framed; a lone create node without metadata that overflows dense is retried plain the same way (`encode_and_frame`). Normal input never overflows or crosses the threshold; what it pays is an operation counter per written element, a range update and a byte count per flush and one content-length check per OSC element.
 3. **Drain / stream output** (`drain.rs`, `stream_output.rs`) - results reordered to file order; consecutive passthroughs coalesced (owned-route frames flushed at `OWNED_PASSTHROUGH_FLUSH_BYTES`); the creates no blob's range holds are written by the drain as create runs at their sorted positions: gap creates before the blob they precede, and the remaining upserts of every kind an item's own kind passes (a kind after its last blob, or one the base never holds, before its first blob or between two of its kinds) when that item arrives, and of the rest at end of input. One rule closes kinds in order, so no kind's upserts are skipped whatever kind the base starts or ends with. Every create run is checked by the output-order guard before it is written. A run is cut into blocks of the element cap, as one builder filling to it would cut it; a run of more than one block is encoded and framed in parallel on the invocation's executor, `APPLY_CHANGES_CREATE_BATCH_BLOCKS` blocks per call (on the drain thread under an explicit `-j 1`, which runs sequentially), so the drain is not held for the whole run while the workers produce behind it. Every block leaves as a raw frame (`write_raw_owned`); apply-changes frames nothing through the writer's own framing job.
 
@@ -757,10 +757,9 @@ Consequences:
   passes the flag when enriching, and sparse implements both fields too
   so the backend-parity canary keeps covering them (decision 2 of the
   same note, ratified alongside).
-- Daily write volume roughly doubles at planet: apply-changes rewrites
-  most blobs (86% by count in `3ad57fc5`; ~90 GB output) and altw writes the full enriched file
-  again. Wall stays comfortable (~17-18 min for the whole loop); NVMe
-  endurance is the number to watch if the host changes.
+- Daily write volume at planet comes from two full outputs. Apply-changes
+  writes the updated base and add-locations-to-ways writes the enriched
+  file. NVMe endurance is the number to watch if the host changes.
 
 **`sort` is not in the pipeline.** Geofabrik and planet PBFs are always `Sort.Type_then_ID`, and every pipeline step preserves sorted order: `cat` copies blobs in input order, `merge` interleaves upserts at sorted positions, `add-locations-to-ways` passes through or decodes without reordering. The `sort` command exists for repairing unsorted PBFs from other tools (osmosis, custom exporters) - a one-time fix, not a recurring step.
 
@@ -997,19 +996,24 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 - `WireBlock` group ranges: (offset, length) pairs appended to the decompressed buffer - zero separate allocation
 - Element wrappers: stack-allocated (~24 bytes each)
 
-## Merge passthrough ratios (measured)
+## Apply-changes passthrough accounting
 
-The apply-changes descriptor pipeline (see Command Pipelines above) is
-passthrough-dominated on small extracts and rewrite-dominated at planet:
+The apply-changes summary reports source blob counts and output data bytes
+separately.
 
-- Denmark (465 MB, ~300K changes): ~92% passthrough, ~8% rewrite
-- Germany (4.5 GB, ~146K changes): ~82% passthrough, ~18% rewrite
-- Planet (~90 GB, daily diff): most blobs touched; 43,670 of 50,816
-  rewritten (86%) in the recorded run `3ad57fc5` (commit `16e3694`,
-  plantasjen)
+- **Source blobs** counts input blobs by disposition: passthrough or
+  rewritten. `blobs_rewritten` counts each rewritten source blob once,
+  even if it yields zero or several output frames.
+- **Output data bytes** partitions the on-disk bytes of all output OSMData
+  frames, including framing and excluding the file header. Passthrough
+  bytes come from frames passed through. Rewritten bytes include every
+  frame a rewritten source blob yields, including any inline creates.
+  Created bytes come from standalone create runs. The reported percentage
+  divides rewritten plus created bytes by total output data bytes.
 
-The planet ratio is why the daily loop's write volume is effectively one
-full file per step: passthrough saves little there.
+In the recorded planet daily-diff run `3ad57fc5` (commit `16e3694`,
+plantasjen), apply-changes rewrote 43,670 of 50,816 source blobs (86% by
+count). See [apply-changes measurements](performance/apply-changes.md).
 
 ## Write Side (shared by merge rewrite + cat filtered + add-locations-to-ways)
 
@@ -1152,7 +1156,7 @@ string.
 | Path | Decompress | Compress | Backend |
 |---|---|---|---|
 | Read (all ingest) | every blob | - | zlib-rs via flate2 |
-| Merge passthrough | none (~92% DK) | none | - |
+| Merge passthrough | none | none | - |
 | Merge rewrite | yes | zlib:6 | zlib-rs via flate2 |
 | Cat passthrough | none | none | - |
 | Cat filtered | every blob | zlib (default) | zlib-rs via flate2 |

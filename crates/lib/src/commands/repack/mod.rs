@@ -626,9 +626,10 @@ fn write_central(
 /// Encode one way into the per-worker full-block `BlockBuilder`, reusing the
 /// caller's scratch buffers. When `preserve_locations` is set (input header
 /// declares LocationsOnWays) the way's own inline coordinates are embedded via
-/// `add_way_with_locations`. The length guard keeps a way that carries no
-/// inline coordinates under a LOW header (empty lat/lon fields) on the plain
-/// `add_way` path instead of tripping the refs==locations invariant.
+/// `add_way_with_locations`. A way that carries no inline coordinates under a
+/// LOW header (empty lat/lon fields) stays on the plain `add_way` path; a
+/// nonempty count that disagrees with the refs is an internal error, since
+/// the decoder already refused such input.
 fn encode_way_full_block(
     bb: &mut BlockBuilder,
     w: &crate::Way<'_>,
@@ -644,8 +645,9 @@ fn encode_way_full_block(
         for loc in w.node_locations() {
             locations_buf.push((loc.decimicro_lat()?, loc.decimicro_lon()?));
         }
+        crate::owned::check_way_locations(w.id(), refs_buf.len(), locations_buf.len(), true)?;
     }
-    if preserve_locations && locations_buf.len() == refs_buf.len() && !locations_buf.is_empty() {
+    if preserve_locations && !locations_buf.is_empty() {
         bb.add_way_with_locations_partial(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
     } else {
         bb.add_way_partial(w.id(), w.tags(), refs_buf, meta.as_ref());

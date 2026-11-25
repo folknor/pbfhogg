@@ -1895,8 +1895,7 @@ spread to LRU loss of its four osmium artifacts; nothing recorded supports
 or refutes that.
 
 Blocked on measurement: deciding needs a germany run and a repeated denmark
-`verify all` with the per-step hit times now printed, neither of which this
-session's rulings allow. Note that `retain` caps bytes only after a run; no
+`verify all` with the per-step hit times now printed. Note that `retain` caps bytes only after a run; no
 ranking caps scratch during one.
 
 Kind: local, medium.
@@ -2194,8 +2193,7 @@ The PASS line's steps now time the verifier's own OPL reading
 (`opl merge`, `opl order scan`, `opl derive model`) apart from the decodes.
 What remains is the measurement those labels exist for: one denmark `all`,
 read for the split between `osmium cat` and the merge, before any redesign of
-the comparison path is argued from cost. It waits on the session rule that
-forbids `verify all` until the reference-path items have landed. No baseline
+the comparison path is argued from cost. No baseline
 with the 8 KiB OPL readers exists to set against it; the readers are now
 1 MiB.
 

@@ -36,14 +36,6 @@ for judgement against each command's promise. The sort and `cat --dedupe` sweep
 now keeps them when every input declares `LocationsOnWays`; time-filter drops
 them deliberately (they are not as of the cutoff).
 
-## BUG-007 - add_owned_way silently drops mismatched locations
-
-Reported by: encoding.
-
-`add_owned_way` (`owned.rs`) falls back to a plain way when a nonempty
-locations vector disagrees with refs; the direct builder location API refuses
-the mismatch. The fallback can hide an internal transformation error.
-
 ## BUG-019 - apply-changes blob-size percentiles sample passthrough only
 
 Reported by: apply-core.

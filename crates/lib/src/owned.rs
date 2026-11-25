@@ -204,8 +204,8 @@ pub(crate) struct OwnedWay {
     /// always leaves this empty; `read_way_with_locations` (repack) and
     /// `read_declared_way` (the sort and `cat --dedupe` sweep over declaring
     /// inputs) populate it. The `write_single_way*` helpers switch to
-    /// `add_way_with_locations` only when this is non-empty and its length
-    /// matches `refs`.
+    /// `add_way_with_locations` when this is non-empty; a non-empty vector
+    /// whose length differs from `refs` is refused as an internal error.
     pub(crate) locations: Vec<(i32, i32)>,
     pub(crate) metadata: Option<OwnedMetadata>,
 }
@@ -439,12 +439,36 @@ pub(crate) fn add_owned_node(bb: &mut BlockBuilder, node: &OwnedNode) {
     }
 }
 
-/// Add an owned way: with its inline locations when it carries one per ref,
-/// plain otherwise.
-pub(crate) fn add_owned_way(bb: &mut BlockBuilder, way: &OwnedWay) {
+/// A way's inline locations against its refs, checked before the write that
+/// would encode them: one location per ref, or none when `allow_empty`.
+///
+/// Every location vector here comes from the decoder, which already refused
+/// lat/lon arrays whose length disagrees with the refs, so a disagreement is
+/// a pbfhogg transformation bug, not input: `Error::internal` (ADR-0021).
+/// The writer used to fall back to a plain way on a nonempty mismatch, which
+/// would have dropped the coordinates silently; the builder's own length
+/// guard poisons instead, but surfaces as `invalid_data`, the wrong class.
+pub(crate) fn check_way_locations(
+    id: i64,
+    refs: usize,
+    locations: usize,
+    allow_empty: bool,
+) -> Result<()> {
+    if locations == refs || (allow_empty && locations == 0) {
+        return Ok(());
+    }
+    Err(crate::Error::internal(format!(
+        "way {id}: {refs} node ref(s) but {locations} inline location(s) reached the writer"
+    )))
+}
+
+/// Add an owned way: with its inline locations when it carries any, plain
+/// otherwise. The caller has run [`check_way_locations`], so nonempty
+/// locations match the refs one for one.
+fn add_owned_way(bb: &mut BlockBuilder, way: &OwnedWay) {
     let tags = way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let meta = way.metadata.as_ref().map(OwnedMetadata::as_partial);
-    if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
+    if !way.locations.is_empty() {
         bb.add_way_with_locations_partial(way.id, tags, &way.refs, &way.locations, meta.as_ref());
     } else {
         bb.add_way_partial(way.id, tags, &way.refs, meta.as_ref());
@@ -897,6 +921,7 @@ pub(crate) fn write_declared_way_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<()> {
+    check_way_locations(way.id, way.refs.len(), way.locations.len(), false)?;
     crate::commands::ensure_way_capacity_local(bb, output)?;
     let tags = way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let meta = way.metadata.as_ref().map(OwnedMetadata::as_partial);
@@ -951,6 +976,7 @@ pub(crate) fn write_single_way_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<()> {
+    check_way_locations(way.id, way.refs.len(), way.locations.len(), true)?;
     crate::commands::ensure_way_capacity_local(bb, output)?;
     add_owned_way(bb, way);
     Ok(())
@@ -972,6 +998,25 @@ mod tests {
     use super::read_dense_node;
     use crate::block_builder::{BlockBuilder, Metadata, PartialMetadata};
     use crate::{Element, PrimitiveBlock};
+
+    /// A nonempty location vector that disagrees with the refs is an
+    /// internal error at the write boundary, never a silent plain way; empty
+    /// passes only where the writer allows a way without coordinates.
+    #[test]
+    fn mismatched_way_locations_are_an_internal_error() {
+        assert!(super::check_way_locations(1, 3, 3, false).is_ok());
+        assert!(super::check_way_locations(1, 0, 0, false).is_ok());
+        assert!(super::check_way_locations(1, 3, 0, true).is_ok());
+        for (refs, locations, allow_empty) in [(3, 0, false), (3, 2, true)] {
+            let err = super::check_way_locations(7, refs, locations, allow_empty)
+                .expect_err("mismatch must be refused");
+            assert!(
+                matches!(err.kind(), crate::error::ErrorKind::Internal { .. }),
+                "{err}"
+            );
+            assert!(err.to_string().contains("way 7"), "{err}");
+        }
+    }
 
     type Fields = (
         Option<i32>,

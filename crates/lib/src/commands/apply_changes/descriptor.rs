@@ -175,8 +175,8 @@ pub(super) enum DrainItem {
     /// spike (P1.5 in the plan). Stats merge as before.
     Rewritten {
         seq: u64,
-        /// Each output block's frame with the block's kind, in output order.
-        framed_chunks: Vec<(ElementKind, Vec<u8>)>,
+        /// The output blocks' frames, in output order.
+        frames: RewrittenFrames,
         kind: ElementKind,
         /// The input blob's range, verified exact by the rewrite's walk (or
         /// derived from an unindexed payload), not the output blocks'.
@@ -192,6 +192,31 @@ pub(super) enum DrainItem {
     /// so the reorder buffer advances, but it has no kind: it must not
     /// move the drain's type transitions, gap creates or order watermark.
     Omitted { seq: u64 },
+}
+
+/// A rewritten blob's frames: held in the item, or streamed by its worker.
+pub(super) enum RewrittenFrames {
+    /// Each output block's frame with the block's kind, in output order:
+    /// every blob whose rewrite fit its blocks and stayed within
+    /// `APPLY_CHANGES_REWRITE_RETAIN_BYTES`, which is every blob of real
+    /// data.
+    Held(Vec<(ElementKind, Vec<u8>)>),
+    /// A blob whose output overflowed a block or the retention threshold:
+    /// its worker writes the blob again once the item is sent and sends
+    /// each frame here as it is framed, then [`StreamMsg::End`]
+    /// (`overflow.rs`). The drain reads it when the item is the head, so
+    /// at most the channel's capacity of frames is in flight. The worker
+    /// keeps the sender until it has published any failure (`run_workers`),
+    /// so a stream that closes without `End` always has a published cause.
+    Stream(std::sync::mpsc::Receiver<StreamMsg>),
+}
+
+/// One message of a [`RewrittenFrames::Stream`].
+pub(super) enum StreamMsg {
+    /// One output block's frame.
+    Frame(Vec<u8>),
+    /// The blob's last frame has been sent.
+    End,
 }
 
 /// What the drain channel carries: a blob's [`DrainItem`], or the scanner's
@@ -390,12 +415,15 @@ impl DrainItem {
                 DESCRIPTOR_OVERHEAD + tagdata.as_ref().map_or(0, |t| t.len())
             }
             DrainItem::OwnedBytes { frame_bytes, .. } => DESCRIPTOR_OVERHEAD + frame_bytes.len(),
-            DrainItem::Rewritten { framed_chunks, .. } => {
+            DrainItem::Rewritten { frames, .. } => {
                 DESCRIPTOR_OVERHEAD
-                    + framed_chunks
-                        .iter()
-                        .map(|(_, chunk)| chunk.len())
-                        .sum::<usize>()
+                    + match frames {
+                        RewrittenFrames::Held(chunks) => {
+                            chunks.iter().map(|(_, chunk)| chunk.len()).sum::<usize>()
+                        }
+                        // Its frames are not held by the item.
+                        RewrittenFrames::Stream(_) => 0,
+                    }
             }
             DrainItem::Omitted { .. } => DESCRIPTOR_OVERHEAD,
         }

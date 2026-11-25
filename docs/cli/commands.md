@@ -1931,7 +1931,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)); `--format osc` only, which keeps its per-action XML there, removed on completion: for a `.osc.gz` output from indexed inputs that XML is already gzip-compressed (about the output's size), otherwise it is plain XML several times larger. Must exist and be writable; checked before any input is read. Default: the output's directory. A text diff writes no scratch and refuses it |
 | `--direct-io` | Use O_DIRECT when reading the PBF inputs; see the [I/O capability matrix](#io-capability-matrix) |
 
-With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)). A created or modified element whose metadata says it is hidden is written with `visible="false"`, which `apply-changes` applies as the object's deletion; so the roundtrip holds for snapshots of visible objects. Visibility is compared as well as content: an element hidden or unhidden with unchanged content is written as a modify of the new record (with `visible="false"` when hidden), carrying its new version; the text `diff` still compares content only. That holds for elements that fit a PBF block on their own with room to spare, while the changed output of any one base blob stays under 256 MiB. Otherwise `apply-changes` can refuse, loudly and before publishing anything (see [apply-changes](#apply-changes)). A string XML 1.0 cannot carry (NUL, another control character besides tab, newline and carriage return, or U+FFFE / U+FFFF), which a PBF may hold, makes the run fail without publishing, naming the element. Every OSC reader (`apply-changes`, `merge-changes`, OSC `tags-filter`) refuses an input document holding such a character anywhere, literally or as a character reference, as osmium does; see [Output files](#output-files).
+With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)). A created or modified element whose metadata says it is hidden is written with `visible="false"`, which `apply-changes` applies as the object's deletion; so the roundtrip holds for snapshots of visible objects. Visibility is compared as well as content: an element hidden or unhidden with unchanged content is written as a modify of the new record (with `visible="false"` when hidden), carrying its new version; the text `diff` still compares content only. That holds for elements that fit a PBF block on their own with room to spare. Otherwise `apply-changes` can refuse, loudly and before publishing anything (see [apply-changes](#apply-changes)). A string XML 1.0 cannot carry (NUL, another control character besides tab, newline and carriage return, or U+FFFE / U+FFFF), which a PBF may hold, makes the run fail without publishing, naming the element. Every OSC reader (`apply-changes`, `merge-changes`, OSC `tags-filter`) refuses an input document holding such a character anywhere, literally or as a character reference, as osmium does; see [Output files](#output-files).
 
 **Only values `apply-changes` reads back.** `--format osc` never writes a value pbfhogg's own OSC reader refuses. A created or modified node outside latitude -90 to 90 or longitude -180 to 180 is refused, and so is one whose coordinate does not fit the PBF representation. An element timestamp outside years 0000 to 9999 is refused too, because `YYYY-MM-DDTHH:MM:SSZ` cannot spell it, and so is one whose scaling overflows. Each refusal exits `2` and publishes nothing. A clock past 9999 under `--update-timestamp` is refused before either input is opened. Deleted elements print only ID, version and the override timestamp, so their old values are never checked.
 
@@ -2279,13 +2279,15 @@ element that grew past its source (refreshed `--locations-on-ways`
 coordinates, say) is not held back by a large string the changes removed;
 where that fails it tries again with blocks that carry the source table. An
 element that does not fit a block alone with its own strings fails the run
-(exit 2) with the oversize error and publishes nothing. The re-cut of one
-input blob may produce at most 256 MiB of blocks, as when its changes carry
-more than 256 MiB of large values between them, or a large string is shared
-by many changed elements that must be cut apart. Past that the run fails
-(exit 2) with an error naming that allowance, followed by the oversize error
-that started the re-cut, and publishes nothing; apply-changes has no option
-that changes either limit.
+(exit 2) with the oversize error and publishes nothing. The re-cut halves a
+piece that does not fit, so it can miss a cut that fits only within bytes
+of the limit (a block's size depends on its neighbours' strings); that also
+fails with the oversize error. There is no limit on how large one input
+blob's output may grow: a large string shared by many changed elements that
+must be cut apart is written once per block, however many blocks that takes
+(a blob whose output is that large is written twice, the second time
+streamed to the output, so it is never held in memory whole).
+apply-changes has no option that changes the block limit.
 
 The output header declares no bbox (the OSC can place a node outside the
 base's). Of the base's replication state it keeps the base URL and drops the

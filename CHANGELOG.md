@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **`apply-changes` no longer limits one base blob's re-cut output, and
+  `ErrorKind::OverflowReplayBudget` is gone.** A base blob whose rewritten
+  output overflows a block, or grows past 64 MiB, is now written a second
+  time with its frames streamed to the output, so it is never held in
+  memory whole. Many changed elements sharing a large string that each
+  need a block of their own, or more than 256 MiB of large changed values
+  in one blob, used to fail the run (exit `2`) and now apply. Library
+  callers matching `ErrorKind::OverflowReplayBudget` must drop the arm;
+  the harness's `overflow_replay_budget` kind is gone with it. An element
+  too large for a block alone is still refused before publication.
+
 - **`export` runs on every core, stops at a failed write, and believes
   kind claims.** Features are now formatted on the read's decode workers
   and written in input order, so export is many times faster (Germany

@@ -173,9 +173,8 @@ fn a_large_value_beside_a_surviving_large_value_applies() {
 /// A large string the diff removes no longer rides along with every block
 /// of survivors. Node 1's 28 MiB value is modified away while survivors
 /// alternate with 5 MiB values: re-cut blocks that each carried the source
-/// table would hold more than the replay's 256 MiB budget between them,
-/// so the run was refused; blocks carrying only the strings they use come
-/// to about the size of the values.
+/// table would repeat the dead value in every block; blocks carrying only
+/// the strings they use come to about the size of the values.
 #[test]
 fn a_removed_large_value_is_not_repeated_across_recovered_blocks() {
     let dir = crate::common::test_scratch();
@@ -202,6 +201,59 @@ fn a_removed_large_value_is_not_repeated_across_recovered_blocks() {
     assert_eq!(node_ids_id_only(&c), (1..=50).collect::<Vec<i64>>());
     assert_eq!(stats.diff_nodes, 13);
     assert_eq!(stats.base_nodes, 37);
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
+}
+
+/// One large value shared by many creates that cannot share a block: each
+/// create alone fits (the shared value plus its own small one), any two do
+/// not, so every create is a block of its own and every block repeats the
+/// shared value. The blob's output is several times the 256 MiB the re-cut
+/// was once allowed to hold for one blob, and far past what a worker holds
+/// before it streams; it is written whole and in order.
+#[test]
+fn a_large_value_shared_by_many_creates_fans_out() {
+    const CREATES: i64 = 9;
+    let dir = crate::common::test_scratch();
+    let (base, osc, output) = (
+        dir.path().join("base.osm.pbf"),
+        dir.path().join("diff.osc"),
+        dir.path().join("out.osm.pbf"),
+    );
+    let shared: String = std::iter::repeat_n('s', 29 << 20).collect();
+    let ids: Vec<i64> = (20..20 + CREATES).collect();
+    write_base(&base, &[], &ids);
+    let own: Vec<String> = ids
+        .iter()
+        .map(|&id| {
+            let fill = char::from(b'a' + u8::try_from(id - 20).unwrap());
+            std::iter::repeat_n(fill, 2 << 20).collect()
+        })
+        .collect();
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n<create>\n",
+    );
+    for (&id, v) in ids.iter().zip(&own) {
+        writeln!(
+            xml,
+            "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\">\
+             <tag k=\"note\" v=\"{shared}\"/><tag k=\"own\" v=\"{v}\"/></node>"
+        )
+        .unwrap();
+    }
+    xml.push_str("</create>\n</osmChange>\n");
+    std::fs::write(&osc, xml).unwrap();
+    let stats = merge(&base, &osc, &output);
+
+    let notes = node_notes(&output);
+    assert_eq!(notes.len(), ids.len());
+    for ((id, note), &want) in notes.iter().zip(&ids) {
+        assert_eq!(*id, want);
+        assert!(*note == shared, "node {id} keeps the shared value");
+    }
+    let c = read_all_elements_id_only(&output);
+    assert_eq!(node_ids_id_only(&c), (1..=50).collect::<Vec<i64>>());
+    assert_eq!(stats.diff_nodes, u64::try_from(CREATES).unwrap());
     crate::common::assert_every_data_blob_indexed(&output);
     crate::common::assert_sorted_file(&output);
 }

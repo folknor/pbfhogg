@@ -38,6 +38,17 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### Deferred blobs streamed, replay budget removed (bygg, 2026-11-25, `67bcd55c` + change)
+
+The first pass's sink gained a byte count per framed block against
+`APPLY_CHANGES_REWRITE_RETAIN_BYTES`, and the held item's frames became
+one arm of an enum; the plan, second writing and stream run only for a
+blob that overflowed or crossed the threshold, which planet never does.
+Planet apply-diff of OSC 4913, `--iterations 1`, interleaved B V V B,
+baseline `--commit HEAD`, variant uncommitted: baseline 3m21s
+(`6ce554e3`) and 3m23s (`e765fb59`), variant 3m21s (`499cb884`) and
+3m23s (`03e72eb0`). Identical per position. Neutral.
+
 ### Compact overflow replay: subset-seeded raw adds (bygg, 2026-11-24, `84088fed` + change)
 
 The raw adds gained a subset-seed branch (one match per surviving

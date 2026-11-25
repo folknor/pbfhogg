@@ -134,22 +134,24 @@ Reported by: the derive OSC domain item (2026-11-19); narrowed 2026-11-19
 after overflow recovery landed (an overflowing output block is re-cut,
 `apply_changes/overflow.rs` and `stream_output.rs::settle`), and again
 2026-11-24 after the replay's blocks began carrying only the strings their
-survivors use, with the whole-table replay as fallback.
+survivors use, with the whole-table replay as fallback; and 2026-11-25
+after the replay budget was removed (deferred blobs are planned, then
+written again with each frame streamed to the drain).
 
-What recovery does not cure, each a loud refusal before publication. The
-replay budget (`APPLY_CHANGES_OVERFLOW_REPLAY_BYTES`, 256 MiB of frames per
-blob, per strategy) refuses legitimate output: more than 256 MiB of large
-values changed in one base blob, or one large role shared by many relation
-creates that must be cut apart (each piece repeats the role). Closing that
-means streaming a worker's recovered frames to the drain instead of holding
-them until the rewrite ends; `DrainItem::Rewritten` carries one blob's
-frames as one item today, so this needs an ordered frame stream or a spill
-behind that item, delivered without letting later sequences block the next
-one. Second, halving misses a partition that exists only because string
-index widths shrink when two elements share a table, and `add_node_partial`
-writes a metadata-less node dense, which the entry's reporter put at two
-bytes larger than plain (not measured), so a node at exactly the payload
-limit fails. Both need blocks within bytes of 32 MiB.
+What recovery does not cure, a loud refusal before publication, only for
+blocks within bytes of 32 MiB. Halving is not an exhaustive search: a
+block's size depends on its neighbours (a string an earlier element
+interned lands at a narrower index, compact seeds are in source-slot
+order, dense deltas and the compressed body change), so a fitting
+partition can exist that halving misses, in either direction. And a lone
+node goes dense where plain would be about two bytes smaller (counted from
+the wire layout, not measured): `add_node_partial` for metadata-less OSC
+nodes on the worker replay, the drain's create runs (`stream_output.rs`
+`settle`, `-j 1` included) and rebuilt base nodes (`add_node_raw_partial`).
+Fix shape, from the spar: a cold fallback over a rejected span only, either
+reachability over cut positions (fitting contiguous spans as edges, no
+monotonicity assumed) or a singleton retry in plain form through an explicit
+builder route, judged by the real framing check, on both recovery paths.
 
 ## CMD-050 - Blob-local re-encoders still refuse a rebuilt block past the limit
 

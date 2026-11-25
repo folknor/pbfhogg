@@ -30,7 +30,9 @@
 //!      the frame into the passthrough chunk buffer for
 //!      `write_raw_chunks`.
 //!    - [`DrainItem::Rewritten`]: flush both coalescers; write each
-//!      worker-framed chunk with `write_raw_owned`; advance the
+//!      worker-framed chunk with `write_raw_owned`, held in the item or,
+//!      for a deferred blob, read from its stream until its end (the
+//!      main channel is not received meanwhile); advance the
 //!      cursor past `blob_osm_last_key(min_id, max_id)` (the
 //!      cursor-rule invariant - Rewrite advances, CopyRange/OwnedBytes
 //!      do NOT).
@@ -73,7 +75,7 @@ use crate::file_writer::FileWriter;
 use crate::osc::sorted::SortedDiff;
 use crate::writer::PbfWriter;
 
-use super::descriptor::{DrainItem, DrainMessage, Route};
+use super::descriptor::{DrainItem, DrainMessage, RewrittenFrames, Route, StreamMsg};
 use super::failure::FailureSlot;
 use super::loc_mode::{LocMap, LocMode};
 use super::stats::MergeStats;
@@ -927,7 +929,7 @@ fn dispatch_variant(
         }
         DrainItem::Rewritten {
             seq: _,
-            framed_chunks,
+            frames,
             kind,
             id_range,
             observed_first: _,
@@ -942,12 +944,51 @@ fn dispatch_variant(
             // `pipeline_send_wait_ns` blowup) is bypassed entirely.
             // Each chunk's kind is its output block's; placement above and
             // the cursor use the input blob's `kind` and `id_range`.
-            for (_, chunk) in framed_chunks {
+            // Taken only for a stream, so a held blob mints nothing.
+            let cancel = matches!(frames, RewrittenFrames::Stream(_))
+                .then(|| writer.cancel_token().permit());
+            let mut write = |chunk: Vec<u8>| -> Result<()> {
                 rewrite_bytes += chunk.len() as u64;
                 writer.write_raw_owned(chunk)?;
                 counters
                     .rewrite_blocks_written
                     .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            };
+            match frames {
+                RewrittenFrames::Held(chunks) => {
+                    for (_, chunk) in chunks {
+                        write(chunk)?;
+                    }
+                }
+                RewrittenFrames::Stream(rx) => {
+                    // loop-ends: blocks in rx.recv; the worker sends every
+                    // frame and then End, or stops on a failure or the
+                    // token and drops its sender only after publishing
+                    // its cause, which ends the receive with a disconnect
+                    loop {
+                        let msg = rx.recv();
+                        // The worker checks both before each frame, so a
+                        // failure elsewhere or a cancellation stops the
+                        // stream within one op and one framing.
+                        if let Some(e) = cfg.failure.take() {
+                            return Err(e);
+                        }
+                        if let Some(cancel) = &cancel {
+                            cancel.check()?;
+                        }
+                        match msg {
+                            Ok(StreamMsg::Frame(chunk)) => write(chunk)?,
+                            Ok(StreamMsg::End) => break,
+                            Err(mpsc::RecvError) => {
+                                return Err(Error::internal(
+                                    "drain: a rewritten blob's frame stream closed without \
+                                     its end or a published failure",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             stats.bytes_rewritten += rewrite_bytes;
             stats.blobs_rewritten += 1;

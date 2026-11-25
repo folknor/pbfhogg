@@ -32,17 +32,22 @@ use super::element_writes::{
     write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
 };
 use super::loc_mode::LocMode;
-use super::overflow::{Replay, RewriteSink};
+use super::overflow::{
+    self, EmitSink, Inputs, OpSink, RewriteSink, StreamTx, collect_ops, end_stream, plan,
+};
 use super::refresh::StaleProbe;
 use super::stats::MergeStats;
 
-/// Output from `rewrite_block_parallel`: the blob's frames, from a rewrite
-/// whose walk has ended, and its local stats.
+/// Output from `rewrite_block_parallel`, from a rewrite whose walk has
+/// ended.
 pub(super) struct RewriteOutput {
-    /// Each output block's frame, with its kind, in output order.
-    pub(super) frames: Vec<(ElementKind, Vec<u8>)>,
+    /// Each output block's frame, with its kind, in output order; `None`
+    /// once they have been streamed, the item already sent.
+    pub(super) frames: Option<Vec<(ElementKind, Vec<u8>)>>,
     /// Wall time spent framing those blocks, excluding their encoding.
     pub(super) frame_ns: u64,
+    /// The blob's local stats, for a held item (a streamed item carried
+    /// them).
     pub(super) stats: MergeStats,
     /// Inline-coordinate refresh counts for the block's surviving base ways
     /// (all zero without `--locations-on-ways`).
@@ -326,14 +331,18 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
 /// their string indices) plus what the OSC elements add, so it can outgrow
 /// the PBF blob limit although the source block and every changed element
 /// fit: a 17 MiB tag value modified to another 17 MiB value. Such a block's
-/// framing refusal is recorded, not returned, and once the walk has ended
-/// its elements are written again in smaller blocks that carry only the
-/// strings they use (`overflow.rs`); only a single element that overflows
-/// even with its own strings alone fails the rewrite, with its framing
-/// error, and so does a recovery past its byte budget, with the budget
-/// error (`ErrorKind::OverflowReplayBudget`). A recorded overflow outranks
+/// framing refusal is recorded, not returned, and so is the moment the
+/// held frames pass `APPLY_CHANGES_REWRITE_RETAIN_BYTES`. Either defers the
+/// blob (`overflow.rs`): once the walk has ended each overflow is planned
+/// into smaller blocks that carry only the strings they use, the walk's own
+/// refusal is returned, and then `open` sends the blob's item with a frame
+/// stream and the blob is written again, each frame sent as it is framed.
+/// Only a single element that overflows even with its own strings alone
+/// fails the rewrite, with its framing error; a recorded overflow outranks
 /// any later error of the walk, as it would have had it been returned at
-/// its flush.
+/// its flush. Nothing of a blob refused before `open` leaves the worker; a
+/// failure while streaming leaves part of the blob in the output, which is
+/// then not published.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
@@ -348,8 +357,10 @@ pub(super) fn rewrite_block_parallel(
     claim: Option<&BlobIndex>,
     compression: &Compression,
     metrics: &crate::write::metrics::WriterMetrics,
+    stream: &StreamTx<'_>,
+    open: impl FnOnce(MergeStats) -> Result<()>,
 ) -> Result<RewriteOutput> {
-    let mut sink = RewriteSink::new(FramedBlocks::new(*compression, metrics));
+    let mut sink = RewriteSink::first_pass(FramedBlocks::new(*compression, metrics));
     let mut stats = MergeStats::new();
     let mut base_writes = BaseWrites::new(block, probe, scratch);
     let walked = {
@@ -373,32 +384,67 @@ pub(super) fn rewrite_block_parallel(
     };
     // The last use of `base_writes`, which releases `scratch` for a replay.
     let refresh = base_writes.tally;
+    if !sink.deferred() {
+        walked?;
+        return Ok(RewriteOutput {
+            frames: Some(sink.framed.frames),
+            frame_ns: sink.framed.frame_ns,
+            stats,
+            refresh,
+        });
+    }
     let RewriteSink {
         framed, overflows, ..
     } = sink;
-    let mut frames = framed.frames;
     let mut frame_ns = framed.frame_ns;
-    if !overflows.is_empty() {
-        let replay = Replay {
-            block,
-            diff,
-            kind,
-            inline: inline_upserts,
-            loc,
-            probe,
-            scratch,
-            compression,
-            metrics,
-        };
-        let (recovered, ns) = replay.run(&overflows, frames)?;
-        frames = recovered;
-        frame_ns += ns;
-    }
+    drop(framed.frames);
+    let inputs = Inputs {
+        block,
+        diff,
+        kind,
+        loc,
+        probe,
+        compression,
+        metrics,
+    };
+    let end = overflows.last().map_or(0, |o| o.ops().end);
+    let ops = collect_ops(inputs, inline_upserts.clone(), end, stream)?;
+    let plans = plan(inputs, &ops, &overflows, scratch, stream)?;
     walked?;
+    open(stats)?;
+    // The second writing: the walk again (fresh steps, claim walk and
+    // seeded builder, so it writes what the first wrote), each block sent
+    // as it is framed and each overflow replaced by its plan.
+    let depth = plans.iter().map(overflow::Plan::depth).max().unwrap_or(0);
+    let mut scratches: Vec<RefreshScratch> = std::iter::repeat_with(RefreshScratch::default)
+        .take(depth)
+        .collect();
+    let mut emit = EmitSink::new(inputs, &ops, &plans, &mut scratches, stream, 0);
+    let mut again = MergeStats::new();
+    let mut base_writes = BaseWrites::new(block, probe, scratch);
+    let mut cx = OpContext {
+        block,
+        diff,
+        loc,
+        stats: &mut again,
+        base_writes: &mut base_writes,
+    };
+    walk_and_write(
+        block,
+        diff,
+        bb,
+        inline_upserts,
+        kind,
+        claim,
+        &mut emit,
+        &mut cx,
+    )?;
+    frame_ns += emit.finish()?;
+    end_stream(stream)?;
     Ok(RewriteOutput {
-        frames,
+        frames: None,
         frame_ns,
-        stats,
+        stats: MergeStats::new(),
         refresh,
     })
 }
@@ -407,14 +453,14 @@ pub(super) fn rewrite_block_parallel(
 /// into `sink` (which records an overflowing block instead of failing), the
 /// last block flushed, then the walk ended.
 #[allow(clippy::too_many_arguments)]
-fn walk_and_write(
+fn walk_and_write<S: OpSink>(
     block: &PrimitiveBlock,
     diff: &SortedDiff,
     bb: &mut BlockBuilder,
     inline_upserts: Range<usize>,
     kind: ElementKind,
     claim: Option<&BlobIndex>,
-    sink: &mut RewriteSink<'_>,
+    sink: &mut S,
     cx: &mut OpContext<'_, '_>,
 ) -> Result<()> {
     let mut walk = blob_walk(claim);

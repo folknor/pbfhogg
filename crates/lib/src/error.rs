@@ -204,11 +204,6 @@ pub(crate) fn new_blob_too_large(part: OversizePart, size: u64, limit: u64) -> E
 }
 
 #[cold]
-pub(crate) fn new_overflow_replay_budget(limit: u64, trigger: Error) -> Error {
-    new_error(ErrorKind::OverflowReplayBudget { limit, trigger })
-}
-
-#[cold]
 pub(crate) fn new_version_regression(
     consumer: &'static str,
     kind: crate::ElementKind,
@@ -606,7 +601,6 @@ impl Error {
                 source: Some(source),
                 ..
             }) => Some(source),
-            ErrorKind::OverflowReplayBudget { trigger, .. } => Some(trigger),
             ErrorKind::Output(_)
             | ErrorKind::StringtableIndexOutOfBounds { .. }
             | ErrorKind::Blob(_)
@@ -840,16 +834,6 @@ pub enum ErrorKind {
         size: u64,
         limit: u64,
     },
-    /// apply-changes re-cut the output blocks of one input blob that
-    /// overflowed the data blob limits, and the strategy that ran last
-    /// produced more than `limit` bytes of frames for that blob, the
-    /// recovery's fixed allowance (the worker holds a blob's frames until its
-    /// rewrite ends). `trigger` is the [`BlobTooLarge`](Self::BlobTooLarge)
-    /// refusal of the block whose recovery passed it, and is this error's
-    /// source. The count crossed can include frames of an attempt the
-    /// recovery would have dropped, so nothing here measures what a fitting
-    /// output would need.
-    OverflowReplayBudget { limit: u64, trigger: Error },
     /// A change claims `version` for an object already held at the higher
     /// version `held`, and lower-version changes were not allowed.
     /// `consumer` names the operation that refused it. With `in_base`
@@ -1537,12 +1521,6 @@ impl fmt::Display for Message<'_> {
                  stopped rather than read some of its passes from each"
             ),
             ErrorKind::BlobTooLarge { part, size, limit } => part.describe(f, size, limit),
-            ErrorKind::OverflowReplayBudget { limit, .. } => write!(
-                f,
-                "an output block too large for a blob was being re-cut into smaller ones, \
-                 and the recovery passed its allowance of {limit} bytes of re-cut blocks \
-                 for one input blob"
-            ),
             ErrorKind::VersionRegression {
                 consumer,
                 kind,

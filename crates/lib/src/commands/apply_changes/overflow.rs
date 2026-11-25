@@ -1,4 +1,6 @@
-//! Recovery from an output block that overflowed the PBF data blob limits.
+//! Rewritten blobs whose output cannot travel to the drain as one held item:
+//! a block that overflowed the PBF data blob limits, or frames past the
+//! retention threshold.
 //!
 //! An apply-changes output block can outgrow the limit although everything
 //! that went into it fits on its own: a rewritten block carries its source
@@ -6,50 +8,63 @@
 //! string indices, plus the strings of every OSC element written into it,
 //! and blocks are cut by element count, not by bytes. A 17 MiB tag value
 //! modified to another 17 MiB value makes a 34 MiB block from a source block
-//! and an OSC element that each fit.
+//! and an OSC element that each fit. And a blob's frames can be many times
+//! its input: every block repeats the strings its elements share, so one
+//! large role on many relation creates is framed once per block.
 //!
-//! Nothing is sized up front, so normal input pays nothing: an overflowing
-//! block's framing refusal is recorded with the range of operations it held
-//! ([`RewriteSink`]), and [`Replay`] writes that range again into fresh
-//! blocks, by one of two strategies.
+//! Nothing is sized up front, so normal input pays nothing beyond a byte
+//! count per frame: the first pass ([`RewriteSink`]) records an overflowing
+//! block's framing refusal with the range of operations it held, and stops
+//! holding frames once they pass `APPLY_CHANGES_REWRITE_RETAIN_BYTES`. A
+//! blob that did either is *deferred*:
 //!
-//! The compact one comes first: an attempt's survivors are written with
-//! their string indices translated into a table holding only the source
-//! strings that attempt's survivors use
-//! (`BlockBuilder::pre_seed_subset_string_table`), with the OSC elements'
-//! strings beside them. An attempt that overflows anywhere is dropped and
-//! each half tried with its own strings, so a single element is tried with
-//! exactly its own: a survivor that grew (refreshed `--locations-on-ways`
-//! coordinates) beside a large string the diff removed, or survivors
-//! alternating with large OSC values, no longer carry the dead string into
-//! every frame.
-//!
-//! Where the compact strategy ends in a framing refusal (a single element)
-//! or passes its budget, the whole-table one runs from scratch: survivors' blocks
-//! carry the source table as in the first pass, the attempt starts
-//! unseeded so OSC elements before the first survivor go into a block
-//! without it, and a block that still overflows is halved. Compact output
-//! is smaller for the same partition but its cuts and index widths differ
-//! (strings are interned by content, so an index can land wider than its
-//! source slot, and a smaller payload can compress to a larger body), so
-//! it is not a superset of what the whole table recovers; the fallback
-//! keeps every recovery that strategy finds.
+//! 1. Every overflow is planned ([`plan`]) by trial writes whose frames are
+//!    dropped as they are framed, so planning holds no output. The compact
+//!    strategy comes first: an attempt's survivors are written with their
+//!    string indices translated into a table holding only the source strings
+//!    that attempt's survivors use (`BlockBuilder::pre_seed_subset_string_table`),
+//!    with the OSC elements' strings beside them. An attempt that overflows
+//!    anywhere is dropped and each half tried with its own strings, so a
+//!    single element is tried with exactly its own: a survivor that grew
+//!    (refreshed `--locations-on-ways` coordinates) beside a large string the
+//!    diff removed, or survivors alternating with large OSC values, no
+//!    longer carry the dead string into every frame. Where the compact
+//!    strategy ends in a framing refusal (a single element), the whole-table
+//!    one plans every overflow again: survivors' blocks carry the source
+//!    table as in the first pass, an attempt starts unseeded so OSC elements
+//!    before the first survivor go into a block without it, and a block of
+//!    an attempt that still overflows is planned again on its own, halved
+//!    when it was the whole attempt. Compact output is smaller for the same
+//!    partition but its cuts and index widths differ (strings are interned
+//!    by content, so an index can land wider than its source slot, and a
+//!    smaller payload can compress to a larger body), so it is not a superset
+//!    of what the whole table recovers; the fallback keeps every recovery
+//!    that strategy finds. A plan is a tree of attempts ([`Plan`]): every
+//!    attempt is a pure function of its operations and strategy (its subset
+//!    is marked over its own operations, its builder starts fresh), so
+//!    writing it again yields the same blocks.
+//! 2. Then the walk's own refusal, if any, is returned, so a refused blob
+//!    sends nothing; otherwise the worker sends the blob's item with a frame
+//!    stream ([`RewrittenFrames::Stream`](super::descriptor::RewrittenFrames))
+//!    and writes the blob a second time ([`EmitSink`]): the walk again, each
+//!    block framed and sent as it completes, and in place of each recorded
+//!    overflow its plan, written the same way. A block that differs from the
+//!    record (an overflow the plan does not hold, a recorded one that now
+//!    frames) is an internal error. At most the stream's few frames are in
+//!    flight, so the blob's output is never resident, however large.
 //!
 //! What this does not cure, and stays a loud refusal before publication: an
-//! element that does not fit a block alone with only its own strings, and
-//! an input whose recovery under both strategies needs more than
-//! `APPLY_CHANGES_OVERFLOW_REPLAY_BYTES` of frames for one blob (as when its
-//! changes carry that many bytes of large values between them, or one large
-//! string is shared by many changed elements that must be cut apart: the
-//! worker holds a blob's frames until its rewrite ends). The first is
-//! refused with that element's own framing error; the second with
-//! `ErrorKind::OverflowReplayBudget`, which names the allowance and carries
-//! the overflowed block's framing refusal as its source. Halving finds a
-//! fitting partition whenever every element fits alone; it can miss one
-//! that exists only because string index widths shrink when two elements
-//! share a table, which needs blocks within bytes of the limit.
+//! element that does not fit a block alone with only its own strings,
+//! refused with that element's own framing error. Halving is not an
+//! exhaustive search either: a block's size depends on the elements beside
+//! it (a string another element interned first lands at a narrower index,
+//! a compact seed is in source-slot order, dense deltas and the compressed
+//! body change with neighbours), so a partition can exist that halving does
+//! not find, which needs blocks within bytes of the limit.
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::mpsc::SyncSender;
 
 use crate::ElementKind;
 use crate::PrimitiveBlock;
@@ -57,63 +72,90 @@ use crate::block_builder::BlockBuilder;
 use crate::commands::{BlockSink, FramedBlocks, flush_local, is_block_overflow};
 use crate::error::Error;
 use crate::osc::sorted::SortedDiff;
-use crate::tunables::APPLY_CHANGES_OVERFLOW_REPLAY_BYTES;
+use crate::tunables::APPLY_CHANGES_REWRITE_RETAIN_BYTES;
 use crate::writer::Compression;
 
 use super::Result;
+use super::descriptor::StreamMsg;
 use super::element_writes::{BaseWrites, RefreshScratch, SourceSeed, mark_used_slots};
+use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::refresh::StaleProbe;
 use super::rewrite_block::{Op, OpContext, Step, Steps, write_op};
 use super::stats::MergeStats;
 
-type Frame = (ElementKind, Vec<u8>);
+/// A block sink that numbers the operations written into its blocks: the
+/// writer calls [`op_written`](Self::op_written) after each, and every
+/// flush happens before the next operation is added (capacity, re-seeding
+/// and the final flush alike), so a flushed block holds exactly the
+/// operations since the last.
+pub(super) trait OpSink: BlockSink {
+    fn op_written(&mut self);
+}
 
-/// An output block that overflowed: the operations it held and where its
-/// frame would have gone.
+/// An output block that overflowed: the operations it held, numbered in
+/// write order, and its framing refusal.
 pub(super) struct Overflow {
-    /// Its operations, numbered in write order.
     ops: Range<usize>,
-    /// The number of frames before it.
-    at: usize,
-    /// Its framing refusal.
     error: Error,
 }
 
-/// A rewrite's block sink: frames like [`FramedBlocks`], and records a block
-/// that overflows the blob limits, with the operations it held, rather than
-/// failing. The writer numbers operations by calling
-/// [`op_written`](Self::op_written) after each; every flush happens before
-/// the next operation is added (capacity, re-seeding and the final flush
-/// alike), so a flushed block holds exactly the operations since the last.
+impl Overflow {
+    pub(super) fn ops(&self) -> Range<usize> {
+        self.ops.clone()
+    }
+}
+
+/// The first pass's sink, and a planning trial's: frames like
+/// [`FramedBlocks`], and records a block that overflows the blob limits,
+/// with the operations it held, rather than failing. The first pass holds
+/// its frames until they pass `APPLY_CHANGES_REWRITE_RETAIN_BYTES`, then
+/// releases them and holds none; a trial holds none.
 pub(super) struct RewriteSink<'a> {
     pub(super) framed: FramedBlocks<'a>,
     next_op: usize,
     block_start: usize,
     pub(super) overflows: Vec<Overflow>,
-    /// A recovery attempt's byte allowance for the frames it holds (what the
-    /// blob's budget has left), and the block refusal that started the
-    /// recovery, carried by the budget error raised past it; `None` for a
-    /// rewrite's first pass.
-    cap: Option<(usize, Error)>,
+    /// The bytes of frames held before they are released; `None` for a
+    /// trial.
+    retain: Option<usize>,
     held: usize,
+    released: bool,
 }
 
 impl<'a> RewriteSink<'a> {
-    pub(super) fn new(framed: FramedBlocks<'a>) -> Self {
+    /// The first pass's sink.
+    pub(super) fn first_pass(framed: FramedBlocks<'a>) -> Self {
+        Self::new(framed, Some(APPLY_CHANGES_REWRITE_RETAIN_BYTES), 0)
+    }
+
+    /// A trial's sink, numbering operations from `start`.
+    fn trial(framed: FramedBlocks<'a>, start: usize) -> Self {
+        Self::new(framed, None, start)
+    }
+
+    fn new(framed: FramedBlocks<'a>, retain: Option<usize>, start: usize) -> Self {
         Self {
             framed,
-            next_op: 0,
-            block_start: 0,
+            next_op: start,
+            block_start: start,
             overflows: Vec::new(),
-            cap: None,
+            retain,
             held: 0,
+            released: false,
         }
     }
 
-    /// Count one operation written into the block in progress.
+    /// Whether the blob cannot be sent as held frames: a block overflowed,
+    /// or the frames were released.
+    pub(super) fn deferred(&self) -> bool {
+        self.released || !self.overflows.is_empty()
+    }
+}
+
+impl OpSink for RewriteSink<'_> {
     #[inline]
-    pub(super) fn op_written(&mut self) {
+    fn op_written(&mut self) {
         self.next_op += 1;
     }
 }
@@ -123,321 +165,534 @@ impl BlockSink for RewriteSink<'_> {
         let ops = self.block_start..self.next_op;
         let before = self.framed.frames.len();
         if let Some(error) = self.framed.flush_or_overflow(bb)? {
-            self.overflows.push(Overflow {
-                ops,
-                at: self.framed.frames.len(),
-                error,
-            });
+            self.overflows.push(Overflow { ops, error });
         }
         self.block_start = self.next_op;
-        // Every frame is charged: a block carrying the source table repeats
-        // it, and an OSC-only block repeats whatever strings its elements
-        // share (one interned role on thousands of relations).
-        if let Some((cap, refusal)) = &self.cap {
-            for frame in &self.framed.frames[before..] {
-                self.held = self.held.saturating_add(frame.1.len());
+        match self.retain {
+            Some(limit) if !self.released => {
+                if let Some((_, frame)) = self.framed.frames.get(before) {
+                    self.held = self.held.saturating_add(frame.len());
+                }
+                if self.held > limit {
+                    self.framed.frames = Vec::new();
+                    self.released = true;
+                }
             }
-            if self.held > *cap {
-                return Err(crate::error::new_overflow_replay_budget(
-                    APPLY_CHANGES_OVERFLOW_REPLAY_BYTES as u64,
-                    refusal.clone(),
-                ));
-            }
+            _ => self.framed.frames.clear(),
         }
+        Ok(())
+    }
+}
+
+/// The worker's slot for the sender of the stream it is writing, kept
+/// outside the worker's unwind boundary (`run_workers`) so the sender is
+/// dropped only after a failure has been published: the drain then never
+/// sees a stream close without a cause it can take.
+pub(super) type StreamSlot = RefCell<Option<SyncSender<StreamMsg>>>;
+
+/// Where a deferred blob's frames go, and what stops writing them: the
+/// invocation's token, and a failure published by any producer, which the
+/// drain reading this stream would otherwise learn of only when the stream
+/// ends. Checked before every operation, trial and frame.
+pub(super) struct StreamTx<'a> {
+    pub(super) slot: &'a StreamSlot,
+    pub(super) failure: &'a FailureSlot,
+    pub(super) cancel: &'a crate::host::Recorder,
+}
+
+impl StreamTx<'_> {
+    /// `Err` once the token is tripped or a failure is published. The
+    /// latter's error is never reported: the published one is first.
+    pub(super) fn check(&self) -> Result<()> {
+        self.cancel.check()?;
+        if self.failure.has_failed() {
+            return Err(Error::internal(
+                "apply-changes: stopped writing a deferred blob after a failure was published",
+            ));
+        }
+        Ok(())
+    }
+
+    fn send(&self, msg: StreamMsg) -> Result<()> {
+        self.check()?;
+        let slot = self.slot.borrow();
+        let tx = slot
+            .as_ref()
+            .ok_or_else(|| Error::internal("apply-changes: a deferred blob has no open stream"))?;
+        tx.send(msg)
+            .map_err(|_| Error::internal("apply-changes: the drain closed a blob's frame stream"))
+    }
+
+    /// Send the end of the stream and close it. Only a successful send
+    /// clears the slot; a failed one leaves the sender for the worker's
+    /// failure publication to outlive.
+    fn end(&self) -> Result<()> {
+        self.send(StreamMsg::End)?;
+        drop(self.slot.borrow_mut().take());
         Ok(())
     }
 }
 
 /// What writing a rewrite's operations again needs: the same inputs the
 /// rewrite had.
-pub(super) struct Replay<'a, 's> {
+#[derive(Clone, Copy)]
+pub(super) struct Inputs<'a> {
     pub(super) block: &'a PrimitiveBlock,
     pub(super) diff: &'a SortedDiff,
     pub(super) kind: ElementKind,
-    pub(super) inline: Range<usize>,
     pub(super) loc: LocMode<'a>,
     pub(super) probe: &'a StaleProbe,
-    pub(super) scratch: &'s mut RefreshScratch,
     pub(super) compression: &'a Compression,
     pub(super) metrics: &'a crate::write::metrics::WriterMetrics,
 }
 
-impl Replay<'_, '_> {
-    /// Re-encode every block in `overflows` (in write order) and splice its
-    /// frames into `frames` where the block's frame would have gone.
-    /// Returns the frames and the framing time the recovery spent.
-    pub(super) fn run(
-        mut self,
-        overflows: &[Overflow],
-        frames: Vec<Frame>,
-    ) -> Result<(Vec<Frame>, u64)> {
-        let end = overflows.last().map_or(0, |o| o.ops.end);
-        // The steps are a pure function of the block, the diff and the
-        // inline slice, so this walk writes what the first one wrote, in
-        // the same order; only the writing is replayed (no walk, no stats).
-        let ops: Vec<Op<'_>> = Steps::new(self.block, self.diff, self.kind, self.inline.clone())
-            .filter_map(|step| match step {
-                Ok(Step::Create(op) | Step::Element { op: Some(op), .. }) => Some(Ok(op)),
-                Ok(Step::Observe(_) | Step::Element { op: None, .. }) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .take(end)
-            .collect::<Result<_>>()?;
-        if ops.len() < end {
-            return Err(Error::internal(format!(
-                "apply-changes overflow replay found {} operations where the rewrite wrote {end}",
-                ops.len()
-            )));
+/// The operations the rewrite wrote, in order, up to `end`. The steps are a
+/// pure function of the block, the diff and the inline slice, so this walk
+/// yields what the first one wrote (no walk, no stats).
+pub(super) fn collect_ops<'a>(
+    inputs: Inputs<'a>,
+    inline: Range<usize>,
+    end: usize,
+    tx: &StreamTx<'_>,
+) -> Result<Vec<Op<'a>>> {
+    let mut ops = Vec::new();
+    for step in Steps::new(inputs.block, inputs.diff, inputs.kind, inline) {
+        if ops.len() == end {
+            break;
         }
-        let mut frame_ns = 0;
-        // The compact strategy first; where it ends in a framing refusal
-        // (a single element) or its budget, the whole-table one, which
-        // refuses only what this replay refused before the compact one
-        // existed. Neither touches `frames` until one has succeeded, so a
-        // failed strategy leaves nothing behind.
-        let pieces = match self.recover(&ops, overflows, Strategy::Compact, &mut frame_ns) {
-            Ok(pieces) => pieces,
-            Err(e) if is_block_overflow(&e) || is_budget_refusal(&e) => {
-                self.recover(&ops, overflows, Strategy::WholeTable, &mut frame_ns)?
-            }
-            Err(e) => return Err(e),
-        };
-        let mut out = Vec::with_capacity(frames.len() + pieces.iter().map(Vec::len).sum::<usize>());
-        let mut kept = frames.into_iter();
-        let mut taken = 0;
-        for (overflow, piece) in overflows.iter().zip(pieces) {
-            out.extend(kept.by_ref().take(overflow.at - taken));
-            taken = overflow.at;
-            out.extend(piece);
+        tx.check()?;
+        match step? {
+            Step::Create(op) | Step::Element { op: Some(op), .. } => ops.push(op),
+            Step::Observe(_) | Step::Element { op: None, .. } => {}
         }
-        out.extend(kept);
-        Ok((out, frame_ns))
     }
-
-    /// Every overflowed block's replacement frames under `strategy`, in
-    /// order, with a budget of its own.
-    fn recover(
-        &mut self,
-        ops: &[Op<'_>],
-        overflows: &[Overflow],
-        strategy: Strategy,
-        frame_ns: &mut u64,
-    ) -> Result<Vec<Vec<Frame>>> {
-        let mut budget = Budget {
-            left: APPLY_CHANGES_OVERFLOW_REPLAY_BYTES,
-            frame_ns: 0,
-        };
-        let mut pieces = Vec::with_capacity(overflows.len());
-        let mut result = Ok(());
-        for overflow in overflows {
-            let ops = &ops[overflow.ops.clone()];
-            let mut out = Vec::new();
-            result = match strategy {
-                Strategy::Compact => {
-                    self.encode_compact(ops, &overflow.error, &mut budget, &mut out)
-                }
-                Strategy::WholeTable => {
-                    self.encode_range(ops, &overflow.error, &mut budget, &mut out)
-                }
-            };
-            if result.is_err() {
-                break;
-            }
-            pieces.push(out);
-        }
-        *frame_ns += budget.frame_ns;
-        result.map(|()| pieces)
+    if ops.len() < end {
+        return Err(Error::internal(format!(
+            "apply-changes overflow replay found {} operations where the rewrite wrote {end}",
+            ops.len()
+        )));
     }
-
-    /// The compact strategy for `ops`: one attempt whose survivors' blocks
-    /// carry only the source strings `ops`' survivors use; kept whole if
-    /// nothing in it overflowed, otherwise dropped and each half tried the
-    /// same way with its own strings, so a single element is tried with
-    /// exactly its own. A single element that still overflows is refused
-    /// with its framing error.
-    fn encode_compact(
-        &mut self,
-        ops: &[Op<'_>],
-        original: &Error,
-        budget: &mut Budget,
-        out: &mut Vec<Frame>,
-    ) -> Result<()> {
-        let mut used = vec![false; self.block.string_table_len()];
-        for op in ops {
-            if let Op::Base(element) = op {
-                mark_used_slots(element, &mut used)?;
-            }
-        }
-        let seed = SourceSeed::Subset(&used);
-        let (frames, overflows, held) = self.attempt(ops, original, budget, seed)?;
-        if overflows.is_empty() {
-            // Only kept frames are charged: a dropped attempt's are freed.
-            budget.left = budget.left.saturating_sub(held);
-            out.extend(frames);
-            return Ok(());
-        }
-        drop(frames);
-        if let [_] = ops {
-            return Err(overflows
-                .into_iter()
-                .next()
-                .map_or_else(|| original.clone(), |o| o.error));
-        }
-        let (left, right) = ops.split_at(ops.len() / 2);
-        self.encode_compact(left, original, budget, out)?;
-        self.encode_compact(right, original, budget, out)
-    }
-
-    /// The whole-table strategy for `ops`, appending their frames to `out`:
-    /// one attempt with the ordinary cuts, then each block of it that
-    /// overflowed again on its own, halved when it was the whole attempt.
-    fn encode_range(
-        &mut self,
-        ops: &[Op<'_>],
-        original: &Error,
-        budget: &mut Budget,
-        out: &mut Vec<Frame>,
-    ) -> Result<()> {
-        let (frames, overflows, held) = self.attempt(ops, original, budget, SourceSeed::Whole)?;
-        // Charged now, before any recursion: these frames are held until
-        // the recovery ends. The cap kept the charge within what was left.
-        budget.left = budget.left.saturating_sub(held);
-        let mut kept = frames.into_iter();
-        let mut taken = 0;
-        for overflow in overflows {
-            out.extend(kept.by_ref().take(overflow.at - taken));
-            taken = overflow.at;
-            let sub = &ops[overflow.ops];
-            if sub.len() < ops.len() {
-                self.encode_range(sub, original, budget, out)?;
-            } else if sub.len() == 1 {
-                return Err(overflow.error);
-            } else {
-                let (left, right) = sub.split_at(sub.len() / 2);
-                self.encode_range(left, original, budget, out)?;
-                self.encode_range(right, original, budget, out)?;
-            }
-        }
-        out.extend(kept);
-        Ok(())
-    }
-
-    /// One attempt at `ops`: a fresh builder, the rewrite's own write rules
-    /// with survivors' blocks seeded by `seed`, and the frames, overflows
-    /// and framed bytes that came of it (the caller charges the bytes it
-    /// keeps). Under the whole table the builder starts unseeded, so OSC
-    /// elements before the first survivor go into a block without the
-    /// source table; under a subset it starts seeded when any survivor is
-    /// among `ops`, so OSC elements and survivors share blocks. Stats and
-    /// refresh counts are discarded: the first pass counted these elements.
-    fn attempt(
-        &mut self,
-        ops: &[Op<'_>],
-        original: &Error,
-        budget: &mut Budget,
-        seed: SourceSeed<'_>,
-    ) -> Result<(Vec<Frame>, Vec<Overflow>, usize)> {
-        let mut bb = BlockBuilder::new();
-        if let SourceSeed::Subset(used) = seed
-            && ops.iter().any(|op| matches!(op, Op::Base(_)))
-        {
-            bb.pre_seed_subset_string_table(self.block, used)?;
-        }
-        let mut sink = RewriteSink::new(FramedBlocks::new(*self.compression, self.metrics));
-        // The attempt holds its frames until it returns, so the budget
-        // stops it as it goes, not only once they are charged.
-        sink.cap = Some((budget.left, original.clone()));
-        let mut stats = MergeStats::new();
-        let mut base_writes = BaseWrites::new(self.block, self.probe, self.scratch);
-        base_writes.seed = seed;
-        let mut cx = OpContext {
-            block: self.block,
-            diff: self.diff,
-            loc: self.loc,
-            stats: &mut stats,
-            base_writes: &mut base_writes,
-        };
-        for op in ops {
-            write_op(op, &mut bb, &mut sink, &mut cx)?;
-            sink.op_written();
-        }
-        flush_local(&mut bb, &mut sink)?;
-        budget.frame_ns += sink.framed.frame_ns;
-        Ok((sink.framed.frames, sink.overflows, sink.held))
-    }
+    Ok(ops)
 }
 
-/// Whether `error` is a strategy passing its replay budget
-/// ([`ErrorKind::OverflowReplayBudget`](crate::ErrorKind::OverflowReplayBudget)).
-fn is_budget_refusal(error: &Error) -> bool {
-    matches!(error.kind(), crate::ErrorKind::OverflowReplayBudget { .. })
-}
-
-/// How a replay writes an overflowed block's elements again.
-#[derive(Clone, Copy)]
-enum Strategy {
-    /// Blocks of survivors carry only the source strings their slice uses
-    /// ([`Replay::encode_compact`]).
+/// How an attempt writes survivors' blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Strategy {
+    /// Blocks of survivors carry only the source strings the attempt's
+    /// survivors use.
     Compact,
     /// Blocks of survivors carry the source block's whole table, as the
-    /// first pass's do ([`Replay::encode_range`]).
+    /// first pass's do.
     WholeTable,
 }
 
-/// The bytes of frames a blob's recovery may still produce, and the
-/// framing time it has spent.
-struct Budget {
-    left: usize,
-    frame_ns: u64,
+/// How a recorded overflow's operations are written: a tree of attempts.
+pub(super) enum Plan {
+    /// One attempt at `ops` under `strategy`, with, for each block of it
+    /// that overflowed, in order, the plan of that block's operations (a
+    /// compact attempt is kept only when none did).
+    Attempt {
+        ops: Range<usize>,
+        strategy: Strategy,
+        children: Vec<Plan>,
+    },
+    /// Consecutive pieces, together covering a range.
+    Seq(Vec<Plan>),
+}
+
+impl Plan {
+    fn range(&self) -> Range<usize> {
+        match self {
+            Plan::Attempt { ops, .. } => ops.clone(),
+            Plan::Seq(parts) => {
+                let start = parts.first().map_or(0, |p| p.range().start);
+                let end = parts.last().map_or(0, |p| p.range().end);
+                start..end
+            }
+        }
+    }
+
+    /// How many attempts deep the plan nests, each needing scratch of its
+    /// own while the ones above it are mid-write.
+    pub(super) fn depth(&self) -> usize {
+        match self {
+            Plan::Attempt { children, .. } => {
+                1 + children.iter().map(Plan::depth).max().unwrap_or(0)
+            }
+            Plan::Seq(parts) => parts.iter().map(Plan::depth).max().unwrap_or(0),
+        }
+    }
+}
+
+/// Plan every recorded overflow, in order: the compact strategy for all,
+/// or, where it ends in a framing refusal, the whole-table one for all,
+/// which refuses only what the whole-table recovery refused before the
+/// compact one existed.
+pub(super) fn plan(
+    inputs: Inputs<'_>,
+    ops: &[Op<'_>],
+    overflows: &[Overflow],
+    scratch: &mut RefreshScratch,
+    tx: &StreamTx<'_>,
+) -> Result<Vec<Plan>> {
+    let mut planner = Planner {
+        inputs,
+        ops,
+        scratch,
+        tx,
+    };
+    let compact = overflows
+        .iter()
+        .map(|o| planner.compact(o.ops.clone()))
+        .collect::<Result<Vec<_>>>();
+    match compact {
+        Ok(plans) => Ok(plans),
+        Err(e) if is_block_overflow(&e) => overflows
+            .iter()
+            .map(|o| planner.whole(o.ops.clone()))
+            .collect(),
+        Err(e) => Err(e),
+    }
+}
+
+struct Planner<'p, 'a> {
+    inputs: Inputs<'a>,
+    ops: &'p [Op<'a>],
+    scratch: &'p mut RefreshScratch,
+    tx: &'p StreamTx<'p>,
+}
+
+impl Planner<'_, '_> {
+    /// One trial of `range`: the blocks that overflowed.
+    fn trial(&mut self, range: Range<usize>, strategy: Strategy) -> Result<Vec<Overflow>> {
+        let mut sink = RewriteSink::trial(
+            FramedBlocks::new(*self.inputs.compression, self.inputs.metrics),
+            range.start,
+        );
+        write_attempt(
+            self.inputs,
+            self.ops,
+            range,
+            strategy,
+            self.scratch,
+            &mut sink,
+            self.tx,
+        )?;
+        Ok(sink.overflows)
+    }
+
+    /// The compact plan of `range`: kept whole if nothing in it overflowed,
+    /// otherwise each half planned the same way with its own strings, so a
+    /// single element is tried with exactly its own. A single element that
+    /// still overflows is refused with its framing error.
+    fn compact(&mut self, range: Range<usize>) -> Result<Plan> {
+        let overflows = self.trial(range.clone(), Strategy::Compact)?;
+        let Some(first) = overflows.into_iter().next() else {
+            return Ok(Plan::Attempt {
+                ops: range,
+                strategy: Strategy::Compact,
+                children: Vec::new(),
+            });
+        };
+        if range.len() == 1 {
+            return Err(first.error);
+        }
+        let mid = range.start + range.len() / 2;
+        Ok(Plan::Seq(vec![
+            self.compact(range.start..mid)?,
+            self.compact(mid..range.end)?,
+        ]))
+    }
+
+    /// The whole-table plan of `range`: one attempt with the ordinary cuts,
+    /// then each block of it that overflowed planned again on its own, or
+    /// halved when it was the whole attempt.
+    fn whole(&mut self, range: Range<usize>) -> Result<Plan> {
+        let overflows = self.trial(range.clone(), Strategy::WholeTable)?;
+        if let [only] = overflows.as_slice()
+            && only.ops == range
+        {
+            if range.len() == 1 {
+                return Err(overflows.into_iter().next().map_or_else(
+                    || Error::internal("apply-changes overflow plan lost its refusal"),
+                    |o| o.error,
+                ));
+            }
+            let mid = range.start + range.len() / 2;
+            return Ok(Plan::Seq(vec![
+                self.whole(range.start..mid)?,
+                self.whole(mid..range.end)?,
+            ]));
+        }
+        let children = overflows
+            .into_iter()
+            .map(|o| self.whole(o.ops))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Plan::Attempt {
+            ops: range,
+            strategy: Strategy::WholeTable,
+            children,
+        })
+    }
+}
+
+/// Write `ops[range]` as one attempt into `sink`: a fresh builder, the
+/// rewrite's own write rules with survivors' blocks seeded by `strategy`.
+/// Under the whole table the builder starts unseeded, so OSC elements
+/// before the first survivor go into a block without the source table;
+/// under a subset (marked over these operations' survivors) it starts
+/// seeded when any survivor is among them, so OSC elements and survivors
+/// share blocks. Stats and refresh counts are discarded: the first pass
+/// counted these elements.
+fn write_attempt<S: OpSink>(
+    inputs: Inputs<'_>,
+    ops: &[Op<'_>],
+    range: Range<usize>,
+    strategy: Strategy,
+    scratch: &mut RefreshScratch,
+    sink: &mut S,
+    tx: &StreamTx<'_>,
+) -> Result<()> {
+    let ops = ops
+        .get(range)
+        .ok_or_else(|| Error::internal("apply-changes overflow plan outside its operations"))?;
+    let mut used = match strategy {
+        Strategy::WholeTable => Vec::new(),
+        Strategy::Compact => vec![false; inputs.block.string_table_len()],
+    };
+    let mut bb = BlockBuilder::new();
+    let seed = match strategy {
+        Strategy::WholeTable => SourceSeed::Whole,
+        Strategy::Compact => {
+            let mut any_base = false;
+            for op in ops {
+                if let Op::Base(element) = op {
+                    tx.check()?;
+                    mark_used_slots(element, &mut used)?;
+                    any_base = true;
+                }
+            }
+            if any_base {
+                tx.check()?;
+                bb.pre_seed_subset_string_table(inputs.block, &used)?;
+            }
+            SourceSeed::Subset(&used)
+        }
+    };
+    let mut stats = MergeStats::new();
+    let mut base_writes = BaseWrites::new(inputs.block, inputs.probe, scratch);
+    base_writes.seed = seed;
+    let mut cx = OpContext {
+        block: inputs.block,
+        diff: inputs.diff,
+        loc: inputs.loc,
+        stats: &mut stats,
+        base_writes: &mut base_writes,
+    };
+    for op in ops {
+        tx.check()?;
+        write_op(op, &mut bb, sink, &mut cx)?;
+        sink.op_written();
+    }
+    flush_local(&mut bb, sink)
+}
+
+/// The second writing's sink: each block framed and sent as it completes,
+/// and each recorded overflow replaced by its plan, written the same way.
+pub(super) struct EmitSink<'e, 'a> {
+    framed: FramedBlocks<'a>,
+    next_op: usize,
+    block_start: usize,
+    inputs: Inputs<'a>,
+    ops: &'e [Op<'a>],
+    children: std::slice::Iter<'e, Plan>,
+    next: Option<&'e Plan>,
+    /// Scratch for the plans below this writing, one per nesting level.
+    scratches: &'e mut [RefreshScratch],
+    tx: &'e StreamTx<'e>,
+    /// Framing time of the plans written in place of overflows.
+    nested_ns: u64,
+}
+
+impl<'e, 'a> EmitSink<'e, 'a> {
+    /// The sink of a writing numbering operations from `start` whose
+    /// overflows the plans `children` replace, in order.
+    pub(super) fn new(
+        inputs: Inputs<'a>,
+        ops: &'e [Op<'a>],
+        children: &'e [Plan],
+        scratches: &'e mut [RefreshScratch],
+        tx: &'e StreamTx<'e>,
+        start: usize,
+    ) -> Self {
+        let mut children = children.iter();
+        let next = children.next();
+        Self {
+            framed: FramedBlocks::new(*inputs.compression, inputs.metrics),
+            next_op: start,
+            block_start: start,
+            inputs,
+            ops,
+            children,
+            next,
+            scratches,
+            tx,
+            nested_ns: 0,
+        }
+    }
+
+    /// Every plan was written; the framing time spent.
+    pub(super) fn finish(self) -> Result<u64> {
+        if self.next.is_some() {
+            return Err(Error::internal(
+                "apply-changes: a deferred blob's second writing did not reach a recorded overflow",
+            ));
+        }
+        Ok(self.framed.frame_ns + self.nested_ns)
+    }
+}
+
+impl OpSink for EmitSink<'_, '_> {
+    #[inline]
+    fn op_written(&mut self) {
+        self.next_op += 1;
+    }
+}
+
+impl BlockSink for EmitSink<'_, '_> {
+    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
+        let ops = self.block_start..self.next_op;
+        self.block_start = self.next_op;
+        // The framing borrow ends here, so a plan below can frame.
+        let overflow = self.framed.flush_or_overflow(bb)?;
+        if overflow.is_some() {
+            let child = self
+                .next
+                .take()
+                .filter(|plan| plan.range() == ops)
+                .ok_or_else(|| {
+                    Error::internal(
+                        "apply-changes: a deferred blob overflowed where its plan recorded no overflow",
+                    )
+                })?;
+            self.next = self.children.next();
+            return emit(
+                child,
+                self.inputs,
+                self.ops,
+                self.scratches,
+                self.tx,
+                &mut self.nested_ns,
+            );
+        }
+        if !ops.is_empty()
+            && let Some(plan) = self.next
+            && ops.end > plan.range().start
+        {
+            return Err(Error::internal(
+                "apply-changes: a deferred blob framed a block its plan recorded as an overflow",
+            ));
+        }
+        for (_, frame) in self.framed.frames.drain(..) {
+            self.tx.send(StreamMsg::Frame(frame))?;
+        }
+        Ok(())
+    }
+}
+
+/// Write `plan`, sending its frames as they are framed.
+fn emit(
+    plan: &Plan,
+    inputs: Inputs<'_>,
+    ops: &[Op<'_>],
+    scratches: &mut [RefreshScratch],
+    tx: &StreamTx<'_>,
+    frame_ns: &mut u64,
+) -> Result<()> {
+    match plan {
+        Plan::Seq(parts) => {
+            for part in parts {
+                emit(part, inputs, ops, scratches, tx, frame_ns)?;
+            }
+            Ok(())
+        }
+        Plan::Attempt {
+            ops: range,
+            strategy,
+            children,
+        } => {
+            let (mine, below) = scratches.split_first_mut().ok_or_else(|| {
+                Error::internal("apply-changes: a deferred blob's plan outran its scratch")
+            })?;
+            let mut sink = EmitSink::new(inputs, ops, children, below, tx, range.start);
+            write_attempt(inputs, ops, range.clone(), *strategy, mine, &mut sink, tx)?;
+            *frame_ns += sink.finish()?;
+            Ok(())
+        }
+    }
+}
+
+/// End a deferred blob's stream once its second writing has ended.
+pub(super) fn end_stream(tx: &StreamTx<'_>) -> Result<()> {
+    tx.end()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RewriteSink, is_budget_refusal};
+    use super::{RewriteSink, StreamMsg, StreamSlot, StreamTx};
     use crate::block_builder::BlockBuilder;
-    use crate::commands::{BlockSink, FramedBlocks, is_block_overflow};
+    use crate::commands::{BlockSink, FramedBlocks};
     use crate::write::metrics::WriterMetrics;
     use crate::writer::Compression;
-    use crate::{ErrorKind, OversizePart};
 
-    /// A recovery attempt past what its blob's budget has left is refused
-    /// with the budget's own error, naming the whole allowance and carrying
-    /// the block refusal that started the recovery as its source; it is not
-    /// a block overflow, so no sink records it as one.
+    /// The first pass holds its frames up to the retention threshold and
+    /// releases them past it, which defers the blob; a trial holds none.
     #[test]
-    fn an_attempt_past_its_allowance_is_refused_with_the_budget_error() {
-        let trigger = crate::error::new_blob_too_large(OversizePart::Payload, 40, 32);
+    fn frames_past_the_retention_threshold_are_released() {
         let metrics = WriterMetrics::new();
-        let mut sink = RewriteSink::new(FramedBlocks::new(Compression::None, &metrics));
-        sink.cap = Some((1, trigger));
+        let mut sink = RewriteSink::new(FramedBlocks::new(Compression::None, &metrics), Some(1), 0);
         let mut bb = BlockBuilder::new();
         bb.add_node(1, 10, 20, [("name", "a")], None);
-        let Err(err) = sink.flush(&mut bb) else {
-            panic!("a frame past a one-byte allowance must be refused");
+        sink.flush(&mut bb).expect("flush");
+        assert!(sink.framed.frames.is_empty());
+        assert!(sink.deferred());
+
+        let mut held = RewriteSink::first_pass(FramedBlocks::new(Compression::None, &metrics));
+        bb.add_node(1, 10, 20, [("name", "a")], None);
+        held.flush(&mut bb).expect("flush");
+        assert_eq!(held.framed.frames.len(), 1);
+        assert!(!held.deferred());
+
+        let mut trial = RewriteSink::trial(FramedBlocks::new(Compression::None, &metrics), 0);
+        bb.add_node(1, 10, 20, [("name", "a")], None);
+        trial.flush(&mut bb).expect("flush");
+        assert!(trial.framed.frames.is_empty());
+        assert!(!trial.deferred());
+    }
+
+    /// A stream ends with `End` and closes; a failed end send keeps the
+    /// sender in the slot, for the failure publication to outlive.
+    #[test]
+    fn a_stream_closes_only_on_a_sent_end() {
+        let cancel = crate::host::Call::detached();
+        let (drain_tx, _drain_rx) = std::sync::mpsc::sync_channel(1);
+        let drain_tx = std::sync::Arc::new(drain_tx);
+        let failure = super::FailureSlot::new(super::super::descriptor::DrainWake::new(&drain_tx));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let slot: StreamSlot = std::cell::RefCell::new(Some(tx));
+        let stream = StreamTx {
+            slot: &slot,
+            failure: &failure,
+            cancel: &cancel,
         };
-        assert!(is_budget_refusal(&err), "{err}");
-        assert!(!is_block_overflow(&err), "{err}");
-        let ErrorKind::OverflowReplayBudget { limit, trigger } = err.kind() else {
-            panic!("expected the budget error, got {err}");
-        };
-        assert_eq!(
-            *limit,
-            super::APPLY_CHANGES_OVERFLOW_REPLAY_BYTES as u64,
-            "the whole allowance, not what was left of it"
-        );
-        assert!(matches!(
-            trigger.kind(),
-            ErrorKind::BlobTooLarge {
-                part: OversizePart::Payload,
-                ..
-            }
-        ));
-        let source = std::error::Error::source(&err)
-            .and_then(|s| s.downcast_ref::<crate::Error>())
-            .map(crate::Error::kind);
-        assert!(matches!(source, Some(ErrorKind::BlobTooLarge { .. })));
-        let report = err.report();
-        assert!(report.contains("allowance"), "{report}");
-        assert!(report.contains("must be at most 32"), "{report}");
+        stream.end().expect("end");
+        assert!(slot.borrow().is_none());
+        assert!(matches!(rx.recv(), Ok(StreamMsg::End)));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx);
+        *slot.borrow_mut() = Some(tx);
+        assert!(stream.end().is_err());
+        assert!(slot.borrow().is_some());
     }
 }

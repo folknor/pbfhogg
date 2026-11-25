@@ -623,23 +623,23 @@ pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
 pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: std::num::NonZeroUsize =
     std::num::NonZeroUsize::MIN.saturating_add(63);
 
-/// Framed bytes one apply-changes rewrite worker may produce re-encoding the
-/// output blocks of one input blob that overflowed the PBF data blob limit
-/// (`apply_changes/overflow.rs`), per strategy. The worker holds a blob's
-/// frames until its rewrite ends, and every split block repeats the strings
-/// its elements share (and, under the whole-table fallback, every block of
-/// surviving base elements the source block's whole table), so a large
-/// shared role interleaved with many changed elements could fan out into
-/// gigabytes. The budget also bounds legitimate recovery: one blob's
-/// changed elements needing more than this many bytes of frames between
-/// them are refused.
-/// Past this budget under the whole-table strategy, the last to run, the
-/// worker gives up with `ErrorKind::OverflowReplayBudget`, which names this
-/// allowance and carries the overflowed block's oversize error as its
-/// source: a loud refusal before publication. Real data never overflows (blocks are a few
-/// MiB at most), so the value only decides how hostile an input is still
-/// recovered: eight blob limits' worth.
-pub(crate) const APPLY_CHANGES_OVERFLOW_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+/// Framed bytes an apply-changes rewrite worker holds for one input blob
+/// before it stops holding them. A rewritten blob's frames normally travel
+/// to the drain in one item; a blob whose frames pass this (every block
+/// repeating one large string its elements share, or many large changed
+/// values), or one with a block over the PBF blob limit, is written a
+/// second time once its item is sent instead, each frame streamed to the
+/// drain as it is framed (`apply_changes/overflow.rs`). It is a delivery
+/// threshold, never a refusal: it bounds what a worker retains, at this plus
+/// the one frame that crosses it. A planet blob's rewrite frames a few MiB,
+/// so real data never crosses it; two blob limits' worth.
+pub(crate) const APPLY_CHANGES_REWRITE_RETAIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Frames a streamed apply-changes rewrite may have queued for the drain
+/// (`APPLY_CHANGES_REWRITE_RETAIN_BYTES`): the worker blocks past it until
+/// the drain, which reads the stream only once the blob is the head of the
+/// output, has written one. Each frame is at most a blob limit.
+pub(crate) const APPLY_CHANGES_REWRITE_STREAM_FRAMES: usize = 2;
 
 /// Filter bits per OSC node in the `--locations-on-ways` refresh probe
 /// (`apply_changes/refresh.rs`), before rounding up to a power of two. The

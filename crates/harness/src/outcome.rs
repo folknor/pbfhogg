@@ -22,7 +22,6 @@ fn kind_id(kind: &ErrorKind) -> &'static str {
         ErrorKind::MissingNodeLocations { .. } => "missing_node_locations",
         ErrorKind::InputReplaced => "input_replaced",
         ErrorKind::BlobTooLarge { .. } => "blob_too_large",
-        ErrorKind::OverflowReplayBudget { .. } => "overflow_replay_budget",
         ErrorKind::VersionRegression { .. } => "version_regression",
         ErrorKind::InvalidArgument { .. } => "invalid_argument",
         ErrorKind::InvalidData { .. } => "invalid_data",

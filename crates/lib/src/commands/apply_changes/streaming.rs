@@ -70,12 +70,15 @@ use crate::error::{Error, Result};
 use crate::writer::{Compression, reframe_raw_with_index};
 
 use super::classify::{blob_walk, block_overlaps_diff};
-use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
+use super::descriptor::{
+    BlobDescriptor, DrainItem, DrainMessage, RewrittenFrames, Route, ScannedBlob,
+};
 use super::drain::LocMapHandle;
 use super::element_writes::RefreshScratch;
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::node_coords::extract_node_coords;
+use super::overflow::{StreamSlot, StreamTx};
 use super::refresh::{StaleProbe, detect_stale_block, detect_stale_wire};
 use super::rewrite_block::rewrite_block_parallel;
 
@@ -357,6 +360,14 @@ pub(super) fn run_workers(
             let cancel = &cancel;
 
             let spawned = scope.spawn(move || {
+                // Outside the unwind boundary, like `drain_tx`: a deferred
+                // blob's stream sender, dropped only after publication.
+                let stream_slot: StreamSlot = std::cell::RefCell::new(None);
+                let stream = StreamTx {
+                    slot: &stream_slot,
+                    failure,
+                    cancel,
+                };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker_loop(
                         worker_id,
@@ -370,15 +381,17 @@ pub(super) fn run_workers(
                         &compression,
                         route,
                         cancel,
+                        &stream,
                     )
                 }));
-                // Publish before this closure returns: `drain_tx` (moved in
-                // above) is only dropped after it.
+                // Publish before this closure returns: `drain_tx` and the
+                // stream slot (both bound above) are only dropped after it.
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => failure.publish(e),
                     Err(payload) => failure.publish_panic("streaming worker", payload),
                 }
+                drop(stream_slot);
                 drop(drain_tx);
             });
             if let Err(e) = spawned {
@@ -429,6 +442,7 @@ fn worker_loop(
     compression: &Compression,
     route: Route<()>,
     cancel: &crate::host::Recorder,
+    stream: &StreamTx<'_>,
 ) -> Result<()> {
     // The decode buffer moves into each parsed block and comes back through
     // this worker's pool when the block drops, so one buffer serves every
@@ -489,8 +503,16 @@ fn worker_loop(
                     compression,
                     route,
                     &cancel.metrics().writer,
+                    stream,
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
+                // Only a sent end closes a stream, so one left open after a
+                // successful blob would leave the drain waiting.
+                if stream.slot.borrow().is_some() {
+                    return Err(Error::internal(
+                        "streaming: a deferred blob returned with its stream open",
+                    ));
+                }
                 #[cfg(pbfhogg_test_hooks)]
                 cancel.faults().on_apply_changes_candidate_done(desc.seq);
             }
@@ -696,6 +718,7 @@ fn handle_candidate(
     compression: &Compression,
     route: Route<()>,
     metrics: &crate::write::metrics::WriterMetrics,
+    stream: &StreamTx<'_>,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     let WorkerScratch {
@@ -1066,6 +1089,30 @@ fn handle_candidate(
     // the hit) and returns frames only once that walk has ended, so a framing
     // error can outrank a later walk refusal of the same blob; either way
     // the run fails unpublished.
+    let seq = desc.seq;
+    let id_range = (effective_min_id, effective_max_id);
+    // A deferred blob's item, sent before its frames are written again:
+    // the stream's sender goes into the worker's slot, which outlives any
+    // failure publication (`StreamSlot`).
+    let open = |stats| {
+        let (tx, rx) = mpsc::sync_channel(crate::tunables::APPLY_CHANGES_REWRITE_STREAM_FRAMES);
+        if stream.slot.replace(Some(tx)).is_some() {
+            return Err(Error::internal(
+                "streaming: a deferred blob opened a stream while another was open",
+            ));
+        }
+        send_drain(
+            drain_tx,
+            DrainItem::Rewritten {
+                seq,
+                frames: RewrittenFrames::Stream(rx),
+                kind: effective_kind,
+                id_range,
+                observed_first: first,
+                stats,
+            },
+        )
+    };
     let output = rewrite_block_parallel(
         &block,
         diff,
@@ -1078,6 +1125,8 @@ fn handle_candidate(
         claim.as_ref(),
         compression,
         metrics,
+        stream,
+        open,
     )?;
     counters.rewrite_ns.fetch_add(
         t_rewrite.elapsed_ns().saturating_sub(output.frame_ns),
@@ -1097,13 +1146,17 @@ fn handle_candidate(
         .fetch_add(output.refresh.deleted_refs, Ordering::Relaxed);
 
     counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
+    let Some(frames) = output.frames else {
+        // Streamed: the item went with the stream.
+        return Ok(());
+    };
     send_drain(
         drain_tx,
         DrainItem::Rewritten {
-            seq: desc.seq,
-            framed_chunks: output.frames,
+            seq,
+            frames: RewrittenFrames::Held(frames),
             kind: effective_kind,
-            id_range: (effective_min_id, effective_max_id),
+            id_range,
             observed_first: first,
             stats: output.stats,
         },

@@ -855,11 +855,8 @@ fn dispatch_variant(
             stats.bytes_passthrough += frame_len as u64;
             stats.blobs_passthrough += 1;
             stats.blobs_index_hit += 1;
-            // One original input frame, not the coalesced copy range: the
-            // HeaderWalker caps its body below 32 MiB and header below 64 KiB
-            // (plus the 4-byte prefix), so this sample fits u32.
-            #[allow(clippy::cast_possible_truncation)]
-            stats.blob_sizes.push(frame_len as u32);
+            // One original input frame, not the coalesced copy range.
+            stats.record_data_frame(frame_len);
             // The element count is the indexdata `count` claim, folded into
             // the observed `base_*` totals. A worker's copy (a decoded false
             // positive or clean refresh scan, `observed_first` set) has had
@@ -886,6 +883,9 @@ fn dispatch_variant(
         } => {
             // Flush the copy_range coalescer so on-disk order is right.
             flush_copy_range(state, cfg, writer, counters)?;
+            // Workers copy one validated original frame here; sampled per
+            // item, not as the accumulated passthrough buffer's length.
+            stats.record_data_frame(frame_bytes.len());
             let frame_len = frame_bytes.len() as u64;
             state.passthrough_chunks.push(frame_bytes);
             // Bound the coalescer: an unchanged same-kind run would otherwise
@@ -907,11 +907,6 @@ fn dispatch_variant(
             if verbatim {
                 stats.blobs_index_hit += 1;
             }
-            // Workers copy one validated original frame here. The same
-            // 32 MiB body + 64 KiB header + 4-byte prefix bound applies;
-            // this is not the accumulated passthrough buffer's length.
-            #[allow(clippy::cast_possible_truncation)]
-            stats.blob_sizes.push(frame_len as u32);
             // Credit per-kind base_* stats the same way the CopyRange arm
             // above does. Before this line `OwnedBytes` dropped per-kind
             // counts entirely, so any merge that routed passthroughs
@@ -949,6 +944,7 @@ fn dispatch_variant(
                 .then(|| writer.cancel_token().permit());
             let mut write = |chunk: Vec<u8>| -> Result<()> {
                 rewrite_bytes += chunk.len() as u64;
+                stats.record_data_frame(chunk.len());
                 writer.write_raw_owned(chunk)?;
                 counters
                     .rewrite_blocks_written

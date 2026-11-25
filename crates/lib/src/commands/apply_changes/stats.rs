@@ -28,8 +28,13 @@ pub struct MergeStats {
     /// overhead. The parse-time hash indexes, deleted sets and version
     /// floors are gone by then and are not in it.
     pub diff_heap_bytes: u64,
-    /// Per-blob frame sizes in bytes for exact percentile computation.
-    /// Retains 4 bytes per observed blob (plus Vec spare capacity); summary
+    /// Sizes in bytes of every OSMData frame the output holds, for exact
+    /// percentile computation: each passthrough frame (sampled per item at
+    /// dispatch, not per coalesced flush), each frame of a rewritten blob
+    /// and each create frame. The OSMHeader frame is not sampled. The unit
+    /// is the output frame, not the source blob: a rewritten blob can
+    /// yield several frames. Filled only through `record_data_frame`.
+    /// Retains 4 bytes per frame (plus Vec spare capacity); summary
     /// temporarily clones that allocation to sort without mutating stats.
     /// A fixed-width histogram gives approximate percentiles and changes the
     /// reported values. Keep exact samples: compare this 8-byte-per-blob peak
@@ -116,6 +121,14 @@ impl MergeStats {
             + self.diff_relations
     }
 
+    /// Sample one output OSMData frame of `len` bytes. A frame is at most
+    /// a 4-byte prefix, a header below 64 KiB and a body below 32 MiB
+    /// (validated on input, enforced when framing), so it fits u32; the
+    /// saturation cannot fire.
+    pub(super) fn record_data_frame(&mut self, len: usize) {
+        self.blob_sizes.push(u32::try_from(len).unwrap_or(u32::MAX));
+    }
+
     pub(super) fn merge_from(&mut self, other: &MergeStats) {
         self.base_nodes += other.base_nodes;
         self.base_ways += other.base_ways;
@@ -164,7 +177,10 @@ impl MergeStats {
         if !self.blob_sizes.is_empty() {
             let mut sizes = self.blob_sizes.clone();
             let (p50, p95, p99) = percentiles_u32(&mut sizes);
-            writeln!(w, "  Blob sizes: p50={p50}, p95={p95}, p99={p99} bytes")?;
+            writeln!(
+                w,
+                "  Output data frame sizes: p50={p50}, p95={p95}, p99={p99} bytes"
+            )?;
         }
         if self.diff_heap_bytes > 0 {
             #[allow(clippy::cast_precision_loss)]

@@ -106,7 +106,10 @@ impl<'a> CreateEncoder<'a> {
             &mut self.bb,
             &invocation,
             |bb, chunk| encode_and_frame(bb, kind, chunk, diff, loc, &compression, metrics),
-            |frame| writer.write_raw_owned(frame),
+            |frame| {
+                stats.record_data_frame(frame.len());
+                writer.write_raw_owned(frame)
+            },
         )?;
         match kind {
             ElementKind::Node => stats.diff_nodes += added,

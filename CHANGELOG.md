@@ -917,6 +917,13 @@
 
 ### Fixed
 
+- **`apply-changes`' summary reports percentiles over every output data
+  frame.** The `Blob sizes` line sampled only passthrough frames, so a
+  run's rewritten and created frames never moved it. It is now
+  `Output data frame sizes` and covers passthrough, rewritten and create
+  frames (the OSMHeader frame excluded); a rewritten blob contributes one
+  sample per frame it writes.
+
 - **Multi-extract copies a node blob raw to each region its single
   extract would.** `extract --simple --config` copied a node blob raw
   only when it lay inside every region, and otherwise rebuilt it in the

@@ -42,12 +42,17 @@ the declaration for that run, is a maintainer decision. The other droppers are
 deliberate: time-filter (not as of the cutoff), degrade (a fault tool),
 apply-changes without `--locations-on-ways` (cannot refresh them).
 
-## BUG-019 - apply-changes blob-size percentiles sample passthrough only
+## BUG-030 - apply-changes byte totals leave out create frames
 
-Reported by: apply-core.
+Reported by: apply-core spar, 2026-11-25.
 
-Samples are inserted only in the two passthrough arms; rewritten and create
-frames never contribute, though `stats.rs` labels the result blob sizes.
+`bytes_rewritten` and `blobs_rewritten` are incremented only in the drain's
+Rewritten arm; frames written by `CreateEncoder::emit` (gap, kind-transition
+and trailing creates) reach neither. The summary's "Bytes: ... rewrite ratio"
+line, the `merge_bytes_rewritten` counter and the bench instrument's
+`bytes_rewritten` therefore exclude create output. Also `blobs_rewritten`
+counts source blobs while `bytes_rewritten` sums every output frame of them.
+Fault tests (`fault_apply_changes.rs` `stats_figures`) pin the current values.
 
 ## BUG-027 - Geocode building placement is a vertex mean
 

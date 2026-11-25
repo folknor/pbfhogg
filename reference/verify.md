@@ -193,10 +193,13 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   or parse error before any step-down is raised with no order verdict.
   Elsewhere (the reference side of the input-order family, apply-changes'
   output, multi-extract's sequential sorted copies) a separate decode
-  (`opl_compare::order`, no metadata or coordinates; apply-changes decodes
-  under its comparison's policy instead, so its element merge reuses that
-  decoding) judges it first, since a later failure would otherwise lose the
-  verdict.
+  (`opl_compare::order`, no metadata or coordinates; apply-changes and the
+  input-order family's reference side decode under their comparison's
+  policy instead, so the element merge reuses that decoding - the family
+  takes it from the reference header alone, metadata always and inline
+  coordinates when the reference declares them, before anything of
+  pbfhogg's is read) judges it first, since a later failure would
+  otherwise lose the verdict.
   `osmium fileinfo -e` cannot serve here, since it refuses a file whose ways
   lack their nodes, as every way-only or filtered output does; it still
   reads whole inputs for check-ids, repack and degrade. apply-changes and
@@ -306,7 +309,8 @@ child subreaper; stop signals (SIGTERM, SIGINT, SIGHUP) arrive on a signalfd
 polled beside each child. Launches run in groups, every member started from
 the one thread; a lone launch is a group of one. Grouped launches are an
 OPL comparison's missing decodes, uncached reference runs, and the
-independent pbfhogg runs of diff, diff --format osc and cat --dedupe (at
+independent pbfhogg runs of diff, diff --format osc, cat --dedupe and
+geocode's two `build-geocode-index` builds, each exit judged at settlement (at
 most `PBFHOGG_GROUP` per group, each group judged before the next starts;
 in diff --format osc the two strips run together, then the indexed and
 unindexed derives together, or the indexed derive alone when a strip

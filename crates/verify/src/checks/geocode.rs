@@ -88,6 +88,7 @@
 mod admin;
 mod interp;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -390,32 +391,66 @@ fn expectation<T>(found: &[(f64, usize)], get: impl Fn(usize) -> T) -> Expect<T>
 }
 
 /// The value of tag `key` in a decoded tag list, the last occurrence winning.
-fn tag<'t>(tags: &'t [(String, String)], key: &str) -> Option<&'t str> {
+fn tag<'t>(tags: &'t [(Cow<'_, str>, Cow<'_, str>)], key: &str) -> Option<&'t str> {
     tags.iter()
         .rev()
         .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
+        .map(|(_, v)| v.as_ref())
+}
+
+/// An OPL field unescaped, borrowed from the line when it holds no escape.
+fn unescape(text: &str) -> Result<Cow<'_, str>, String> {
+    if text.contains('%') {
+        decode(text).map(Cow::Owned)
+    } else {
+        Ok(Cow::Borrowed(text))
+    }
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
     value.filter(|v| !v.is_empty()).map(str::to_owned)
 }
 
-/// One OPL record, as far as the model reads it.
-struct Record {
+/// One OPL record, as far as the model reads it, borrowing its line where
+/// no escape had to be decoded.
+struct Record<'a> {
     kind: u8,
-    tags: Vec<(String, String)>,
+    tags: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     location: Option<(i32, i32)>,
     /// A way's node locations, `None` where osmium had none.
     nodes: Vec<Option<(i32, i32)>>,
     /// A way's node ids, signed, one per entry of `nodes`.
     refs: Vec<i64>,
     /// A relation's members: type letter, id and role.
-    members: Vec<(u8, i64, String)>,
-    id: String,
+    members: Vec<(u8, i64, Cow<'a, str>)>,
+    id: Cow<'a, str>,
 }
 
-fn parse_record(line: &str) -> Result<Record, String> {
+impl Record<'_> {
+    /// The record detached from its line, for one kept past it.
+    fn into_owned(self) -> Record<'static> {
+        let own = |c: Cow<'_, str>| Cow::Owned(c.into_owned());
+        Record {
+            kind: self.kind,
+            tags: self
+                .tags
+                .into_iter()
+                .map(|(k, v)| (own(k), own(v)))
+                .collect(),
+            location: self.location,
+            nodes: self.nodes,
+            refs: self.refs,
+            members: self
+                .members
+                .into_iter()
+                .map(|(kind, id, role)| (kind, id, own(role)))
+                .collect(),
+            id: own(self.id),
+        }
+    }
+}
+
+fn parse_record(line: &str) -> Result<Record<'_>, String> {
     let mut fields = line.split(' ');
     let first = fields.next().unwrap_or_default();
     let kind = *first.as_bytes().first().ok_or("empty record")?;
@@ -434,7 +469,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
                     let (k, v) = pair
                         .split_once('=')
                         .ok_or_else(|| format!("{first}: tag {pair:?}"))?;
-                    tags.push((decode(k)?, decode(v)?));
+                    tags.push((unescape(k)?, unescape(v)?));
                 }
             }
             "x" if !value.is_empty() => x = Some(coordinate(value)?),
@@ -473,7 +508,11 @@ fn parse_record(line: &str) -> Result<Record, String> {
                     let id: i64 = id
                         .parse()
                         .map_err(|_| format!("{first}: member {token:?}"))?;
-                    members.push((*kind.as_bytes().first().unwrap_or(&b'?'), id, decode(role)?));
+                    members.push((
+                        *kind.as_bytes().first().unwrap_or(&b'?'),
+                        id,
+                        unescape(role)?,
+                    ));
                 }
             }
             _ => {}
@@ -486,8 +525,43 @@ fn parse_record(line: &str) -> Result<Record, String> {
         nodes,
         refs,
         members,
-        id: first.to_owned(),
+        id: Cow::Borrowed(first),
     })
+}
+
+/// An OPL file's lines, read into one reused buffer, each with its 1-based
+/// number and without its line ending, as `BufRead::lines` gives them.
+struct Lines {
+    reader: BufReader<std::fs::File>,
+    buf: String,
+    n: usize,
+}
+
+impl Lines {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            reader: BufReader::new(file),
+            buf: String::new(),
+            n: 0,
+        }
+    }
+
+    fn next_line(&mut self, path: &Path) -> Result<Option<(usize, &str)>, Error> {
+        self.buf.clear();
+        let read = self
+            .reader
+            .read_line(&mut self.buf)
+            .map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        self.n += 1;
+        let mut line = self.buf.as_str();
+        if let Some(rest) = line.strip_suffix('\n') {
+            line = rest.strip_suffix('\r').unwrap_or(rest);
+        }
+        Ok(Some((self.n, line)))
+    }
 }
 
 /// The model of the OPL file at `path`.
@@ -496,10 +570,10 @@ fn build_model(path: &Path) -> Result<Model, Error> {
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
     let mut model = Model::default();
     let mut previous = None;
-    for (n, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
-        let at = |why: String| Error::Failed(format!("{} line {}: {why}", path.display(), n + 1));
-        let record = parse_record(&line).map_err(at)?;
+    let mut lines = Lines::new(file);
+    while let Some((n, line)) = lines.next_line(path)? {
+        let at = |why: String| Error::Failed(format!("{} line {n}: {why}", path.display()));
+        let record = parse_record(line).map_err(at)?;
         refuse_repeat(&mut previous, &record).map_err(Error::Tool)?;
         model_record(&mut model, &record).map_err(Error::Tool)?;
     }
@@ -514,7 +588,7 @@ fn build_model(path: &Path) -> Result<Model, Error> {
 /// them by version, so a repeat is outside the compared domain. This does not
 /// certify the input's uniqueness: a non-adjacent repeat in a file falsely
 /// claiming its sort order is not seen.
-fn refuse_repeat(previous: &mut Option<(u8, String)>, r: &Record) -> Result<(), String> {
+fn refuse_repeat(previous: &mut Option<(u8, String)>, r: &Record<'_>) -> Result<(), String> {
     if previous
         .as_ref()
         .is_some_and(|(kind, id)| *kind == r.kind && *id == r.id)
@@ -524,11 +598,18 @@ fn refuse_repeat(previous: &mut Option<(u8, String)>, r: &Record) -> Result<(), 
             r.id
         ));
     }
-    *previous = Some((r.kind, r.id.clone()));
+    match previous {
+        Some((kind, id)) => {
+            *kind = r.kind;
+            id.clear();
+            id.push_str(&r.id);
+        }
+        None => *previous = Some((r.kind, r.id.to_string())),
+    }
     Ok(())
 }
 
-fn model_record(model: &mut Model, r: &Record) -> Result<(), String> {
+fn model_record(model: &mut Model, r: &Record<'_>) -> Result<(), String> {
     let house_number = tag(&r.tags, "addr:housenumber");
     let street = non_empty(tag(&r.tags, "addr:street"));
     let place = non_empty(tag(&r.tags, "addr:place"));
@@ -684,6 +765,13 @@ fn offset(lat: i32, lon: i32, reach_m: f64, bearing: f64) -> (f64, f64) {
 /// The fixed query set: uniform points over the extent, then witnesses
 /// until every class the model holds has its quota in each category, then
 /// admin witnesses near boundary vertices.
+///
+/// Building every class's full expectation per attempt is deliberate and
+/// cheap: the whole draw measured under a tenth of a second on denmark
+/// (the `query draw` step), as did both admin bands' polygon scans (`admin
+/// judge`). The admin witnesses continue the same draw stream, so any change
+/// to where this loop stops changes the admin query set; a parallel or
+/// category-only draw has nothing to win and that hazard to carry.
 fn queries(model: &Model, admin: &admin::AdminModel) -> Result<Vec<Query>, Error> {
     let (min_lat, min_lon, max_lat, max_lon) = model
         .extent
@@ -855,10 +943,10 @@ fn admin_model(path: &Path) -> Result<admin::AdminModel, Error> {
     let mut node_records: admin::NodeRecords = HashMap::new();
     let mut relations = Vec::new();
     let mut previous = None;
-    for (n, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
-        let at = |why: String| Error::Failed(format!("{} line {}: {why}", path.display(), n + 1));
-        let record = parse_record(&line).map_err(at)?;
+    let mut lines = Lines::new(file);
+    while let Some((n, line)) = lines.next_line(path)? {
+        let at = |why: String| Error::Failed(format!("{} line {n}: {why}", path.display()));
+        let record = parse_record(line).map_err(at)?;
         refuse_repeat(&mut previous, &record).map_err(Error::Tool)?;
         match record.kind {
             b'w' => {
@@ -879,35 +967,26 @@ fn admin_model(path: &Path) -> Result<admin::AdminModel, Error> {
                     .map_err(|_| at(format!("node id {}", record.id)))?;
                 node_records.insert(id, record.location);
             }
-            b'r' => relations.push(record),
+            b'r' => relations.push(record.into_owned()),
             _ => {}
         }
     }
     admin::AdminModel::build(&relations, &ways, &node_records).map_err(Error::Tool)
 }
 
-/// Build an index of `pbf` at `admin_tolerance` meters into `index`.
-fn build_index(
-    harness: &mut Harness,
-    pbf: &Path,
-    index: &Path,
-    admin_tolerance: f64,
-    direct_io: bool,
-) -> Result<(), Error> {
-    let ended = harness.pbfhogg_discard(
-        PbfArgv::new("build-geocode-index")
-            .input(pbf)
-            .output_flag("--output-dir", index)
-            .scratch()
-            .arg("--search-radius")
-            .arg(GEOCODE_FINE_RADIUS_M.to_string())
-            .arg("--coarse-search-radius")
-            .arg(GEOCODE_COARSE_RADIUS_M.to_string())
-            .arg("--admin-tolerance")
-            .arg(admin_tolerance.to_string())
-            .arg_if(direct_io, "--direct-io"),
-    )?;
-    harness.require_success(&ended, "pbfhogg build-geocode-index")
+/// The build of an index of `pbf` at `admin_tolerance` meters into `index`.
+fn build_argv(pbf: &Path, index: &Path, admin_tolerance: f64, direct_io: bool) -> PbfArgv {
+    PbfArgv::new("build-geocode-index")
+        .input(pbf)
+        .output_flag("--output-dir", index)
+        .scratch()
+        .arg("--search-radius")
+        .arg(GEOCODE_FINE_RADIUS_M.to_string())
+        .arg("--coarse-search-radius")
+        .arg(GEOCODE_COARSE_RADIUS_M.to_string())
+        .arg("--admin-tolerance")
+        .arg(admin_tolerance.to_string())
+        .arg_if(direct_io, "--direct-io")
 }
 
 /// `geocode-query` over `index`: one parsed answer per query, each echoing
@@ -1010,16 +1089,18 @@ fn judge_admin(
 ) -> Result<(), Error> {
     let mut tally = admin::AdminTally::default();
     let mut wrong = Vec::new();
-    for (q, answer) in queries.iter().zip(answered) {
-        let expect = admin.expect(q.lat, q.lon, band_m);
-        let result = answer
-            .get("admin")
-            .ok_or_else(|| "the answer has no admin key".to_owned())
-            .and_then(|v| admin.judge(&expect, v, &mut tally));
-        if let Err(why) = result {
-            wrong.push(format!("query {}: {why}", q.text));
+    harness.timed("admin judge", || {
+        for (q, answer) in queries.iter().zip(answered) {
+            let expect = admin.expect(q.lat, q.lon, band_m);
+            let result = answer
+                .get("admin")
+                .ok_or_else(|| "the answer has no admin key".to_owned())
+                .and_then(|v| admin.judge(&expect, v, &mut tally));
+            if let Err(why) = result {
+                wrong.push(format!("query {}: {why}", q.text));
+            }
         }
-    }
+    });
     harness.msg(&format!(
         "  admin {label}: {} containing answers judged ({} among several containing areas, \
          {} postal, {} with a country code), {} empty levels inside a polygon's box, {} \
@@ -1051,36 +1132,69 @@ fn judge_admin(
     Ok(())
 }
 
+/// Build the index at the non-zero admin tolerance into `index` and at
+/// tolerance 0 into `exact_index`. The two builds read only the input and
+/// write disjoint directories, so they run as one launch group, settled
+/// before either index is queried.
+fn build_indexes(
+    harness: &mut Harness,
+    pbf: &Path,
+    index: &Path,
+    exact_index: &Path,
+    direct_io: bool,
+) -> Result<(), Error> {
+    let builds = [(index, GEOCODE_ADMIN_TOLERANCE_M), (exact_index, 0.0)];
+    let ended = harness.pbfhogg_group(
+        builds
+            .iter()
+            .map(|(dir, tolerance)| {
+                (
+                    build_argv(pbf, dir, *tolerance, direct_io),
+                    dir.with_extension("stdout"),
+                )
+            })
+            .collect(),
+    )?;
+    for (ended, (_, tolerance)) in ended.iter().zip(&builds) {
+        harness.require_success(
+            ended,
+            &format!("pbfhogg build-geocode-index --admin-tolerance {tolerance}"),
+        )?;
+    }
+    Ok(())
+}
+
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("geocode")?;
     harness.msg("=== verify geocode (address, street, interpolation and admin answers) ===");
 
     let index = outdir.join("index");
-    build_index(harness, pbf, &index, GEOCODE_ADMIN_TOLERANCE_M, direct_io)?;
     let exact_index = outdir.join("index-tolerance-0");
-    build_index(harness, pbf, &exact_index, 0.0, direct_io)?;
+    build_indexes(harness, pbf, &index, &exact_index, direct_io)?;
 
     // osmium locates a way's refs as it passes the way, so on claimless input
     // a way stored before its nodes would come out unlocated though the
     // builder resolves it; the decodings read an osmium-sorted copy there.
     let order = InputOrder::of(harness, pbf, &outdir)?;
     let reference = order.reference_input.as_path();
-    let model = build_model(&located_opl(
+    let geocode_opl = located_opl(
         harness,
         reference,
         &outdir,
         "geocode",
         &["nw/addr:housenumber", "w/highway", "w/addr:interpolation"],
         false,
-    )?)?;
-    let admin = admin_model(&located_opl(
+    )?;
+    let model = harness.timed("geocode model", || build_model(&geocode_opl))?;
+    let admin_opl = located_opl(
         harness,
         reference,
         &outdir,
         "geocode-admin",
         &["r/boundary=administrative,postal_code"],
         true,
-    )?)?;
+    )?;
+    let admin = harness.timed("admin model", || admin_model(&admin_opl))?;
     harness.msg(&format!(
         "  model: {} address points, {} street segments, {} interpolation ranges from {} \
          resolved ways ({} refused), {} admin polygons from {} boundary relations ({} \
@@ -1109,7 +1223,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             ));
         }
     }
-    let queries = queries(&model, &admin)?;
+    let queries = harness.timed("query draw", || queries(&model, &admin))?;
     let points = outdir.join("points.txt");
     {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&points)?);

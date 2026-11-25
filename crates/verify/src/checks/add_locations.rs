@@ -187,6 +187,13 @@ pub fn run(
         // coordinates and metadata included; then pbfhogg's own full-record
         // digest, which also covers what osmium's records do not represent
         // (pbfhogg's declared extension fields, exact metadata presence).
+        // Parity is not derived by transitivity from the two comparisons
+        // with osmium: with summaries live it is already decided from the
+        // two engine summaries those comparisons published, with no decode
+        // or merge, and under --fresh-reference two passes under FULL do not
+        // by themselves prove one common reading of the reference. A
+        // three-way merge was likewise refused: each file is already decoded
+        // once.
         harness.msg(&format!(
             "--- engine parity ({} vs {}, osmium-decoded records) ---",
             a.name(),

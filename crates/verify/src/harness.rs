@@ -692,14 +692,9 @@ impl Harness {
     }
 
     /// Whether `pbf`'s objects strictly ascend by kind and then ID as osmium
-    /// decodes them ([`opl_compare::order`]: no ID repeated), never the
-    /// header claim, which can be blind to intra-blob disorder.
-    pub(crate) fn check_sorted(&mut self, label: &str, pbf: Operand<'_>) -> Result<Verdict, Error> {
-        Ok(self.check_sorted_counted(label, pbf)?.0)
-    }
-
-    /// [`Self::check_sorted`], decoding under `cold` when nothing recorded
-    /// answers ([`opl_compare::order_as`]).
+    /// decodes them (no ID repeated), never the header claim, which can be
+    /// blind to intra-blob disorder; decoding under `cold` when nothing
+    /// recorded answers ([`opl_compare::order_as`]).
     pub(crate) fn check_sorted_as(
         &mut self,
         label: &str,

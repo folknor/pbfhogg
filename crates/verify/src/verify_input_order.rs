@@ -136,9 +136,25 @@ pub(crate) fn compare_outputs(
     // The reference's order is a precondition settled before anything of
     // pbfhogg's is judged, so its own decode stays: folded into the
     // comparison, a pbfhogg header verdict or copy-sort failure could come
-    // first and hide it.
+    // first and hide it. Its decode is made under the policy the comparison
+    // reads the reference with, so the comparison reuses it instead of
+    // decoding osmium's output twice: metadata always, inline coordinates
+    // when the reference declares them (`Policy::between` reads them only
+    // when both sides do; a pbfhogg side without them costs only the reuse).
+    // The hint comes from the reference alone, before anything of pbfhogg's
+    // is read; a header the verifier's reader refuses falls back to the
+    // content decode. The hint never decides a verdict; a hinted decode that
+    // fails (scratch exhausted by the richer OPL) is the run's error before
+    // the reference order is reported, where a content decode might have
+    // reported it first. The comparison needs that richer decode whenever
+    // pbfhogg's side also declares coordinates, so this is accepted.
+    let hint = match pbf_frames::header(theirs, Origin::Other) {
+        Ok(header) if header.optional_feature("LocationsOnWays") => Policy::FULL,
+        Ok(_) => Policy::NO_LOCATIONS,
+        Err(_) => Policy::CONTENT,
+    };
     if !harness
-        .check_sorted(osmium_label, (theirs, Origin::Other))?
+        .check_sorted_as(osmium_label, (theirs, Origin::Other), hint)?
         .is_pass()
     {
         return Err(Error::Tool(format!(

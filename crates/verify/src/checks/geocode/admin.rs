@@ -198,7 +198,7 @@ struct Boundary {
     inner: Vec<i64>,
 }
 
-fn select(r: &Record) -> Option<Boundary> {
+fn select(r: &Record<'_>) -> Option<Boundary> {
     let boundary = tag(&r.tags, "boundary")?;
     let level = match boundary {
         "administrative" => {
@@ -226,7 +226,7 @@ fn select(r: &Record) -> Option<Boundary> {
         if *kind != b'w' {
             continue;
         }
-        match role.as_str() {
+        match role.as_ref() {
             "" | "outer" => outer.push(*id),
             "inner" => inner.push(*id),
             _ => {}
@@ -491,7 +491,7 @@ fn area_interval(ring: &[Pt], bbox: (i32, i32, i32, i32)) -> (f64, f64) {
 impl AdminModel {
     /// The model of the decoded relations and their member ways.
     pub(super) fn build(
-        relations: &[Record],
+        relations: &[Record<'_>],
         ways: &HashMap<i64, Way>,
         records: &NodeRecords,
     ) -> Result<Self, String> {
@@ -541,7 +541,7 @@ impl AdminModel {
                 model.unmodelled.push((b.level, world));
                 model
                     .unmodelled_why
-                    .push((r.id.clone(), b.level, Unmodelled::Unlocated));
+                    .push((r.id.to_string(), b.level, Unmodelled::Unlocated));
                 continue;
             }
             let Some(member_box) = bbox_of(members.iter().flatten()) else {
@@ -585,7 +585,7 @@ impl AdminModel {
                 model.unmodelled.push((b.level, member_box));
                 model
                     .unmodelled_why
-                    .push((r.id.clone(), b.level, Unmodelled::Junction));
+                    .push((r.id.to_string(), b.level, Unmodelled::Junction));
                 continue;
             };
             // A ring whose points all lie on one line has no interior, and
@@ -994,11 +994,12 @@ mod tests {
         assert!(needs_full_topology(&[7], &[bridged]));
     }
 
-    fn relation(members: &str) -> Record {
+    fn relation(members: &str) -> Record<'static> {
         super::super::parse_record(&format!(
             "r1 v1 Tboundary=administrative,admin_level=2,name=C,ISO3166-1:alpha2=CC M{members}"
         ))
         .unwrap()
+        .into_owned()
     }
 
     #[test]
@@ -1082,7 +1083,7 @@ mod tests {
 
     #[test]
     fn an_undecided_hole_leaves_only_its_box_unjudged() {
-        let record = |line: &str| super::super::parse_record(line).unwrap();
+        let record = |line: &str| super::super::parse_record(line).unwrap().into_owned();
         // An outer square of side 100 and a hole sharing its corner.
         let relation = record(
             "r1 v1 Tboundary=administrative,admin_level=2,name=C,ISO3166-1:alpha2=CC \

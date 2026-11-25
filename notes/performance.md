@@ -2047,34 +2047,6 @@ Residue:
   runs no drop or unsort case. Unit tests hold
   the predicted listing, counts and digest to the merge's.
 
-## PERF-071 - add-locations-to-ways --mode all decodes ten times for three files
-
-Reported by: heavy-opus, heavy-codex, orchestration-codex.
-
-Mechanism: `compare_outputs` runs once per engine against the same osmium
-output: an order decode per side, then a strict merge of both. Then comes
-engine parity. That is 10 osmium decodes, plus two `digest --form full`, plus
-two `check --locations --agreement`. The location judge itself decodes nodes
-for keys and again for coordinates.
-
-Redesigns:
-
-- heavy-opus: decode the osmium output once and compare both engines against
-  it. Engine parity follows by transitivity, exactly, when both osmium
-  comparisons passed under `Policy::FULL`: record it PASS without decoding,
-  and run it as today otherwise. Keep `digest --form full` parity. This gives
-  3 decodes.
-- heavy-codex: a three-way ordered merge emitting every verdict with its own
-  per-pair field policy. Fuse the native digest projection with location-fact
-  extraction on the same frames. Project node coordinates and way references
-  once, and route them by node ID when partitioning (see PERF-046), which also
-  serves apply-changes -l.
-
-Risks: the transitivity guard is `Policy::between` returning FULL for both; the
-unsorted route keeps external's refusal and duplicate detection.
-
-Kind: local (heavy-opus); rewrite (heavy-codex).
-
 ## PERF-074 - sort runs osmium multipass even on already ordered input
 
 Reported by: heavy-codex, orchestration-codex.
@@ -2191,59 +2163,6 @@ keep `check --index` and the header-only paths.
 
 Kind: medium local (engine-opus, heavy-opus); high-conviction rewrite
 (engine-codex, its second).
-
-## PERF-078 - geocode builds two full indexes and rebuilds its reference model serially
-
-Reported by: other-codex, other-opus, orchestration-codex.
-
-Mechanism: in sequence, the check:
-
-1. runs `build-geocode-index` at tolerance 20 and again at 0. The 0 build is
-   judged only for admin answers, yet each build hashes, resolves, generates
-   S2 entries through scratch buckets, writes and smoke-tests the whole input.
-2. runs two osmium `tags-filter` plus `add-locations-to-ways -f opl` chains.
-3. parses both OPLs on one thread with a `String` per line. Admin keeps a
-   SipHash entry for every node.
-4. draws 1000 uniform queries, up to 40,000 witness attempts and 600 admin
-   witnesses. Each attempt computes full tied expectations for every class
-   before acceptance, which needs only categories; `expect_street` clones a
-   `String` and inserts into a `HashSet` per candidate. `AdminModel::expect`
-   scans every polygon per query, twice per query, once per band.
-5. runs two `geocode-query`.
-
-Redesigns:
-
-- other-codex (production): one builder producing both admin variants. Rings,
-  hole ownership and area are assembled once, then each output is simplified
-  and checked for representability separately, sharing the address, street,
-  interpolation and cell files, and both are reopened through the reader.
-- other-codex (reference): a libosmium worker selecting both arms and emitting
-  typed model inputs. Keep the distinction between a way's location at read
-  time and its node's final presence.
-- other-opus:
-  - A launch DAG: both builds and both osmium chains at once, the models
-    built during the builds.
-  - Cache the reference product (queries plus expectations) keyed by the two
-    OPL digests and the verifier digest.
-  - An exact parallel witness draw. splitmix64 state is a counter and every
-    attempt consumes exactly four draws, so attempts can be evaluated in
-    batches and accepted in order, stopping at the same attempt.
-  - Cheap nearest-only acceptance, with the full `Expect` built only for kept
-    attempts.
-  - A parallel mmap model parse applied in line order.
-  - Grid-bucketed admin polygons with containment computed once for both
-    bands.
-  - On a cold cache, one union tags-filter could feed both models.
-- other-opus, open question: build the tolerance-0 index from the boundary-only
-  osmium output. It would be tiny, but it takes `--allow-unindexed`, a
-  different path, so it needs a maintainer ruling.
-
-Risks: memory with concurrent builds at germany scale. The admin witness set
-depends on where the witness loop stopped, so any loop change silently changes
-the admin queries; a parallel draw must keep the attempt count exactly, and a
-test pinning the attempt count on a fixture would guard it (other-opus).
-
-Kind: high-conviction rewrite (both).
 
 ## PERF-079 - merge-changes and the OSC listing path sort pointers into text
 

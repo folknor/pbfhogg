@@ -90,6 +90,43 @@ uncommitted:
   orphans, the walk's own figures.
 - Verdict: pays.
 
+### add-locations-to-ways: reference order read under the comparison's policy
+
+A = 6ced6dd4, B = 6ced6dd4 plus the change that decodes the reference
+for its order verdict under the policy its comparison reads (inline
+coordinates when the reference declares them), on bygg, denmark, B
+measured uncommitted, one cell per arm:
+
+- Stored summaries removed before each cell, ordinary run: A 9.3 s
+  (`osmium cat` 2.4 s, 3 runs; `opl merge` 1.1 s), B 8.4 s (`osmium cat`
+  2.2 s, 2 runs; no merge: the reference summary the order scan publishes
+  lets each engine comparison decide from one scanned side).
+- `--fresh-reference` (summaries off): 20.4 s on both arms. One decode
+  fewer, but the sparse decode no longer shares a launch group with the
+  reference's, so the wall does not move.
+- Warm summaries: 5.0-5.1 s on both, no decode.
+- Verdict: pays on the cold-summary path; neutral elsewhere. Engine
+  parity by transitivity was not built: with summaries live the parity
+  is already decided from the engines' summaries.
+
+### geocode: one launch group for both builds, borrowed model parse
+
+A = 6ced6dd4 with step labels added, B = A plus the build group and the
+borrowed-line OPL parse, on bygg, denmark, warm reference cache, B
+measured uncommitted:
+
+- A 5.2 s: `geocode model` 2.7 s (parse and finish of a 1.24 GB OPL),
+  `pbfhogg build-geocode-index` 1.6 s (2 runs), `geocode-query` 0.29 s,
+  `admin model` 0.27 s, `query draw` 0.086 s, `admin judge` 0.086 s
+  (both bands).
+- B 4.3-4.4 s: `geocode model` 2.4 s (2.1 s parse and 0.33 s
+  interpolation resolve, timed apart in one cell), builds 1.0 s; the rest
+  unchanged; the same 1727 queries.
+- Cold reference (`--fresh-reference`, A): 11.3 s, adding `osmium
+  tags-filter` 4.6 s and `osmium add-locations-to-ways` 1.1 s.
+- Verdict: pays. The witness loop and admin polygon scan cost under a
+  tenth of a second each and were left alone.
+
 ## History
 
 ### Launch groups (2026-11-21)

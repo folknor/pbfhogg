@@ -120,6 +120,25 @@ pub(super) fn regions_of(mask: &[u64]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
+/// Whether `admit` (a node blob's region admission, `None` for every
+/// region) holds `region`.
+#[inline]
+pub(super) fn admits(admit: Option<&[u64]>, region: usize) -> bool {
+    admit.is_none_or(|mask| mask[region / 64] & (1u64 << (region % 64)) != 0)
+}
+
+/// Clear from `mask` every region `admit` does not hold; whether any
+/// region is left. `None` admits every region and leaves `mask` as it is.
+#[inline]
+pub(super) fn restrict(mask: &mut [u64], admit: Option<&[u64]>) -> bool {
+    if let Some(admit) = admit {
+        for (word, a) in mask.iter_mut().zip(admit) {
+            *word &= a;
+        }
+    }
+    mask.iter().any(|&word| word != 0)
+}
+
 /// Split an ID into (page key, offset in page), over its two's-complement
 /// bits. See the module docs on negative IDs.
 #[inline]

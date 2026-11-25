@@ -15,6 +15,29 @@ the 256 KiB per-output buffer, the shared region membership (they used one
 `IdSet` per region and kind) and the fused pass. 5 disjoint longitude strips
 per configured bench.
 
+### Per-region node blob admission (bygg, 2026-11-25, against `6a8edb6f`)
+
+Each node blob carries the regions its bbox meets, and its occurrences
+are classified for and written to those alone (simple fused and
+two-phase, complete and smart node classify). `brokkr bench --iterations 1
+region-extract --mode multi --dataset planet` (5 strips), interleaved,
+baseline `--commit HEAD` at `6a8edb6f`, variant uncommitted on it:
+
+| Strategy | Arm | Wall | UUID |
+|---|---|---:|---|
+| simple | base | 51.8 s | `8b6a457b` |
+| simple | variant | 51.6 s | `d0224a32` |
+| simple | variant | 51.8 s | `4b50e8af` |
+| simple | base | 51.2 s | `7fc09b8c` |
+| complete | variant | 74.0 s | `94d0e635` |
+| complete | base | 71.7 s | `32c6baa5` |
+| complete | base | 73.4 s | `bf3c1db5` |
+| complete | variant | 71.8 s | `4933de4b` |
+
+Neutral on both: the complete pairs disagree in sign, and the first
+pair's 2.3 s gap sits in the header-only schedule scan (4.5 s against
+6.2 s), I/O the change does not touch.
+
 ### Fused simple kind pass (bygg, 2026-11-25, against `a74c2464`)
 
 `brokkr bench --iterations 1 region-extract --mode multi --strategy simple

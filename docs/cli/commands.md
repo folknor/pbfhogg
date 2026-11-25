@@ -1745,23 +1745,31 @@ decimicrodegree it selects.
 
 Node blobs whose indexdata bbox misses the region are skipped unread, and the
 sorted-input schedules split blobs on their indexdata kind; both claims are
-believed. A node blob copied raw is first decoded to prove every node lies in
+believed. Through `--config` a node blob is read when its bbox meets any
+region, and its nodes are selected for, and written to, only the regions
+its bbox meets, so a node ID repeated in several blobs (history-shaped input)
+reaches each region from the blobs its single-region extract reads. A node blob copied raw is first decoded to prove every node lies in
 the region, but keeps its input `BlobHeader`. `--simple` on sorted input,
 single region or through `--config`, decodes each blob of a kind once when the kind's indexdata ID
 ranges are pairwise disjoint, and then refuses a blob whose ID range or count
 is not exact for what it holds (nothing is published); a kind without such
 ranges is read twice, a classify pass and a write pass, and its ranges are not
-consulted. See
+consulted. Through `--config` that choice is made per kind over the blobs any
+region reads, so an inexact node ID range or count that a single-region
+extract would refuse can pass unchecked; `check --index` verifies the claims.
+See
 [indexdata-trust.md](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
 
 Supports multi-extract via `--config` with a JSON config file specifying multiple regions.
 On sorted input every strategy takes a shared route: `--simple` (cleaned or
-not) classifies each kind once for all regions and writes them in a second
-pass; complete-ways and `--smart` classify nodes, ways and relations once for
+not) selects and writes every region in one read of a kind with disjoint ID
+ranges, and otherwise classifies the kind once for all regions and writes
+them in a second pass; complete-ways and `--smart` classify nodes, ways and relations once for
 all regions, resolve way completion, relation parents and (smart) relation
 completion per region in shared membership tables, and write every region in
 one pass over the input. Each region's output and summary line are those of a
-single-region extract with the same strategy and flags. The shared route
+single-region extract with the same strategy and flags (on claims that are
+exact; see the indexdata paragraph above). The shared route
 writes every output through a buffered writer, `--direct-io` or not (see
 the I/O matrix), and asks for one descriptor per region
 up front. Unsorted input takes one full extract per region, announced by a

@@ -2950,6 +2950,133 @@ fn multi_extract_overlapping_regions_match_their_single_extracts() {
     }
 }
 
+/// A node at a coordinate inside `BBOX_STR` (`in_a`) or inside `SOUTH`.
+fn node_at(id: i64, in_a: bool) -> TestNode<'static> {
+    TestNode {
+        id,
+        lat: if in_a { 557_000_000 } else { 540_000_000 },
+        lon: 125_000_000,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+/// Ways and a relation over nodes 1 to 3: way 10 joins 1 and 3, way 11
+/// is node 2 alone, relation 20 holds node 1 and way 11.
+fn admission_ways_and_relation() -> (Vec<TestWay<'static>>, Vec<TestRelation<'static>>) {
+    let ways = vec![
+        TestWay {
+            id: 10,
+            refs: vec![1, 3],
+            tags: vec![],
+            meta: None,
+        },
+        TestWay {
+            id: 11,
+            refs: vec![2],
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let relations = vec![TestRelation {
+        id: 20,
+        members: vec![
+            TestMember {
+                id: MemberId::Node(1),
+                role: "",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "",
+            },
+        ],
+        tags: vec![("type", "route")],
+        meta: None,
+    }];
+    (ways, relations)
+}
+
+/// A node ID repeated in two blobs whose bboxes each meet one region only
+/// (history-shaped input, one node per blob): each region reads only the
+/// blobs its bbox meets, as its single extract does, so node 1 is not
+/// written to `SOUTH` from the blob at `BBOX_STR`'s coordinate, nor node 2
+/// to `BBOX_STR` from the one at `SOUTH`'s.
+#[test]
+fn multi_extract_reads_a_repeated_id_only_from_each_regions_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("repeat.osm.pbf");
+    let nodes = [
+        node_at(1, true),
+        node_at(1, false),
+        node_at(2, false),
+        node_at(2, true),
+        node_at(3, true),
+    ];
+    let (ways, relations) = admission_ways_and_relation();
+    crate::common::write_test_pbf_impl(&input, &nodes, &ways, &relations, true, Some(1));
+    for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
+        let outputs = assert_multi_matches_singles(
+            dir.path(),
+            &input,
+            "repeat",
+            &[BBOX_STR, SOUTH],
+            strategy,
+            &[],
+        );
+        if matches!(strategy, Strategy::Simple) {
+            let a = read_all_elements(&outputs[0]);
+            let south = read_all_elements(&outputs[1]);
+            // A: 1 and 2 from the blobs at its coordinate, and 3. SOUTH: 1
+            // and 2 from the blobs at its coordinate.
+            assert_eq!(node_ids(&a), vec![1, 2, 3]);
+            assert_eq!(node_ids(&south), vec![1, 2]);
+        }
+    }
+}
+
+/// A node blob whose bbox claim understates its node (claimed at `SOUTH`'s
+/// coordinate, holding node 1 at `BBOX_STR`'s) is skipped unread by the
+/// single `BBOX_STR` extract, so the multi run must not classify node 1
+/// for `BBOX_STR` either - nor match way 10 or relation 20 through it. On
+/// disjoint ID ranges (simple runs fused) and, with node 3 repeated, on
+/// overlapping ones (simple classifies then writes).
+#[test]
+fn multi_extract_believes_an_understated_node_bbox_per_region() {
+    let dir = crate::common::test_scratch();
+    let (ways, relations) = admission_ways_and_relation();
+    for (tag, repeat) in [("disjoint", false), ("overlap", true)] {
+        let honest = dir.path().join(format!("{tag}-honest.osm.pbf"));
+        let input = dir.path().join(format!("{tag}.osm.pbf"));
+        let mut nodes = vec![node_at(1, true), node_at(2, false), node_at(3, true)];
+        if repeat {
+            nodes.push(node_at(3, true));
+        }
+        crate::common::write_test_pbf_impl(&honest, &nodes, &ways, &relations, true, Some(1));
+        // Frame 1 holds node 1, frame 2 node 2: give frame 1 frame 2's bbox
+        // (indexdata bytes 26 to 42), keeping its own kind and ID range.
+        let pbf = std::fs::read(&honest).unwrap();
+        let south_bbox = indexdata_of(&pbf, 2)[26..42].to_vec();
+        let understated = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 1, |ix| {
+            ix[26..42].copy_from_slice(&south_bbox);
+        });
+        std::fs::write(&input, understated).unwrap();
+        for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
+            let outputs = assert_multi_matches_singles(
+                dir.path(),
+                &input,
+                tag,
+                &[BBOX_STR, SOUTH],
+                strategy,
+                &[],
+            );
+            if matches!(strategy, Strategy::Simple) {
+                let a = read_all_elements(&outputs[0]);
+                assert_eq!(node_ids(&a), if repeat { vec![3, 3] } else { vec![3] });
+            }
+        }
+    }
+}
+
 /// The same parity on an input without indexdata (`--force`): its blobs
 /// join every classify schedule and the write pass reads each once.
 #[test]

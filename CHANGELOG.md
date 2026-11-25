@@ -893,6 +893,17 @@
 
 ### Fixed
 
+- **Multi-extract reads each region's node blobs as its single extract
+  does.** On sorted indexed input, `extract --config` read a node blob
+  whose indexdata bbox met any region and then selected and wrote its
+  nodes for every region. On input with a node ID in several blobs
+  (history-shaped), a region could get that ID's occurrence from a blob
+  its single-region extract never reads, and an understated bbox claim
+  let a region select, and with complete-ways or `--smart` match ways and
+  relations through, nodes its single extract skips. Each node blob now
+  counts only for the regions its bbox meets, and one that meets none is
+  not read. Inputs with each node ID in one blob are unaffected.
+
 - **`apply-changes` writes a lone metadata-less node plain when dense
   would not fit a block.** A node without metadata that overflows the
   32 MiB block limit alone in the dense form is retried as a plain node,

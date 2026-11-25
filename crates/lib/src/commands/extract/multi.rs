@@ -18,7 +18,9 @@ use super::common::{
     BboxInt, MatchableMember, Passthrough, dense_only_payload, matchable_members,
     spatial_blob_filter, warn_passthrough_demotions,
 };
-use super::membership::{BatchBuilder, Membership, PageBatch, full_mask, mask_words, regions_of};
+use super::membership::{
+    BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of, restrict,
+};
 use super::{ExtractStats, Region};
 
 use crate::owned::{dense_node_metadata, element_metadata};
@@ -160,6 +162,14 @@ pub(super) fn try_extract_multi_single_pass(
             }
             match idx.kind {
                 crate::ElementKind::Node => {
+                    let admit = node_blob_regions(&bbox_ints, Some(idx));
+                    if admit
+                        .as_deref()
+                        .is_some_and(|mask| mask.iter().all(|&word| word == 0))
+                    {
+                        // Between regions: only the union box met it.
+                        continue;
+                    }
                     // Raw passthrough is only sound for bbox regions - polygon
                     // regions can exclude nodes inside the bbox but outside the
                     // polygon boundary or inside holes - and only when the
@@ -181,6 +191,7 @@ pub(super) fn try_extract_multi_single_pass(
                     node_blobs.push(NodeBlob {
                         entry,
                         claim: Some(*idx),
+                        admit,
                         passthrough: if candidate {
                             Passthrough::Candidate
                         } else {
@@ -202,6 +213,7 @@ pub(super) fn try_extract_multi_single_pass(
             node_blobs.push(NodeBlob {
                 entry,
                 claim: None,
+                admit: None,
                 passthrough: Passthrough::No,
             });
             way_blobs.push(KindBlob { entry, claim: None });
@@ -251,6 +263,14 @@ pub(super) fn try_extract_multi_single_pass(
     // planet multi-region config is the hardest case, not the only
     // one.
     //
+    // This pin is a speed ruling only. It does not cover output parity: a
+    // single extract copies a blob inside its region raw, keeping a
+    // coordinate granularity finer than a decimicrodegree and sub-second
+    // timestamps, which the re-encode here drops for a blob inside some
+    // regions but not all. Fixing that parity is per-region fan-out of the
+    // validated frame, a correctness change this measurement does not
+    // refuse.
+    //
     // Sister pin: crates/lib/src/commands/tags_filter/mod.rs pass-2 worker (same
     // precedent: shadow measurement produced zero, reverted, leave the
     // pin as the block against re-attempting).
@@ -278,6 +298,7 @@ pub(super) fn try_extract_multi_single_pass(
             blob.entry,
             blob.claim,
             blob.passthrough == Passthrough::Candidate,
+            blob.admit.as_deref(),
         )
     }));
     if let Some(fused) = node_fused {
@@ -381,6 +402,12 @@ pub(super) fn try_extract_multi_single_pass(
                     };
                     let block = validated.into_block();
                     classify_columns(&block, columns, scratch)?;
+                    let admit = node_blobs_ref[position].admit.as_deref();
+                    for (region, ids) in scratch.iter_mut().enumerate() {
+                        if !admits(admit, region) {
+                            ids.clear();
+                        }
+                    }
                     // Occurrence counts, not set sizes: a duplicate id counts
                     // every time it is copied.
                     let observed = columns.len();
@@ -401,12 +428,15 @@ pub(super) fn try_extract_multi_single_pass(
                 host,
             )?;
         } else {
-            crate::scan::classify::parallel_classify_phase(
+            let node_blobs_ref = &node_blobs;
+            crate::scan::classify::parallel_project_phase(
                 &shared_file,
                 &node_schedule,
                 None,
                 || BatchBuilder::new(n),
-                |block, builder: &mut BatchBuilder| {
+                |position, buffer, builder: &mut BatchBuilder| {
+                    let block = buffer.block()?;
+                    let admit = node_blobs_ref[position].admit.as_deref();
                     for element in block.elements_skip_metadata() {
                         let (id, lat, lon) = match &element {
                             Element::DenseNode(node) => (
@@ -426,22 +456,26 @@ pub(super) fn try_extract_multi_single_pass(
                             Some(grid) => {
                                 for &region in grid.candidates(lat, lon) {
                                     let region = region as usize;
-                                    if regions[region].contains_decimicro(
-                                        &inside_bbox_ints[region],
-                                        lat,
-                                        lon,
-                                    ) {
+                                    if admits(admit, region)
+                                        && regions[region].contains_decimicro(
+                                            &inside_bbox_ints[region],
+                                            lat,
+                                            lon,
+                                        )
+                                    {
                                         builder.push(id, region);
                                     }
                                 }
                             }
                             None => {
                                 for region in 0..n {
-                                    if regions[region].contains_decimicro(
-                                        &inside_bbox_ints[region],
-                                        lat,
-                                        lon,
-                                    ) {
+                                    if admits(admit, region)
+                                        && regions[region].contains_decimicro(
+                                            &inside_bbox_ints[region],
+                                            lat,
+                                            lon,
+                                        )
+                                    {
                                         builder.push(id, region);
                                     }
                                 }
@@ -483,14 +517,19 @@ pub(super) fn try_extract_multi_single_pass(
             &shared_file,
             &node_blobs,
             n,
-            |block, bbs, output, _scratch| {
+            |block, admit, bbs, output, _scratch| {
                 let mut counts = vec![0u64; n];
                 let mut mask = vec![0u64; mw];
+                // An occurrence goes only to the regions its blob is read
+                // for (`node_blob_regions`), as in each single extract.
+                let member = |id: i64, mask: &mut [u64]| {
+                    node_members.mask_into(id, mask) && restrict(mask, admit)
+                };
                 for element in block.elements() {
                     match &element {
                         // A non-member skips metadata decode: the overwhelmingly
                         // common no-region-matches node.
-                        Element::DenseNode(dn) if node_members.mask_into(dn.id(), &mut mask) => {
+                        Element::DenseNode(dn) if member(dn.id(), &mut mask) => {
                             let id = dn.id();
                             let (lat, lon) = super::common::dense_coords(dn)?;
                             let meta = clean_metadata(dense_node_metadata(dn)?, clean);
@@ -500,7 +539,7 @@ pub(super) fn try_extract_multi_single_pass(
                                 counts[i] += 1;
                             }
                         }
-                        Element::Node(nd) if node_members.mask_into(nd.id(), &mut mask) => {
+                        Element::Node(nd) if member(nd.id(), &mut mask) => {
                             let id = nd.id();
                             let (lat, lon) = super::common::plain_coords(nd)?;
                             let meta = clean_partial_metadata(
@@ -544,7 +583,11 @@ pub(super) fn try_extract_multi_single_pass(
     // projection would remove is a smaller share still
     // (reference/performance/inspect.md, "inspect --nodes reads through a
     // projection").
-    let way_fused = fused_blobs(way_blobs.iter().map(|blob| (blob.entry, blob.claim, false)));
+    let way_fused = fused_blobs(
+        way_blobs
+            .iter()
+            .map(|blob| (blob.entry, blob.claim, false, None)),
+    );
     if let Some(fused) = way_fused {
         host.invocation.marker("MULTI_WAY_FUSED_START");
         let select = super::multi_fused::MultiSelect::Ways {
@@ -645,7 +688,7 @@ pub(super) fn try_extract_multi_single_pass(
     let relation_fused = fused_blobs(
         relation_blobs
             .iter()
-            .map(|blob| (blob.entry, blob.claim, false)),
+            .map(|blob| (blob.entry, blob.claim, false, None)),
     );
     if let Some(fused) = relation_fused {
         // Nothing reads relation membership after this pass.
@@ -836,6 +879,40 @@ pub(super) fn union_bbox(bbox_ints: &[BboxInt]) -> BboxInt {
     }
 }
 
+/// The regions a node blob is read for: those whose blob-selection box
+/// (`bbox_ints`, `BboxInt::from_bbox`, the box a single-region extract of
+/// every strategy admits node blobs by) meets the blob's claimed bbox.
+/// `None` means every region: no claim, no bbox in it, or every box met,
+/// the normal case at scale, where an ID-sorted node blob is near
+/// planet-wide. `Some` of an all-zero mask means no region; the caller
+/// drops such a blob, which only the union box admitted (it lies between
+/// regions), as every single extract skips it.
+///
+/// The multi passes admit node blobs by the union of the boxes, so this
+/// mask is what keeps each region to its single extract's schedule: an
+/// occurrence in the blob is classified for, and written to, only the
+/// regions it admits. Without it a node ID repeated in two blobs of
+/// disjoint claimed bboxes (history-shaped input) was written to a region
+/// from a blob that region's single extract never reads, and an
+/// understated bbox claim let a region classify nodes its single extract
+/// skips unread.
+pub(super) fn node_blob_regions(
+    bbox_ints: &[BboxInt],
+    claim: Option<&crate::blob_meta::BlobIndex>,
+) -> Option<Box<[u64]>> {
+    let blob = claim?.bbox.as_ref()?;
+    let mut mask = vec![0u64; mask_words(bbox_ints.len())];
+    let mut every = true;
+    for (region, b) in bbox_ints.iter().enumerate() {
+        if crate::BlobBbox::new(b.min_lat, b.max_lat, b.min_lon, b.max_lon).intersects(blob) {
+            mask[region / 64] |= 1u64 << (region % 64);
+        } else {
+            every = false;
+        }
+    }
+    (!every).then(|| mask.into_boxed_slice())
+}
+
 /// The N sync-mode output writers, each with its region's header written,
 /// and the pool-side framing that feeds them.
 ///
@@ -933,6 +1010,10 @@ struct NodeBlob {
     entry: ScheduledBlob,
     /// The blob's indexdata claim, for the fused pass's gate and exact check.
     claim: Option<crate::blob_meta::BlobIndex>,
+    /// The regions the blob is read for (`node_blob_regions`; `None` for
+    /// every region): its occurrences are classified for and written to
+    /// these alone, on the fused and the two-phase form.
+    admit: Option<Box<[u64]>>,
     /// `Candidate` when the indexdata bbox claims containment in every
     /// region; settled to `Verified` or `No` after node classify.
     passthrough: Passthrough,
@@ -948,19 +1029,26 @@ struct KindBlob {
 /// The fused pass's blobs for a kind whose claims are all present and
 /// pairwise disjoint (`fused::ranges_disjoint`), else `None`: the kind then
 /// runs the classify-then-write form.
-fn fused_blobs(
-    blobs: impl ExactSizeIterator<Item = (ScheduledBlob, Option<crate::blob_meta::BlobIndex>, bool)>
-    + Clone,
-) -> Option<Vec<super::multi_fused::FusedBlob>> {
-    if !super::fused::ranges_disjoint(blobs.clone().map(|(_, claim, _)| claim)) {
+fn fused_blobs<'a>(
+    blobs: impl ExactSizeIterator<
+        Item = (
+            ScheduledBlob,
+            Option<crate::blob_meta::BlobIndex>,
+            bool,
+            Option<&'a [u64]>,
+        ),
+    > + Clone,
+) -> Option<Vec<super::multi_fused::FusedBlob<'a>>> {
+    if !super::fused::ranges_disjoint(blobs.clone().map(|(_, claim, _, _)| claim)) {
         return None;
     }
     blobs
-        .map(|(entry, claim, candidate)| {
+        .map(|(entry, claim, candidate, admit)| {
             Some(super::multi_fused::FusedBlob {
                 entry,
                 claim: claim?,
                 candidate,
+                admit,
             })
         })
         .collect()
@@ -989,6 +1077,7 @@ fn multi_extract_pread_write_nodes<F>(
 where
     F: Fn(
             &PrimitiveBlock,
+            Option<&[u64]>,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
             &mut Vec<i64>,
@@ -1042,10 +1131,11 @@ where
         },
         |_| MultiLocal::new(n, &host.invocation),
         |(), local: &mut MultiLocal, ordinal| {
-            let entry = &blobs[decode_at.position(ordinal)].entry;
+            let blob = &blobs[decode_at.position(ordinal)];
+            let entry = &blob.entry;
             let block = local.decode(input, entry, &host.invocation)?;
             local
-                .classify(&block, n, &block_fn, framing)
+                .classify(&block, blob.admit.as_deref(), n, &block_fn, framing)
                 .map_err(|e| input.locate_blob(entry, e))
         },
         &mut consumer,
@@ -1114,6 +1204,7 @@ impl MultiLocal {
     fn classify<F>(
         &mut self,
         block: &PrimitiveBlock,
+        admit: Option<&[u64]>,
         n: usize,
         block_fn: &F,
         framing: &RegionFraming<'_>,
@@ -1121,6 +1212,7 @@ impl MultiLocal {
     where
         F: Fn(
             &PrimitiveBlock,
+            Option<&[u64]>,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
             &mut Vec<i64>,
@@ -1131,6 +1223,7 @@ impl MultiLocal {
         }
         let counts = block_fn(
             block,
+            admit,
             &mut self.bbs,
             &mut self.output,
             &mut self.i64_scratch,
@@ -1348,13 +1441,21 @@ where
     // The ordered classify pool: per-region results in schedule order,
     // bounded by its window. Each worker keeps its per-region builders,
     // output vectors and ID scratch across blobs, built on its own thread.
+    // Way and relation blobs have no spatial admission: every region reads
+    // them.
+    let block_fn =
+        |block: &PrimitiveBlock,
+         _admit: Option<&[u64]>,
+         bbs: &mut Vec<BlockBuilder>,
+         output: &mut Vec<Vec<OwnedBlock>>,
+         scratch: &mut Vec<i64>| block_fn(block, bbs, output, scratch);
     crate::scan::classify::parallel_classify_phase_ordered(
         input,
         schedule,
         None,
         None,
         || MultiLocal::new(n, &host.invocation),
-        |block, local: &mut MultiLocal| local.classify(block, n, &block_fn, framing),
+        |block, local: &mut MultiLocal| local.classify(block, None, n, &block_fn, framing),
         |_position, item| write_regions(item, writers, stats, stat_field),
         host,
     )

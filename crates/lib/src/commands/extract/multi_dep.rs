@@ -63,9 +63,12 @@ use crate::scan::classify::ScheduledBlob;
 use super::common::{
     BboxInt, BlobDesc, MatchableMember, Passthrough, matchable_members, spatial_blob_filter,
 };
-use super::membership::{BatchBuilder, Membership, PageBatch, full_mask, mask_words, regions_of};
+use super::membership::{
+    BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of,
+};
 use super::multi::{
-    RegionFraming, open_region_writers, probe_sorted_header, region_grid, union_bbox,
+    RegionFraming, node_blob_regions, open_region_writers, probe_sorted_header, region_grid,
+    union_bbox,
 };
 use super::smart::{CompletionMember, completion_members, push_parent_edges};
 use super::{ExtractStats, ExtractStrategy, Region};
@@ -170,6 +173,10 @@ pub(super) fn try_extract_multi_dependent(
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
     let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
+    // Each node-schedule position's region admission
+    // (`multi::node_blob_regions`), pushed beside it: the classify pool
+    // takes a bare schedule and hands back the position.
+    let mut node_admit: Vec<Option<Box<[u64]>>> = Vec::new();
     // Way blobs are never skipped by the spatial filter, so this one
     // schedule serves the way classify and smart's extra-way sweep.
     let mut way_schedule: Vec<ScheduledBlob> = Vec::new();
@@ -202,7 +209,19 @@ pub(super) fn try_extract_multi_dependent(
                 continue;
             }
             match idx.kind {
-                ElementKind::Node => node_schedule.push(entry),
+                ElementKind::Node => {
+                    // Classified only for the regions it is read for, as in
+                    // each single extract; one between regions is skipped.
+                    let admit = node_blob_regions(&bbox_ints, Some(idx));
+                    if admit
+                        .as_deref()
+                        .is_some_and(|mask| mask.iter().all(|&word| word == 0))
+                    {
+                        continue;
+                    }
+                    node_schedule.push(entry);
+                    node_admit.push(admit);
+                }
                 ElementKind::Way => way_schedule.push(entry),
                 ElementKind::Relation => relation_schedule.push(entry),
             }
@@ -210,6 +229,7 @@ pub(super) fn try_extract_multi_dependent(
             // Non-indexed blob (force path): every phase sees it and acts
             // on its own kind only.
             node_schedule.push(entry);
+            node_admit.push(None);
             way_schedule.push(entry);
             relation_schedule.push(entry);
         }
@@ -235,7 +255,8 @@ pub(super) fn try_extract_multi_dependent(
     if all_bbox {
         let bboxes = &region_bboxes;
         let grid = &grid;
-        crate::scan::classify::parallel_classify_phase(
+        let node_admit = &node_admit;
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &node_schedule,
             None,
@@ -246,7 +267,8 @@ pub(super) fn try_extract_multi_dependent(
                     BatchBuilder::new(n),
                 )
             },
-            |block, (columns, scratch, builder)| {
+            |position, buffer, (columns, scratch, builder)| {
+                let block = buffer.block()?;
                 block.decode_dense_columns(columns)?;
                 for v in scratch.iter_mut() {
                     v.clear();
@@ -271,7 +293,11 @@ pub(super) fn try_extract_multi_dependent(
                         }
                     }
                 }
+                let admit = node_admit[position].as_deref();
                 for (region, ids) in scratch.iter().enumerate() {
+                    if !admits(admit, region) {
+                        continue;
+                    }
                     for &id in ids {
                         builder.push(id, region);
                     }
@@ -284,12 +310,15 @@ pub(super) fn try_extract_multi_dependent(
     } else {
         let grid = &grid;
         let inside = &inside_bbox_ints;
-        crate::scan::classify::parallel_classify_phase(
+        let node_admit = &node_admit;
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &node_schedule,
             None,
             || BatchBuilder::new(n),
-            |block, builder: &mut BatchBuilder| {
+            |position, buffer, builder: &mut BatchBuilder| {
+                let block = buffer.block()?;
+                let admit = node_admit[position].as_deref();
                 for element in block.elements_skip_metadata() {
                     let (id, lat, lon) = match &element {
                         Element::DenseNode(node) => (
@@ -309,14 +338,18 @@ pub(super) fn try_extract_multi_dependent(
                         Some(grid) => {
                             for &region in grid.candidates(lat, lon) {
                                 let region = region as usize;
-                                if regions[region].contains_decimicro(&inside[region], lat, lon) {
+                                if admits(admit, region)
+                                    && regions[region].contains_decimicro(&inside[region], lat, lon)
+                                {
                                     builder.push(id, region);
                                 }
                             }
                         }
                         None => {
                             for region in 0..n {
-                                if regions[region].contains_decimicro(&inside[region], lat, lon) {
+                                if admits(admit, region)
+                                    && regions[region].contains_decimicro(&inside[region], lat, lon)
+                                {
                                     builder.push(id, region);
                                 }
                             }

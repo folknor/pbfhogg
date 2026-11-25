@@ -377,8 +377,14 @@ fn extract_simple_repeated_ids_match_the_non_indexed_run() {
 /// Multi-extract's counterpart. At block sizes 3 and 100 every repeat sits
 /// inside one blob and takes the fused pass's blob-local union; at block
 /// size 2 the repeats straddle blobs, the ranges overlap, and the kind
-/// classifies then writes. Each region writes every occurrence of an ID any occurrence
-/// matched in that region, as the non-indexed run does.
+/// classifies then writes. Each region writes every occurrence of an ID any
+/// occurrence matched in that region, from the blobs that region's single
+/// extract reads. At block sizes 3 and 100 every blob spans both regions,
+/// so that is every blob, as in the non-indexed run. At block size 2 the
+/// first blob (`1, 2` at region b's coordinate) has a bbox missing region
+/// a and the last (`4, 5` at a's) one missing b, so each region skips one
+/// blob, as its single extract does, and the indexed run writes fewer
+/// occurrences than the non-indexed one, which has no bbox to skip on.
 #[cfg(feature = "commands")]
 #[test]
 fn extract_multi_simple_repeated_ids_match_the_non_indexed_run() {
@@ -443,13 +449,39 @@ fn extract_multi_simple_repeated_ids_match_the_non_indexed_run() {
             .expect("extract_multi");
             all_stats.push(stats);
         }
-        for (idx, non) in outputs("idx").iter().zip(outputs("non").iter()) {
-            assert_elements_equivalent(idx, non);
+        // Each indexed region equals its single extract.
+        for (i, idx) in outputs("idx").iter().enumerate() {
+            let single = dir.path().join(format!("single_{i}.osm.pbf"));
+            pbfhogg::commands::extract::extract(
+                &in_idx,
+                crate::common::out(&single),
+                &regions()[i],
+                pbfhogg::commands::extract::ExtractStrategy::Simple,
+                true,
+                &pbfhogg::cat::CleanAttrs::default(),
+                &forced(),
+                &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
+            )
+            .expect("extract");
+            assert_elements_equivalent(idx, &single);
         }
-        // a: 2, 2, 4, 4, 5. b: 1, 2, 2, 4, 4.
-        for stats in &all_stats {
-            assert_eq!(stats[0].nodes_in_bbox, 5, "block size {block_size}");
-            assert_eq!(stats[1].nodes_in_bbox, 5, "block size {block_size}");
+        if block_size == 2 {
+            // a: 2 (blob 2), 4, 4, 5. b: 1, 2, 2 (blob 2), 4.
+            for stats in &all_stats[0] {
+                assert_eq!(stats.nodes_in_bbox, 4, "indexed");
+            }
+            for stats in &all_stats[1] {
+                assert_eq!(stats.nodes_in_bbox, 5, "non-indexed");
+            }
+        } else {
+            for (idx, non) in outputs("idx").iter().zip(outputs("non").iter()) {
+                assert_elements_equivalent(idx, non);
+            }
+            // a: 2, 2, 4, 4, 5. b: 1, 2, 2, 4, 4.
+            for stats in all_stats.iter().flatten() {
+                assert_eq!(stats.nodes_in_bbox, 5, "block size {block_size}");
+            }
         }
     }
 }

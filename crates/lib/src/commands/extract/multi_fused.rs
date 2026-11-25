@@ -50,18 +50,20 @@ use super::common::{
     BboxInt, MatchableMember, dense_coords, dense_only_payload, matchable_members, plain_coords,
     warn_passthrough_demotions,
 };
-use super::membership::{BatchBuilder, Membership, PageBatch, regions_of};
+use super::membership::{BatchBuilder, Membership, PageBatch, admits, regions_of};
 use super::multi::{RegionFraming, write_regions};
 use super::{ExtractStats, Region};
 use crate::owned::{dense_node_metadata, element_metadata};
 
-/// One blob of a fused kind: its schedule entry, its (exact-checked) claim
-/// and whether it is a raw-copy candidate.
+/// One blob of a fused kind: its schedule entry, its (exact-checked) claim,
+/// whether it is a raw-copy candidate, and for a node blob the regions it
+/// is read for (`multi::node_blob_regions`; `None` for every region).
 #[derive(Clone, Copy)]
-pub(super) struct FusedBlob {
+pub(super) struct FusedBlob<'a> {
     pub(super) entry: ScheduledBlob,
     pub(super) claim: BlobIndex,
     pub(super) candidate: bool,
+    pub(super) admit: Option<&'a [u64]>,
 }
 
 /// What decides an occurrence of the pass's kind, per region.
@@ -142,7 +144,7 @@ struct Local {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn multi_fused_pass(
     input: &InputFile,
-    blobs: &[FusedBlob],
+    blobs: &[FusedBlob<'_>],
     select: &MultiSelect<'_>,
     n: usize,
     clean: &crate::cat::CleanAttrs,
@@ -267,7 +269,7 @@ fn strictly_increasing(ids: &[i64]) -> bool {
 )]
 fn fuse_blob(
     input: &InputFile,
-    blob: &FusedBlob,
+    blob: &FusedBlob<'_>,
     select: &MultiSelect<'_>,
     n: usize,
     clean: &crate::cat::CleanAttrs,
@@ -419,6 +421,20 @@ fn fuse_blob(
                 }
             }
         }
+    }
+
+    // A node blob's occurrences hit only the regions it is read for, as in
+    // each single extract (`multi::node_blob_regions`). A raw-copy
+    // candidate is admitted by every region (its bbox lies inside each), so
+    // this never thins a candidate's hits.
+    if let Some(admit) = blob.admit {
+        let admit = Some(admit);
+        local
+            .dense_hits
+            .retain(|&(_, region)| admits(admit, region as usize));
+        local
+            .plain_hits
+            .retain(|&(_, region)| admits(admit, region as usize));
     }
 
     // The exact claim check over every occurrence, before anything leaves.

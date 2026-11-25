@@ -793,7 +793,9 @@ fn extract_multi_to(
             regions.len(),
             output.destination().display()
         );
-        let stats = extract_to(
+        // Admitted once above for the dependency strategies; simple has no
+        // admission.
+        let stats = extract_admitted(
             input, output, region, strategy, set_bounds, clean, write, overrides, host,
         )?;
         all_stats.push(stats);
@@ -972,6 +974,26 @@ pub(crate) fn extract_to(
     if !matches!(strategy, ExtractStrategy::Simple) {
         require_dependency_indexdata(input, write, host)?;
     }
+    extract_admitted(
+        input, output, region, strategy, set_bounds, clean, write, overrides, host,
+    )
+}
+
+/// [`extract_to`] after its indexdata admission, for a caller that has
+/// already admitted the input once for the run (multi-extract's per-region
+/// fallback), so a forced run warns once rather than once per region more.
+#[allow(clippy::too_many_arguments)]
+fn extract_admitted(
+    input: &PinnedInput,
+    output: &crate::output::BoundOutput,
+    region: &Region,
+    strategy: ExtractStrategy,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Entered<'_>,
+) -> Result<ExtractStats> {
     let result = match strategy {
         ExtractStrategy::Simple => simple::extract_simple(
             input, output, region, set_bounds, clean, write, overrides, host,

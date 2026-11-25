@@ -214,6 +214,16 @@ Counters emitted (UUID `c1ff6ec9` values):
 
 ### Multi-extract
 
+#### Partial per-region node-blob passthrough disproved (commit `57b01f9`, 2026-04-20, plantasjen)
+
+A shadow counter classified every node blob by whole-blob containment in
+each region's bbox without copying anything raw. Planet 5-region
+`extract --config --simple` (bbox -25,34,45,72), UUID `dad573cb`: 0 of
+32,835 node blobs would have qualified for partial passthrough; all landed
+in the none-contained bucket, and the all-regions-contained fast path also
+fired 0 times. Verdict: dropped, shadow reverted. The pin comment in
+`crates/lib/src/commands/extract/multi.rs` carries the reasoning.
+
 #### Way-classify scratch reuse (commit `b7cd0e4`, 2026-04-17)
 
 The way-classify phase used `|| ()` as its per-worker init and

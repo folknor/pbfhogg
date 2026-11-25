@@ -26,11 +26,6 @@
 //! A header that claims the flag over disordered content takes the ordinary
 //! path in every check, where a refusal of it is an error.
 
-#![allow(
-    dead_code,
-    reason = "shared verifier helpers consumed by the remaining family slices"
-)]
-
 use std::path::{Path, PathBuf};
 
 use crate::argv::PbfArgv;

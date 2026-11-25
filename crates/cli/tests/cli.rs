@@ -418,7 +418,9 @@ fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
     let dir = crate::common::test_scratch();
     for (name, bytes) in [
         ("unknown.pbf", b"not a PBF".as_slice()),
-        ("unknown.osc.gz", b"\x1f\x8bnot OSC".as_slice()),
+        // No gzip magic: content that sniffs as neither kind, so only the
+        // suffix can route it to OSC.
+        ("unknown.osc.gz", b"not OSC".as_slice()),
         ("unknown.osc.bz2", b"BZhnot OSC".as_slice()),
     ] {
         let input = dir.path().join(name);

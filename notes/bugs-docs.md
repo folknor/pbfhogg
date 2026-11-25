@@ -286,19 +286,3 @@ makes field 20 authoritative only where `pbfhogg.SharedNodePins-v1` is
 declared, and splice outputs (apply-changes, renumber) carry it
 undeclared, so the guide should tell a caller to check
 `HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.
-
-## DOC-051 - time-filter's selection rule differs from osmium's unrecorded
-
-Reported by: the spar accounting of the parallel history time-filter
-change, from its scout's lateral (2026-11-25); read from both sources, not
-run.
-
-On a history file osmium (`command_time_filter.cpp`, libosmium
-`diff_object.hpp` `is_visible_at`) keeps a version whose timestamp is at
-or before the cutoff when the next record of the same object has a later
-timestamp, with no version rule. pbfhogg keeps the last record at or
-before the cutoff and refuses versions that do not strictly ascend. They
-agree on well-formed files; they answer differently where a later version
-carries an earlier timestamp, and pbfhogg refuses input osmium accepts
-(descending, repeated or absent versions). `DEVIATIONS.md` records only the
-sequence-number difference for time-filter.

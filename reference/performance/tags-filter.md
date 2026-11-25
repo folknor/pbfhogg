@@ -261,6 +261,15 @@ baseline's 2.440 s; warm cells agree within 1 %. Variant peak anon 135 MB,
 
 ### Tags-filter
 
+#### Pass-2 blob-level raw passthrough disproved (commit `a5c6854`, 2026-04-18, plantasjen)
+
+A shadow counter ran the full ID-set classification per pass-2 blob without
+copying anything raw. Planet `w/highway=primary`, UUID `8c786794`: 0 of
+50,364 pass-2 blobs would have qualified (17,529 way blobs at a 0.34 %
+per-element match rate, 32,835 node blobs at 0.40 %). Verdict: dropped,
+shadow removed in `0ef4107`. The pin comment in
+`crates/lib/src/commands/tags_filter/mod.rs` carries the reasoning.
+
 #### Sequential → two-pass → parallel arc
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel

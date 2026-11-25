@@ -147,29 +147,6 @@ precedence and surface as a content difference blamed on pbfhogg. Traced
 from source only; derive emits new's versions, so whether real derives
 reach it is unchecked.
 
-## TOOL-055 - The .osc.gz routing fixture cannot detect a broken suffix fallback
-
-Reported by: TOOL-032 link 2 review.
-
-`cli_tags_filter_ambiguous_content_uses_legacy_fallback` (crates/cli/tests/cli.rs)
-writes gzip magic into `unknown.osc.gz`, so on a host whose input pin
-sniffs content the file reaches the OSC route by sniff, not by its suffix;
-the expected 64 is the same either way, so the cell cannot catch a broken
-`.osc.gz` name fallback there. Use bytes that sniff as neither kind under
-that suffix.
-
-## TOOL-056 - verify_input_order.rs allows dead code for slices that have landed
-
-Reported by: the spar accounting of the verifier reference-order change,
-from its scout's lateral (2026-11-25); read from source, not built.
-
-`crates/verify/src/verify_input_order.rs` opens with a module-wide
-`#![allow(dead_code)]` whose reason is "shared verifier helpers consumed by
-the remaining family slices". The input-order family is complete, so the
-reason no longer holds, and the allow hides any helper that has become dead
-(the same change removed one, `Harness::check_sorted`). Remove the allow
-and delete or justify what the compiler then reports.
-
 ## TOOL-057 - No fixture test drives the geocode verify check
 
 Reported by: the spar accounting of the verifier reference-order change,
@@ -213,4 +190,3 @@ becomes ENVIRONMENT and `all` continues. Decide which wins; the contract
 reads as if the verifier error should, so `Tool` probably belongs in the
 pass-through arm beside `Interrupted` and `Unsettled`. Left for the user
 because it changes which outcomes stop a suite.
-

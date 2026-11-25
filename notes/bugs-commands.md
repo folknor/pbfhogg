@@ -197,18 +197,6 @@ kind per block; the case was traced correct in the spar review, not run.
 Fix shape: a history cancellation scenario in `cancel.rs`, and a fixture
 with a mixed-kind blob whose last object straddles the seam.
 
-## CMD-079 - Forced unsorted multi-extract prints the missing-indexdata warning twice
-
-Reported by: the shared multi-extract chain (its engine link), via the
-spar accounting (2026-11-25); not reproduced.
-
-Multi-extract now admits its input once on the shared route. When the
-sortedness probe then declines (unsorted input under `--force`), the
-per-region fallback calls `extract_to`, which admits again, so the
-missing-indexdata warning is printed one more time than before the shared
-route existed. Admit once and hand the admission to the fallback, or keep
-the fallback from repeating the warning.
-
 ## CMD-080 - No cancellation scenario covers multi-extract
 
 Reported by: the spar accounting of the shared multi-extract change, from

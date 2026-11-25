@@ -137,8 +137,9 @@ impl Route {
             // shared by every classify phase and smart's extra-way sweep)
             // and the write pass.
             (_, true) => 4,
-            // The probe declines, then one extract per region.
-            (_, false) => front + 1 + 2 * per_extract,
+            // The probe declines, then one extract per region, each without
+            // the front read the run already took.
+            (_, false) => front + 1 + 2 * (per_extract - front),
         }
     }
 

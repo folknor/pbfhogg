@@ -944,6 +944,27 @@ sequence number whenever it cannot show the output is still at the input's
 state: when it lowered the timestamp, and when the input has no timestamp to
 compare against. A cutoff at or after the input's timestamp keeps both.
 
+## time-filter: which history version is the one at the cutoff
+
+`osmium time-filter` (`command_time_filter.cpp`, with libosmium's
+`DiffObject::is_visible_at`) keeps a history record when it is visible, its
+timestamp is at or before the cutoff, and the next record of the same object
+has a timestamp after the cutoff (the object's last record counts as valid
+forever). Versions play no part: the rule reads record order and timestamps
+alone.
+
+`pbfhogg time-filter` keeps, per object, the last record at or before the
+cutoff in input order, omitting the object when that record is deleted, and
+refuses a history input whose versions for one object do not strictly
+ascend. On a well-formed history (versions ascending, timestamps not
+descending) the two pick the same record. They differ where a later version
+carries an earlier timestamp: osmium can then write two records of one
+object (v1 at 100, v2 at 300, v3 at 200, cutoff 250 keeps v1 and v3), while
+pbfhogg writes one, v3. And pbfhogg refuses input osmium accepts:
+descending, repeated or absent versions. The refusal is deliberate - such a
+file has no single version at the cutoff, and a snapshot carrying two
+records of one ID is not a snapshot.
+
 ## tags-filter and inspect tags: expression-syntax edge cases
 
 The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`

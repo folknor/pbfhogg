@@ -403,3 +403,35 @@ stream shard output to per-shard scratch temp files", "Walker phase ~15 s"
 via `HeaderWalker`) with no mark that streaming work units replaced it;
 only later sections say so. Move the current planet baselines to the top
 and the shard-era sections under History.
+
+## DOC-055 - pipeline.md's tags-filter section predates the catalog and two-read closure
+
+Reported by: the spar accounting of the tags-filter pass-2 node skip
+change, from its scout's lateral (2026-11-25).
+
+`reference/pipeline.md` "### tags-filter" describes the default mode as
+"Blob filter -> pipelined decode -> element matching" with matched
+relations pulling in members "transitively (multi-pass)". The two-pass
+route (`tags_filter_two_pass`, `commands/tags_filter/mod.rs`) is a header
+walk recorded in a catalog that feeds every schedule, a pass-1 classify on
+pread workers, a relation closure of at most two relation reads plus an
+in-memory worklist (`commands/relation_closure.rs`, shared with getid), a
+way-dependency walk only when the closure added member ways, and a pass 2
+that reads node blobs only when some node is included. getid's section in
+the same file was updated for the shared closure; tags-filter's was not.
+Rewrite the section to the current passes.
+
+## DOC-056 - pipeline.md says inspect decodes selectively for --blocks
+
+Reported by: the spar accounting of the unindexed check pair fusion, from
+its scout's lateral (2026-11-25).
+
+`reference/pipeline.md` "### inspect" opens "Selective decode on demand for
+`--nodes`, `--blocks`, or element display." `--blocks` is a report option
+of whichever scan runs: the index-only walk serves it from indexdata
+(`inspect/scan.rs`, whose index-only condition does not name
+`show_blocks`), as `docs/cli/commands.md` says ("per-block stats from the
+blobs' own indexdata"). `--nodes` is a separate engine (`node_stats` on the
+classify pool over a node schedule), and the full-decode report runs on the
+ordered read pipeline. Reword the line to the index-only walk, the
+full-decode scan and what selects each, and `node_stats` as its own read.

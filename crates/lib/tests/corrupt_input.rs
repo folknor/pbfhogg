@@ -401,6 +401,37 @@ fn cat_rejects_oversized_header_length() {
     );
 }
 
+/// `check_refs` decodes the leading `OSMHeader` payload rather than
+/// trusting its frame type: a correctly framed header whose payload is the
+/// one-byte truncated varint `0x80` is refused, not reported as an empty,
+/// successful reference check.
+#[cfg(feature = "commands")]
+#[test]
+fn check_refs_rejects_unreadable_leading_header() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("bad-header.osm.pbf");
+    let pbf = crate::common::adversarial::mutate_blob_payload(&write_one_block_pbf(), 0, |p| {
+        *p = vec![0x80];
+    });
+    std::fs::write(&input, &pbf).unwrap();
+
+    let opts = pbfhogg::check::refs::CheckRefsOptions {
+        direct_io: false,
+        check_relations: false,
+        show_ids: None,
+    };
+    let result = pbfhogg::check::refs::check_refs(&input, &opts, &crate::common::test_host());
+    let err = match result {
+        Ok(_) => panic!("expected check_refs to refuse an unreadable leading header"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&input.display().to_string()) && msg.contains("at byte offset 0"),
+        "expected a located header-decode refusal, got: {msg}",
+    );
+}
+
 /// A schedule builder never accepts an entry whose blob body extends
 /// past EOF, to fail later at `read_exact_at` in a pread worker: the
 /// `HeaderWalker` every builder walks with refuses the frame first,

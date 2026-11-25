@@ -116,18 +116,6 @@ removes it and emits no replacement `@user`. This contradicts ADR-0010's
 emitted-name rule. If reserving the whole namespace is intended, the
 documented rule should say so.
 
-## CMD-039 - check --refs passes an unreadable leading header payload
-
-Reported by: shared-primitives (the hunter explicitly does not count this as a
-confirmed defect).
-
-`consume_leading_header` (`scan/classify.rs`) checks the frame's type but
-never decodes its body, and `check_refs` (`check/refs.rs`) does no separate
-header decode. A correctly framed `OSMHeader` with the one-byte payload `0x80`
-and no data blobs reaches a successful empty reference report. `--refs`
-promises only referential integrity, so its success does not certify that the
-header is readable.
-
 ## CMD-049 - apply-changes still refuses a few elements that fit a block
 
 Reported by: the derive OSC domain item (2026-11-19); narrowed 2026-11-19

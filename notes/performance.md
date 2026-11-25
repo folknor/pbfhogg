@@ -1253,41 +1253,6 @@ by text. Medium-confidence: partition-owner counting instead of mutex shards.
 
 Kind: high conviction.
 
-## PERF-043 - tags-filter decodes every way blob twice on relation queries
-
-Reported by: tags, framing, decode, indexdata.
-
-On a query whose relation closure pulls in member ways, the way-dependency
-walk (`collect_way_node_dependencies`) decodes every way blob to collect
-member-way node refs, then pass 2 decodes every way blob again to emit the
-selected ways. Planet `r/type=route` (bygg, 2026-11-24): WAYDEPS 9.3 s of
-55.5 s, pass 2 38.4 s. Removing the second decode while keeping input-order
-output needs the selected ways' output held until node selection is
-complete, because nodes are written before ways. Two shapes:
-
-- Stage re-encoded ways in a spool during the walk, emit nodes, drain the
-  spool, then relations. Output-way volume is sub-GB for route queries and
-  most of the planet's ways under `--invert-match`, so a general spool is
-  on disk, which changes the scratch contract in docs/cli/commands.md
-  (tags-filter takes no scratch today). Needs the maintainer's ruling.
-- Write `header | ways | nodes` into the output staging file the command
-  already owns, then rotate the two byte ranges in place before appending
-  relations and publishing. No separate scratch, but the rotation rereads
-  and rewrites the node output; needs a writer change.
-
-Either must keep the per-record counts the `matched_records` check uses,
-fall back for unknown kinds, and stay correct under `--distrust-metadata`.
-A relation-first ordering that merges direct-way classification with the
-member-way walk saves no read on `r/type=route` (pass 1 skips way blobs
-there) and helps only mixed queries.
-
-Also open: invert-match at planet was not re-measured after the two-read
-closure; ID-range pruning of the way-deps and pass-2 schedules was not
-pursued on a density hypothesis (see the `CatalogEntry` doc), without a
-zero-hit blob count per kind. Single-consumer insertion is PERF-025.
-
-Kind: redesign, moderate conviction.
-
 ## PERF-044 - tags-filter OSC formats every element before deciding to keep it
 
 Reported by: tags, osc.

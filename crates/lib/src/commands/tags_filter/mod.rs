@@ -1032,6 +1032,18 @@ fn tags_filter_two_pass(
     // --- Pass 2: Write matching elements via pread-from-workers ---
     // Every scheduled blob is decoded and its included elements re-encoded by
     // parallel workers; there is no raw passthrough (see the pin below).
+    //
+    // When the way-dependency walk above ran, pass 2 decodes every way blob
+    // a second time. That double decode is a deliberate trade, not an
+    // oversight. Nodes are written before ways, so emitting the selected
+    // ways during the walk would mean holding them until node selection is
+    // complete: either a spool of the re-encoded ways (on disk at planet
+    // scale under --invert-match, which would give tags-filter a scratch
+    // requirement it does not have), or writing ways before nodes into the
+    // output staging file and rotating the two byte ranges in place (a
+    // writer change that rereads and rewrites the node output). The gain is
+    // bounded by the walk itself, a few seconds of a planet relation query,
+    // and peak memory is already modest, so neither shape was taken.
     host.invocation.marker("TAGSFILTER_PASS2_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;

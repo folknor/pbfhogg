@@ -12,7 +12,7 @@
 //! `flate2::read::MultiGzDecoder` read them all, while
 //! `flate2::read::GzDecoder` stops after the first and silently returns
 //! a prefix. Consumers must use a multi-member reader; the in-crate OSC
-//! reader (`open_osc_reader`) does. Compressing chunks independently
+//! reader (`osc::xml_parse`, inline and inflate-ahead alike) does. Compressing chunks independently
 //! gives up the cross-chunk dictionary and adds per-member framing, a
 //! workload-dependent ratio loss, in exchange for compressing chunks in
 //! parallel.

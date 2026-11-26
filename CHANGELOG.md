@@ -656,6 +656,15 @@
 
 ### Changed
 
+- **Reading a `.osc.gz` inflates it on a thread of its own, ahead of the
+  XML parse.** Every OSC reader (`merge-changes`, `tags-filter
+  --input-kind osc`, `apply-changes`, the library's `osc` parsers) now
+  overlaps gzip inflation with parsing for a gzip input that is a regular
+  file; plain `.osc` and stream inputs are read as before. Planet:
+  `tags-filter` on one daily OSC 1.77 s to 1.36 s, `merge-changes` of
+  seven 3.1 s to 2.9 s. Each gzip input holds up to 6 MiB of inflated
+  read-ahead and one extra thread.
+
 - **`diff --format osc` on indexed inputs writes creates straight into the
   output and keeps only modifies and deletes in scratch.** Its scratch
   footprint shrinks by the create volume (most of a typical snapshot

@@ -100,6 +100,17 @@ pub(crate) const MERGE_CHANGES_WORKERS_MIN: usize = 1;
 /// Merge-changes worker count when the host reports no parallelism.
 pub(crate) const MERGE_CHANGES_WORKERS_FALLBACK: usize = 8;
 
+/// Inflated bytes per chunk the OSC reader's inflate-ahead thread hands to
+/// the XML tokenizer, for a gzip OSC that is a regular file. Large enough
+/// that one channel handoff per chunk is negligible against inflating it,
+/// small enough that the tokenizer starts within a chunk's inflate time.
+pub(crate) const OSC_INFLATE_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Inflated chunks the inflate-ahead thread may queue before it blocks. With
+/// the chunk the tokenizer holds and the one being filled this bounds each
+/// gzip input's inflated read-ahead at `OSC_INFLATE_AHEAD_CHUNKS + 2` chunks.
+pub(crate) const OSC_INFLATE_AHEAD_CHUNKS: usize = 4;
+
 /// Raw element bytes (tag content before entity decoding, as the OSC reader
 /// copies it) at which a merge-changes reader seals a batch for encoding.
 /// Every sealed batch becomes its own gzip member (or plain fragment) with

@@ -8,6 +8,28 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Gzip inflated ahead of the tokenizer (bygg, 2026-11-26, `1b3dfe61` + change)
+
+Each reader thread used to inflate its gzip input inside the XML reader's
+`read()` calls, so inflate and tokenizing added up on one thread. A regular
+gzip file is now inflated on a scoped thread of its own into 1 MiB chunks,
+four queued ahead, that quick-xml reads in place. Planet 7-OSC
+`4914..4920`, `--iterations 1`, interleaved, baseline on `--commit HEAD`:
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `dbb1fb21` 3159 ms | `2113ec7e` 2899 ms |
+| 2 | `d516f6b7` 3115 ms | `5857c94e` 2834 ms |
+| 3 | `97a54739` 3057 ms | `1bf90362` 2886 ms |
+
+Medians 3115 against 2886 ms, -7.4 %, every pair the same sign. The gain
+is all in `MERGECHANGES_PARALLEL_EMIT` (2799 to 2633 ms in pair 3, cores
+21.2 to 23.2); drain is unchanged. Peak RSS in the emit phase 183 to 240
+MB, the read-ahead chunks of seven inputs. The saving is well short of
+the per-reader inflate time (0.5-0.9 s), so the readers are now bound by
+tokenizing and framing, not inflate. This supersedes the pre-flight below
+that ruled out decoupled decompression on the serial whole-input shape.
+
 ### Later inputs' members held in memory instead of spilled: declined (bygg, 2026-11-26, `eecbc773` + change)
 
 The streaming coordinator writes every member of an input that is not the
@@ -447,7 +469,10 @@ decompress wall separately from the surrounding `quick_xml` machinery:
 **gzip = 1.5 % of wall** (3.98 s of 272.6 s, 1.4-1.5 % per-OSC). That
 killed the parallel-decompress + sequential-XML alternative outright -
 no win to extract there - and forced the buffer-and-drain shape that
-landed at `43dd620` and `99057fa`. The same pre-flight added
+landed at `43dd620` and `99057fa`. (Once the merge became reader-bound
+on lexical batches, inflate was a quarter or more of each reader's life
+and inflating ahead paid; see "Gzip inflated ahead of the tokenizer"
+above.) The same pre-flight added
 `merge_changes_changes_per_osc` (per-input change-count delta) which
 sized peak per-worker `ChangeStream` residual at 5.8 M changes for
 the heaviest OSC.

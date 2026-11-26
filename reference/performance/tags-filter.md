@@ -1,5 +1,15 @@
 # Tags Filter
 
+### OSC gzip inflated ahead of the tokenizer (bygg, 2026-11-26, `1b3dfe61` + change)
+
+The one OSC reader now inflates a regular gzip file on a thread of its own
+(see the merge-changes record of the same change). `tag-select
+--input-kind osc --input 4920` on planet, `--iterations 1`, interleaved,
+baseline on `--commit HEAD`: `a7724d81` 1809 / `8d28dfb8` 1732 ms against
+`9de5cbf9` 1363 / `c0131071` 1349 ms, medians 1770 against 1356 ms,
+-23 %. One input has no other reader to hide its inflate behind, so the
+overlap is worth more here than in a 7-input merge.
+
 ### Single-pass builder kept per decode worker: not kept (bygg, 2026-11-26, variant against `908626e7`)
 
 The `-R` single pass builds a `BlockBuilder` (8000-element preallocation)

@@ -789,23 +789,33 @@ impl<R: io::Read> io::Read for TimedRead<R> {
     }
 }
 
-pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
+/// The opened input with its sniffed prefix replayed ahead of the rest.
+type Sniffed = io::Chain<io::Take<io::Cursor<[u8; 3]>>, std::fs::File>;
 
-/// Open an OSC file, transparently handling both gzip-compressed and
-/// plain XML.
+/// How an opened OSC input is read.
+enum OscInput {
+    /// Plain XML, or gzip from a stream: read on the tokenizer's thread.
+    Inline(Box<dyn io::Read>),
+    /// Gzip from a regular file: inflated ahead on a thread of its own.
+    InflateAhead(Sniffed),
+}
+
+/// Open an OSC file and sniff whether it is gzip-compressed or plain XML.
 ///
 /// `apply-changes` used to wrap every input in `MultiGzDecoder`
 /// unconditionally and fail on a plain `.osc` with a raw gzip error,
 /// while `merge-changes` sniffed the magic and handled both. The sniff
 /// belongs to the shared parser, not to one of its two callers.
 ///
-/// Returns the reader and the shared cell accumulating time spent in the
-/// input reader's `read()` calls (see `TimedRead`: file reads plus gzip
-/// decompression, or file reads alone for plain XML).
-pub(crate) fn open_osc_reader(
+/// A gzip input that is a regular file is inflated ahead of the tokenizer
+/// (see [`inflate_ahead`]); a stream stays inline, because a read-ahead
+/// blocked on a FIFO writer cannot be interrupted, and would turn an error
+/// the tokenizer has already found into a wait for that writer.
+fn open_osc_input(
     path: &Path,
+    total: &Rc<Cell<u64>>,
     cancel: &crate::host::Recorder,
-) -> ParseResult<(OscReader, Rc<Cell<u64>>)> {
+) -> ParseResult<OscInput> {
     let mut file = crate::read::input::open(path)?;
     // The input is read front to back exactly once and never rewound, so
     // it may be a stream (a FIFO, `/dev/stdin`): the sniffed prefix is
@@ -829,27 +839,213 @@ pub(crate) fn open_osc_reader(
         }
     }
     let gzip = got >= 2 && prefix[..2] == [0x1f, 0x8b];
+    let regular = gzip && file.metadata().map_err(read_error)?.is_file();
     let file = io::Cursor::new(prefix).take(got as u64).chain(file);
 
-    let total = Rc::new(Cell::new(0_u64));
+    if regular {
+        return Ok(OscInput::InflateAhead(file));
+    }
     let inner: Box<dyn io::Read> = if gzip {
         Box::new(TimedRead {
             inner: MultiGzDecoder::new(file),
-            total: Rc::clone(&total),
+            total: Rc::clone(total),
             cancel: cancel.handle().clone(),
         })
     } else {
         Box::new(TimedRead {
             inner: file,
-            total: Rc::clone(&total),
+            total: Rc::clone(total),
             cancel: cancel.handle().clone(),
         })
     };
-    let mut reader = Reader::from_reader(BufReader::new(inner));
+    Ok(OscInput::Inline(inner))
+}
+
+/// The XML reader every OSC parse drives, over either input form.
+fn xml_reader<R: io::BufRead>(inner: R) -> Reader<R> {
+    let mut reader = Reader::from_reader(inner);
     reader.config_mut().trim_text(true);
     // XML forbids `--` inside a comment; quick-xml checks it only on request.
     reader.config_mut().check_comments = true;
-    Ok((reader, total))
+    reader
+}
+
+/// What the inflate-ahead thread sends, in stream order. The channel closing
+/// without `Eof` or `Failed` means the thread died (its panic is re-raised by
+/// the scope), never a clean end of input.
+enum Inflated {
+    Data(Vec<u8>),
+    Eof,
+    /// The original read failure, kind and cause intact, delivered at its
+    /// position in the stream so the driver classifies it as it would inline.
+    Failed(io::Error),
+}
+
+/// Inflate `file` into chunks for [`ChunkReader`], until end of input, a
+/// read failure, a cancellation or the reader hanging up. Returns the
+/// nanoseconds spent in decoder reads (file reads plus inflate, the same
+/// quantity `TimedRead` times inline), excluding channel waits.
+///
+/// Inflate is a large share of a merge-changes reader thread's life on
+/// planet OSCs; on this thread it overlaps the tokenizer instead of adding to it.
+/// Every upstream OSC is a single gzip member, so the inflate itself stays
+/// serial per input. Splitting one DEFLATE member (block-boundary search,
+/// window resolution) is declined: measured on planet (bygg, 2026-11-26),
+/// overlapping took merge-changes of seven OSCs from 3115 to 2886 ms and
+/// one-OSC tags-filter from 1770 to 1356 ms (most of its 0.52 s of
+/// inflate). Inflate is now off the readers' critical path, which is
+/// tokenizing, so a faster inflate would not shorten them.
+fn inflate_ahead(
+    file: Sniffed,
+    tx: &std::sync::mpsc::SyncSender<Inflated>,
+    free: &std::sync::mpsc::Receiver<Vec<u8>>,
+    cancel: &crate::host::Invocation,
+) -> u64 {
+    use crate::tunables::OSC_INFLATE_CHUNK_BYTES as CHUNK;
+    let mut decoder = MultiGzDecoder::new(file);
+    let mut total = 0_u64;
+    // loop-ends: never polls; each pass inflates one chunk and blocks only
+    // in the bounded send, which the reader hanging up releases, and ends at
+    // end of input, a read failure or a cancellation.
+    loop {
+        if let Err(e) = cancel.check() {
+            // A reader that hung up needs no reason; either way this ends.
+            tx.send(Inflated::Failed(io::Error::from(e))).ok(); // ok-deliberate: see above
+            return total;
+        }
+        // A recycled chunk if the reader has returned one, else a new one;
+        // the bounded channel caps how many are alive either way.
+        let mut chunk = free.try_recv().unwrap_or_default();
+        chunk.resize(CHUNK, 0);
+        let mut filled = 0;
+        let mut end = None;
+        let start = crate::counters::Stopwatch::start();
+        while filled < CHUNK {
+            match decoder.read(&mut chunk[filled..]) {
+                Ok(0) => {
+                    end = Some(Inflated::Eof);
+                    break;
+                }
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    end = Some(Inflated::Failed(e));
+                    break;
+                }
+            }
+        }
+        total = total.saturating_add(start.elapsed_ns());
+        chunk.truncate(filled);
+        if filled > 0 && tx.send(Inflated::Data(chunk)).is_err() {
+            return total;
+        }
+        if let Some(end) = end {
+            tx.send(end).ok(); // ok-deliberate: a reader that hung up needs no end
+
+            return total;
+        }
+    }
+}
+
+/// The tokenizer's side of [`inflate_ahead`]: serves each chunk in place as
+/// quick-xml's buffer, so inflated bytes are not copied again, and returns
+/// consumed chunks for reuse. Observes cancellation at every chunk handoff.
+struct ChunkReader<'a> {
+    rx: &'a std::sync::mpsc::Receiver<Inflated>,
+    free: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
+    chunk: Vec<u8>,
+    pos: usize,
+    /// End of input reached, or a failure already returned.
+    done: bool,
+    cancel: &'a crate::host::Invocation,
+}
+
+impl io::Read for ChunkReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = {
+            let avail = io::BufRead::fill_buf(self)?;
+            let n = avail.len().min(buf.len());
+            buf[..n].copy_from_slice(&avail[..n]);
+            n
+        };
+        io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl io::BufRead for ChunkReader<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos == self.chunk.len() && !self.done {
+            self.cancel.check().map_err(io::Error::from)?;
+            let used = std::mem::take(&mut self.chunk);
+            self.pos = 0;
+            self.free.try_send(used).ok(); // ok-deliberate: a full free list drops the chunk
+            match self.rx.recv() {
+                Ok(Inflated::Data(chunk)) => self.chunk = chunk,
+                Ok(Inflated::Eof) => self.done = true,
+                Ok(Inflated::Failed(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.done = true;
+                    return Err(io::Error::from(Error::internal(
+                        "the OSC inflate thread ended without reaching the end of its input",
+                    )));
+                }
+            }
+        }
+        Ok(&self.chunk[self.pos..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.pos = (self.pos + amount).min(self.chunk.len());
+    }
+}
+
+/// Drive a regular-file gzip input with its inflate on a scoped thread.
+fn drive_inflated<S: OscSink>(
+    file: Sniffed,
+    sink: &mut S,
+    path: &Path,
+    cancel: &crate::host::Recorder,
+) -> (ParseResult<()>, u64) {
+    let invocation = cancel.handle();
+    crate::threads::scope(invocation, |threads| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::tunables::OSC_INFLATE_AHEAD_CHUNKS);
+        let (free_tx, free_rx) =
+            std::sync::mpsc::sync_channel(crate::tunables::OSC_INFLATE_AHEAD_CHUNKS);
+        let inflater = match threads.spawn_named("osc-inflate".to_owned(), move || {
+            inflate_ahead(file, &tx, &free_rx, invocation)
+        }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let err = Error::from(e).context(format!(
+                    "failed to start the inflate thread for {}",
+                    path.display()
+                ));
+                return (Err(err), 0);
+            }
+        };
+        let result = {
+            let mut reader = xml_reader(ChunkReader {
+                rx: &rx,
+                free: &free_tx,
+                chunk: Vec::new(),
+                pos: 0,
+                done: false,
+                cancel: invocation,
+            });
+            drive_osc(&mut reader, sink, path)
+        };
+        // Hanging up releases an inflater blocked on a full channel.
+        drop(rx);
+        drop(free_tx);
+        match inflater.join() {
+            Ok(total) => (result, total),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,11 +1773,19 @@ pub(crate) fn parse_osc_path<S: OscSink>(
     sink: &mut S,
     cancel: &crate::host::Recorder,
 ) -> ParseResult<()> {
-    let (mut reader, decompress_total) = open_osc_reader(path, cancel)?;
-    let result = drive_osc(&mut reader, sink, path);
+    let total = Rc::new(Cell::new(0_u64));
+    let (result, decompress_total) = match open_osc_input(path, &total, cancel)? {
+        OscInput::Inline(inner) => {
+            let mut reader = xml_reader(BufReader::new(inner));
+            (drive_osc(&mut reader, sink, path), total.get())
+        }
+        OscInput::InflateAhead(file) => drive_inflated(file, sink, path, cancel),
+    };
     // Deliberately emit this historical name once per file, without accumulation,
     // from every sink. Changing attribution or totals breaks brokkr run comparisons.
-    cancel.counter("merge_changes_decompress_ns", decompress_total.get());
+    // Inflated ahead, it times the inflate thread's decoder reads, the same
+    // file reads plus inflate, now overlapping the parse rather than within it.
+    cancel.counter("merge_changes_decompress_ns", decompress_total);
     result
 }
 

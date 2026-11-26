@@ -1240,6 +1240,75 @@ mod tests {
         Ok(())
     }
 
+    /// Write a `.osc.gz` of `nodes` created nodes as three gzip members cut
+    /// at arbitrary byte offsets (mid-element). Returns the XML and the
+    /// first member's compressed length.
+    fn write_multi_member(path: &Path, nodes: i64) -> (String, usize) {
+        let mut xml =
+            String::from("<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n<create>\n");
+        for id in 1..=nodes {
+            xml.push_str(&format!(
+                "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"><tag k=\"n\" v=\"{id}\"/></node>\n"
+            ));
+        }
+        xml.push_str("</create>\n</osmChange>");
+        let mut out = Vec::new();
+        let third = xml.len() / 3;
+        let mut first_member_len = 0;
+        for (i, part) in [&xml[..third], &xml[third..2 * third], &xml[2 * third..]]
+            .iter()
+            .enumerate()
+        {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(part.as_bytes()).expect("write member");
+            out.extend(enc.finish().expect("finish member"));
+            if i == 0 {
+                first_member_len = out.len();
+            }
+        }
+        std::fs::write(path, &out).expect("write osc.gz");
+        (xml, first_member_len)
+    }
+
+    /// A regular-file `.osc.gz` is inflated ahead of the tokenizer in
+    /// chunks: a document of several gzip members whose inflated size spans
+    /// several chunks, with members and chunks cut mid-element, parses whole.
+    #[test]
+    fn test_multi_member_osc_spanning_chunks_parses_whole() -> ParseResult<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let path = scratch.path().join("members.osc.gz");
+        let nodes = 50_000;
+        let (xml, _) = write_multi_member(&path, nodes);
+        assert!(xml.len() > 2 * crate::tunables::OSC_INFLATE_CHUNK_BYTES);
+        let overlay = parse_osc_file(&path)?;
+        for id in [1, nodes / 3, nodes / 2, nodes] {
+            assert!(overlay.has_node(id), "node {id} missing");
+        }
+        Ok(())
+    }
+
+    /// A gzip member whose trailer CRC does not match its body is refused,
+    /// even though the XML it inflates to is whole: the inflate thread's
+    /// failure reaches the parse at its position in the stream.
+    #[test]
+    fn test_osc_member_with_a_bad_crc_is_refused() {
+        let scratch = crate::path_guard::tests::scratch();
+        let path = scratch.path().join("crc.osc.gz");
+        let (_, first_member_len) = write_multi_member(&path, 50_000);
+        let mut bytes = std::fs::read(&path).expect("read osc.gz");
+        // The CRC32 is the first four of the member's eight trailer bytes.
+        bytes[first_member_len - 8] ^= 0xff;
+        std::fs::write(&path, &bytes).expect("rewrite osc.gz");
+        let err = parse_osc_file(&path)
+            .err()
+            .expect("a member failing its CRC must not parse");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("checksum") && text.contains("crc.osc.gz"),
+            "the refusal names the checksum and the file; got: {text}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Framing: elements outside a change section
     // -----------------------------------------------------------------------

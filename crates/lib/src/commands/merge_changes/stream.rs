@@ -46,7 +46,10 @@
 //! tag bytes; resident memory is a bounded multiple of that (the batch, its
 //! descriptors and the encoded member it becomes, which re-emission can make
 //! larger than its input), plus per reader one batch under construction, one
-//! element, the XML reader's buffer and inflate state. It does not grow with
+//! element, the XML reader's buffer and inflate state, and for a gzip input
+//! that is a regular file the inflated read-ahead its inflate thread keeps
+//! (`OSC_INFLATE_AHEAD_CHUNKS + 2` chunks of `OSC_INFLATE_CHUNK_BYTES`;
+//! each reader then runs two threads). It does not grow with
 //! the output. The output that is produced ahead of the head input lives in
 //! scratch files, not in memory.
 //!

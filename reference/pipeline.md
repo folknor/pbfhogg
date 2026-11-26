@@ -721,6 +721,15 @@ credit ledger; pool workers replay each batch into a byte sink that checks
 every element with the shared parsers and writes the owned writers' XML
 bytes, without building owned elements.
 
+Every OSC parse (these readers, apply-changes' serial ingest and the
+library's `parse_osc_file`) inflates a gzip input that is a regular file on
+a scoped thread of its own, a few chunks ahead of the tokenizer
+(`OSC_INFLATE_CHUNK_BYTES`, `OSC_INFLATE_AHEAD_CHUNKS`), so inflate overlaps
+tokenizing instead of adding to it. One gzip member is still inflated
+serially, and every upstream OSC is one member. Plain XML and streams (a
+FIFO, `/dev/stdin`) are read inline: a read-ahead blocked on a stream's
+writer could not be interrupted when the tokenizer has already failed.
+
 - **Default**: each batch becomes its own gzip member; one coordinator
   writes members in input and batch order, spilling a later input's output
   to scratch until it becomes the head. A reader slot is reused only once

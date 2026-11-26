@@ -1026,7 +1026,8 @@ Kind: coherent topology rewrite.
 Reported by: osc, apply-core.
 
 Mechanism: apply-changes takes one OSC and parses it serially on the calling
-thread (one inflater, one tokenizer) before any pipeline thread starts. For a
+thread (one tokenizer, its inflate overlapped on one helper thread) before
+any pipeline thread starts. For a
 single daily planet OSC that does not pay: ingest ended at 4.8 s of 203.7 s
 on bygg (e765fb59, 67bcd55c, zlib output) and 5.3 of 97.9 s on a zstd:1 cell
 (3608960f). Parallel ingest and `CompactSink` staging reuse were declined on
@@ -1089,18 +1090,6 @@ validate.
 
 Risks: framing must understand quoted attributes, comments and XML constructs;
 byte-pattern splitting is insufficient.
-
-## PERF-040 - Gzip inflation is serial inside the OSC reader
-
-Reported by: osc.
-
-Mechanism: `open_osc_reader` inflates gzip synchronously in the reader driving
-XML tokenization, so parallel parsing cannot exceed one inflater.
-
-Redesign: decouple inflation from framing; inflate independent files
-concurrently in native ingest too. Parallel inflation of one gzip member is a
-separate medium-conviction rewrite (DEFLATE bit boundaries, dictionaries,
-member and trailer validation).
 
 ## PERF-041 - Diff decodes crossing frames per unit and builds full elements to compare
 

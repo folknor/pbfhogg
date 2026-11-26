@@ -1,16 +1,23 @@
 # pbfhogg-verify
 
-## Frame audit reuse and cold equality scans
+## Frame audit reuse and cold equality scans (bygg, 2026-11-26, `876d9dd7` against `6808a7c1`)
 
-Measurement pending. Compare the new verifier against `da1f1a55` using
-the same pbfhogg binary and serial, matched Denmark runs of `degrade` and
-`repack`. Add `--fresh-reference` to both cold arms to bypass persistent
-reference artifacts and OPL summaries. This measures a cold verifier
-cache and leaves the OS page cache alone. For warm arms, prime each
-check without the flag, then measure repeated runs without it. Compare
-the check wall and the `opl-compare.1`, `opl summary scan`, and
-`opl merge` step walls. Matching cold whole-stream comparisons should
-shift from merge to scan. Drop and unsort still merge on a cold run.
+Frame audits are reused per file identity within a run, and a cold
+whole-stream equality case decides from the decoding summary, merging
+only on mismatch. Denmark, the same pbfhogg binary on both arms; cold
+arms pass `--fresh-reference` (verifier cache bypassed, page cache left
+alone):
+
+| Check | `876d9dd7` | `6808a7c1` |
+|---|---|---|
+| `degrade` cold | 1m12s (osmium cat 27.8 s, merge 15.5 s) | 1m11s (merge 12.5 s, summary scan 1.5 s) |
+| `repack` cold | 54.8 s (merge 12.4 s) | 48.4 s (summary scan 6.1 s, no merge) |
+| `degrade` warm | 41.5 s | 41.6 s |
+
+Repack cold about 12 % faster; degrade's drop and unsort cases still
+merge, so its cold wall barely moves. Cold runs are now dominated by
+osmium `cat` itself (27.8 s of degrade's 71 s). Warm is unchanged, as
+expected: warm runs were already decided from stored summaries.
 
 ## Shared expected file and the pooled frame reader (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 

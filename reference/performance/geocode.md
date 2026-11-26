@@ -13,9 +13,12 @@ set; Pass 2 classifies address keys once per string entry. Germany,
 | `geocode-query`, measured call | 12.8 s `a1361a74`, 12.8 s `2f2c19f9` | 11.2 s `047c39f7`, 11.3 s `455be5b9` |
 
 Build neutral; query about 12 % faster. The index has 2,417 interpolation
-records instead of 2,724 (307 unresolved ways no longer written). The CLI's
-parallel `geocode-query` path is not measured: this bench drives the
-library lookup serially.
+records instead of 2,724 (307 unresolved ways no longer written).
+
+The CLI's parallel batches, through `geocode-query-cli` (the user-facing
+command over the library bench's point sequence), germany measured call:
+`1361533e` 3.9 s `ba89b165`, 3.9 s `16ec1d27`; `6808a7c1` 1.2 s
+`a86fd3b0`, 1.1 s `cb3f3e24`. About 3.4x faster.
 
 ## build-geocode-index
 

@@ -679,7 +679,8 @@
   prefixes cut a germany query batch by about 12 %.
 
 - **`geocode-query` answers points in parallel.** Queries run in ordered
-  batches on every core and each answer is serialized directly; the output
+  batches on every core and each answer is serialized directly (a germany
+  query batch 3.9 s to 1.1 s); the output
   is byte-identical and is still written only once every query has
   answered, so an interrupted run prints nothing.
 

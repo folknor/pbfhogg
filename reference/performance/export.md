@@ -7,7 +7,9 @@ refs and locations are read in one walk. Germany `geojson-export`
 (geojsonseq, no bbox), `--iterations 1` interleaved: `1361533e` 8.9 s
 `270b27e9`, 8.8 s `7a336892`; `da1f1a55` 8.9 s `ab486fc9`, 8.7 s
 `2a9859b2`. Neutral: the ordered consumer's write path bounds the run, as
-expected. The bbox case has no bench param and is unmeasured.
+expected. With `--bbox 9.0,50.0,11.0,52.0` (the fused walk's case):
+`1361533e` 3.7 s `55540878`, 3.6 s `7b5d1e73`; `6808a7c1` 3.5 s
+`1348b818`, 3.6 s `6fef7137`. Neutral.
 
 `pbfhogg export` to GeoJSON, measured with the `geojson-export` script bench
 (output to an iteration-owned file on scratch). All cells below: host bygg

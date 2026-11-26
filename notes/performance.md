@@ -728,16 +728,12 @@ Sparse ALTW pass 0 is done: workers insert word-batched and atomically over a
 claim-sized reservation (planet pass 0 36.5 s to 15.3 s,
 `reference/performance/add-locations-to-ways.md`), and tags-filter pass 1
 took the same shape (planet invert-match 4m45s to 3m03s,
-`reference/performance/tags-filter.md`). What remains:
-
-- Under `--inject-prepass` the reservation factor is halved across the two
-  sets, so a dense extract leaves its top chunks to the serial union (Japan
-  spilled 97 M of 323 M refs, 617 ms serial). Raising it is a memory
-  envelope decision, not a tuning one.
-- `check --refs` `replay_nodes` does one `try_insert_atomic` per node on
-  the workers (not a serial consumer); node IDs ascend within a blob, so
-  `AtomicWordBatch` applies as in renumber. Unmeasured; check refs planet
-  is 20 s with the consumer waiting on workers.
+`reference/performance/tags-filter.md`); `check --refs` replays
+word-batched too (planet within 3 %, `reference/performance/check.md`).
+What remains: under `--inject-prepass` the reservation factor is halved
+across the two sets, so a dense extract leaves its top chunks to the
+serial union (Japan spilled 97 M of 323 M refs, 617 ms serial). Raising it
+is a memory envelope decision, not a tuning one.
 
 Chunk-partitioned owners were considered for pass 0 and not built:
 atomic insertion over a bounded reservation removed the serial union with
@@ -1295,13 +1291,13 @@ Kind: reuse join algorithms; generalize later.
 Reported by: geocode. Narrowed 2026-11-26: format 10 persists the
 interpolation prefixes (germany query -12 %), pass 2 classifies address
 keys once per string entry, and the CLI answers in ordered parallel
-batches (reference/performance/geocode.md).
+batches (germany CLI call 3.9 s to 1.1 s; reference/performance/
+geocode.md).
 
-- Fusing dense validation with decode and address extraction is not done:
-  it needs a validator projection in `read/`, and the build wall did not
-  move with the per-entry classification alone (germany 6.2 s both arms).
-- The CLI's parallel query path is unmeasured: the `geocode-query` bench
-  drives the library lookup serially and bypasses it.
+Residue: fusing dense validation with decode and address extraction is not
+done. It needs a validator projection in `read/`, and the build wall did
+not move with the per-entry classification alone (germany 6.2 s both
+arms), so the payoff is unlikely to be large.
 
 ## PERF-059 - Read-side local changes
 
@@ -1330,20 +1326,19 @@ scan now runs on the frame pool, the dedupe sweep's loser validation stages
 no members, the interner and tags-count kind-filter proposals were declined
 at their code sites, and the `CompactSink` staging item joined PERF-036.
 Further narrowed 2026-11-26: forced `degrade --drop-ids` selects in one
-`KindIds` pass, the OSC writers and the text diff sink no longer allocate
-or copy per value or piece (planet diff neutral, reference/performance/
-diff.md), and dedupe winners stream relation members (denmark neutral).
-What remains is unmeasured.
+`KindIds` pass (denmark forced -20 %, reference/performance/
+repack-degrade.md), the OSC writers and the text diff sink no longer
+allocate or copy per value or piece (planet diff neutral,
+reference/performance/diff.md), and dedupe winners stream relation members
+(denmark neutral). What remains is unmeasured.
 
-- Forced `degrade --drop-ids` has no bench cell: `perturb-pbf` exposes
-  neither `--drop-ids` nor `--force`.
 - Simplified OSC (`merge_changes/simplify.rs`) collects every chunk in
   `all_chunks` before the drain; for plain `.osc` that is a second XML copy of
   every survivor. An ordered windowed drain was measured on `.osc.gz` and is
   wall- and peak-neutral there (reference/performance/merge-changes.md,
   2026-11-26), so only the plain `.osc` case remains: a memory win there,
-  unmeasured (the bench has no plain-output option), is the sole reason
-  left to carry it.
+  now measurable with `merge-diffs --output-name merged.osc`, is the sole
+  reason left to carry it.
 - The serial diff planner reads both payload streams on one thread; the
   denmark common-output record already shows planner and head delays, with no
   evidence it limits planet today.
@@ -1628,11 +1623,11 @@ repack 32.5 s to 22.2 s).
 
 Residue:
 
-- A cold run, or an output whose bytes changed, still decodes and merges
-  every case. A cheaper cold path (hash-scan the output decoding, merge
-  only on mismatch) is unmeasured.
-- Each audited output still gets `index_truth`, `check --index` and a
-  claims walk as separate passes.
+- A cold whole-stream equality case now decides from the summary scan
+  (cold repack 54.8 s to 48.4 s), but cold drop and unsort cases still
+  merge, since their judges need the removal or swap listing; cold degrade
+  stays at about 71 s, 27.8 s of it osmium `cat`. Streaming that decode
+  is PERF-064.
 - No test reaches the summary-decided sequence walk end to end: repack and
   degrade are driven only by the encoding fixture, which runs fresh
   because its fake osmium decodes by file name, and its 3-object input
@@ -1728,20 +1723,15 @@ orchestration-opus.
 Narrowed 2026-11-26: `index_truth` reads through one open file and
 inflates on a worker pool folding in file order, and header-only walks use
 positional reads with `POSIX_FADV_RANDOM` (verifier.md, "Shared expected
-file and the pooled frame reader").
+file and the pooled frame reader"). Further narrowed 2026-11-26: frame
+audits are memoized per file identity within a run and shared by the
+header, indexdata, size, layout and unsort checks; dedupe reads IDs and
+group shape in one walk with reused buffers.
 
-Residue:
-
-- `blob_ids_and_shape` walks the groups again.
-- Results are not memoized per file digest, so each audited output is
-  inflated again by each check that judges it.
-- Dedupe passthrough allocates buffers per payload pair.
-
-Redesign (residue): return count, kind, extrema and shape in one pass and
-memoize per file digest; fuse with the claims walks that judge the same
-output (`output_blobs`, `LayoutCheck`, `judge_header`). codex-engine adds
-reusing decode results for byte-equal payloads across related files while
-judging each occurrence's framing separately.
+Residue: codex-engine's reuse of decode results for byte-equal payloads
+across related files (an output and its input share most blobs), judging
+each occurrence's framing separately. Unmeasured; warm runs no longer
+inflate much, so this pays only cold.
 
 Risks: sharing buffers only where both interpretations see the bytes they need;
 keep `check --index` and the header-only paths.

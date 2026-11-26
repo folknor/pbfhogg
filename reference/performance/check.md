@@ -1,5 +1,13 @@
 # Check
 
+## check --refs inserts word-batched (bygg, 2026-11-26, `876d9dd7` against `6808a7c1`)
+
+Node, way and relation ID replay inserts through `AtomicWordBatch`, one
+atomic OR per run of IDs sharing a word. Planet `ref-integrity`,
+`--iterations 1` interleaved: `876d9dd7` 27.6 s `44b9d70f`, 27.4 s
+`7f0363ce`; `6808a7c1` 26.6 s `a54f2b63`, 26.6 s `a5221b5d`. About 3 %, at
+the noise floor: the replay was not what bounds the check.
+
 ## check --index stops computing what it discards (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 Intra-blob sortedness is no longer tracked and coordinate extents only

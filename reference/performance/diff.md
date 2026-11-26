@@ -12,8 +12,11 @@ deflate state. Planet `diff-pair --from base --to 20260411`,
 | `osc` | 2m14s `efca6bad`, 2m16s `37eb3a93` | 2m17s `5ee91039`, 2m15s `6d04d7cd` |
 | text | 1m47s `c436fe0d`, 1m47s `f9bfe496` | 1m50s `579eb41b`, 1m49s `6a01eace` |
 
-Both neutral (text within 2-3 %). The gzip member reuse is not on these
-cells: the bench writes plain `diff.osc` (no `.osc.gz` cell exists).
+Both neutral (text within 2-3 %). The gzip member reuse, measured once
+`diff-pair` gained `--output-name`: `--format osc --output-name
+diff.osc.gz`, `1361533e` 1m58s `26a2e747`, 1m59s `da299189`; `6808a7c1`
+1m58s `6e4169d6`, 1m58s `b0a86b45`. Neutral: per-member deflate setup was
+not on the critical path.
 
 The pbfhogg CLI command is `diff` (single command). Its performance
 shape depends on the inputs: two PBFs with byte-level blob overlap

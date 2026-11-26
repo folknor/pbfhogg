@@ -702,6 +702,16 @@ fn read_input<'s, T, E>(
 }
 
 /// Where an input's in-order members go.
+///
+/// A later input's members go to scratch even when they would fit in
+/// memory. Keeping them resident instead (a run-wide allowance of encoded
+/// bytes, spilling only past it, never waiting on it) was measured on
+/// planet 7-OSC (bygg, 2026-11-26, over `eecbc773`): 3105/3128/3149 ms
+/// against 3097/3078/3063 ms, with about 100 MB per input held and the
+/// rest spilled. The run is bound by its readers; each promotion copies
+/// in about 15 ms from the page cache at the tail, so neither the spill
+/// write nor the copy-back is on the critical path. Re-measure only after
+/// a change that makes the coordinator or promotion the bound.
 enum Sink {
     /// Not the head yet and nothing written: no file made.
     Pending,

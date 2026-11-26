@@ -1,8 +1,10 @@
 //! Generate an OSC diff from two PBF snapshots. Equivalent to `osmium derive-changes`.
 //!
-//! Merges both files, appending each work unit's changes to one temp file
-//! per action in unit order, then assembles the final `.osc.gz` in a single
-//! pass. Memory is bounded by the units and decoded blocks in flight, not
+//! Merges both files. For indexed inputs the work units' creates are
+//! written into the output as they arrive, in unit order, and their
+//! modifies and deletes are deferred to scratch and appended after the
+//! creates; the unindexed element stream writes one temp file per action
+//! and assembles the output from them in a single pass. Memory is bounded by the units and decoded blocks in flight, not
 //! total change count.
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
@@ -55,8 +57,10 @@ impl DeriveChangesStats {
 ///
 /// Performs a merge-join by (type, id), over streaming work units for
 /// indexed inputs (`parallelism` sets the worker count; the answer is the
-/// same at any count). Each unit's changes are appended to one temp file
-/// per action in unit order, then written as OsmChange XML, gzipped when
+/// same at any count). Changes are written as OsmChange XML in unit order
+/// (indexed inputs write creates straight into the output and hold modifies
+/// and deletes in scratch until the creates are done; unindexed inputs
+/// hold every action in scratch), gzipped when
 /// the output name ends `.osc.gz` and plain when it ends `.osc` (any other
 /// name is refused before any work). Memory is bounded by the units and
 /// decoded blocks in flight, not total change count.
@@ -180,45 +184,51 @@ pub(crate) fn derive_changes_to(
 
     host.invocation.marker("DERIVECHANGES_SCAN_START");
 
-    // The unit workers deflate the fragments themselves for a gzip output;
-    // the element stream writes plain XML on this thread.
-    let encoding = if both_indexed && gzip {
-        Fragments::GzipMembers
-    } else {
-        Fragments::Raw
-    };
-    let mut sink = ChangeSink::new(scratch, encoding, increment_version, timestamp)?;
-
-    let result = (|| -> Result<DeriveChangesStats> {
-        if both_indexed {
-            derive_changes_block_pair(
-                &old,
-                &new,
-                jobs,
-                direct_io,
-                increment_version,
-                timestamp,
-                &mut sink,
-                scratch,
-                host,
-            )?;
+    let stats = if both_indexed {
+        let units = IndexedRun {
+            old: &old,
+            new: &new,
+            jobs,
+            direct_io,
+            increment_version,
+            timestamp,
+            scratch,
+            host,
+        };
+        // The output's writing session opens here, after both front reads
+        // and before the body scan: creates are written into it as the
+        // units deliver them. An error or panic from here on drops the
+        // writer unfinished, so nothing is published.
+        if gzip {
+            units.derive(
+                GlueMembers {
+                    out: output.writer()?,
+                    pending: Vec::new(),
+                },
+                Fragments::GzipMembers,
+            )?
         } else {
-            derive_changes_element_stream(&old, &new, direct_io, &mut sink, host)?;
+            units.derive(output.writer()?, Fragments::Raw)?
         }
-        sink.flush()?;
+    } else {
+        let mut sink = ChangeSink::new(scratch, increment_version, timestamp)?;
+        let result = (|| -> Result<DeriveChangesStats> {
+            derive_changes_element_stream(&old, &new, direct_io, &mut sink, host)?;
+            sink.flush()?;
 
-        host.invocation.marker("DERIVECHANGES_SCAN_END");
+            host.invocation.marker("DERIVECHANGES_SCAN_END");
 
-        let stats = sink.stats();
+            let stats = sink.stats();
 
-        host.invocation.marker("DERIVECHANGES_WRITE_START");
-        assemble_osc(output, &sink, parallelism, host)?;
-        host.invocation.marker("DERIVECHANGES_WRITE_END");
-        Ok(stats)
-    })();
-    // Remove fragments before returning, on errors and during unwinding too.
-    drop(sink);
-    let stats = result?;
+            host.invocation.marker("DERIVECHANGES_WRITE_START");
+            assemble_osc(output, &sink, parallelism, host)?;
+            host.invocation.marker("DERIVECHANGES_WRITE_END");
+            Ok(stats)
+        })();
+        // Remove fragments before returning, on errors and during unwinding too.
+        drop(sink);
+        result?
+    };
 
     host.invocation
         .counter("derivechanges_creates", stats.creates);
@@ -234,11 +244,12 @@ pub(crate) fn derive_changes_to(
 // Streaming change sink - writes element XML directly to temp files
 // ---------------------------------------------------------------------------
 
-/// The run's change sink: the three action fragments, as scratch files the
-/// OSC assembly frames.
+/// The unindexed element stream's change sink: the three action fragments,
+/// plain XML in scratch files the OSC assembly frames. (The work-unit
+/// engine writes creates straight into the output and defers only modifies
+/// and deletes; see [`IndexedConsumer`].)
 struct ChangeSink {
     w: ChangeWriters<io::BufWriter<crate::scratch::ScratchFile>>,
-    encoding: Fragments,
     creates_path: crate::scratch::ScratchPath,
     modifies_path: crate::scratch::ScratchPath,
     deletes_path: crate::scratch::ScratchPath,
@@ -248,7 +259,6 @@ impl ChangeSink {
     /// A sink on three fresh scratch files, `derive-<action>.xml.tmp`.
     fn new(
         scratch: &crate::scratch::RunScratch,
-        encoding: Fragments,
         increment_version: bool,
         timestamp: Option<u64>,
     ) -> Result<Self> {
@@ -260,7 +270,6 @@ impl ChangeSink {
         let deletes = io::BufWriter::new(crate::scratch::create_file(&dp)?);
         Ok(Self {
             w: ChangeWriters::new(creates, modifies, deletes, increment_version, timestamp),
-            encoding,
             creates_path: cp,
             modifies_path: mp,
             deletes_path: dp,
@@ -297,38 +306,66 @@ impl Section {
     }
 }
 
-/// What the three action fragments hold. Chosen once per run and never
-/// read off a file or an output name after that.
+/// What a derive unit hands over: the member encoding of the work-unit
+/// engine, chosen once per run from the output name and never read off a
+/// file after that.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fragments {
-    /// Plain element XML: the unindexed element stream, and every plain
-    /// `.osc` output. Assembly frames it (deflating it for `.osc.gz`).
+    /// Plain element XML, for a plain `.osc` output.
     Raw,
-    /// Concatenated gzip members of element XML, deflated by the unit
-    /// workers: the work-unit engine writing `.osc.gz`. Assembly deflates
-    /// only the document framing and copies the fragments verbatim.
+    /// One gzip member of element XML per handover, deflated by the unit
+    /// worker, for a `.osc.gz` output: everything downstream copies members
+    /// verbatim and deflates only the document framing.
     GzipMembers,
 }
 
 /// Copy a scratch file to the end of `dst`, checking the cancellation token
-/// between buffers: neither file observes it.
+/// between buffers: neither file observes it. Returns the bytes copied.
 fn copy_checked(
     src: &crate::scratch::ScratchPath,
-    dst: &mut impl Write,
+    dst: &mut dyn Write,
     cancel: &crate::host::Recorder,
-) -> Result<()> {
-    let mut src = crate::scratch::open_file(src)?;
+) -> Result<u64> {
+    let mut file = crate::scratch::open_file(src)?;
     let mut buf = vec![0_u8; crate::tunables::DIFF_SPILL_COPY_BUFFER];
+    copy_range(&mut file, None, dst, &mut buf, cancel)
+        .map_err(|e| e.context(format!("failed to copy {}", src.display())))
+}
+
+/// Copy `len` bytes of `src` (to its end when `None`) to `dst` through
+/// `buf`, checking the cancellation token between buffers. A source that
+/// ends before `len` is an internal error: the caller recorded that many
+/// bytes written to it.
+fn copy_range(
+    src: &mut dyn io::Read,
+    len: Option<u64>,
+    dst: &mut dyn Write,
+    buf: &mut [u8],
+    cancel: &crate::host::Recorder,
+) -> Result<u64> {
+    let mut copied = 0_u64;
     loop {
+        let want = match len {
+            Some(len) if copied >= len => return Ok(copied),
+            Some(len) => usize::try_from(len - copied).map_or(buf.len(), |r| r.min(buf.len())),
+            None => buf.len(),
+        };
         cancel.check()?;
-        let n = match io::Read::read(&mut src, &mut buf) {
-            Ok(0) => return Ok(()),
+        let n = match src.read(buf.get_mut(..want).unwrap_or_default()) {
+            Ok(0) if len.is_none() => return Ok(copied),
+            Ok(0) => {
+                return Err(Error::internal(format!(
+                    "derive scratch fragment ended after {copied} of {} recorded bytes",
+                    len.unwrap_or_default()
+                )));
+            }
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         };
         // `read` never reports more than the buffer holds.
         dst.write_all(buf.get(..n).unwrap_or_default())?;
+        copied += n as u64;
     }
 }
 
@@ -596,8 +633,8 @@ struct Spill {
 ///
 /// Members go to the unit's channel while it has room. Once it is full the
 /// unit spills every later member, to the end of the unit, to a scratch
-/// file per section, which the consumer appends to the fragment after the
-/// unit's queued members. Without the spill a unit the consumer is not
+/// file per section, which the consumer places after the unit's queued
+/// members (see [`IndexedConsumer`]). Without the spill a unit the consumer is not
 /// reading yet could only run a few chunks ahead, and a stretch of units
 /// with large output (the new nodes at a planet's tail) would format on one
 /// core, the head unit's. The switch is one-way, so each section's members
@@ -745,44 +782,174 @@ impl super::units::UnitSink for UnitWriters<'_> {
     }
 }
 
-/// Derive's side on the calling thread: each member appended to its action's
-/// fragment of the run's [`ChangeSink`], then the unit's spills, counts
-/// folded in unit order, so every fragment holds its elements in input
-/// order.
-struct OscConsumer<'a> {
-    sink: &'a mut ChangeSink,
+/// One stretch of a deferred section, in output order.
+enum Segment {
+    /// The next this many bytes of the section's fragment file.
+    Range(u64),
+    /// A unit's spill file, copied whole and then removed.
+    Spill(crate::scratch::ScratchPath),
+}
+
+/// A modify or delete section of the work-unit engine, deferred until every
+/// create is written: the queued members appended to one fragment file, and
+/// the units' spill files kept as files of their own, placed between
+/// fragment ranges, so each byte passes through scratch once. Past
+/// [`DIFF_DEFERRED_SPILL_FILES`](crate::tunables::DIFF_DEFERRED_SPILL_FILES)
+/// retained spills, a further spill is appended to the fragment instead,
+/// in the same place, which bounds the files and the segment list.
+struct Deferred {
+    path: crate::scratch::ScratchPath,
+    /// Unbuffered: a member is already a whole buffer, so it goes straight
+    /// to the file, which is current on disk after every member.
+    file: crate::scratch::ScratchFile,
+    /// Bytes appended to the fragment so far.
+    written: u64,
+    /// Where the fragment's not yet recorded range starts.
+    cursor: u64,
+    segments: Vec<Segment>,
+    spill_files: usize,
+    /// Spill files kept as their own segments before further ones are
+    /// appended to the fragment.
+    max_spill_files: usize,
+}
+
+impl Deferred {
+    fn new(
+        scratch: &crate::scratch::RunScratch,
+        name: &str,
+        max_spill_files: usize,
+    ) -> Result<Self> {
+        let path = scratch.file(name)?;
+        let file = crate::scratch::create_file(&path)?;
+        Ok(Self {
+            path,
+            file,
+            written: 0,
+            cursor: 0,
+            segments: Vec::new(),
+            spill_files: 0,
+            max_spill_files,
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Place a unit's spill after everything appended so far.
+    fn splice(
+        &mut self,
+        spill: crate::scratch::ScratchPath,
+        scratch: &crate::scratch::RunScratch,
+        cancel: &crate::host::Recorder,
+    ) -> Result<()> {
+        if self.spill_files < self.max_spill_files {
+            if self.written > self.cursor {
+                self.segments
+                    .push(Segment::Range(self.written - self.cursor));
+                self.cursor = self.written;
+            }
+            self.segments.push(Segment::Spill(spill));
+            self.spill_files += 1;
+        } else {
+            // Appended where it belongs: the unrecorded range simply grows.
+            self.written += copy_checked(&spill, &mut self.file, cancel)?;
+            scratch.remove(&spill);
+        }
+        Ok(())
+    }
+
+    /// Copy the whole section, in order, to `dst`, removing its files as
+    /// they are done with.
+    fn copy_into(
+        self,
+        dst: &mut dyn Write,
+        scratch: &crate::scratch::RunScratch,
+        cancel: &crate::host::Recorder,
+    ) -> Result<()> {
+        let Self {
+            path,
+            file,
+            written,
+            cursor,
+            mut segments,
+            ..
+        } = self;
+        drop(file);
+        if written > cursor {
+            segments.push(Segment::Range(written - cursor));
+        }
+        let mut fragment = crate::scratch::open_file(&path)?;
+        let mut buf = vec![0_u8; crate::tunables::DIFF_SPILL_COPY_BUFFER];
+        for segment in segments {
+            match segment {
+                Segment::Range(len) => {
+                    copy_range(&mut fragment, Some(len), dst, &mut buf, cancel)
+                        .map_err(|e| e.context(format!("failed to copy {}", path.display())))?;
+                }
+                Segment::Spill(spill) => {
+                    copy_checked(&spill, dst, cancel)?;
+                    scratch.remove(&spill);
+                }
+            }
+        }
+        drop(fragment);
+        scratch.remove(&path);
+        Ok(())
+    }
+}
+
+/// The work-unit engine's side on the calling thread, in unit order:
+/// creates written into the output document as they arrive (a unit's spill
+/// right after its queued members), modifies and deletes deferred to their
+/// [`Deferred`] sections, counts folded. Every section thus holds its
+/// elements in input order, and the document is byte for byte the one the
+/// three-fragment assembly writes.
+struct IndexedConsumer<'a, W: DocSink> {
+    doc: Document<W>,
+    /// Modifies, then deletes.
+    deferred: [Deferred; 2],
+    stats: DeriveChangesStats,
     scratch: &'a crate::scratch::RunScratch,
     cancel: &'a crate::host::Recorder,
 }
 
-impl<'a> super::units::UnitConsumer for OscConsumer<'a> {
+impl<'a, W: DocSink> super::units::UnitConsumer for IndexedConsumer<'a, W> {
     type Sink = UnitWriters<'a>;
 
     const WORKER: &'static str = "derive unit worker";
 
-    /// A member is already a whole buffer: it goes straight to the file
-    /// (the fragment's buffer holds nothing on this path), so the fragment
-    /// on disk is current after every member.
     fn item(&mut self, (section, bytes): (Section, Vec<u8>)) -> Result<()> {
-        let fragment = self.sink.w.section(section).get_mut();
-        fragment.flush()?;
-        fragment.get_mut().write_all(&bytes)?;
-        Ok(())
+        match section {
+            Section::Creates => {
+                self.doc.open_section("create")?;
+                self.doc.payload()?.write_all(&bytes)?;
+                Ok(())
+            }
+            Section::Modifies => self.deferred[0].append(&bytes),
+            Section::Deletes => self.deferred[1].append(&bytes),
+        }
     }
 
     fn finish_unit(&mut self, done: UnitDone) -> Result<()> {
-        for (section, spill) in SECTIONS.into_iter().zip(&done.spills) {
-            if let Some(path) = spill {
-                let fragment = self.sink.w.section(section).get_mut();
-                fragment.flush()?;
-                copy_checked(path, fragment.get_mut(), self.cancel)?;
-                self.scratch.remove(path);
+        for (section, spill) in SECTIONS.into_iter().zip(done.spills) {
+            let Some(path) = spill else { continue };
+            match section {
+                Section::Creates => {
+                    self.doc.open_section("create")?;
+                    copy_checked(&path, self.doc.payload()?, self.cancel)?;
+                    self.scratch.remove(&path);
+                }
+                Section::Modifies => self.deferred[0].splice(path, self.scratch, self.cancel)?,
+                Section::Deletes => self.deferred[1].splice(path, self.scratch, self.cancel)?,
             }
         }
         let stats = done.stats;
-        self.sink.w.create_count += stats.creates;
-        self.sink.w.modify_count += stats.modifies;
-        self.sink.w.delete_count += stats.deletes;
+        self.stats.creates += stats.creates;
+        self.stats.modifies += stats.modifies;
+        self.stats.deletes += stats.deletes;
         Ok(())
     }
 
@@ -875,24 +1042,122 @@ fn extract_delete_info(
 /// work units streamed from both inputs (see `units`). Only changed
 /// elements are serialized; each unit's XML reaches the run's fragments in
 /// unit order as the run goes.
+struct IndexedRun<'r, 'h> {
+    old: &'r PinnedInput,
+    new: &'r PinnedInput,
+    jobs: usize,
+    direct_io: bool,
+    increment_version: bool,
+    timestamp: Option<u64>,
+    scratch: &'r crate::scratch::RunScratch,
+    host: &'r crate::host::Entered<'h>,
+}
+
+impl IndexedRun<'_, '_> {
+    /// The whole indexed derive into `out`: the scan writing creates into
+    /// the document as the units deliver them, then the deferred modify and
+    /// delete sections, then the document's end and the output's checked
+    /// finish. `</create>` and everything after it are written only once
+    /// [`units::run`](super::units::run) has returned, planner joined, so a
+    /// failure anywhere in the scan leaves the output unfinished.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn derive<W: DocSink>(self, out: W, encoding: Fragments) -> Result<DeriveChangesStats> {
+        let Self {
+            old,
+            new,
+            jobs,
+            direct_io,
+            increment_version,
+            timestamp,
+            scratch,
+            host,
+        } = self;
+        // Header ranges and counts cannot predict changed XML bytes, so an
+        // input-size free-space refusal here would be a guess, not a
+        // lifetime-aware budget; retain bounded-memory streaming and
+        // propagate actual write failures.
+        let mut consumer = IndexedConsumer {
+            doc: Document::start(out)?,
+            deferred: [
+                Deferred::new(
+                    scratch,
+                    "derive-modifies.xml.tmp",
+                    crate::tunables::DIFF_DEFERRED_SPILL_FILES,
+                )?,
+                Deferred::new(
+                    scratch,
+                    "derive-deletes.xml.tmp",
+                    crate::tunables::DIFF_DEFERRED_SPILL_FILES,
+                )?,
+            ],
+            stats: DeriveChangesStats {
+                creates: 0,
+                modifies: 0,
+                deletes: 0,
+            },
+            scratch,
+            cancel: &host.invocation,
+        };
+        derive_units(
+            old,
+            new,
+            jobs,
+            direct_io,
+            increment_version,
+            timestamp,
+            encoding,
+            &mut consumer,
+            scratch,
+            host,
+        )?;
+        host.invocation.marker("DERIVECHANGES_SCAN_END");
+        host.invocation.marker("DERIVECHANGES_WRITE_START");
+        let IndexedConsumer {
+            mut doc,
+            deferred: [modifies, deletes],
+            stats,
+            ..
+        } = consumer;
+        // A section is written exactly when it holds an element, the rule
+        // the three-fragment assembly applies through its counts.
+        if doc.is_open("create") != (stats.creates > 0) {
+            return Err(Error::internal(format!(
+                "derive wrote a create section for {} creates",
+                stats.creates
+            )));
+        }
+        doc.close_section()?;
+        for (tag, section, count) in [
+            ("modify", modifies, stats.modifies),
+            ("delete", deletes, stats.deletes),
+        ] {
+            if count > 0 {
+                doc.open_section(tag)?;
+                section.copy_into(doc.payload()?, scratch, &host.invocation)?;
+                doc.close_section()?;
+            }
+        }
+        doc.finish()?;
+        host.invocation.marker("DERIVECHANGES_WRITE_END");
+        Ok(stats)
+    }
+}
+
+/// The work units of both inputs, run on the ordered pool, each delivering
+/// its members to `consumer` in unit order.
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn derive_changes_block_pair(
+fn derive_units<'a, W: DocSink>(
     old: &PinnedInput,
     new: &PinnedInput,
     jobs: usize,
     direct_io: bool,
     increment_version: bool,
     timestamp: Option<u64>,
-    sink: &mut ChangeSink,
-    scratch: &crate::scratch::RunScratch,
+    encoding: Fragments,
+    consumer: &mut IndexedConsumer<'a, W>,
+    scratch: &'a crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    // Scratch holds the three action fragments, which gzip assembly keeps
-    // alive. Header ranges/counts cannot predict changed XML bytes, so an
-    // input-size free-space refusal here would be a guess, not a
-    // lifetime-aware budget; retain bounded-memory streaming and propagate
-    // actual write failures.
     let phases = [
         super::units::Phase {
             kind: ElementKind::Node,
@@ -910,7 +1175,6 @@ fn derive_changes_block_pair(
             end_marker: "DERIVECHANGES_PHASE_REL_END",
         },
     ];
-    let encoding = sink.encoding;
     let (chunk_bytes, spill_after) = unit_output_limits(&host.invocation);
     let make_sink = |unit: usize| UnitWriters {
         w: ChangeWriters::new(
@@ -929,22 +1193,8 @@ fn derive_changes_block_pair(
         spilling: false,
         spills: [None, None, None],
     };
-    let mut consumer = OscConsumer {
-        sink,
-        scratch,
-        cancel: &host.invocation,
-    };
     let merge_stats = super::units::run(
-        old,
-        new,
-        &phases,
-        jobs,
-        direct_io,
-        true,
-        false,
-        &make_sink,
-        &mut consumer,
-        host,
+        old, new, &phases, jobs, direct_io, true, false, &make_sink, consumer, host,
     )?;
     super::emit_merge_stats_counters(&merge_stats, &host.invocation);
     Ok(())
@@ -1023,11 +1273,9 @@ fn derive_changes_element_stream(
 // OSC XML writer
 // ---------------------------------------------------------------------------
 
-/// Assemble the output from the run's three fragments and their element
-/// counts. Writes the XML structure via a quick_xml Writer and copies the
-/// fragment bytes directly to the writer underneath it (not through the XML
-/// writer): plain fragments through the parallel gzip writer or as they are,
-/// gzip-member fragments verbatim between deflated framing members.
+/// Assemble the unindexed element stream's output from its three plain
+/// fragments and their element counts, through the parallel gzip writer
+/// for a `.osc.gz` or as they are for a `.osc`.
 fn assemble_osc(
     output: &crate::output::BoundOutput,
     sink: &ChangeSink,
@@ -1042,7 +1290,6 @@ fn assemble_osc(
         sink.w.modify_count,
         sink.w.delete_count,
     );
-    let encoding = sink.encoding;
     use crate::write::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 
     // Stage boundary. The assembly itself stops through the output writer,
@@ -1062,9 +1309,9 @@ fn assemble_osc(
     // propagate actual output write failures rather than promise a preflight.
     let buf = output.writer()?;
 
-    // Raw fragments (the unindexed element stream) are deflated here in
-    // `DEFAULT_CHUNK_SIZE` members; gzip-member fragments arrive deflated by
-    // the unit workers in `DIFF_OUTPUT_CHUNK_BYTES` members (plus at most one
+    // The plain fragments are deflated here in `DEFAULT_CHUNK_SIZE`
+    // members; the work-unit engine's members arrive deflated by the unit
+    // workers in `DIFF_OUTPUT_CHUNK_BYTES` members (plus at most one
     // element). Each member's 18 B framing and dictionary reset cost a little
     // ratio either way.
     let paths = [creates_path, modifies_path, deletes_path];
@@ -1072,60 +1319,62 @@ fn assemble_osc(
     // Deliberately not one output stage with merge-changes. Both already
     // deflate on workers and copy finished members in order; what they would
     // share is that copy. The obligations that decide correctness differ:
-    // this assembler joins three already ordered action fragments and
-    // deflates only the framing, while merge-changes' coordinator orders
-    // concurrent inputs' batches against a credit ledger and promotes spill
-    // files. The raw arm keeps `ParallelGzipWriter` for the unindexed stream,
-    // whose fragments are plain XML.
-    match (gzip, encoding) {
-        (true, Fragments::GzipMembers) => {
-            // The fragments are gzip members already; only the framing
-            // between them is deflated, each stretch as its own member.
-            let glue = GlueMembers {
-                out: buf,
-                pending: Vec::new(),
-            };
-            let glue = write_document(glue, paths, counts, &mut |glue, path| {
-                glue.emit_pending()?;
-                let mut fragment = crate::scratch::open_file(path)?;
-                io::copy(&mut fragment, &mut glue.out).map_err(|e| {
-                    Error::from(e).context(format!("failed to copy {}", path.display()))
-                })?;
-                Ok(())
-            })?;
-            glue.finish()?.finish()
-        }
-        (true, Fragments::Raw) => {
-            let auto_workers = crate::host::sized_workers(
-                &*host.resources,
-                crate::tunables::DERIVE_GZIP_WORKERS_RESERVED,
-                crate::tunables::DERIVE_GZIP_WORKERS_MIN,
-                crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
-            );
-            let worker_count = parallelism
-                .fixed()
-                .map_or(auto_workers, |cap| cap.min(auto_workers));
-            let gz =
-                ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count, &host.invocation);
-            let gz = write_document(gz, paths, counts, &mut copy_raw)?;
-            gz.finish()?.finish()
-        }
-        (false, _) => write_document(buf, paths, counts, &mut copy_raw)?.finish(),
+    // derive joins already ordered action sections and deflates only the
+    // framing, while merge-changes' coordinator orders concurrent inputs'
+    // batches against a credit ledger and promotes spill files.
+    if gzip {
+        let auto_workers = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DERIVE_GZIP_WORKERS_RESERVED,
+            crate::tunables::DERIVE_GZIP_WORKERS_MIN,
+            crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
+        );
+        let worker_count = parallelism
+            .fixed()
+            .map_or(auto_workers, |cap| cap.min(auto_workers));
+        let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count, &host.invocation);
+        write_document(gz, paths, counts)
+    } else {
+        write_document(buf, paths, counts)
     }
 }
 
-/// Copy a plain fragment through to the document's sink.
-fn copy_raw<W: Write>(sink: &mut W, path: &crate::scratch::ScratchPath) -> Result<()> {
-    let mut tmp = io::BufReader::new(crate::scratch::open_file(path)?);
-    io::copy(&mut tmp, sink)
-        .map_err(|e| Error::from(e).context(format!("failed to copy {}", path.display())))?;
-    Ok(())
+/// The output under an OsmChange [`Document`]: where element payload goes,
+/// and the checked finish of the output's writing session.
+trait DocSink: Write {
+    /// The writer element payload goes to, with any framing still pending
+    /// written out first.
+    fn payload(&mut self) -> Result<&mut dyn Write>;
+
+    /// Write out anything pending and finish the output, checked.
+    fn close(self) -> Result<()>;
 }
 
-/// The document framing around gzip-member fragments: framing bytes gather
-/// in `pending` and leave as one gzip member before each fragment and at
-/// the end, so the decompressed document is byte for byte the one the plain
-/// path writes.
+impl DocSink for crate::output::OutputWriter {
+    fn payload(&mut self) -> Result<&mut dyn Write> {
+        Ok(self)
+    }
+
+    fn close(self) -> Result<()> {
+        self.finish()
+    }
+}
+
+impl DocSink for crate::write::parallel_gzip::ParallelGzipWriter<crate::output::OutputWriter> {
+    fn payload(&mut self) -> Result<&mut dyn Write> {
+        Ok(self)
+    }
+
+    fn close(self) -> Result<()> {
+        self.finish()?.finish()
+    }
+}
+
+/// The document framing around gzip-member payload: framing bytes gather
+/// in `pending` and leave as one gzip member before the next payload and
+/// at the end, so the decompressed document is byte for byte the one the
+/// plain path writes, and consecutive payload members get no framing
+/// member between them.
 struct GlueMembers<W: Write> {
     out: W,
     pending: Vec<u8>,
@@ -1140,11 +1389,6 @@ impl<W: Write> GlueMembers<W> {
         }
         Ok(())
     }
-
-    fn finish(mut self) -> Result<W> {
-        self.emit_pending()?;
-        Ok(self.out)
-    }
 }
 
 impl<W: Write> Write for GlueMembers<W> {
@@ -1153,56 +1397,111 @@ impl<W: Write> Write for GlueMembers<W> {
         Ok(bytes.len())
     }
 
-    /// Framing stays pending until a fragment or the end needs it out.
+    /// Framing stays pending until payload or the end needs it out.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
-/// Write the OsmChange document around the three fragments into `sink` and
-/// hand the sink back for the caller to finish.
-fn write_document<W: Write>(
-    sink: W,
-    [creates_path, modifies_path, deletes_path]: [&crate::scratch::ScratchPath; 3],
-    [create_count, modify_count, delete_count]: [u64; 3],
-    copy: &mut dyn FnMut(&mut W, &crate::scratch::ScratchPath) -> Result<()>,
-) -> Result<W> {
-    let mut writer = Writer::new_with_indent(sink, b' ', 2);
+impl DocSink for GlueMembers<crate::output::OutputWriter> {
+    fn payload(&mut self) -> Result<&mut dyn Write> {
+        self.emit_pending()?;
+        Ok(&mut self.out)
+    }
 
-    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
-    writer.write_event(Event::Text(BytesText::new("\n")))?;
-
-    let mut root = BytesStart::new("osmChange");
-    root.push_attribute(("version", "0.6"));
-    writer.write_event(Event::Start(root))?;
-
-    copy_section(&mut writer, "create", creates_path, create_count, copy)?;
-    copy_section(&mut writer, "modify", modifies_path, modify_count, copy)?;
-    copy_section(&mut writer, "delete", deletes_path, delete_count, copy)?;
-
-    writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
-
-    Ok(writer.into_inner())
+    fn close(mut self) -> Result<()> {
+        self.emit_pending()?;
+        self.out.finish()
+    }
 }
 
-/// Copy a temp file's fragment into an action section through `copy`.
-/// Flushes the XML writer before the copy to the underlying writer, then
-/// resumes structured writing for the closing tag.
-fn copy_section<W: Write>(
-    writer: &mut Writer<W>,
-    tag: &str,
-    path: &crate::scratch::ScratchPath,
-    count: u64,
-    copy: &mut dyn FnMut(&mut W, &crate::scratch::ScratchPath) -> Result<()>,
-) -> Result<()> {
-    if count == 0 {
-        return Ok(());
+/// An OsmChange document being written: the XML writer for the framing,
+/// whose sink element payload bypasses (see [`DocSink::payload`]), and the
+/// action section open, if any. The framing events are the same whatever
+/// the payload's timing, so the bytes are too.
+struct Document<W: DocSink> {
+    xml: Writer<W>,
+    open: Option<&'static str>,
+}
+
+impl<W: DocSink> Document<W> {
+    /// The declaration and the `osmChange` root's start.
+    fn start(sink: W) -> Result<Self> {
+        let mut xml = Writer::new_with_indent(sink, b' ', 2);
+        xml.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+        xml.write_event(Event::Text(BytesText::new("\n")))?;
+        let mut root = BytesStart::new("osmChange");
+        root.push_attribute(("version", "0.6"));
+        xml.write_event(Event::Start(root))?;
+        Ok(Self { xml, open: None })
     }
-    writer.write_event(Event::Start(BytesStart::new(tag)))?;
-    writer.get_mut().flush()?;
-    copy(writer.get_mut(), path)?;
-    writer.write_event(Event::End(BytesEnd::new(tag)))?;
-    Ok(())
+
+    fn is_open(&self, tag: &str) -> bool {
+        self.open == Some(tag)
+    }
+
+    /// Open the `tag` section unless it is the open one.
+    fn open_section(&mut self, tag: &'static str) -> Result<()> {
+        match self.open {
+            Some(open) if open == tag => Ok(()),
+            Some(open) => Err(Error::internal(format!(
+                "derive opened <{tag}> inside <{open}>"
+            ))),
+            None => {
+                self.xml.write_event(Event::Start(BytesStart::new(tag)))?;
+                self.open = Some(tag);
+                Ok(())
+            }
+        }
+    }
+
+    fn close_section(&mut self) -> Result<()> {
+        if let Some(tag) = self.open.take() {
+            self.xml.write_event(Event::End(BytesEnd::new(tag)))?;
+        }
+        Ok(())
+    }
+
+    fn payload(&mut self) -> Result<&mut dyn Write> {
+        self.xml.get_mut().payload()
+    }
+
+    /// Close the open section and the root, and finish the output.
+    fn finish(mut self) -> Result<()> {
+        self.close_section()?;
+        self.xml
+            .write_event(Event::End(BytesEnd::new("osmChange")))?;
+        self.xml.into_inner().close()
+    }
+}
+
+/// Write the OsmChange document around the three plain fragments into
+/// `sink`, each nonempty section copied whole, and finish the output.
+fn write_document<W: DocSink>(
+    sink: W,
+    paths: [&crate::scratch::ScratchPath; 3],
+    counts: [u64; 3],
+) -> Result<()> {
+    let mut doc = Document::start(sink)?;
+    for ((tag, path), count) in ["create", "modify", "delete"]
+        .into_iter()
+        .zip(paths)
+        .zip(counts)
+    {
+        if count == 0 {
+            continue;
+        }
+        doc.open_section(tag)?;
+        // Through the parallel gzip writer this cuts a member at the start
+        // of each section, as the assembly always has.
+        let payload = doc.payload()?;
+        payload.flush()?;
+        let mut tmp = io::BufReader::new(crate::scratch::open_file(path)?);
+        io::copy(&mut tmp, payload)
+            .map_err(|e| Error::from(e).context(format!("failed to copy {}", path.display())))?;
+        doc.close_section()?;
+    }
+    doc.finish()
 }
 
 /// Write one `<node|way|relation id=".." [version=".."] [timestamp=".."]/>`
@@ -1276,6 +1575,68 @@ mod scratch_tests {
     use super::ChangeSink;
     use crate::scratch::RunScratch;
 
+    /// A deferred section keeps its order whichever way each unit spill is
+    /// placed: as a retained file between fragment ranges, or, past the
+    /// cap, appended to the fragment. Its files are gone once it is copied.
+    #[test]
+    fn a_deferred_section_keeps_its_order_across_retained_and_appended_spills() {
+        use std::io::Write;
+        let dir = crate::path_guard::tests::scratch();
+        let host = crate::host::Host::for_tests();
+        let entered = host.entered();
+        let scratch = RunScratch::create(dir.path(), &entered).expect("scratch");
+        // Every file under the scratch location, the run directory's own
+        // bookkeeping included.
+        let files = || {
+            let mut names = Vec::new();
+            for run in std::fs::read_dir(dir.path()).expect("directory") {
+                let run = run.expect("entry").path();
+                for entry in std::fs::read_dir(&run).expect("run directory") {
+                    names.push(entry.expect("entry").path());
+                }
+            }
+            names.sort();
+            names
+        };
+        let before = files();
+        let spill = |name: &str, bytes: &[u8]| {
+            let path = scratch.file(name).expect("spill path");
+            let mut file = crate::scratch::create_file(&path).expect("spill file");
+            file.write_all(bytes).expect("spill bytes");
+            path
+        };
+        for cap in [0, 1, 2, 8] {
+            let mut section =
+                super::Deferred::new(&scratch, &format!("fragment-{cap}"), cap).expect("section");
+            let cancel = &entered.invocation;
+            section
+                .splice(spill(&format!("s0-{cap}"), b"<s0/>"), &scratch, cancel)
+                .expect("leading spill");
+            section.append(b"<a/>").expect("append");
+            section
+                .splice(spill(&format!("s1-{cap}"), b"<s1/>"), &scratch, cancel)
+                .expect("spill");
+            section.append(b"<b/>").expect("append");
+            section.append(b"<c/>").expect("append");
+            section
+                .splice(spill(&format!("s2-{cap}"), b"<s2/>"), &scratch, cancel)
+                .expect("spill");
+            section.append(b"<d/>").expect("append");
+            let mut out = Vec::new();
+            section.copy_into(&mut out, &scratch, cancel).expect("copy");
+            assert_eq!(
+                String::from_utf8(out).expect("utf8"),
+                "<s0/><a/><s1/><b/><c/><s2/><d/>",
+                "cap {cap}"
+            );
+        }
+        assert_eq!(
+            files(),
+            before,
+            "every fragment and spill is removed once copied"
+        );
+    }
+
     #[test]
     fn delete_elements_use_the_supplied_timestamp() {
         let mut writer = quick_xml::Writer::new(Vec::new());
@@ -1335,8 +1696,7 @@ mod scratch_tests {
         let scratch = RunScratch::create(dir.path(), &crate::host::Host::for_tests().entered())
             .expect("scratch");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _sink =
-                ChangeSink::new(&scratch, super::Fragments::Raw, false, None).expect("sink");
+            let _sink = ChangeSink::new(&scratch, false, None).expect("sink");
             panic!("simulate a failed derive run");
         }));
         // The simulated failure, not the sink's `expect`, must be what

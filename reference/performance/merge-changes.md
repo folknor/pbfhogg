@@ -8,6 +8,30 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Later inputs' members held in memory instead of spilled: declined (bygg, 2026-11-26, `eecbc773` + change)
+
+The streaming coordinator writes every member of an input that is not the
+head yet to that input's spill file and copies it back at promotion. The
+variant kept a later input's in-order members in memory against a run-wide
+allowance of encoded bytes (1 GiB, 256 MiB per input, charged by
+allocation capacity), spilling only the members past it and never waiting
+on it. Planet 7-OSC `4914..4920`, `--iterations 1`, interleaved, variant on
+the uncommitted tree:
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `055c8d74` 3097 ms | `7d78e3e9` 3105 ms |
+| 2 | `eb6194cf` 3078 ms | `d15a5606` 3128 ms |
+| 3 | `dae98caa` 3063 ms | `426b0d0c` 3149 ms |
+
+Medians 3078 against 3128 ms, within noise and if anything worse. The
+variant held about 92-105 MB per input (the per-input cap, charged at
+capacity) and spilled 13-65 MB each. The run is bound by its readers
+(decompression ends at about 2.8 s); each promotion copies in about 15 ms
+from the page cache at the tail, so neither the spill write nor the
+copy-back is on the critical path. Reverted; the reason sits at
+`stream.rs` `Sink`.
+
 ### Simplify output streamed in order: declined (bygg, 2026-11-26, `5affed23` + change)
 
 The variant planned the chunks of all three action groups in output

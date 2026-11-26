@@ -38,3 +38,37 @@ verify cannot tell which route ran (reference/verify.md). Add a declared route
 for it in the `pinned_cell::check` driver, single and multi.
 
 Kind: coverage gap.
+
+## VER-166 - No cancellation cell runs merge-changes --simplify
+
+Reported by: the spar accounting of the merge-changes simplify item, from a
+scout lateral (2026-11-26); read from source.
+
+The `merge_changes` scenario in `crates/lib/tests/cancel.rs` runs
+`MergeMode::Stream` only; `MergeMode::Simplify` appears in
+`osc_parser_parity.rs`, the `merge_changes/mod.rs` unit tests and the CLI tests,
+none of which trips cancellation. Simplify has its own stages (render jobs,
+the dedupe sort and scan, per-action emit, the serial drain) and its own
+`cancel.check()` points, and `docs/cli/commands.md` states its in-memory dedupe
+has no cancellation point inside it. Add a simplify scenario so a cancel during
+render or emit is held to the same no-publication outcome as the stream path.
+
+Kind: coverage gap.
+
+## VER-167 - No test pins that an input failure outranks a version regression in simplify
+
+Reported by: the spar accounting of the merge-changes simplify item, from a
+scout lateral (2026-11-26); read from source and tests.
+
+`simplify.rs` documents that every input is read to its end before dedupe, so
+an input failure always outranks a version regression. No test feeds simplify
+an input that both regresses a version and is malformed or truncated later
+(in the same or a later input): the truncation and refusal tests in
+`cli_merge_changes.rs` and `osc_parser_parity.rs` carry no regression, and
+`rendered_simplify_reports_the_owned_regression` and the verifier's
+`expect_regression` pin only which regression is reported among several. Any
+redesign that reduces before every input is read could invert the precedence
+silently. Add a cell with a regression in input 1 and a malformed element in
+input 2, expecting the input error.
+
+Kind: coverage gap.

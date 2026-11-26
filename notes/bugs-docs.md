@@ -454,3 +454,69 @@ resolved view and record them as `record.ids`, but the IDs are not a bound
 param, and nothing found says script result rows pair on them. Confirm what
 pairs script rows (asked in brokkr#225) and reword or drop the sentence.
 
+## DOC-072 - The CLI's merge-changes -j comment names the test-only simplify oracle
+
+Reported by: the spar accounting of the merge-changes simplify item, from a
+scout lateral (2026-11-26); read from source.
+
+The comment on the merge-changes `-j` argument in `crates/cli/src/lib.rs` says
+`-j` sizes "the simplify path's `write_simplified` chunk fan-out".
+`write_simplified` exists only under `#[cfg(test)]` in
+`crates/lib/src/commands/merge_changes/mod.rs`, as the owned oracle the
+production path is held to; production simplify is `simplify::run`, whose
+`par_chunks` per action group is what `-j` sizes. Name the production path.
+
+## DOC-073 - commands.md does not say merge-changes --simplify bytes depend on -j
+
+Reported by: the spar accounting of the merge-changes simplify item, from a
+scout lateral (2026-11-26); read from docs and source.
+
+`docs/cli/commands.md` says of the default merge-changes path that "the bytes
+do not depend on `-j` or the host", and of `-j` only that it sizes "the
+simplify path's chunk fan-out". The `simplify.rs` module doc and the
+`tunables.rs` header state that simplify's gzip member layout (one chunk per
+worker per action) makes its output bytes depend on the worker count, and
+through `-j 0` on the host's core count, while the changes and their order do
+not. A user comparing simplified outputs byte for byte across hosts cannot
+learn that from the CLI reference. Say it in the `--simplify` text.
+
+## DOC-074 - merge-changes.md keeps "near-zero overhead" for simplify as still holding
+
+Reported by: the spar accounting of the merge-changes simplify item, from a
+scout lateral (2026-11-26); read from the document and its recorded cells.
+
+`reference/performance/merge-changes.md`, under "Pre-parallel observations
+from the matrix that still hold", says `--simplify` "is a near-zero overhead at
+every scale measured" and that "the `BTreeMap` dedupe is cheap relative to the
+parse cost". Production simplify no longer uses a `BTreeMap` (it renders
+batches and dedupes by a parallel key sort), and the same file's current planet
+week cells put simplify at about 4.4 s against about 3.0 to 3.7 s for the
+default merge, with a 12.0 GB peak against about 123 MB. Move the bullet to
+history or drop the "still hold" claim for it.
+
+## DOC-075 - extract.md opens with a baseline table that predates the current engines
+
+Reported by: the spar accounting of the complete-ways and smart extract item,
+from a scout lateral (2026-11-26); read from the document.
+
+`reference/performance/extract.md` starts with a per-strategy table (Denmark,
+Japan, Europe, planet; host Plantasjen; commits `aacbe80`, `cadc3e6`) in the
+position the performance-record convention gives current baselines. It
+predates fused simple extract, the shared multi-region dependency engine,
+exact coordinates, parent closure and the dependency-pass blob selection, and
+its rows are not matched against anything current; the dated sections below
+it hold the current evidence. Move the table under History or label it as the
+2026-04 state.
+
+## DOC-076 - The performance README calls unsorted extract paths an intentional non-goal
+
+Reported by: the spar accounting of the complete-ways and smart extract item,
+from a scout lateral (2026-11-26); read from docs and git history.
+
+`reference/performance/README.md`, in the list of retired plans, says of the
+scan optimization audit that "unsorted extract paths remain intentional
+non-goals". Since then unsorted simple extract moved its passes onto workers
+with a per-kind blob skip (shipped in CHANGELOG), and the complete-ways and
+smart unsorted sweeps gained the same kind skip. Reword the bullet so it
+records the audit's scope at retirement without asserting a standing non-goal.
+

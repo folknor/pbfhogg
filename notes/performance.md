@@ -681,7 +681,10 @@ Mechanism: `write_regions` drains every destination serially from one
 aggregate result through synchronous writers; one slow destination stalls
 others; admission credit covers an input blob's whole fan-out. `MultiLocal`
 flushes every region's builder at each input-block boundary, making small
-blocks for sparse matches.
+blocks for sparse matches. The multi-region complete-ways and smart engine
+(`extract/multi_dep.rs` `write_pass`) has the same shape: its ordered-pool
+consumer writes every region's frames for a blob through each region's
+synchronous writer in turn (found by the 2026-11-26 spar accounting).
 
 Redesign: per-destination ordered frontiers and write queues under one shared
 byte budget and one shared output scheduler (not a full pool per region); pack
@@ -1086,33 +1089,6 @@ validate.
 
 Risks: framing must understand quoted attributes, comments and XML constructs;
 byte-pattern splitting is insufficient.
-
-## PERF-039 - OSC output passes through spill tiers
-
-Reported by: osc, merge, output.
-
-Mechanism: streaming merge always spills members produced for a non-head input
-to that input's scratch file and later copies it into the destination, even if
-it would fit in memory; promotion occupies the sole coordinator
-(`Coordinator::drain`, `advance_head`). Diff derive switches a unit to per-action
-spill files when its channel fills; the consumer copies those into three action
-fragments; `assemble_osc` copies fragments into the output, so a spilled byte
-is written and read twice.
-
-Redesign: merge - a bounded ordered completion window charged for retained
-encoded bytes, reserving progress for the head and keeping compression workers
-nonblocking; spill only under real pressure. Derive - stream creates into the
-staged destination as results arrive; retain or spool modify and delete members
-once; append them after creates; reference worker spill extents directly. Gzip
-members can be copied without recompression.
-
-Payoff: depends on output volume; large for big change exports.
-
-Risks: a naive shared budget can be exhausted by later inputs; ordering,
-cancellation, fragment lifetime; unknown compressed lengths still need ordering
-before offsets.
-
-Kind: high conviction about the waste.
 
 ## PERF-040 - Gzip inflation is serial inside the OSC reader
 
@@ -2186,3 +2162,18 @@ pair measure the saving and the component-length distribution, including how
 often the 8-blob cap sends a kind back to two passes.
 
 Kind: measurement gap; the change is neutral on normal input.
+
+## PERF-087 - Indexed `.osc.gz` derive has no bench cell
+
+Reported by: the change writing indexed OSC creates straight into the output.
+
+`diff-pair --format osc` writes a fixed plain `diff.osc`
+(`benches/lib/diff.lua`), so only the plain-fragment route of indexed derive
+is measurable. The `.osc.gz` route (members deflated on the unit workers,
+framing glued between them) was last measured by the retired typed
+`diff-snapshots` cells, and the change that now writes creates into the
+output before the scan ends has no `.osc.gz` cell. A bench param selecting
+the output name would cover it. Likewise `merge-diffs` writes a fixed
+`merged.osc.gz`, so a plain `.osc` merge is not measurable.
+
+Kind: measurement gap.

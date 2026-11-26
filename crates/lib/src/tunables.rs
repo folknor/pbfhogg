@@ -956,9 +956,18 @@ pub(crate) const DIGEST_RECORD_BUFFERS_KEPT: usize = DEFAULT_DECODE_AHEAD;
 /// passes it by at most one element. Not measured.
 pub(crate) const DIFF_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 
-/// Read buffer for appending a derive unit's spill file to its fragment;
-/// the cancellation token is checked once per buffer. Not measured.
+/// Read buffer for copying a derive unit's spill file or a deferred
+/// fragment range onward; the cancellation token is checked once per
+/// buffer. Not measured.
 pub(crate) const DIFF_SPILL_COPY_BUFFER: usize = 1 << 20;
+
+/// Unit spill files a deferred derive section (modify, delete) keeps as
+/// their own scratch files until assembly copies them into the output.
+/// Past it, a further unit spill is appended to the section's fragment as it
+/// arrives, which costs that spill one more scratch write and read but keeps
+/// the retained file count and the segment list bounded however many units
+/// spill. A bound on inodes and metadata, not a measured trade-off.
+pub(crate) const DIFF_DEFERRED_SPILL_FILES: usize = 4096;
 
 /// Output chunks one unit may have queued for the consumer before its
 /// worker blocks (text) or spills the rest of the unit to scratch (derive).

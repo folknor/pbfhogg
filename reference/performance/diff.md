@@ -16,6 +16,37 @@ former typed commands, `brokkr diff-snapshots` and `brokkr diff`.
 
 ## Current baselines
 
+### Indexed OSC creates written straight into the output (bygg, 2026-11-26, against `eecbc773`)
+
+Every member a derive unit handed over used to be appended to one of three
+action fragments in scratch, a unit's spill copied into the fragment on
+top, and the fragments copied into the output at the end, so the output's
+whole volume crossed scratch once (twice for spilled bytes) and the copy
+ran after the scan at under one core. Now the output's writing session
+opens before the body scan: creates are written into it as the units
+deliver them (a create spill copied straight in), and only modifies and
+deletes are deferred, a modify or delete spill kept as its own file and
+copied once at assembly. Output bytes are unchanged (the same framing
+events in the same order; 33,536,630,828 B in every cell). Planet base
+against `20260411`, plain `.osc` (the bench's output), `--iterations 1`,
+interleaved after one `brokkr fstrim`; variant cells on the uncommitted tree.
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 (baseline first) | `3fea5533` 2m15s | `7e3e07c1` 2m06s |
+| 2 (baseline first) | `187167d9` 135.5 s | `1b92a984` 126.7 s |
+
+About -6.5 %, sign-consistent. The phase split (`brokkr sidecar --compare
+187167d9 1b92a984`) puts all of it in the segment after
+`DERIVECHANGES_WRITE_START`, 15.5 s to 6.4 s, which now copies only the
+deferred modify and delete sections; the scan is unchanged (node 78.3 s
+against 79.4 s) though it now also writes the creates. Device writes for
+the run fell from 79.3 GB to 59.9 GB. The `.osc.gz` route (worker-deflated
+members) takes the same path but has no script-bench cell; its fragments
+were already compressed, so its share is smaller. `DERIVECHANGES_WRITE`
+spans before this entry include writing the creates and are not
+comparable with later ones.
+
 ### Persistent merge cursors (bygg, 2026-11-25, against `31c482e2`)
 
 The block-pair merge used to rebuild each side's element iterator every

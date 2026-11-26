@@ -656,6 +656,14 @@
 
 ### Changed
 
+- **`diff --format osc` on indexed inputs writes creates straight into the
+  output and keeps only modifies and deletes in scratch.** Its scratch
+  footprint shrinks by the create volume (most of a typical snapshot
+  diff), and spilled worker output is copied once instead of twice. The
+  output bytes are unchanged. Planet base against a later snapshot, plain
+  `.osc`: 135 s to 127 s, about 19 GB less written to disk. Unindexed
+  inputs are unchanged.
+
 - **`extract` complete-ways and `--smart` read only the blobs that can
   hold what they still need.** On sorted input, single region and through
   `--config`, smart's relation-completion pass reads only the way blobs

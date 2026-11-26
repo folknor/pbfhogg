@@ -31,11 +31,18 @@ Tests go where they couple least.
   `test_support::refused` and its wrappers, `guard::apply` and the
   guard's control test) calls `skip::fail_if_required`, which fails
   the test where the run requires that backend. By convention these
-  predicates are the only route to a backend skip; nothing enforces
-  that structurally. A source-policy rule confining matches on
-  `PlatformUnsupported` to the predicates would not: a hand-rolled skip
-  can as well read error text, an errno or the CLI's exit 3, and an
-  early return needs no match at all. Tests that assert a refusal itself inspect the
+  predicates are the only route to a backend skip. A source-policy rule
+  confining matches on `PlatformUnsupported` to the predicates would
+  not enforce it: a hand-rolled skip can as well read error text, an
+  errno or the CLI's exit 3, and an early return needs no match at all.
+  What does enforce it, for the pinned-input fault cells, is the
+  driver that runs them whole (`crates/lib/tests/common/pinned_cell.rs`,
+  below): the cell's callbacks return values, not control, so no cell
+  can end early without a witness, and its one skip is the driver's
+  own. The other backend cells (the roundtrip, `host_contract` and
+  `process_nofile` direct and io_uring arms, the library unit cells,
+  the CLI cells, the apply-changes direct cell) still rest on the
+  convention. Tests that assert a refusal itself inspect the
   error directly and are not affected. What the gate guarantees is
   that a required backend's refusal cannot pass as a skip, so it goes
   green only on a host, and a test scratch filesystem, that does not
@@ -71,11 +78,12 @@ Tests go where they couple least.
   the invocation's `direct_io_read_opens` or `direct_io_write_opens`
   (`crate::direct_io::DirectIoMetrics`; the io_uring writer's output
   is a write open). The library cells that run a command or a writer
-  path constructor with a direct option assert one through
-  `common::assert_direct_opened` or `common::witness_direct_reads` on
-  their own fresh invocation (the `fault_*_input` references, the
-  roundtrip direct and io_uring cells, the `process_nofile` direct and
-  io_uring arms); the CLI cells through
+  path constructor with a direct option assert one on their own fresh
+  invocation, through `common::assert_direct_opened` (the roundtrip
+  direct and io_uring cells, the `process_nofile` direct and io_uring
+  arms) or the pinned-cell driver (the `fault_*_input` cells, which
+  also hold a direct cell whose route owes no direct open to recording
+  none); the CLI cells through
   `invoker::assert_direct_opened` on the marker stream. Cells that
   construct a direct type themselves (`DirectReader::open`,
   `direct_io::open_for_read`) need none: the unit test
@@ -97,18 +105,28 @@ Tests go where they couple least.
   several direct paths is satisfied by any one. The fault plan's
   input replacement records the transport of every verified open of
   its pinned target, in order (`InputReplacement::transports`, tagged
-  by the pin constructor, `open` or `open_direct`), and the
-  `fault_*_input` reference runs, buffered runs included, assert their
-  route's exact list through `common::witness_transports` (two do not:
-  inspect's node-stats cell asserts only a direct read, and degrade's
-  passthrough reference does not arm the hook), as do the getid
-  full-scan unit cell and the apply-changes
-  `direct_reads_reach_every_base_open` cell; the expected lists follow
-  the reach each command documents (`crates/cli/src/io_reach.rs`).
-  The extract, sort, add-locations-to-ways and getparents fault files
-  drive direct every route they drive buffered, so each route's direct
-  list is pinned; a new route there gets both. The other fault files
-  drive only some of their routes direct. The CLI cells witness the flag reaching the library, which
+  by the pin constructor, `open` or `open_direct`). The
+  `fault_*_input` reference-and-matrix cells run through one driver,
+  `pinned_cell::check`,
+  which owns the reference run, its exact list (buffered runs
+  included), and the replacement matrix after it, judging every
+  matrix run from that run's own report (a refused run's verified
+  opens hold to the list's prefix); the getid full-scan unit cell and
+  the apply-changes `direct_reads_reach_every_base_open` cell assert
+  their lists by hand. The expected lists follow the reach each
+  command documents (`crates/cli/src/io_reach.rs`). Every route the
+  driver runs runs in every read mode the build has, buffered and
+  direct, so each such route's direct list is pinned and a new route
+  gets both; the hand-rolled repeated-input (`cat a a`, `diff a a`,
+  `derive a a`) and replaced-before-the-call caller-pin cells run
+  buffered only. On Unix the driver's one skip is a typed `direct-io`
+  setup refusal of the reference on a cell whose list owes a direct
+  open, through `common::direct_io_unavailable`; it ends that cell, not
+  the test. Off Unix it skips the matrix after the reference, which
+  needs file identity verification. Its own cells, over a toy command,
+  show a reference that opens less than declared, a matrix run through
+  a fresh pin on another host, a run that returns early and a refusal
+  on a route that owes no direct open each failing. The CLI cells witness the flag reaching the library, which
   each command wires by hand: they assert a direct open in every
   direction the command's reach row claims (reads, writes or both),
   not an exact count, since the per-open attribution is the library
@@ -239,10 +257,11 @@ NAME` list each harness in turn to find one test.
   line in `crates/lib/tests/all.rs` instead. A helper crate would see only its
   own features, and its dependency on the library would have to keep
   `commands` off for the `minimal` sweep. `crates/lib/tests/common/` holds fixtures
-  only; nothing in it spawns the binary. Two files there are not modules of
-  `common/mod.rs`, so pbfhogg-cli never compiles them: `fifo_capture.rs`
-  and `reopen_cell.rs` (the reopen-strategy admission the `fault_*_input`
-  replacement cells share) are each declared once, by `#[path]`, in
+  only; nothing in it spawns the binary. Some files there are not modules of
+  `common/mod.rs`, so pbfhogg-cli never compiles them: `fifo_capture.rs`,
+  `reopen_cell.rs` (the reopen-strategy admission the `fault_*_input`
+  replacement cells share) and `pinned_cell.rs` (the driver that runs
+  each of those cells whole) are each declared once, by `#[path]`, in
   `crates/lib/tests/all.rs`, and the harness mounts `fifo_capture.rs` the
   same way. `reopen_cell.rs` also holds the replacement seam
   `Scenario::run` (`Pinned` or `Path`): it pins the input with an injected

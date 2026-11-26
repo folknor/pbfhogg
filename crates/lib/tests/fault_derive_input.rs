@@ -22,6 +22,7 @@
 //! when the run succeeds: a refused run leaves an absent destination absent
 //! and an existing one (replace mode) as it was.
 
+use crate::pinned_cell::{self, Cell, Judged};
 use crate::reopen_cell;
 
 use std::io::Read as _;
@@ -216,190 +217,111 @@ fn run_paths(
     Ok(format!("{stats}\n{}", read_osc(route, output)))
 }
 
-enum Reference {
-    Output(String),
-    Skipped,
-}
-
-/// The unreplaced run's answer, with the open count of `target` checked:
-/// armed past its last open, the replacement never fires and only counts.
-/// Also checks that the replacement changes the answer, so the comparisons
-/// below can tell which file a run read.
-fn reference(
-    route: Route,
-    inputs: &Inputs,
-    target: Side,
-    skippable: impl Fn(&pbfhogg::Error) -> bool,
-) -> Reference {
-    let opens = route.opens();
-    let dir = inputs.dir.path();
-    let host = crate::common::test_host();
-    host.invocation.faults().arm_input_replacement(
-        inputs.path(target),
-        &dir.join("unused.osm.pbf"),
-        opens + 1,
-    );
-    let cell = format!("{route:?}, {}", inputs.path(target).display());
-    let output = dir.join(route.output_name("reference"));
-    let expected = match run_paths(route, inputs, None, &output, false, &host) {
-        Ok(out) => out,
-        Err(e) if skippable(&e) => {
-            crate::common::skip(format!("{cell}: {e}"));
-            return Reference::Skipped;
-        }
-        Err(e) => panic!("{cell}: unreplaced run: {}", e.report()),
-    };
-    crate::common::witness_direct_reads(route.direct, &host.invocation, &cell);
-    let counted = host
-        .invocation
-        .faults()
-        .input_replacement()
-        .expect("armed replacement");
-    assert!(!counted.fired, "{cell}: {counted:?}");
-    assert_eq!(counted.attempts, opens, "{cell}: {counted:?}");
-    assert_eq!(counted.verified, opens, "{cell}: {counted:?}");
-    assert_eq!(counted.refused, 0, "{cell}: {counted:?}");
-    crate::common::witness_transports(route.direct, &counted, || "DD", &cell);
-
-    let swapped = dir.join("swapped.osm.pbf");
-    write_input(&swapped, route, target, true);
-    let (old, new) = match target {
-        Side::Old => (swapped.as_path(), inputs.new.as_path()),
-        Side::New => (inputs.old.as_path(), swapped.as_path()),
-    };
-    let other_output = dir.join(route.output_name("swapped"));
-    run(
-        route,
-        InputSource::Path(old),
-        InputSource::Path(new),
-        &other_output,
-        false,
-        &inputs.scratch(),
-        &crate::common::test_host(),
-    )
-    .unwrap_or_else(|e| panic!("{cell}: run on the replacement: {}", e.report()));
-    assert_ne!(
-        read_osc(route, &other_output),
-        read_osc(route, &output),
-        "{cell}: the replacement must change the answer"
-    );
-    for path in [&swapped, &output, &other_output] {
-        std::fs::remove_file(path).expect("remove reference files");
-    }
-    Reference::Output(expected)
-}
-
-/// Run `route` with the replacement of `target` armed after each of its
-/// opens in turn, in both reopen modes, into an absent destination and over
-/// an existing one, against the unreplaced `expected`.
-fn check_replacements(route: Route, inputs: &Inputs, target: Side, expected: &str) {
-    let opens = route.opens();
-    let input = inputs.path(target);
-    let replacement = inputs.dir.path().join("replacement.osm.pbf");
-    let output = inputs.dir.path().join(route.output_name("changes"));
-    for after in 1..=opens {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
+/// Check `route` in every read mode through [`pinned_cell::check`], with
+/// each input as the replacement target in turn, into an absent
+/// destination and over an existing one: the reference with the target's
+/// exact transports (both opens direct on a direct run, following the diff
+/// row of `crates/cli/src/io_reach.rs`, which `diff --format osc` shares),
+/// then the replacement armed after each of its opens in turn, in both
+/// reopen modes. `opens` is the expected open count per input, fixed so an
+/// open that stopped deriving from its pin (and so stopped counting) cannot
+/// shrink the arming range unnoticed. The reference also checks that the
+/// replacement changes the answer, so the comparisons can tell which file a
+/// run read.
+fn check_route(route: Route, opens: u64) {
+    assert_eq!(route.opens(), opens, "{route:?}");
+    for &direct in pinned_cell::modes() {
+        let route = Route { direct, ..route };
+        for target in [Side::Old, Side::New] {
             for existing in [false, true] {
-                write_input(input, route, target, false);
-                write_input(&replacement, route, target, true);
-                let host = crate::common::test_host();
-                scenario.run(input, &host, |pin, scenario| {
-                    if existing {
-                        std::fs::write(&output, SENTINEL).expect("earlier output");
-                    } else if output.exists() {
-                        std::fs::remove_file(&output).expect("clear output");
-                    }
-                    host.invocation
-                        .faults()
-                        .arm_input_replacement(input, &replacement, after);
-                    let result =
-                        run_paths(route, inputs, Some((target, pin)), &output, existing, &host);
-
-                    let cell = format!(
-                        "{route:?}, {} replaced after open {after}, scenario {scenario:?}, \
-                         existing output {existing}",
-                        input.display()
-                    );
-                    let report = host
-                        .invocation
-                        .faults()
-                        .input_replacement()
-                        .expect("armed replacement");
-                    assert!(
-                        report.fired,
-                        "{cell}: the replacement must fire: {report:?}"
-                    );
-
-                    // After the input's last open nothing opens it again, so the
-                    // run reads only what it already holds, in either mode.
-                    match (scenario, after == opens) {
-                        (reopen_cell::Scenario::Pinned, _)
-                        | (reopen_cell::Scenario::Path, true) => {
-                            let out = result.unwrap_or_else(|e| {
-                                panic!(
-                                    "{cell}: the run is unaffected by the replacement: {}",
-                                    e.report()
-                                )
-                            });
-                            assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                            assert_eq!(report.verified, opens, "{cell}: {report:?}");
-                            assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                            assert_eq!(
-                                report.attempts_after_fired,
-                                opens - after,
-                                "{cell}: {report:?}"
-                            );
-                            assert_eq!(
-                                out, expected,
-                                "{cell}: the answer must come from the pinned inputs alone"
-                            );
-                        }
-                        (reopen_cell::Scenario::Path, false) => {
-                            let err = result
-                                .err()
-                                .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                            assert!(
-                                matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                                "{cell}: {err:?}"
-                            );
-                            assert_eq!(err.source_path(), Some(input), "{cell}: {err:?}");
-                            assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                            assert_eq!(report.verified, after, "{cell}: {report:?}");
-                            assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-                            assert_eq!(report.attempts_after_fired, 1, "{cell}: {report:?}");
-                            if existing {
-                                assert_eq!(
-                                    std::fs::read(&output).expect("earlier output"),
-                                    SENTINEL,
-                                    "{cell}: a refused run replaced the earlier output"
-                                );
-                            } else {
-                                assert!(!output.exists(), "{cell}: a refused run published");
-                            }
-                        }
-                    }
-                });
+                check_target(route, target, existing);
             }
         }
     }
 }
 
-/// Check `route` with each input replaced in turn. `opens` is the expected
-/// open count per input, fixed so an open that stopped deriving from its pin
-/// (and so stopped counting) cannot shrink the arming range unnoticed.
-fn check_route_with(route: Route, opens: u64, skippable: impl Fn(&pbfhogg::Error) -> bool) {
-    assert_eq!(route.opens(), opens, "{route:?}");
-    for target in [Side::Old, Side::New] {
-        let inputs = inputs(route);
-        let Reference::Output(expected) = reference(route, &inputs, target, &skippable) else {
-            return;
-        };
-        check_replacements(route, &inputs, target, &expected);
-    }
-}
-
-fn check_route(route: Route, opens: u64) {
-    check_route_with(route, opens, |_| false);
+fn check_target(route: Route, target: Side, existing: bool) {
+    let inputs = inputs(route);
+    let dir = inputs.dir.path();
+    let input = inputs.path(target);
+    let replacement = dir.join("replacement.osm.pbf");
+    let reference = dir.join(route.output_name("reference"));
+    let output = dir.join(route.output_name("changes"));
+    let cell = Cell::new(
+        format!("{route:?}, {}, existing output {existing}", input.display()),
+        route.direct,
+        input,
+        &replacement,
+        route.opens(),
+        "DD",
+    )
+    .scratch(dir);
+    pinned_cell::check(
+        &cell,
+        |host| run_paths(route, &inputs, None, &reference, false, host),
+        |expected| {
+            let swapped = dir.join("swapped.osm.pbf");
+            write_input(&swapped, route, target, true);
+            let (old, new) = match target {
+                Side::Old => (swapped.as_path(), inputs.new.as_path()),
+                Side::New => (inputs.old.as_path(), swapped.as_path()),
+            };
+            let other_output = dir.join(route.output_name("swapped"));
+            run(
+                route,
+                InputSource::Path(old),
+                InputSource::Path(new),
+                &other_output,
+                false,
+                &inputs.scratch(),
+                &crate::common::test_host(),
+            )
+            .unwrap_or_else(|e| panic!("{}: run on the replacement: {}", cell.what(), e.report()));
+            assert_ne!(
+                read_osc(route, &other_output),
+                read_osc(route, &reference),
+                "{}: the replacement must change the answer",
+                cell.what()
+            );
+            for path in [&swapped, &reference, &other_output] {
+                std::fs::remove_file(path).expect("remove reference files");
+            }
+            expected
+        },
+        |_, _| {
+            write_input(input, route, target, false);
+            write_input(&replacement, route, target, true);
+            if existing {
+                std::fs::write(&output, SENTINEL).expect("earlier output");
+            } else if output.exists() {
+                std::fs::remove_file(&output).expect("clear output");
+            }
+        },
+        |(), step| {
+            run_paths(
+                route,
+                &inputs,
+                Some((target, step.pin)),
+                &output,
+                existing,
+                step.host,
+            )
+        },
+        |expected, (), step, judged| match judged {
+            Judged::Unaffected(out) => assert_eq!(
+                &out, expected,
+                "{}: the answer must come from the pinned inputs alone",
+                step.what
+            ),
+            Judged::Refused if existing => assert_eq!(
+                std::fs::read(&output).expect("earlier output"),
+                SENTINEL,
+                "{}: a refused run replaced the earlier output",
+                step.what
+            ),
+            Judged::Refused => assert!(!output.exists(), "{}: a refused run published", step.what),
+        },
+    );
 }
 
 #[test]
@@ -460,38 +382,6 @@ fn the_streaming_derive_reads_only_the_pinned_inputs() {
             },
             2,
         );
-    }
-}
-
-/// The front reads, the planner's blob cursors and the streaming readers
-/// open `O_DIRECT` when asked to, through the pin's own direct open.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn direct_reads_follow_the_pinned_inputs() {
-    for (route, opens) in [
-        (Route::SEQUENTIAL, 2),
-        (Route::PARALLEL, 2),
-        (
-            Route {
-                negative: true,
-                ..Route::PARALLEL
-            },
-            2,
-        ),
-        (
-            Route {
-                unindexed: [true, false],
-                ..Route::SEQUENTIAL
-            },
-            2,
-        ),
-    ] {
-        let route = Route {
-            direct: true,
-            ..route
-        };
-        // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
-        check_route_with(route, opens, |e| crate::common::direct_io_unavailable(e));
     }
 }
 
@@ -596,9 +486,17 @@ fn a_repeated_input_is_one_pin() {
 fn a_caller_pin_is_used_as_it_is() {
     for route in [Route::SEQUENTIAL, Route::PARALLEL] {
         let inputs = inputs(route);
-        let Reference::Output(expected) = reference(route, &inputs, Side::Old, |_| false) else {
-            unreachable!("no failure is skippable here");
-        };
+        let unreplaced = inputs.dir.path().join(route.output_name("unreplaced"));
+        let expected = run_paths(
+            route,
+            &inputs,
+            None,
+            &unreplaced,
+            false,
+            &crate::common::test_host(),
+        )
+        .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {}", e.report()));
+        std::fs::remove_file(&unreplaced).expect("remove unreplaced output");
         let replacement = inputs.dir.path().join("replacement.osm.pbf");
         let output = inputs.dir.path().join(route.output_name("changes"));
         for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {

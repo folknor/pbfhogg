@@ -18,9 +18,10 @@
 //! covered in `crates/cli/tests/cli_input_contract.rs`; the caller-pin tests here
 //! cover the library side of it for all three checks.
 
+use crate::pinned_cell::{self, Cell, Judged};
 use crate::reopen_cell;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pbfhogg::check::verify_ids::{VerifyIdsOptions, verify_ids};
 use pbfhogg::read::input::InputSource;
@@ -117,128 +118,50 @@ fn expected(route: Route) -> serde_json::Value {
     })
 }
 
-/// What [`reference`] found.
-enum Reference {
-    Report(serde_json::Value),
-    /// The host cannot run the route.
-    Skipped,
-}
-
-/// The unreplaced run's report, with its open count checked: armed past the
-/// last open, the replacement never fires and only counts. Skipped when the
-/// run failed and `skippable` accepts its error; any other failure panics.
-fn reference(
-    route: Route,
-    input: &Path,
-    dir: &Path,
-    skippable: impl Fn(&pbfhogg::Error) -> bool,
-) -> Reference {
-    let host = crate::common::test_host();
-    host.invocation
-        .faults()
-        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), OPENS + 1);
-    let report = match run(route, input, &host) {
-        Ok(report) => report,
-        Err(e) if skippable(&e) => {
-            crate::common::skip(format!("{route:?}: {e}"));
-            return Reference::Skipped;
-        }
-        Err(e) => panic!("{route:?}: unreplaced run: {e}"),
-    };
-    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
-    let counted = host
-        .invocation
-        .faults()
-        .input_replacement()
-        .expect("armed replacement");
-    assert!(!counted.fired, "{route:?}: {counted:?}");
-    assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
-    assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
-    assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
-    crate::common::witness_transports(route.direct, &counted, || "DB", &format!("{route:?}"));
-    assert_eq!(report, expected(route), "{route:?}: the unreplaced report");
-    Reference::Report(report)
-}
-
-/// Run `route` with the replacement armed after each of its opens in turn,
-/// in both reopen modes, against the unreplaced `expected`.
-fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &serde_json::Value) {
-    let replacement = dir.join("replacement.osm.pbf");
-    for after in 1..=OPENS {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(input, route.unindexed);
-            write_replacement(&replacement);
-            let host = crate::common::test_host();
-            scenario.run(input, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(input, &replacement, after);
-                let before = crate::common::snapshot_dir(dir);
-                let result = run(route, pin, &host);
-
-                let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(
-                    report.fired,
-                    "{cell}: the replacement must fire: {report:?}"
-                );
-
-                // After the last open nothing opens again, so the run reads only
-                // what it already holds, in either mode.
-                match (scenario, after == OPENS) {
-                    (reopen_cell::Scenario::Pinned, _) | (reopen_cell::Scenario::Path, true) => {
-                        let got = result.unwrap_or_else(|e| {
-                            panic!("{cell}: the run is unaffected by the replacement: {e}")
-                        });
-                        assert_eq!(report.attempts, OPENS, "{cell}: {report:?}");
-                        assert_eq!(report.verified, OPENS, "{cell}: {report:?}");
-                        assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                        assert_eq!(
-                            report.attempts_after_fired,
-                            OPENS - after,
-                            "{cell}: {report:?}"
-                        );
-                        assert_eq!(
-                            &got, expected,
-                            "{cell}: the report must come only from the pinned input"
-                        );
-                    }
-                    (reopen_cell::Scenario::Path, false) => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                        assert_eq!(report.verified, after, "{cell}: {report:?}");
-                        assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-                        assert_eq!(report.attempts_after_fired, 1, "{cell}: {report:?}");
-                        // The replacement was renamed over the input, so it is the
-                        // one path the run itself did not account for.
-                        let mut after_run = crate::common::snapshot_dir(dir);
-                        after_run.insert(PathBuf::from("replacement.osm.pbf"));
-                        crate::common::assert_scratch_unchanged(&before, &after_run);
-                    }
-                }
-            });
-        }
-    }
-}
-
+/// Check `route` in every read mode through [`pinned_cell::check`]: the
+/// reference with its exact transports (the probe direct on a direct run,
+/// the walk buffered, following the check row of
+/// `crates/cli/src/io_reach.rs`), then the replacement armed after each
+/// open in turn, in both reopen modes.
 fn check_route(route: Route) {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    write_input(&input, route.unindexed);
-    let Reference::Report(expected) = reference(route, &input, dir.path(), |_| false) else {
-        unreachable!("no failure is skippable here");
-    };
-    check_replacements(route, dir.path(), &input, &expected);
+    for &direct in pinned_cell::modes() {
+        let route = Route { direct, ..route };
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        write_input(&input, route.unindexed);
+        let cell = Cell::new(
+            format!("{route:?}"),
+            direct,
+            &input,
+            &replacement,
+            OPENS,
+            "DB",
+        )
+        .scratch(dir.path());
+        pinned_cell::check(
+            &cell,
+            |host| run(route, &input, host),
+            |report| {
+                assert_eq!(report, expected(route), "{route:?}: the unreplaced report");
+                report
+            },
+            |_, _| {
+                write_input(&input, route.unindexed);
+                write_replacement(&replacement);
+            },
+            |(), step| run(route, step.pin, step.host),
+            |expected, (), step, judged| {
+                if let Judged::Unaffected(got) = judged {
+                    assert_eq!(
+                        &got, expected,
+                        "{}: the report must come only from the pinned input",
+                        step.what
+                    );
+                }
+            },
+        );
+    }
 }
 
 #[test]
@@ -272,30 +195,6 @@ fn a_type_filter_reads_only_the_pinned_input() {
             ways_only: true,
             ..Route::PLAIN
         });
-    }
-}
-
-/// The probe opens `O_DIRECT` when asked to, through the pin's own direct
-/// open; the walk stays buffered.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn direct_reads_follow_the_pinned_input() {
-    for full in [false, true] {
-        let route = Route {
-            full,
-            direct: true,
-            ..Route::PLAIN
-        };
-        let dir = crate::common::test_scratch();
-        let input = dir.path().join("in.osm.pbf");
-        write_input(&input, false);
-        // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
-        let Reference::Report(expected) = reference(route, &input, dir.path(), |e| {
-            crate::common::direct_io_unavailable(e)
-        }) else {
-            return;
-        };
-        check_replacements(route, dir.path(), &input, &expected);
     }
 }
 

@@ -19,6 +19,7 @@
 //! are exact. The replacement differs from the input in its element counts,
 //! node coordinates and size, so a read of it shows in any report.
 
+use crate::pinned_cell::{self, Cell, Judged};
 use crate::reopen_cell;
 
 use std::path::Path;
@@ -103,16 +104,6 @@ struct Route {
 }
 
 impl Route {
-    /// How many times the route opens the input through a pin: the pinning
-    /// routes count their own opens, the decode-only route takes no pin.
-    fn pinned_opens(self) -> u64 {
-        match (self.decode_only, self.indexed) {
-            (true, _) => 0,
-            (false, true) => 1,
-            (false, false) => 2,
-        }
-    }
-
     fn options(self) -> InspectOptions {
         InspectOptions {
             show_blocks: false,
@@ -147,125 +138,90 @@ fn expected(route: Route, input: &Path) -> Vec<Option<String>> {
     ]
 }
 
-/// The unreplaced run's report, with its pinned-open count checked: armed
-/// past the last open, the replacement never fires and only counts. `None`
-/// when the run failed and `skippable` accepts its error.
-fn reference(
-    route: Route,
-    input: &Path,
-    dir: &Path,
-    skippable: impl Fn(&pbfhogg::Error) -> bool,
-) -> Option<Vec<Option<String>>> {
-    let opens = route.pinned_opens();
-    let host = crate::common::test_host();
-    host.invocation
-        .faults()
-        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), opens + 1);
-    let report = match run_inspect(route, input, &host) {
-        Ok(report) => report,
-        Err(e) if skippable(&e) => {
-            crate::common::skip(format!("{route:?}: {e}"));
-            return None;
+impl Route {
+    /// How many times the cell opens the input through a pin: the pinning
+    /// routes count their own opens; the decode-only route takes no pin,
+    /// so its cell hands it one and sees its one open.
+    fn opens(self) -> u64 {
+        match (self.decode_only, self.indexed) {
+            (true, _) | (false, true) => 1,
+            (false, false) => 2,
         }
-        Err(e) => panic!("{route:?}: unreplaced run: {e}"),
-    };
-    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
-    let Some(counted) = host.invocation.faults().input_replacement() else {
-        panic!("{route:?}: the replacement was armed");
-    };
-    assert!(!counted.fired, "{route:?}: {counted:?}");
-    assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
-    assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
-    assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
-    crate::common::witness_transports(route.direct, &counted, || "BD", &format!("{route:?}"));
-    assert_eq!(report, expected(route, input), "{route:?}: the report");
-    Some(report)
-}
+    }
 
-/// Run `route` with the replacement armed after each of its pinned opens in
-/// turn, in both reopen modes, against the unreplaced report.
-fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Option<String>]) {
-    let opens = route.pinned_opens();
-    let replacement = dir.join("replacement.osm.pbf");
-    for after in 1..=opens {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(input, route.indexed);
-            write_replacement(&replacement, route.indexed);
-            let host = crate::common::test_host();
-            scenario.run(input, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(input, &replacement, after);
-                let result = run_inspect(route, pin, &host);
-
-                let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(
-                    report.fired,
-                    "{cell}: the replacement must fire: {report:?}"
-                );
-                match (scenario, after == opens) {
-                    (reopen_cell::Scenario::Pinned, _) | (reopen_cell::Scenario::Path, true) => {
-                        let got = result.unwrap_or_else(|e| {
-                            panic!("{cell}: the run is unaffected by the replacement: {e}")
-                        });
-                        assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                        assert_eq!(report.verified, opens, "{cell}: {report:?}");
-                        assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                        assert_eq!(
-                            report.attempts_after_fired,
-                            opens - after,
-                            "{cell}: {report:?}"
-                        );
-                        assert_eq!(
-                            got, expected,
-                            "{cell}: the report must be of the pinned input"
-                        );
-                    }
-                    (reopen_cell::Scenario::Path, false) => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                        assert_eq!(report.verified, after, "{cell}: {report:?}");
-                        assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-                        assert_eq!(report.attempts_after_fired, 1, "{cell}: {report:?}");
-                    }
-                }
-            });
+    /// The transport of each open on a direct run, following the inspect
+    /// row of `crates/cli/src/io_reach.rs`: the index scan's header walk
+    /// buffered whatever the flag, the full decode (the fallback's second
+    /// open, or the decode-only route's only one) direct.
+    fn transports(self) -> &'static str {
+        match (self.decode_only, self.indexed) {
+            (true, _) => "D",
+            (false, true) => "B",
+            (false, false) => "BD",
         }
     }
 }
 
-fn check_route(route: Route, skippable: impl Fn(&pbfhogg::Error) -> bool) {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    write_input(&input, route.indexed);
-    let Some(expected) = reference(route, &input, dir.path(), skippable) else {
-        return;
-    };
-    check_replacements(route, dir.path(), &input, &expected);
+/// Check `route` in every read mode through [`pinned_cell::check`]: the
+/// reference report with its exact transports, then the replacement armed
+/// after each open in turn, in both reopen modes. The decode-only route's
+/// one open is its last, so a replacement after it changes nothing, file
+/// size included, in either reopen mode.
+fn check_route(route: Route) {
+    for &direct in pinned_cell::modes() {
+        let route = Route { direct, ..route };
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        write_input(&input, route.indexed);
+        let cell = Cell::new(
+            format!("{route:?}"),
+            direct,
+            &input,
+            &replacement,
+            route.opens(),
+            route.transports(),
+        );
+        pinned_cell::check(
+            &cell,
+            |host| {
+                if route.decode_only {
+                    let pin = pbfhogg::read::input::PinnedInput::pin(&input, host)?;
+                    run_inspect(route, &pin, host)
+                } else {
+                    run_inspect(route, &input, host)
+                }
+            },
+            |report| {
+                assert_eq!(report, expected(route, &input), "{route:?}: the report");
+                report
+            },
+            |_, _| {
+                write_input(&input, route.indexed);
+                write_replacement(&replacement, route.indexed);
+            },
+            |(), step| run_inspect(route, step.pin, step.host),
+            |expected, (), step, judged| {
+                if let Judged::Unaffected(got) = judged {
+                    assert_eq!(
+                        &got, expected,
+                        "{}: the report must be of the pinned input",
+                        step.what
+                    );
+                }
+            },
+        );
+    }
 }
 
 /// Indexed input: the header walk answers the whole report, one open.
 #[test]
 fn the_index_only_scan_reads_only_the_pinned_input() {
-    check_route(
-        Route {
-            indexed: true,
-            decode_only: false,
-            direct: false,
-        },
-        |_| false,
-    );
+    check_route(Route {
+        indexed: true,
+        decode_only: false,
+        direct: false,
+    });
 }
 
 /// Unindexed input: the walk finds a blob without indexdata and the full
@@ -274,72 +230,42 @@ fn the_index_only_scan_reads_only_the_pinned_input() {
 /// included.
 #[test]
 fn the_full_decode_fallback_reads_only_the_pinned_input() {
-    check_route(
-        Route {
-            indexed: false,
-            decode_only: false,
-            direct: false,
-        },
-        |_| false,
-    );
+    check_route(Route {
+        indexed: false,
+        decode_only: false,
+        direct: false,
+    });
 }
 
-/// The fallback decode opens `O_DIRECT` when asked to, through the pin's own
-/// direct open; the walk stays buffered.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn the_direct_fallback_reads_only_the_pinned_input() {
-    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
-    check_route(
-        Route {
-            indexed: false,
-            decode_only: false,
-            direct: true,
-        },
-        |e| crate::common::direct_io_unavailable(e),
-    );
-}
-
-/// A decode-only run takes no pin of its own: given a path it opens the path
-/// (no pinned open is counted). Given a caller's pin it opens through it,
-/// once, and a replacement after that open changes nothing, file size
-/// included, in either reopen mode.
+/// A decode-only run takes no pin of its own: given a path it opens the
+/// path (no pinned open is counted). Given a caller's pin it opens through
+/// it, once.
 #[test]
 fn a_decode_only_run_opens_once_through_a_caller_pin() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
     for indexed in [true, false] {
         let route = Route {
             indexed,
             decode_only: true,
             direct: false,
         };
+        check_route(route);
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
         write_input(&input, indexed);
-        let Some(expected) = reference(route, &input, dir.path(), |_| false) else {
-            unreachable!("no failure is skippable here");
-        };
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, indexed);
-            write_replacement(&replacement, indexed);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(&input, &replacement, 1);
-                let got = run_inspect(route, pin, &host)
-                    .unwrap_or_else(|e| panic!("{route:?}, scenario {scenario:?}: {e}"));
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(report.fired, "{route:?}: {report:?}");
-                assert_eq!(report.attempts, 1, "{route:?}: {report:?}");
-                assert_eq!(report.attempts_after_fired, 0, "{route:?}: {report:?}");
-                assert_eq!(got, expected, "{route:?}, scenario {scenario:?}");
-            });
-        }
+        let host = crate::common::test_host();
+        host.invocation.faults().arm_input_replacement(
+            &input,
+            &dir.path().join("unused.osm.pbf"),
+            1,
+        );
+        let got = run_inspect(route, &input, &host).expect("decode-only run on the path");
+        assert_eq!(got, expected(route, &input), "{route:?}");
+        let counted = host
+            .invocation
+            .faults()
+            .input_replacement()
+            .expect("armed replacement");
+        assert_eq!(counted.attempts, 0, "{route:?}: {counted:?}");
     }
 }
 
@@ -493,99 +419,51 @@ struct NodeStats {
     for_blocks: u64,
 }
 
-fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    write_input(&input, true);
-
-    let host = crate::common::test_host();
-    host.invocation.faults().arm_input_replacement(
-        &input,
-        &dir.path().join("unused.osm.pbf"),
-        NODE_STATS_OPENS + 1,
-    );
-    let expected = match run_node_stats(&input, direct, &host) {
-        Ok(stats) => stats,
-        Err(e) if skippable(&e) => {
-            crate::common::skip(format!("node_stats direct {direct}: {e}"));
-            return;
-        }
-        Err(e) => panic!("node_stats direct {direct}: unreplaced run: {e}"),
-    };
-    crate::common::witness_direct_reads(direct, &host.invocation, "node_stats");
-    let counted = host
-        .invocation
-        .faults()
-        .input_replacement()
-        .expect("armed replacement");
-    assert!(!counted.fired, "{counted:?}");
-    assert_eq!(counted.attempts, NODE_STATS_OPENS, "{counted:?}");
-    assert_eq!(counted.verified, NODE_STATS_OPENS, "{counted:?}");
-    assert_eq!(expected.node_count, 30, "the unreplaced node count");
-
-    for after in 1..=NODE_STATS_OPENS {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, true);
-            write_replacement(&replacement, true);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(&input, &replacement, after);
-                let result = run_node_stats(pin, direct, &host);
-                let cell =
-                    format!("direct {direct}, replaced after open {after}, scenario {scenario:?}");
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(report.fired, "{cell}: {report:?}");
-                match (scenario, after == NODE_STATS_OPENS) {
-                    (reopen_cell::Scenario::Pinned, _) | (reopen_cell::Scenario::Path, true) => {
-                        let got = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                        assert_eq!(report.attempts, NODE_STATS_OPENS, "{cell}: {report:?}");
-                        assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                        assert_eq!(
-                            report.attempts_after_fired,
-                            NODE_STATS_OPENS - after,
-                            "{cell}: {report:?}"
-                        );
-                        assert_eq!(
-                            got, expected,
-                            "{cell}: the stats must be of the pinned input"
-                        );
-                    }
-                    (reopen_cell::Scenario::Path, false) => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                        assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-                    }
-                }
-            });
-        }
-    }
-}
-
-/// Replaced between the probe and the walk, the walk refuses (path reopen)
-/// or reads the pinned file (stable reopen name).
+/// Check `node_stats` in every read mode through [`pinned_cell::check`]:
+/// the reference with its exact transports (the probe direct on a direct
+/// run, the classify walk buffered, following the `--nodes` part of the
+/// inspect row of `crates/cli/src/io_reach.rs`), then the replacement
+/// armed after each open in turn, in both reopen modes. Replaced between
+/// the probe and the walk, the walk refuses (path reopen) or reads the
+/// pinned file (stable reopen name).
 #[test]
 fn node_stats_reads_only_the_pinned_input() {
-    check_node_stats(false, |_| false);
-}
-
-/// The probe opens `O_DIRECT` when asked to, through the pin.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn node_stats_direct_reads_follow_the_pinned_input() {
-    check_node_stats(true, |e| crate::common::direct_io_unavailable(e));
+    for &direct in pinned_cell::modes() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        write_input(&input, true);
+        let cell = Cell::new(
+            "node_stats",
+            direct,
+            &input,
+            &replacement,
+            NODE_STATS_OPENS,
+            "DB",
+        );
+        pinned_cell::check(
+            &cell,
+            |host| run_node_stats(&input, direct, host),
+            |stats| {
+                assert_eq!(stats.node_count, 30, "the unreplaced node count");
+                stats
+            },
+            |_, _| {
+                write_input(&input, true);
+                write_replacement(&replacement, true);
+            },
+            |(), step| run_node_stats(step.pin, direct, step.host),
+            |expected, (), step, judged| {
+                if let Judged::Unaffected(got) = judged {
+                    assert_eq!(
+                        &got, expected,
+                        "{}: the stats must be of the pinned input",
+                        step.what
+                    );
+                }
+            },
+        );
+    }
 }
 
 /// A caller's pin is used as it is: replaced before the call, the stats are
@@ -639,16 +517,30 @@ fn node_stats_refuses_a_fifo() {
 // inspect_header
 // ---------------------------------------------------------------------------
 
-/// The header read and the size come from one open: through a caller's pin
-/// that open is counted once, and a replacement after it changes neither,
-/// in either reopen mode. A stat of the path would report the
+/// The size `inspect_header` reports through `pin`, its header checked.
+fn inspect_header_size(
+    pin: &pbfhogg::read::input::PinnedInput,
+    direct: bool,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<u64> {
+    pbfhogg::inspect::inspect_header(pin, direct, host).map(|read| {
+        assert!(read.header.is_sorted());
+        read.file_size
+    })
+}
+
+/// The header read and the size come from one open, through a caller's
+/// pin, in every read mode through [`pinned_cell::check`]: that open is
+/// counted once, direct on a direct run (the header probe of the inspect
+/// row of `crates/cli/src/io_reach.rs`), and a replacement after it changes
+/// neither, in either reopen mode. A stat of the path would report the
 /// replacement's size.
 #[test]
 fn inspect_header_takes_the_size_from_its_one_open() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
+    for &direct in pinned_cell::modes() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
         write_input(&input, true);
         write_replacement(&replacement, true);
         let size = std::fs::metadata(&input).expect("stat input").len();
@@ -659,23 +551,29 @@ fn inspect_header_takes_the_size_from_its_one_open() {
                 .len(),
             "the sizes must differ for the check to mean anything"
         );
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            host.invocation
-                .faults()
-                .arm_input_replacement(&input, &replacement, 1);
-            let read = pbfhogg::inspect::inspect_header(pin, false, &host)
-                .unwrap_or_else(|e| panic!("scenario {scenario:?}: {e}"));
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(report.fired, "{report:?}");
-            assert_eq!(report.attempts, 1, "{report:?}");
-            assert_eq!(read.file_size, size, "scenario {scenario:?}");
-            assert!(read.header.is_sorted());
-        });
+        let header = |source: &pbfhogg::read::input::PinnedInput, host: &pbfhogg::host::Host| {
+            inspect_header_size(source, direct, host)
+        };
+        let cell = Cell::new("inspect_header", direct, &input, &replacement, 1, "D");
+        pinned_cell::check(
+            &cell,
+            |host| header(&pbfhogg::read::input::PinnedInput::pin(&input, host)?, host),
+            |file_size| {
+                assert_eq!(file_size, size, "the unreplaced size");
+                file_size
+            },
+            |_, _| {
+                write_input(&input, true);
+                write_replacement(&replacement, true);
+            },
+            |(), step| header(step.pin, step.host),
+            |expected, (), step, judged| {
+                let Judged::Unaffected(file_size) = judged else {
+                    panic!("{}: the one open is the last", step.what);
+                };
+                assert_eq!(file_size, *expected, "{}", step.what);
+            },
+        );
     }
 }
 

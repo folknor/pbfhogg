@@ -20,7 +20,7 @@
 //! its ways and nodes other names and coordinates, so a build that read any
 //! open's worth of it publishes other bytes, or fails.
 
-use crate::reopen_cell;
+use crate::pinned_cell::{self, Cell, Judged};
 
 use std::path::{Path, PathBuf};
 
@@ -227,59 +227,6 @@ fn assert_index_of(index_dir: &Path, fixture: &Fixture, identity: (u128, u64), c
     assert_eq!(admin, [fixture.country], "{cell}");
 }
 
-/// What [`reference`] found.
-enum Reference {
-    /// Every file of the unreplaced build's index.
-    Index(std::collections::BTreeMap<PathBuf, Vec<u8>>),
-    /// The host cannot run the route.
-    Skipped,
-}
-
-/// The unreplaced build's index, its open count and content checked: armed
-/// past the last open, the replacement never fires and only counts. Skipped
-/// when the build failed and `skippable` accepts its error; any other
-/// failure panics.
-fn reference(
-    route: Route,
-    input: &Path,
-    dir: &Path,
-    skippable: impl Fn(&pbfhogg::Error) -> bool,
-) -> Reference {
-    let index_dir = dir.join("reference-index");
-    let host = crate::common::test_host();
-    host.invocation
-        .faults()
-        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), OPENS + 1);
-    match run(route, input, &index_dir, &host) {
-        Ok(_) => {}
-        Err(e) if skippable(&e) => {
-            crate::common::skip(format!("{route:?}: {e}"));
-            return Reference::Skipped;
-        }
-        Err(e) => panic!("{route:?}: unreplaced build: {e}"),
-    }
-    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
-    let counted = host
-        .invocation
-        .faults()
-        .input_replacement()
-        .expect("armed replacement");
-    assert!(!counted.fired, "{route:?}: {counted:?}");
-    assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
-    assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
-    assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
-    crate::common::witness_transports(route.direct, &counted, || "DDBB", &format!("{route:?}"));
-    assert_index_of(
-        &index_dir,
-        &INPUT,
-        identity_of(input),
-        &format!("{route:?}, unreplaced"),
-    );
-    let files = index_files(&index_dir);
-    std::fs::remove_dir_all(&index_dir).expect("remove reference index");
-    Reference::Index(files)
-}
-
 /// Put the index of [`REPLACEMENT`] at `index_dir`: a refused build must
 /// leave it as it was, and a build that went through replaces it with the
 /// reference's bytes, which differ from it.
@@ -290,144 +237,100 @@ fn seed_old_index(route: Route, dir: &Path, index_dir: &Path) {
     std::fs::remove_file(&old_input).expect("remove old input");
 }
 
-/// Run `route` with the replacement armed after each open in turn, in both
-/// reopen modes, against the unreplaced `expected`.
-fn check_replacements(
-    route: Route,
-    dir: &Path,
-    input: &Path,
-    expected: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
-) {
-    let replacement = dir.join("replacement.osm.pbf");
-    let index_dir = dir.join("index");
-    for after in 1..=OPENS {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            seed_old_index(route, dir, &index_dir);
-            let old = index_files(&index_dir);
-            assert_ne!(
-                &old, expected,
-                "the old index must differ from the reference"
-            );
-            write_fixture(input, &INPUT, route.indexdata);
-            let identity = identity_of(input);
-            write_fixture(&replacement, &REPLACEMENT, route.indexdata);
-            assert_ne!(identity_of(&replacement), identity);
-            let host = crate::common::test_host();
-            scenario.run(input, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(input, &replacement, after);
-                let before = snapshot_dir(dir);
-                let result = run(route, pin, &index_dir, &host);
+type Index = std::collections::BTreeMap<PathBuf, Vec<u8>>;
 
-                let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(
-                    report.fired,
-                    "{cell}: the replacement must fire: {report:?}"
+/// Check `route` in every read mode through [`pinned_cell::check`]: the
+/// reference build with its exact transports (the probe and the
+/// replication header read direct on a direct run, the schedule walk and
+/// the digest's description buffered, following the build-geocode-index
+/// row of `crates/cli/src/io_reach.rs`), then the replacement armed after
+/// each open in turn, in both reopen modes, over an existing index.
+fn check_route(route: Route) {
+    for &direct in pinned_cell::modes() {
+        let route = Route { direct, ..route };
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        let reference_dir = dir.path().join("reference-index");
+        let index_dir = dir.path().join("index");
+        write_fixture(&input, &INPUT, route.indexdata);
+        let cell = Cell::new(
+            format!("{route:?}"),
+            direct,
+            &input,
+            &replacement,
+            OPENS,
+            "DDBB",
+        )
+        .scratch(dir.path());
+        pinned_cell::check(
+            &cell,
+            |host| run(route, &input, &reference_dir, host),
+            |_| {
+                assert_index_of(
+                    &reference_dir,
+                    &INPUT,
+                    identity_of(&input),
+                    &format!("{route:?}, unreplaced"),
                 );
-
-                // After the last open nothing opens again, so the build reads
-                // only what it already holds, in either mode.
-                if matches!(scenario, reopen_cell::Scenario::Pinned) || after == OPENS {
-                    result.unwrap_or_else(|e| {
-                        panic!("{cell}: the build is unaffected by the replacement: {e}")
-                    });
-                    assert_eq!(report.attempts, OPENS, "{cell}: {report:?}");
-                    assert_eq!(report.verified, OPENS, "{cell}: {report:?}");
-                    assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                    assert_eq!(
-                        report.attempts_after_fired,
-                        OPENS - after,
-                        "{cell}: {report:?}"
-                    );
-                    assert_index_of(&index_dir, &INPUT, identity, &cell);
-                    assert_eq!(
+                let files = index_files(&reference_dir);
+                std::fs::remove_dir_all(&reference_dir).expect("remove reference index");
+                files
+            },
+            |_, _| {
+                seed_old_index(route, dir.path(), &index_dir);
+                let old = index_files(&index_dir);
+                write_fixture(&input, &INPUT, route.indexdata);
+                let identity = identity_of(&input);
+                write_fixture(&replacement, &REPLACEMENT, route.indexdata);
+                assert_ne!(identity_of(&replacement), identity);
+                (old, identity)
+            },
+            |_, step| run(route, step.pin, &index_dir, step.host),
+            |expected: &Index, (old, identity), step, judged| {
+                assert_ne!(
+                    old, expected,
+                    "the old index must differ from the reference"
+                );
+                match judged {
+                    Judged::Unaffected(_) => {
+                        assert_index_of(&index_dir, &INPUT, *identity, &step.what);
+                        assert_eq!(
+                            &index_files(&index_dir),
+                            expected,
+                            "{}: the index must hold only what the pinned input yields",
+                            step.what
+                        );
+                    }
+                    Judged::Refused => assert_eq!(
                         &index_files(&index_dir),
-                        expected,
-                        "{cell}: the index must hold only what the pinned input yields"
-                    );
-                } else {
-                    let err = result
-                        .err()
-                        .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{cell}: {err:?}"
-                    );
-                    assert_eq!(err.source_path(), Some(input), "{cell}: {err:?}");
-                    assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                    assert_eq!(report.verified, after, "{cell}: {report:?}");
-                    assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-                    assert_eq!(report.attempts_after_fired, 1, "{cell}: {report:?}");
-                    assert_eq!(
-                        index_files(&index_dir),
                         old,
-                        "{cell}: a refused build must leave the existing index as it was"
-                    );
-                    // The replacement was renamed over the input, so it is the
-                    // one path the build itself did not account for.
-                    let mut after_run = snapshot_dir(dir);
-                    after_run.insert(PathBuf::from("replacement.osm.pbf"));
-                    crate::common::assert_scratch_unchanged(&before, &after_run);
+                        "{}: a refused build must leave the existing index as it was",
+                        step.what
+                    ),
                 }
                 std::fs::remove_dir_all(&index_dir).expect("remove index");
-            });
-        }
+            },
+        );
     }
-}
-
-fn check_route(route: Route, skippable: impl Fn(&pbfhogg::Error) -> bool) {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    write_fixture(&input, &INPUT, route.indexdata);
-    let Reference::Index(expected) = reference(route, &input, dir.path(), skippable) else {
-        return;
-    };
-    check_replacements(route, dir.path(), &input, &expected);
 }
 
 #[test]
 fn indexed_build_reads_only_the_pinned_input() {
-    check_route(
-        Route {
-            indexdata: true,
-            direct: false,
-        },
-        |_| false,
-    );
+    check_route(Route {
+        indexdata: true,
+        direct: false,
+    });
 }
 
 /// `--allow-unindexed`: the walk decodes the unindexed blobs through its
 /// own description, and the open count is unchanged.
 #[test]
 fn unindexed_build_reads_only_the_pinned_input() {
-    check_route(
-        Route {
-            indexdata: false,
-            direct: false,
-        },
-        |_| false,
-    );
-}
-
-/// The probe and the header read open `O_DIRECT` when asked to,
-/// through the pin's own direct open; the walk stays buffered.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn direct_build_reads_only_the_pinned_input() {
-    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
-    check_route(
-        Route {
-            indexdata: true,
-            direct: true,
-        },
-        |e| crate::common::direct_io_unavailable(e),
-    );
+    check_route(Route {
+        indexdata: false,
+        direct: false,
+    });
 }
 
 /// The index carries the input header's replication values verbatim: a

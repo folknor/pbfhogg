@@ -48,6 +48,9 @@ mod common;
 #[path = "common/fifo_capture.rs"]
 mod fifo_capture;
 #[cfg(pbfhogg_test_hooks)]
+#[path = "common/pinned_cell.rs"]
+mod pinned_cell;
+#[cfg(pbfhogg_test_hooks)]
 #[path = "common/reopen_cell.rs"]
 mod reopen_cell;
 

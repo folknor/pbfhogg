@@ -1684,45 +1684,6 @@ pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
 // Error helpers for platform-specific I/O tests
 // ---------------------------------------------------------------------------
 
-/// The transport witness of a route's pinned-input opens: each verified open
-/// of the armed target, in order, took the transport the route documents.
-/// A buffered run (`direct` false, or a build without `linux-direct-io`)
-/// opens every time buffered; a direct run opens as `direct_spec` (asked
-/// only of a direct run) spells it, one letter per open, `D` for `O_DIRECT`
-/// and `B` for buffered, matching the command's documented reach
-/// (`crates/cli/src/io_reach.rs`). This is what attributes a mixed route's
-/// transports: the invocation's `direct_io_read_opens` count is satisfied
-/// by any one direct open, so a documented direct path falling back to
-/// buffered beside another direct one passes it, and fails here. The tag
-/// is the pin constructor's; that a `Direct` descriptor carries `O_DIRECT`
-/// rests on `direct_io`'s own unit test.
-#[cfg(pbfhogg_test_hooks)]
-pub fn witness_transports<S: AsRef<str>>(
-    direct: bool,
-    counted: &pbfhogg::test_hooks::InputReplacement,
-    direct_spec: impl FnOnce() -> S,
-    what: &str,
-) {
-    use pbfhogg::test_hooks::Transport;
-    let expected: Vec<Transport> = if direct && cfg!(feature = "linux-direct-io") {
-        direct_spec()
-            .as_ref()
-            .chars()
-            .map(|c| match c {
-                'D' => Transport::Direct,
-                'B' => Transport::Buffered,
-                other => panic!("{what}: transport spec letter {other:?}"),
-            })
-            .collect()
-    } else {
-        vec![Transport::Buffered; counted.transports.len()]
-    };
-    assert_eq!(
-        counted.transports, expected,
-        "{what}: pinned-input transports"
-    );
-}
-
 /// An invocation's `direct_io_<direction>_opens` counter: its successful
 /// `O_DIRECT` opens, `direction` being `read` or `write`.
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
@@ -1748,18 +1709,6 @@ pub fn assert_direct_opened(invocation: &pbfhogg::host::Invocation, direction: &
         direct_opens(invocation, direction) > 0,
         "{what}: no O_DIRECT {direction} open was recorded"
     );
-}
-
-/// [`assert_direct_opened`] for reads when `direct` says the run asked for
-/// them, for cells whose routes run either way. Builds without
-/// `linux-direct-io` have no direct route to witness.
-pub fn witness_direct_reads(direct: bool, invocation: &pbfhogg::host::Invocation, what: &str) {
-    #[cfg(feature = "linux-direct-io")]
-    if direct {
-        assert_direct_opened(invocation, "read", what);
-    }
-    #[cfg(not(feature = "linux-direct-io"))]
-    let _ = (direct, invocation, what);
 }
 
 /// Whether `err` authorizes dropping an O_DIRECT cell: only the typed

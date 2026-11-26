@@ -31,36 +31,25 @@ join requests only stage 1, so two joins on one unit overlapping after stage 1 p
 test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
 `Grant` and `Fixed`) are light by convention.
 
-## VER-018 - Fault files drive some routes buffered only, and a backend cell can return unwitnessed
+## VER-018 - Backend cells outside the pinned-cell driver can return unwitnessed
 
-extract, sort, add-locations-to-ways and getparents now drive every route direct
-with an exact transport list. Residue:
+Every reference-and-replacement-matrix cell of the `fault_*_input` files now runs
+through `crates/lib/tests/common/pinned_cell.rs`, which owns the reference, its exact
+transport list and the matrix, in both read modes, so those cells cannot end early
+without a witness. Residue:
 
-- Routes the other fault files drive buffered but never direct, so their direct
-  transports are unpinned: getid (forced unindexed `Include`; `AddReferenced`
-  node-only, and relation-without-way on indexed and unindexed); tags_filter
-  (two-pass without a selected relation, forced unindexed two-pass, the no-probe
-  inverted and metadata-distrust variants of two-pass and `-R`); cat (plain,
-  enriched plain with either input unindexed, type-filtered, untyped clean,
-  type-clean with the first unindexed, dedupe with the first unindexed);
-  check_ids (forced unindexed, ways-only, both modes); degrade (every decode
-  variant but strip-locations, every passthrough variant but strip-indexdata);
-  derive (gzip OSC, mixed-sign, the multi-worker fallback layouts); diff (the
-  sequential, parallel and mixed-sign `diff`/`diff_stats` combinations, the
-  multi-worker fallback layouts); geocode (forced unindexed); inspect
-  (decode-only through a caller pin, `inspect_header`); repack (forced
-  unindexed, LocationsOnWays, absent relation kind); tags_count (forced
-  unindexed ways-only).
-- Two reference runs assert less than an exact list: inspect's node-stats cell
-  checks only that a direct read happened, and degrade's passthrough reference
-  does not arm the hook at all.
-- A backend cell can return early without a witness or a classified refusal and
-  pass; `PBFHOGG_TEST_REQUIRE` only bites when a refusal predicate is reached. A
-  token rule on `PlatformUnsupported` would not close it (reference/testing.md
-  says why). The shape that would: a guard armed before each route's attempt,
-  resolved only by a checked positive witness or a classified refusal, failing
-  the test when dropped unresolved; its acceptance test is an early-return
-  mutation of one route inside a loop.
+- The backend cells outside the driver still rest on the convention that a skip goes
+  through a refusal predicate and a success through a positive witness: the
+  roundtrip, `host_contract` and `process_nofile` direct and io_uring arms, the
+  library unit cells (`test_support::refused` users), the CLI direct cells, the
+  apply-changes `direct_reads_reach_every_base_open` cell (whose `return` on a
+  classified refusal also drops the later backends of its loop) and
+  `fault_uring_writer.rs`. Extending the driver's shape to them means a driver per
+  kind of cell (writer path constructors, CLI children), each owning its run and
+  its witness.
+- The repeated-input cells (`cat a a`, `diff a a`, `derive a a`) and the
+  replaced-before-the-call caller-pin cells are hand-rolled and run buffered only;
+  their direct transports are unpinned.
 
 ## VER-133 - Geocode admin and antimeridian paths the real-data check does not reach
 

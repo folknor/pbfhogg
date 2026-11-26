@@ -5,9 +5,9 @@
 //! stable scratch reopen name a replaced input does not affect the run,
 //! and where opens go through the path the run fails with
 //! `InputReplaced` and publishes nothing. Each route is checked with the
-//! replacement armed after each of its opens but the last in turn, so every
-//! later open is shown to follow the pin and the refusal path of every open
-//! after the first runs.
+//! replacement armed after each of its opens in turn, the last included,
+//! so every later open is shown to follow the pin and the refusal path of
+//! every open after the first runs.
 //!
 //! The opens, in order: the front read (the indexdata precondition), pass
 //! 1's header walker and pass 2's source. The passthrough read, the writer's
@@ -16,15 +16,15 @@
 //! without; the overlap layouts check that the workers' reads follow the pin
 //! too.
 
-use crate::reopen_cell;
+use crate::pinned_cell::{self, Cell, Judged};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::write::WriteOptions;
 use pbfhogg::writer::{Compression, PbfWriter};
 
-use crate::common::{generate_nodes, generate_ways, snapshot_dir, write_multi_block_test_pbf};
+use crate::common::{generate_nodes, generate_ways, write_multi_block_test_pbf};
 
 /// Which element kinds carry an interleaved pair of blobs, each pair one
 /// overlap run.
@@ -156,146 +156,50 @@ fn run<'a>(
     .map(drop)
 }
 
-/// The unreplaced run's output, with its opens and their transports
-/// checked: armed past the last open, the replacement never fires and only
-/// counts. Every open is direct on a direct run, following the sort row of
-/// `io_reach.rs` ("all reads direct"). Skipped when the host refused
-/// O_DIRECT setup, the one refusal that skips.
-fn reference(route: Route, direct: bool, input: &Path, dir: &Path) -> Reference {
-    let opens = route.opens();
-    let what = format!("{route:?}, direct {direct}");
-    let reference = dir.join("reference.osm.pbf");
-    let host = crate::common::test_host();
-    host.invocation
-        .faults()
-        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), opens + 1);
-    match run(route, direct, input, &reference, &host) {
-        Ok(()) => {}
-        #[cfg(feature = "linux-direct-io")]
-        Err(e) if direct && crate::common::direct_io_unavailable(&e) => {
-            crate::common::skip(format!("{what}: {e}"));
-            return Reference::Skipped;
-        }
-        Err(e) => panic!("{what}: unreplaced run: {e}"),
-    }
-    crate::common::witness_direct_reads(direct, &host.invocation, &what);
-    let counted = host
-        .invocation
-        .faults()
-        .input_replacement()
-        .expect("armed replacement");
-    assert!(!counted.fired, "{what}: {counted:?}");
-    assert_eq!(counted.attempts, opens, "{what}: {counted:?}");
-    assert_eq!(counted.verified, opens, "{what}: {counted:?}");
-    crate::common::witness_transports(direct, &counted, || "DDD", &what);
-    let expected = std::fs::read(&reference).expect("read reference output");
-    std::fs::remove_file(&reference).expect("remove reference output");
-    Reference::Output(expected)
-}
-
-/// What [`reference`] found.
-enum Reference {
-    /// The output's bytes.
-    Output(Vec<u8>),
-    /// The host refused O_DIRECT setup.
-    #[cfg_attr(
-        not(feature = "linux-direct-io"),
-        expect(dead_code, reason = "only a direct run skips")
-    )]
-    Skipped,
-}
-
-/// Run `route` with the replacement armed after each of its opens but the
-/// last in turn, in both reopen modes.
+/// Run `route` in every read mode through [`pinned_cell::check`]: the
+/// reference with its exact transports (every open direct on a direct run,
+/// following the sort row of `crates/cli/src/io_reach.rs`, "all reads
+/// direct"), then the replacement armed after each open in turn, in both
+/// reopen modes.
 fn check_route(route: Route) {
-    check_route_with(route, false);
-}
-
-fn check_route_with(route: Route, direct: bool) {
-    let opens = route.opens();
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    write_input(route, &input);
-
-    let Reference::Output(expected) = reference(route, direct, &input, dir.path()) else {
-        return;
-    };
-
-    for after in 1..opens {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(route, &input);
-            write_replacement(&replacement);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(&input, &replacement, after);
-                let output = dir.path().join("out.osm.pbf");
-                let before = snapshot_dir(dir.path());
-                let result = run(route, direct, pin, &output, &host);
-
-                let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(
-                    report.fired,
-                    "{cell}: the replacement must fire: {report:?}"
-                );
-
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        result.unwrap_or_else(|e| {
-                            panic!("{cell}: a pinned run is unaffected by the replacement: {e}")
-                        });
-                        assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                        assert_eq!(report.verified, opens, "{cell}: {report:?}");
-                        assert_eq!(
-                            report.attempts_after_fired,
-                            opens - after,
-                            "{cell}: {report:?}"
-                        );
-                        assert_eq!(
-                            std::fs::read(&output).expect("read output"),
-                            expected,
-                            "{cell}: the run must read only the input it pinned"
-                        );
-                        std::fs::remove_file(&output).expect("remove output");
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                        assert_eq!(
-                            report.attempts,
-                            after + report.refused,
-                            "{cell}: {report:?}"
-                        );
-                        assert_eq!(
-                            report.attempts_after_fired, report.refused,
-                            "{cell}: {report:?}"
-                        );
-                        assert!(
-                            !output.exists(),
-                            "{cell}: a refused run must publish nothing"
-                        );
-                        // The replacement was renamed over the input, so it is the
-                        // one path the run itself did not account for.
-                        let mut after_run = snapshot_dir(dir.path());
-                        after_run.insert(PathBuf::from("replacement.osm.pbf"));
-                        crate::common::assert_scratch_unchanged(&before, &after_run);
-                    }
-                }
-            });
-        }
+    for &direct in pinned_cell::modes() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        let output = dir.path().join("out.osm.pbf");
+        write_input(route, &input);
+        let cell = Cell::new(
+            format!("{route:?}"),
+            direct,
+            &input,
+            &replacement,
+            route.opens(),
+            "DDD",
+        )
+        .scratch(dir.path());
+        pinned_cell::check(
+            &cell,
+            |host| run(route, direct, &input, &output, host),
+            |()| pinned_cell::take(&output),
+            |_, _| {
+                write_input(route, &input);
+                write_replacement(&replacement);
+            },
+            |(), step| run(route, direct, step.pin, &output, step.host),
+            |expected, (), step, judged| match judged {
+                Judged::Unaffected(()) => assert_eq!(
+                    &pinned_cell::take(&output),
+                    expected,
+                    "{}: the run must read only the input it pinned",
+                    step.what
+                ),
+                Judged::Refused => assert!(
+                    !output.exists(),
+                    "{}: a refused run must publish nothing",
+                    step.what
+                ),
+            },
+        );
     }
 }
 
@@ -331,18 +235,5 @@ fn concurrent_overlap_runs_read_only_the_pinned_input() {
             overlaps: Overlaps::Both,
             indexed,
         });
-    }
-}
-
-/// Every route again with direct reads: the front read, the header walker
-/// and the pass 2 source all open `O_DIRECT` through the pin.
-#[cfg(feature = "linux-direct-io")]
-#[test]
-fn direct_reads_follow_the_pinned_input() {
-    check_route_with(Route::DeclaredSorted, true);
-    for overlaps in [Overlaps::Nodes, Overlaps::Ways, Overlaps::Both] {
-        for indexed in [true, false] {
-            check_route_with(Route::Unsorted { overlaps, indexed }, true);
-        }
     }
 }

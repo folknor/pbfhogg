@@ -13,6 +13,7 @@
 //!
 //! The replacement carries other IDs, so a digest of it differs.
 
+use crate::pinned_cell::{self, Cell, Judged};
 use crate::reopen_cell;
 
 use std::path::Path;
@@ -57,88 +58,43 @@ fn expected(input: &Path) -> Digest {
     run(input, false, &crate::common::test_host()).expect("the unreplaced input")
 }
 
-/// One open, through the caller's pin, buffered or direct: armed past it,
-/// the replacement never fires and only counts.
+/// One open, through the caller's pin, in every read mode through
+/// [`pinned_cell::check`]: armed past it, the replacement never fires and
+/// only counts, and the open is direct on a direct run. Replaced right
+/// after it, the run reads only the file it opened, whichever way a later
+/// open would have reached the pin: nothing opens again.
 #[test]
 fn digest_opens_its_input_once() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    write_input(&input);
-    let expected = expected(&input);
-    let directs: &[bool] = if cfg!(feature = "linux-direct-io") {
-        &[false, true]
-    } else {
-        &[false]
-    };
-    for &direct in directs {
-        let host = crate::common::test_host();
-        let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        host.invocation.faults().arm_input_replacement(
-            &input,
-            &dir.path().join("unused.osm.pbf"),
-            2,
-        );
-        let digest = match run(&pin, direct, &host) {
-            Ok(digest) => digest,
-            // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
-            #[cfg(feature = "linux-direct-io")]
-            Err(e) if direct && crate::common::direct_io_unavailable(&e) => {
-                crate::common::skip(format!("direct {direct}: {e}"));
-                continue;
-            }
-            Err(e) => panic!("direct {direct}: {e}"),
-        };
-        assert_eq!(digest, expected, "direct {direct}");
-        crate::common::witness_direct_reads(direct, &host.invocation, "digest");
-        let report = host
-            .invocation
-            .faults()
-            .input_replacement()
-            .expect("armed replacement");
-        assert!(!report.fired, "direct {direct}: {report:?}");
-        assert_eq!(report.attempts, 1, "direct {direct}: {report:?}");
-        assert_eq!(report.verified, 1, "direct {direct}: {report:?}");
-        assert_eq!(report.refused, 0, "direct {direct}: {report:?}");
-        crate::common::witness_transports(direct, &report, || "D", "digest");
-    }
-}
-
-/// Replaced right after the one open, the run reads only the file it
-/// opened, whichever way a later open would have reached the pin: nothing
-/// opens again.
-#[test]
-fn a_replacement_after_the_open_does_not_reach_the_run() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
+    for &direct in pinned_cell::modes() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
         write_input(&input);
         let expected = expected(&input);
-        write_replacement(&replacement);
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            host.invocation
-                .faults()
-                .arm_input_replacement(&input, &replacement, 1);
-            let result = run(pin, false, &host);
-            let cell = format!("scenario {scenario:?}");
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(
-                report.fired,
-                "{cell}: the replacement must fire: {report:?}"
-            );
-            assert_eq!(
-                result.unwrap_or_else(|e| panic!("{cell}: {e}")),
-                expected,
-                "{cell}: the run must read only the file it opened"
-            );
-            assert_eq!(report.attempts, 1, "{cell}: {report:?}");
-            assert_eq!(report.attempts_after_fired, 0, "{cell}: {report:?}");
-        });
+        let cell = Cell::new("digest", direct, &input, &replacement, 1, "D");
+        pinned_cell::check(
+            &cell,
+            |host| run(&PinnedInput::pin(&input, host)?, direct, host),
+            |digest| {
+                assert_eq!(digest, expected, "{}", cell.what());
+                digest
+            },
+            |_, _| {
+                write_input(&input);
+                write_replacement(&replacement);
+            },
+            |(), step| run(step.pin, direct, step.host),
+            |expected, (), step, judged| {
+                let Judged::Unaffected(digest) = judged else {
+                    panic!("{}: the one open is the last", step.what);
+                };
+                assert_eq!(
+                    &digest, expected,
+                    "{}: the run must read only the file it opened",
+                    step.what
+                );
+            },
+        );
     }
 }
 

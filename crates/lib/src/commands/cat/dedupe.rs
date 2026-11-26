@@ -611,9 +611,23 @@ mod tests {
             };
             let merge = plan_merge(&sources, &spliced, &host).expect("direct pass 1");
             let name = format!("{backend:?}.osm.pbf");
+            // Read after pass 1, so its walk cannot stand in for pass 2's
+            // sources.
+            let direct_reads = || {
+                host.invocation
+                    .metrics()
+                    .direct_io
+                    .read_opens
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let reads_before = direct_reads();
             match merged_output(dir.path(), &host, merge, &spliced, &name) {
                 Ok(copied) => {
                     assert_eq!(copied, expected, "{backend:?}");
+                    assert!(
+                        direct_reads() > reads_before,
+                        "{backend:?}: pass 2 opened no source O_DIRECT"
+                    );
                     // Only the io_uring pass registers a pool, and it must:
                     // the witness that the cell ran that backend.
                     let uring = matches!(backend, crate::write::OutputBackend::Uring);
@@ -623,13 +637,15 @@ mod tests {
                         "{backend:?}: registered pool"
                     );
                 }
-                // Only a typed io_uring setup refusal skips.
+                // Only a typed io_uring setup refusal of the io_uring pass
+                // skips.
                 Err(e)
-                    if crate::test_support::refused(
-                        crate::test_support::Backend::IoUring,
-                        &e,
-                        &["io-uring"],
-                    ) =>
+                    if matches!(backend, crate::write::OutputBackend::Uring)
+                        && crate::test_support::refused(
+                            crate::test_support::Backend::IoUring,
+                            &e,
+                            &["io-uring"],
+                        ) =>
                 {
                     crate::test_support::skip(format!("the io_uring pass 2: {e}"));
                 }

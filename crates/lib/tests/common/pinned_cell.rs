@@ -17,6 +17,12 @@
 //! open with `InputReplaced`. Each matrix run holds the same direct-open
 //! count rule as the reference (a refused run, which may stop before its
 //! first direct open, only the half that forbids one). The command's
+//! Last, the caller-pin arm in both reopen strategies: the target replaced
+//! after the step's pin is taken and before the call (`Step::after` 0),
+//! where the stable-name pin must read the pinned file with the cell's
+//! exact transports and the path pin must refuse its first open. That arm
+//! is what catches a run that pins the path afresh on the step's own host.
+//! The command's
 //! callbacks prepare the fixtures, run the command and check its answer;
 //! none of them decides whether a later phase runs, because the driver
 //! calls each in turn.
@@ -292,7 +298,113 @@ pub fn check<T, E, P, O>(
             }
         }
     }
+    for scenario in [Scenario::Pinned, Scenario::Path] {
+        caller_pin_arm(
+            cell,
+            scenario,
+            &expected,
+            &mut prepare,
+            &mut run,
+            &mut validate,
+        );
+    }
     Ran::Witnessed
+}
+
+/// The caller-pin arm: the target is replaced after the caller pinned it
+/// and before the call (`Step::after` 0). The stable-name pin must read the
+/// file the caller pinned, every open through it, with the cell's exact
+/// transports; the path pin must refuse its first open. This is what catches
+/// a run that pins the path afresh on the step's own host, which the matrix
+/// cannot see on a route with one open.
+fn caller_pin_arm<E, P, O>(
+    cell: &Cell<'_>,
+    scenario: Scenario,
+    expected: &E,
+    prepare: &mut impl FnMut(u64, Scenario) -> P,
+    run: &mut impl FnMut(&P, &Step<'_>) -> pbfhogg::Result<O>,
+    validate: &mut impl FnMut(&E, &P, &Step<'_>, Judged<O>),
+) {
+    let what = &cell.what;
+    let prepared = prepare(0, scenario);
+    let host = (cell.host)();
+    let unused = cell
+        .target
+        .with_file_name("never-renamed-over-the-input.osm.pbf");
+    let mut outcome = None;
+    scenario.run(cell.target, &host, |pin, scenario| {
+        outcome = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || {
+                std::fs::rename(cell.replacement, cell.target)
+                    .unwrap_or_else(|e| panic!("{what}: replace the input before the call: {e}"));
+                host.invocation.faults().arm_input_replacement(
+                    cell.target,
+                    &unused,
+                    cell.opens + 1,
+                );
+                let before = cell.scratch.map(crate::common::snapshot_dir);
+                let step = Step {
+                    after: 0,
+                    scenario,
+                    pin,
+                    host: &host,
+                    what: format!("{what}, replaced before the call, scenario {scenario:?}"),
+                };
+                let result = run(&prepared, &step);
+                let report = report(&host, cell, &unused, cell.opens + 1);
+                let what = &step.what;
+                assert!(!report.fired, "{what}: {report:?}");
+                let verdict = if scenario == Scenario::Pinned {
+                    let out = match result {
+                        Ok(out) => out,
+                        Err(e) if refusal_skips(cell, &e) => {
+                            crate::common::skip(format!("{what}: {e}"));
+                            return;
+                        }
+                        Err(e) => panic!("{what}: the caller's pin must be read: {}", e.report()),
+                    };
+                    assert_eq!(report.attempts, cell.opens, "{what}: {report:?}");
+                    assert_eq!(report.verified, cell.opens, "{what}: {report:?}");
+                    assert_eq!(report.refused, 0, "{what}: {report:?}");
+                    assert_eq!(
+                        letters(&report.transports),
+                        cell.spec,
+                        "{what}: pinned-input transports"
+                    );
+                    witness_direct_count(cell, &host, true);
+                    Judged::Unaffected(out)
+                } else {
+                    let err = result.err().unwrap_or_else(|| {
+                        panic!(
+                            "{what}: a path reopen of an input replaced before the call must refuse"
+                        )
+                    });
+                    assert!(
+                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                        "{what}: {err:?}"
+                    );
+                    assert_eq!(err.source_path(), Some(cell.target), "{what}: {err:?}");
+                    assert_eq!(report.refused, 1, "{what}: {report:?}");
+                    assert_eq!(report.attempts, 1, "{what}: {report:?}");
+                    assert_eq!(report.verified, 0, "{what}: {report:?}");
+                    witness_direct_count(cell, &host, false);
+                    if let (Some(dir), Some(before)) = (cell.scratch, before.as_ref()) {
+                        crate::common::assert_scratch_unchanged(
+                            before,
+                            &crate::common::snapshot_dir(dir),
+                        );
+                    }
+                    Judged::Refused
+                };
+                validate(expected, &prepared, &step, verdict);
+            },
+        )));
+    });
+    match outcome {
+        Some(Ok(())) => {}
+        Some(Err(failure)) => std::panic::resume_unwind(failure),
+        None => panic!("{what}: the caller-pin run, scenario {scenario:?}, was not judged"),
+    }
 }
 
 /// Whether `err` ends the cell as a skip: only a typed `direct-io` setup
@@ -528,7 +640,9 @@ mod tests {
                 (1, Scenario::Pinned),
                 (1, Scenario::Path),
                 (2, Scenario::Pinned),
-                (2, Scenario::Path)
+                (2, Scenario::Path),
+                (0, Scenario::Pinned),
+                (0, Scenario::Path)
             ]
         );
     }
@@ -541,11 +655,7 @@ mod tests {
     }
 
     /// A matrix run that took a fresh pin of the path on another host,
-    /// rather than the step's, is not the counted run the driver judges. A
-    /// fresh pin on the step's own host is the caller-pin cells' to catch
-    /// (they replace the input before the call): in a one-open arm both
-    /// pins name the original file until the replacement, so the matrix
-    /// cannot tell them apart.
+    /// rather than the step's, is not the counted run the driver judges.
     #[cfg(unix)]
     #[test]
     fn a_run_that_ignores_the_steps_pin_fails() {
@@ -556,6 +666,21 @@ mod tests {
                     &crate::common::test_host(),
                 )?;
                 toy(&fresh, 2)
+            });
+        });
+    }
+
+    /// A one-open run that pins the path afresh on the step's own host
+    /// passes the matrix (both pins name the original file until the
+    /// replacement) and fails the caller-pin arm, where it reads the
+    /// replacement.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_pins_the_path_afresh_fails() {
+        fails("replaced before the call", |dir| {
+            toy_cell(dir, 1, 1, |(), step| {
+                let fresh = pbfhogg::read::input::PinnedInput::pin(step.pin.path(), step.host)?;
+                toy(&fresh, 1)
             });
         });
     }

@@ -426,84 +426,71 @@ fn dedupe_reads_only_the_pinned_inputs() {
 /// A path given twice is one pin read twice: `cat a a` reads the one file
 /// it pinned for both arguments (stable reopen name) or refuses (path reopen), and the
 /// fault plan counts both arguments' opens on the one path.
+///
+/// The cell runs through [`pinned_cell::check`] in every read mode: the one
+/// path's opens are both arguments' opens, so the spec is the route's
+/// doubled. The path-reopen matrix arms keep the repeated path arguments,
+/// so the library's own pinning of `cat a a` stays exercised; the
+/// stable-name arms, and the caller-pin arm (whose replacement precedes
+/// any pin the library could take), pass the step's pin as both arguments.
 #[test]
 fn a_repeated_input_is_one_pin() {
     for (mode, opens) in [(Mode::Plain, 4), (Mode::Dedupe, 6)] {
-        let route = Route::of(mode);
-        let inputs = inputs(route);
-        let dir = inputs.dir.path();
-        let input = &inputs.paths[0];
-        let files = [input.as_path(), input.as_path()];
-        let output = dir.join("out.osm.pbf");
-        let replacement = dir.join("replacement.osm.pbf");
-
-        let host = crate::common::test_host();
-        host.invocation
-            .faults()
-            .arm_input_replacement(input, &replacement, opens + 1);
-        run(route, &files, &output, &host)
-            .unwrap_or_else(|e| panic!("{mode:?}: unreplaced run: {}", e.report()));
-        let counted = host.invocation.faults().input_replacement().expect("armed");
-        assert_eq!(counted.attempts, opens, "{mode:?}: {counted:?}");
-        let expected = std::fs::read(&output).expect("read reference");
-        std::fs::remove_file(&output).expect("remove reference");
-
-        for after in 1..opens {
-            for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-                write_fixture(input, input_fixture(route, 0));
-                write_fixture(&replacement, replacement_fixture(route, 0));
-                let host = crate::common::test_host();
-                scenario.run(input, &host, |pin, scenario| {
-                    host.invocation
-                        .faults()
-                        .arm_input_replacement(input, &replacement, after);
-                    // The refusal arm keeps the repeated path arguments, so the
-                    // library's own pinning of `cat a a` stays exercised; only
-                    // the stable-name arm needs the injected caller pin.
-                    let result = match scenario {
-                        reopen_cell::Scenario::Pinned => {
-                            let sources = [
-                                pbfhogg::read::input::InputSource::Pinned(pin),
-                                pbfhogg::read::input::InputSource::Pinned(pin),
-                            ];
-                            run(route, &sources, &output, &host)
-                        }
-                        reopen_cell::Scenario::Path => {
-                            host.invocation
-                                .faults()
-                                .force_pin_path_reopen
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                            run(route, &files, &output, &host)
-                        }
-                    };
-                    let cell =
-                        format!("{mode:?}, replaced after open {after}, scenario {scenario:?}");
-                    let report = host.invocation.faults().input_replacement().expect("armed");
-                    assert!(report.fired, "{cell}: {report:?}");
-                    match scenario {
-                        reopen_cell::Scenario::Pinned => {
-                            result.unwrap_or_else(|e| panic!("{cell}: {}", e.report()));
-                            assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                            assert_eq!(
-                                std::fs::read(&output).expect("read output"),
-                                expected,
-                                "{cell}: both arguments must read the pinned file"
-                            );
-                            std::fs::remove_file(&output).expect("remove output");
-                        }
-                        reopen_cell::Scenario::Path => {
-                            let err = result
-                                .err()
-                                .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                            assert!(
-                                matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                                "{cell}: {err:?}"
-                            );
-                            assert!(!output.exists(), "{cell}: published an output");
-                        }
+        for &direct in pinned_cell::modes() {
+            let route = Route {
+                direct,
+                ..Route::of(mode)
+            };
+            let inputs = inputs(route);
+            let dir = inputs.dir.path();
+            let input = &inputs.paths[0];
+            let files = [input.as_path(), input.as_path()];
+            let output = dir.join("out.osm.pbf");
+            let replacement = dir.join("replacement.osm.pbf");
+            let spec = route.transports(0).repeat(2);
+            assert_eq!(2 * route.opens(0), opens, "{route:?}");
+            let cell = Cell::new(
+                format!("{route:?}, repeated input"),
+                direct,
+                input,
+                &replacement,
+                opens,
+                &spec,
+            )
+            .scratch(dir);
+            pinned_cell::check(
+                &cell,
+                |host| run(route, &files, &output, host),
+                |()| pinned_cell::take(&output),
+                |_, _| {
+                    write_fixture(input, input_fixture(route, 0));
+                    write_fixture(&replacement, replacement_fixture(route, 0));
+                },
+                |(), step| {
+                    if step.scenario == reopen_cell::Scenario::Path && step.after > 0 {
+                        step.host
+                            .invocation
+                            .faults()
+                            .force_pin_path_reopen
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        run(route, &files, &output, step.host)
+                    } else {
+                        let pin = pbfhogg::read::input::InputSource::Pinned(step.pin);
+                        run(route, &[pin, pin], &output, step.host)
                     }
-                });
-            }
+                },
+                |expected, (), step, judged| match judged {
+                    Judged::Unaffected(()) => assert_eq!(
+                        &pinned_cell::take(&output),
+                        expected,
+                        "{}: both arguments must read the pinned file",
+                        step.what
+                    ),
+                    Judged::Refused => {
+                        assert!(!output.exists(), "{}: published an output", step.what);
+                    }
+                },
+            );
         }
     }
 }

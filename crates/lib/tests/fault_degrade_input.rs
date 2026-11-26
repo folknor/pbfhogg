@@ -27,7 +27,6 @@
 //! output).
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -489,11 +488,17 @@ fn check_passthrough_route(route: Route) {
             },
             |(), step| run(route, step.pin, out(&output), step.host),
             |expected, (), step, judged| {
-                assert!(
-                    matches!(judged, Judged::Unaffected(())),
-                    "{}: the one open is the last",
-                    step.what
-                );
+                // Only the caller-pin arm (replaced before the call) can
+                // refuse: after the one open nothing opens again.
+                if matches!(judged, Judged::Refused) {
+                    assert_eq!(step.after, 0, "{}: the one open is the last", step.what);
+                    assert!(
+                        !output.exists(),
+                        "{}: a refused run must publish nothing",
+                        step.what
+                    );
+                    return;
+                }
                 assert!(
                     pinned_cell::take(&output) == *expected,
                     "{}: the run must read only the file it opened",
@@ -508,51 +513,6 @@ fn check_passthrough_route(route: Route) {
 fn every_passthrough_route_reads_one_file_through_one_open() {
     for route in passthrough_routes() {
         check_passthrough_route(route);
-    }
-}
-
-/// A caller's pin is the run's pin on either route: replaced between the
-/// caller's pin and the call, the input is the file the caller pinned
-/// (stable reopen name) or the first open is refused and nothing is published (path
-/// reopen). An entry point that pinned or opened the path afresh would
-/// degrade the replacement instead.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    let output = dir.path().join("out.osm.pbf");
-    for route in [Route::strip_locations(), Route::strip_indexdata()] {
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, route);
-            write_replacement(&replacement);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                std::fs::rename(&replacement, &input).expect("replace the input");
-                let result = run(route, pin, out(&output), &host);
-                let cell = format!("{route:?}, scenario {scenario:?}");
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                        assert_from_input(route, &output, &cell);
-                        std::fs::remove_file(&output).expect("remove output");
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert!(
-                            !output.exists(),
-                            "{cell}: a refused run must publish nothing"
-                        );
-                    }
-                }
-            });
-        }
     }
 }
 

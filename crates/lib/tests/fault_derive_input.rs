@@ -386,92 +386,83 @@ fn the_streaming_derive_reads_only_the_pinned_inputs() {
 }
 
 /// Deriving a file against itself, replaced after any of its opens, reads
-/// the file it started on on both sides (stable reopen name) or refuses (path reopen),
-/// never a file against its replacement, and the fault plan counts both
-/// sides' opens on the one path. That the two sides share one pin is
-/// `pin_sources`' unit tests' to prove (no fault point lies between the
-/// pins).
+/// the file it started on on both sides (stable reopen name) or refuses
+/// (path reopen), never a file against its replacement, and the fault plan
+/// counts both sides' opens on the one path. That the two sides share one
+/// pin is `pin_sources`' unit tests' to prove (no fault point lies between
+/// the pins).
+///
+/// The cell runs through [`pinned_cell::check`] in every read mode, its
+/// spec both sides' opens. The path-reopen matrix arms keep the repeated
+/// path arguments, so the library's own pinning of a repeated input stays
+/// exercised; the stable-name arms and the caller-pin arm pass the step's
+/// pin as both sides.
 #[test]
 fn a_repeated_input_is_one_pin() {
     for route in [Route::SEQUENTIAL, Route::PARALLEL] {
-        let inputs = inputs(route);
-        let input = &inputs.old;
-        let replacement = inputs.dir.path().join("replacement.osm.pbf");
-        let output = inputs.dir.path().join(route.output_name("same"));
-        let opens = 2 * route.opens();
-        let same = |source: InputSource<'_>, host: &pbfhogg::host::Host| {
-            run(
-                route,
-                source,
-                source,
-                &output,
-                true,
-                &inputs.scratch(),
-                host,
-            )
-        };
-
-        let host = crate::common::test_host();
-        host.invocation
-            .faults()
-            .arm_input_replacement(input, &replacement, opens + 1);
-        let expected = same(InputSource::Path(input), &host)
-            .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {}", e.report()));
-        let counted = host.invocation.faults().input_replacement().expect("armed");
-        assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
-        assert!(
-            expected.contains("creates: 0, modifies: 0, deletes: 0"),
-            "{route:?}: {expected}"
-        );
-
-        for after in 1..opens {
-            for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-                write_input(input, route, Side::Old, false);
-                write_input(&replacement, route, Side::Old, true);
-                let host = crate::common::test_host();
-                scenario.run(input, &host, |pin, scenario| {
-                    host.invocation
-                        .faults()
-                        .arm_input_replacement(input, &replacement, after);
-                    // The refusal arm keeps the repeated path arguments, so the
-                    // library's own pinning of a repeated input stays exercised;
-                    // only the stable-name arm needs the injected caller pin.
-                    let source = match scenario {
-                        reopen_cell::Scenario::Pinned => InputSource::Pinned(pin),
-                        reopen_cell::Scenario::Path => {
-                            host.invocation
-                                .faults()
-                                .force_pin_path_reopen
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                            InputSource::Path(input)
-                        }
+        for &direct in pinned_cell::modes() {
+            let route = Route { direct, ..route };
+            let inputs = inputs(route);
+            let input = &inputs.old;
+            let replacement = inputs.dir.path().join("replacement.osm.pbf");
+            let output = inputs.dir.path().join(route.output_name("same"));
+            let opens = 2 * route.opens();
+            let same = |source: InputSource<'_>, host: &pbfhogg::host::Host| {
+                run(
+                    route,
+                    source,
+                    source,
+                    &output,
+                    true,
+                    &inputs.scratch(),
+                    host,
+                )
+            };
+            let cell = Cell::new(
+                format!("{route:?}, repeated input"),
+                direct,
+                input,
+                &replacement,
+                opens,
+                "DDDD",
+            );
+            pinned_cell::check(
+                &cell,
+                |host| same(InputSource::Path(input), host),
+                |expected| {
+                    assert!(
+                        expected.contains("creates: 0, modifies: 0, deletes: 0"),
+                        "{route:?}: {expected}"
+                    );
+                    expected
+                },
+                |_, _| {
+                    write_input(input, route, Side::Old, false);
+                    write_input(&replacement, route, Side::Old, true);
+                },
+                |(), step| {
+                    let source = if step.scenario == reopen_cell::Scenario::Path && step.after > 0 {
+                        step.host
+                            .invocation
+                            .faults()
+                            .force_pin_path_reopen
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        InputSource::Path(input)
+                    } else {
+                        InputSource::Pinned(step.pin)
                     };
-                    let result = same(source, &host);
-                    let cell =
-                        format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
-                    let report = host.invocation.faults().input_replacement().expect("armed");
-                    assert!(report.fired, "{cell}: {report:?}");
-                    match scenario {
-                        reopen_cell::Scenario::Pinned => {
-                            let out = result.unwrap_or_else(|e| panic!("{cell}: {}", e.report()));
-                            assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                            assert_eq!(
-                                out, expected,
-                                "{cell}: both sides must read the pinned file"
-                            );
-                        }
-                        reopen_cell::Scenario::Path => {
-                            let err = result
-                                .err()
-                                .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                            assert!(
-                                matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                                "{cell}: {err:?}"
-                            );
-                        }
+                    same(source, step.host)
+                },
+                |expected, (), step, judged| {
+                    if let Judged::Unaffected(out) = judged {
+                        assert_eq!(
+                            &out, expected,
+                            "{}: both sides must read the pinned file",
+                            step.what
+                        );
                     }
-                });
-            }
+                },
+            );
         }
     }
 }

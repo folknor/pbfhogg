@@ -41,8 +41,20 @@ Tests go where they couple least.
   can end early without a witness, and its one skip is the driver's
   own. The other backend cells (the roundtrip, `host_contract` and
   `process_nofile` direct and io_uring arms, the library unit cells,
-  the CLI cells, the apply-changes direct cell) still rest on the
-  convention. Tests that assert a refusal itself inspect the
+  the CLI cells, the apply-changes direct cell) rest on the
+  convention, and stay there by decision rather than by omission: a
+  driver per kind of cell (writer constructors, CLI children, unit
+  cells) would own little the bodies share. The skip half of the
+  convention is already held at run time, under the gate, by every
+  predicate's `fail_if_required`; no driver could hold the io_uring
+  half on a host whose memlock limit refuses the pool (below); and the
+  success half is a positive witness each cell states for the
+  operation it claims, which a driver can check only once the cell
+  declares it, the same statement the cell makes today. What these
+  cells owe instead is that a skip inside a loop of backends or targets
+  ends that iteration only, never the later ones, and that every
+  successful iteration asserts the witness of the backend it ran.
+  Tests that assert a refusal itself inspect the
   error directly and are not affected. What the gate guarantees is
   that a required backend's refusal cannot pass as a skip, so it goes
   green only on a host, and a test scratch filesystem, that does not
@@ -81,7 +93,11 @@ Tests go where they couple least.
   path constructor with a direct option assert one on their own fresh
   invocation, through `common::assert_direct_opened` (the roundtrip
   direct and io_uring cells, the `process_nofile` direct and io_uring
-  arms) or the pinned-cell driver (the `fault_*_input` cells, which
+  arms, whose io_uring arm also asserts a registered pool since the
+  Direct writer makes the same write open, the `host_contract` direct
+  reader and indexdata-probe cells through the host-bound
+  constructors, the apply-changes direct cell for its output side) or
+  the pinned-cell driver (the `fault_*_input` cells, which
   also hold a direct cell whose route owes no direct open to recording
   none); the CLI cells through
   `invoker::assert_direct_opened` on the marker stream. Cells that
@@ -95,7 +111,9 @@ Tests go where they couple least.
   pass 2's dedupe sources, whose per-source transport list
   (`blob_merge::Sources::direct`) the cells assert for every input.
   The sort and dedupe pass-1 unit cells keep their path-specific
-  walker count (`header_walker::tests::direct_opens`).
+  walker count (`header_walker::tests::direct_opens`); the dedupe
+  splicing-output cell counts the read opens its pass 2 adds after
+  pass 1, so pass 1's walk cannot stand in for them.
 
   `O_DIRECT` belongs to the open file description, and nothing in the
   crate clears it (the one `F_SETFL`, clearing `O_NONBLOCK` after a
@@ -117,15 +135,26 @@ Tests go where they couple least.
   command documents (`crates/cli/src/io_reach.rs`). Every route the
   driver runs runs in every read mode the build has, buffered and
   direct, so each such route's direct list is pinned and a new route
-  gets both; the hand-rolled repeated-input (`cat a a`, `diff a a`,
-  `derive a a`) and replaced-before-the-call caller-pin cells run
-  buffered only. On Unix the driver's one skip is a typed `direct-io`
+  gets both; the repeated-input cells (`cat a a`, `diff a a`,
+  `derive a a`) are driver cells too, their list both arguments'
+  opens. After the matrix every cell runs a caller-pin arm in both
+  reopen strategies: the target replaced after the step's pin is taken
+  and before the call, where the stable-name pin must read the pinned
+  file with the cell's exact list and the path pin must refuse its
+  first open. That arm catches a run that pins the path afresh on the
+  step's own host, which the matrix cannot see on a one-open route.
+  Hand-rolled caller-pin cells remain only for what the arm cannot
+  express: `diff` and `derive` with a caller pin against the same path
+  (pinned afresh, so a different file), the `check` index and refs
+  entries and the public `getparents` entry, which no driver cell
+  runs; these run buffered only. On Unix the driver's one skip is a typed `direct-io`
   setup refusal of the reference on a cell whose list owes a direct
   open, through `common::direct_io_unavailable`; it ends that cell, not
   the test. Off Unix it skips the matrix after the reference, which
   needs file identity verification. Its own cells, over a toy command,
   show a reference that opens less than declared, a matrix run through
-  a fresh pin on another host, a run that returns early and a refusal
+  a fresh pin on another host, a one-open run that pins the path
+  afresh on the step's host, a run that returns early and a refusal
   on a route that owes no direct open each failing. The CLI cells witness the flag reaching the library, which
   each command wires by hand: they assert a direct open in every
   direction the command's reach row claims (reads, writes or both),

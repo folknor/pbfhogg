@@ -14,7 +14,6 @@
 //! The replacement carries other IDs, so a digest of it differs.
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -85,8 +84,11 @@ fn digest_opens_its_input_once() {
             },
             |(), step| run(step.pin, direct, step.host),
             |expected, (), step, judged| {
+                // Only the caller-pin arm (replaced before the call) can
+                // refuse: after its one open nothing opens again.
                 let Judged::Unaffected(digest) = judged else {
-                    panic!("{}: the one open is the last", step.what);
+                    assert_eq!(step.after, 0, "{}: the one open is the last", step.what);
+                    return;
                 };
                 assert_eq!(
                     &digest, expected,
@@ -95,45 +97,5 @@ fn digest_opens_its_input_once() {
                 );
             },
         );
-    }
-}
-
-/// A caller's pin is the run's: replaced between the caller's pin and the
-/// call, the input is the file the caller pinned (stable reopen name) or the one open is
-/// refused (path reopen). Opening the path afresh would digest the
-/// replacement.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-        write_input(&input);
-        let expected = expected(&input);
-        write_replacement(&replacement);
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            std::fs::rename(&replacement, &input).expect("replace the input");
-            let result = run(pin, false, &host);
-            let cell = format!("scenario {scenario:?}");
-            match scenario {
-                reopen_cell::Scenario::Pinned => {
-                    assert_eq!(
-                        result.unwrap_or_else(|e| panic!("{cell}: {e}")),
-                        expected,
-                        "{cell}: the digest must be the pinned file's"
-                    );
-                }
-                reopen_cell::Scenario::Path => {
-                    let err = result
-                        .err()
-                        .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{cell}: {err:?}"
-                    );
-                }
-            }
-        });
     }
 }

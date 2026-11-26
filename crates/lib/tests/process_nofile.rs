@@ -558,6 +558,20 @@ fn charge_arm(
     if backend_is_direct(backend) || uring {
         common::assert_direct_opened(&host.invocation, "write", name);
     }
+    // The O_DIRECT write open is the Direct writer's as much as the ring's:
+    // only a registered pool shows the uring arm held a ring.
+    if uring {
+        let mut registered = None;
+        host.invocation.for_each_counter(|counter, value| {
+            if counter == "writer_uring_registered_buffers" {
+                registered = Some(value);
+            }
+        });
+        assert!(
+            registered.is_some_and(|n| n > 0),
+            "{name}: no io_uring pool registered: {registered:?}"
+        );
+    }
     true
 }
 

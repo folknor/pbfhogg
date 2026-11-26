@@ -21,7 +21,6 @@
 //! output).
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -302,59 +301,6 @@ fn a_history_input_reads_only_the_pinned_input() {
         history: true,
         direct: false,
     });
-}
-
-/// A caller's pin is the run's pin: replaced between the caller's pin and
-/// the call, the input is the file the caller pinned (stable reopen name) or the first
-/// open is refused and nothing is published (path reopen). An entry point
-/// that pinned the path afresh would read the replacement's header, take the
-/// other path, and write the replacement's IDs.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    let output = dir.path().join("out.osm.pbf");
-    for history in [false, true] {
-        let route = Route {
-            history,
-            direct: false,
-        };
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, route);
-            write_replacement(&replacement, route);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                std::fs::rename(&replacement, &input).expect("replace the input");
-                let result = run(route, pin, out(&output), &host);
-                let cell = format!("{route:?}, scenario {scenario:?}");
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                        assert_eq!(
-                            read_written(&output),
-                            expected(route),
-                            "{cell}: the output must come from the pinned file"
-                        );
-                        std::fs::remove_file(&output).expect("remove output");
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert!(
-                            !output.exists(),
-                            "{cell}: a refused run must publish nothing"
-                        );
-                    }
-                }
-            });
-        }
-    }
 }
 
 /// The input is pinned before its header is read, so a FIFO is refused up

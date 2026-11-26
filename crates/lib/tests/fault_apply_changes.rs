@@ -1978,7 +1978,8 @@ mod apply_changes {
                 .faults()
                 .input_replacement()
                 .expect("armed replacement");
-            (result, report.transports)
+            let direct_writes = crate::common::direct_opens(&host.invocation, "write");
+            (result, report.transports, direct_writes)
         };
 
         let reference = dir.path().join("reference.osm.pbf");
@@ -1989,14 +1990,23 @@ mod apply_changes {
 
         for (backend, opens) in [(OutputBackend::Direct, 3), (OutputBackend::Parallel, 4)] {
             let output = dir.path().join(format!("direct-{backend:?}.osm.pbf"));
-            let (result, transports) = run(backend, true, &output);
+            let (result, transports, direct_writes) = run(backend, true, &output);
             match result {
                 Ok(_) => {}
+                // One backend's refusal ends that backend's cell, never the
+                // next one's.
                 Err(e) if crate::common::direct_io_unavailable(&e) => {
                     crate::common::skip(format!("{backend:?}: {e}"));
-                    return;
+                    continue;
                 }
                 Err(e) => panic!("{backend:?}: direct run: {e}"),
+            }
+            // The output side: the Direct writer opens its output O_DIRECT,
+            // the Parallel one never does.
+            if matches!(backend, OutputBackend::Direct) {
+                assert!(direct_writes > 0, "{backend:?}: no O_DIRECT write open");
+            } else {
+                assert_eq!(direct_writes, 0, "{backend:?}: an O_DIRECT write open");
             }
             assert_eq!(
                 transports,

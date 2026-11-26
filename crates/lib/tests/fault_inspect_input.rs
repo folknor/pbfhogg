@@ -20,7 +20,6 @@
 //! node coordinates and size, so a read of it shows in any report.
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -269,53 +268,6 @@ fn a_decode_only_run_opens_once_through_a_caller_pin() {
     }
 }
 
-/// A caller's pin is the run's pin on the pinning route: replaced between
-/// the caller's pin and the call, the report is of the file the caller
-/// pinned (stable reopen name) or the first open is refused (path reopen). An entry
-/// that pinned the path afresh would report the replacement.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    for indexed in [true, false] {
-        let route = Route {
-            indexed,
-            decode_only: false,
-            direct: false,
-        };
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, indexed);
-            let expected = expected(route, &input);
-            write_replacement(&replacement, indexed);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                std::fs::rename(&replacement, &input).expect("replace the input");
-                let result = run_inspect(route, pin, &host);
-                let cell = format!("{route:?}, scenario {scenario:?}");
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        let got = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                        assert_eq!(
-                            got, expected,
-                            "{cell}: the report must be of the pinned file"
-                        );
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                    }
-                }
-            });
-        }
-    }
-}
-
 /// The pinning route refuses a FIFO up front rather than opening it (a
 /// blocking open of a FIFO waits for a writer, and none is attached here).
 #[cfg(unix)]
@@ -466,38 +418,6 @@ fn node_stats_reads_only_the_pinned_input() {
     }
 }
 
-/// A caller's pin is used as it is: replaced before the call, the stats are
-/// of the pinned file (stable reopen name) or the probe is refused (path reopen).
-#[test]
-fn node_stats_uses_a_caller_pin_as_it_is() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-        write_input(&input, true);
-        let expected =
-            run_node_stats(&input, false, &crate::common::test_host()).expect("unreplaced run");
-        write_replacement(&replacement, true);
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            std::fs::rename(&replacement, &input).expect("replace the input");
-            let result = run_node_stats(pin, false, &host);
-            match scenario {
-                reopen_cell::Scenario::Pinned => {
-                    assert_eq!(result.expect("pinned run"), expected);
-                }
-                reopen_cell::Scenario::Path => {
-                    let err = result.expect_err("must refuse");
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{err:?}"
-                    );
-                }
-            }
-        });
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn node_stats_refuses_a_fifo() {
@@ -568,8 +488,11 @@ fn inspect_header_takes_the_size_from_its_one_open() {
             },
             |(), step| header(step.pin, step.host),
             |expected, (), step, judged| {
+                // Only the caller-pin arm (replaced before the call) can
+                // refuse: after the one open nothing opens again.
                 let Judged::Unaffected(file_size) = judged else {
-                    panic!("{}: the one open is the last", step.what);
+                    assert_eq!(step.after, 0, "{}: the one open is the last", step.what);
+                    return;
                 };
                 assert_eq!(file_size, *expected, "{}", step.what);
             },

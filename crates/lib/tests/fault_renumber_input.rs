@@ -18,7 +18,6 @@
 //! it serves as the byte reference.
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -232,63 +231,6 @@ fn every_open_reads_only_the_pinned_input() {
                 ),
             },
         );
-    }
-}
-
-/// The output of an unreplaced run of `route` on `input`.
-fn unreplaced(route: Route, input: &Path, dir: &Path) -> Vec<u8> {
-    let output = dir.join("unreplaced.osm.pbf");
-    let stats = run(route, input, &output, &crate::common::test_host())
-        .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {e}"));
-    assert_renumbered_input(&output, &stats, &format!("{route:?}, unreplaced"));
-    pinned_cell::take(&output)
-}
-
-/// A caller's pin is the run's pin: replaced between the caller's pin and
-/// the call, the input is the file the caller pinned (stable reopen name) or the first
-/// open is refused (path reopen). An entry point that pinned the path
-/// afresh would read the replacement instead.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let route = Route { direct: false };
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    write_input(&input);
-    let expected = unreplaced(route, &input, dir.path());
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-        write_input(&input);
-        write_replacement(&replacement);
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            std::fs::rename(&replacement, &input).expect("replace the input");
-            let output = dir.path().join("out.osm.pbf");
-            let result = run(route, pin, &output, &host);
-            let cell = format!("caller pin, scenario {scenario:?}");
-            match scenario {
-                reopen_cell::Scenario::Pinned => {
-                    let stats = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                    assert_renumbered_input(&output, &stats, &cell);
-                    assert_eq!(
-                        std::fs::read(&output).expect("read output"),
-                        expected,
-                        "{cell}: the output must come from the pinned file"
-                    );
-                    std::fs::remove_file(&output).expect("remove output");
-                }
-                reopen_cell::Scenario::Path => {
-                    let err = result
-                        .err()
-                        .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{cell}: {err:?}"
-                    );
-                    assert_eq!(err.source_path(), Some(input.as_path()), "{cell}: {err:?}");
-                    assert!(!output.exists(), "{cell}: published an output");
-                }
-            }
-        });
     }
 }
 

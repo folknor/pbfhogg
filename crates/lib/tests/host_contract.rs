@@ -1737,7 +1737,10 @@ mod direct_read {
         let path = dir.path().join("direct-reader.osm.pbf");
         direct_input(&path);
 
-        let reader = match pbfhogg::BlobReader::open(&path, true) {
+        // The host-bound constructor, whose invocation records the open, so
+        // a selector that ignored `direct` cannot pass on the blob count.
+        let host = common::test_host();
+        let reader = match pbfhogg::BlobReader::open_with(&path, true, &host) {
             Ok(reader) => reader,
             Err(error) if common::direct_io_unavailable(&error) => {
                 common::skip(format!("O_DIRECT not supported: {error}"));
@@ -1745,12 +1748,17 @@ mod direct_read {
             }
             Err(error) => panic!("open direct PBF reader: {error}"),
         };
+        common::assert_direct_opened(&host.invocation, "read", "BlobReader::open_with");
         let mut count = 0;
         for blob in reader {
             blob.expect("read direct PBF blob");
             count += 1;
         }
         assert_eq!(count, 2, "header and data blobs must be readable");
+        // `BlobReader::open` builds a token of its own that no caller can
+        // read, so its selector is held to the same file only by reading it.
+        let reader = pbfhogg::BlobReader::open(&path, true).expect("open direct PBF reader");
+        assert_eq!(reader.count(), 2, "BlobReader::open reads the same file");
     }
 
     #[test]
@@ -1765,16 +1773,28 @@ mod direct_read {
             .expect("header blob");
         std::fs::write(&path, &bytes[..header_blob.blob_end - 1]).expect("truncate fixture");
 
-        let error =
-            match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
-                Ok(_) => panic!("truncated header blob must fail while skipping"),
-                Err(error) if common::direct_io_unavailable(&error) => {
-                    common::skip(format!("O_DIRECT not supported: {error}"));
-                    return;
-                }
-                Err(error) => error,
-            };
-        assert_unexpected_eof(&error);
+        if let Some(error) = direct_probe(&path, "truncated header blob must fail while skipping") {
+            assert_unexpected_eof(&error);
+        }
+    }
+
+    /// The host-bound indexdata probe of `path`, direct, which must fail
+    /// (`refused` says why) after an `O_DIRECT` open: a buffered probe also
+    /// meets the EOF, so the error alone does not show the direct skip ran.
+    /// `None` on the typed direct-io setup refusal, which skips.
+    fn direct_probe(path: &std::path::Path, refused: &str) -> Option<pbfhogg::Error> {
+        let host = common::test_host();
+        match pbfhogg::has_indexdata_in(path, true, &host) {
+            Ok(_) => panic!("{refused}"),
+            Err(error) if common::direct_io_unavailable(&error) => {
+                common::skip(format!("O_DIRECT not supported: {error}"));
+                None
+            }
+            Err(error) => {
+                common::assert_direct_opened(&host.invocation, "read", "has_indexdata_in");
+                Some(error)
+            }
+        }
     }
 
     /// The skip error reaches the caller as a bare `io::Error` or wrapped in
@@ -1810,15 +1830,8 @@ mod direct_read {
         assert_eq!(frame.len(), 18);
         std::fs::write(&path, &frame).expect("write fixture");
 
-        let error =
-            match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
-                Ok(_) => panic!("aligned skip beyond EOF must fail"),
-                Err(error) if common::direct_io_unavailable(&error) => {
-                    common::skip(format!("O_DIRECT not supported: {error}"));
-                    return;
-                }
-                Err(error) => error,
-            };
-        assert_unexpected_eof(&error);
+        if let Some(error) = direct_probe(&path, "aligned skip beyond EOF must fail") {
+            assert_unexpected_eof(&error);
+        }
     }
 }

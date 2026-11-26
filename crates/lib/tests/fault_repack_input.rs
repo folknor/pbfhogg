@@ -21,7 +21,6 @@
 //! output).
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -461,60 +460,6 @@ fn an_absent_kind_reads_only_the_pinned_input() {
         relations: false,
         ..Route::PLAIN
     });
-}
-
-/// A caller's pin is the run's pin: replaced between the caller's pin and
-/// the call, the input is the file the caller pinned (stable reopen name) or the first
-/// open is refused and nothing is published (path reopen). An entry point
-/// that pinned the path afresh would repack the replacement instead.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let route = Route::PLAIN;
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    let output = dir.path().join("out.osm.pbf");
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-        write_input(&input, route);
-        write_replacement(&replacement, route);
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            std::fs::rename(&replacement, &input).expect("replace the input");
-            let result = run(route, pin, out(&output), &host);
-            let cell = format!("scenario {scenario:?}");
-            match scenario {
-                reopen_cell::Scenario::Pinned => {
-                    result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                    assert_eq!(
-                        read_items(&output).0,
-                        Spec::input(route).items(),
-                        "{cell}: the output must come from the pinned file"
-                    );
-                    // The replacement declares `LocationsOnWays`; a header read of it
-                    // would carry the declaration into the output.
-                    assert_eq!(
-                        crate::common::read_header(&output).has_locations_on_ways(),
-                        route.low,
-                        "{cell}: the output header must come from the pinned file"
-                    );
-                    std::fs::remove_file(&output).expect("remove output");
-                }
-                reopen_cell::Scenario::Path => {
-                    let err = result
-                        .err()
-                        .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{cell}: {err:?}"
-                    );
-                    assert!(
-                        !output.exists(),
-                        "{cell}: a refused run must publish nothing"
-                    );
-                }
-            }
-        });
-    }
 }
 
 /// The input is pinned, so a FIFO is refused up front rather than opened (a

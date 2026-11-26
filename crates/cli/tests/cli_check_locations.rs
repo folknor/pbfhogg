@@ -245,7 +245,18 @@ fn direct_io_is_refused_where_only_the_location_check_runs() {
         out.stderr_str()
     );
 
-    let out = check(&path, &["--index", "--direct-io"]);
+    // With the index check beside it the flag is taken, and the run reads
+    // O_DIRECT: the marker stream witnesses it.
+    let markers = dir.path().join("run.markers");
+    std::fs::write(&markers, []).expect("create the marker stream");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg("--locations")
+        .args(["--index", "--direct-io"])
+        .arg(&path)
+        .marker_fifo(&markers)
+        .run();
     if out.is_o_direct_unsupported() {
         crate::common::skip("O_DIRECT not supported on this filesystem");
         return;
@@ -256,6 +267,7 @@ fn direct_io_is_refused_where_only_the_location_check_runs() {
         "{}",
         out.stderr_str()
     );
+    crate::invoker::assert_direct_opened(&markers, "read");
 }
 
 /// Without node 2 the file is still right as far as anyone can tell; with

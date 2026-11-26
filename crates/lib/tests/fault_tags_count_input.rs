@@ -15,7 +15,6 @@
 //! direct reads change neither.
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -301,47 +300,6 @@ fn an_unindexed_input_is_refused_only_where_indexdata_would_skip_blobs() {
         expected(ways),
         "a forced ways-only run counts way tags only"
     );
-}
-
-/// A caller's pin is the run's pin: replaced between the caller's pin and
-/// the call, the input is the file the caller pinned (stable reopen name) or the first
-/// open is refused (path reopen). An entry point that pinned the path
-/// afresh would count the replacement instead.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    let route = Route::PLAIN;
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-        write_input(&input, route);
-        write_replacement(&replacement);
-        let host = crate::common::test_host();
-        scenario.run(&input, &host, |pin, scenario| {
-            std::fs::rename(&replacement, &input).expect("replace the input");
-            let result = run(route, pin, &host);
-            let cell = format!("scenario {scenario:?}");
-            match scenario {
-                reopen_cell::Scenario::Pinned => {
-                    let counts = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                    assert_eq!(
-                        counts,
-                        expected(route),
-                        "{cell}: the counts must come from the pinned file"
-                    );
-                }
-                reopen_cell::Scenario::Path => {
-                    let err = result
-                        .err()
-                        .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{cell}: {err:?}"
-                    );
-                }
-            }
-        });
-    }
 }
 
 /// The input is pinned, so a FIFO is refused up front rather than opened (a

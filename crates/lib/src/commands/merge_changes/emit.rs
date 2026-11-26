@@ -3,14 +3,18 @@
 //! written as the same XML bytes the owned writers produce, without
 //! building an owned element.
 //!
-//! Per element it keeps three reused buffers: the start tag's content, the
-//! structural children (`nd` / `member`) and the tags, each child as a
-//! range of start tag content. The owned writers put every structural child
-//! before every tag whatever their source order, so the children are kept
-//! apart and written at the element's end, structural first; validation
-//! still runs in callback order, so the first refusal is the one the owned
-//! sink would report. Output is written only at the end of an element,
-//! where the driver attributes a failure to the output, not the input.
+//! Per element it keeps the parsed values in reused buffers: id,
+//! coordinates and metadata, the structural children (`nd` / `member`) and
+//! the tags as read. The owned writers put every structural child before
+//! every tag whatever their source order, so the children are kept apart
+//! and rendered at the element's end, structural first; validation still
+//! runs in callback order, so the first refusal is the one the owned sink
+//! would report. Rendering and output happen only at the end of an element
+//! the sink keeps, where the driver attributes a failure to the output, not
+//! the input. A filtering sink therefore formats only its survivors: on a
+//! selective tags-filter run that cut process CPU by about a fifth, though
+//! the one framing reader, not the workers, bounds the wall at the default
+//! worker count.
 //!
 //! The byte contract is the owned writers': `id`, then `lat` and `lon` for
 //! a node that has them (`node_coords` then `format_coord`; always a visible
@@ -33,23 +37,36 @@ use crate::osc::xml_parse::{
     scan_owned_metadata_into,
 };
 
-/// One element's start tag and children, checked and rendered into reused
-/// buffers: the part every re-emitting OSC byte sink shares.
+/// A structural child as parsed, in source order.
+#[derive(Clone, Copy)]
+enum Structural {
+    Nd(i64),
+    /// Member type, ref, and the role's range in `ElementBuf::roles`.
+    Member(ElementKind, i64, usize, usize),
+}
+
+/// One element's start tag and children, checked as they are read and kept
+/// as parsed values in reused buffers: the part every re-emitting OSC byte
+/// sink shares. Rendering waits for [`ElementBuf::write`], so an element a
+/// filtering sink drops is checked but never formatted. Every input refusal
+/// happens in the callbacks; the only check rendering adds is the writer's
+/// own XML 1.0 character check, which OSC input cannot reach because the
+/// shared reader refuses those characters first.
 pub(crate) struct ElementBuf {
     owner: &'static str,
     id: i64,
     /// The current element: its action and kind, when one is open.
     current: Option<(Action, ElementKind)>,
-    head: String,
-    structural: String,
-    structural_ranges: Vec<(usize, usize)>,
-    tags: String,
-    tag_ranges: Vec<(usize, usize)>,
-    /// Each tag's key and value as read (unescaped), for selection.
+    coords: Option<(i32, i32)>,
+    has_meta: bool,
+    structural: Vec<Structural>,
+    roles: String,
+    /// Each tag's key and value as read (unescaped).
     tag_text: String,
     tag_pairs: Vec<(usize, usize, usize)>,
     meta: OwnedMetadata,
-    scratch: String,
+    /// One start tag's content at a time, while writing.
+    content: String,
     coord: String,
 }
 
@@ -61,11 +78,10 @@ impl ElementBuf {
             owner,
             id: 0,
             current: None,
-            head: String::new(),
-            structural: String::new(),
-            structural_ranges: Vec::new(),
-            tags: String::new(),
-            tag_ranges: Vec::new(),
+            coords: None,
+            has_meta: false,
+            structural: Vec::new(),
+            roles: String::new(),
             tag_text: String::new(),
             tag_pairs: Vec::new(),
             meta: OwnedMetadata {
@@ -77,7 +93,7 @@ impl ElementBuf {
                 visible: String::new(),
                 present: 0,
             },
-            scratch: String::new(),
+            content: String::new(),
             coord: String::new(),
         }
     }
@@ -115,27 +131,58 @@ impl ElementBuf {
 
     /// Write the element just finished as the owned writers write it.
     pub(crate) fn write<W: std::io::Write>(
-        &self,
+        &mut self,
         writer: &mut quick_xml::Writer<W>,
         kind: ElementKind,
     ) -> crate::Result<()> {
+        let (id, ctx) = (self.id, || in_element(kind, self.id));
         let name = kind.as_str();
-        let head = BytesStart::from_content(self.head.as_str(), name.len());
-        if self.structural_ranges.is_empty() && self.tag_ranges.is_empty() {
+        let content = &mut self.content;
+        content.clear();
+        content.push_str(name);
+        append_int_attr(content, "id", id);
+        if let Some((lat, lon)) = self.coords {
+            format_coord(&mut self.coord, from_decimicro(lat));
+            append_attr(content, "lat", &self.coord);
+            format_coord(&mut self.coord, from_decimicro(lon));
+            append_attr(content, "lon", &self.coord);
+        }
+        if self.has_meta {
+            self.meta.append_attrs(content).map_err(ctx())?;
+        }
+        let head = BytesStart::from_content(content.as_str(), name.len());
+        if self.structural.is_empty() && self.tag_pairs.is_empty() {
             writer.write_event(Event::Empty(head))?;
             return Ok(());
         }
         writer.write_event(Event::Start(head))?;
-        for &(start, end) in &self.structural_ranges {
-            let content = &self.structural[start..end];
-            let child_len = if content.starts_with("nd") { 2 } else { 6 };
-            writer.write_event(Event::Empty(BytesStart::from_content(content, child_len)))?;
-        }
-        for &(start, end) in &self.tag_ranges {
+        for &child in &self.structural {
+            content.clear();
+            let child_len = match child {
+                Structural::Nd(ref_id) => {
+                    content.push_str("nd");
+                    append_int_attr(content, "ref", ref_id);
+                    2
+                }
+                Structural::Member(member_kind, ref_id, start, end) => {
+                    content.push_str("member");
+                    append_attr(content, "type", member_kind.as_str());
+                    append_int_attr(content, "ref", ref_id);
+                    append_attr_escaped(content, "role", &self.roles[start..end]).map_err(ctx())?;
+                    6
+                }
+            };
             writer.write_event(Event::Empty(BytesStart::from_content(
-                &self.tags[start..end],
-                3,
+                content.as_str(),
+                child_len,
             )))?;
+        }
+        for &(k, v, e) in &self.tag_pairs {
+            content.clear();
+            content.push_str("tag");
+            append_attr_escaped(content, "k", &self.tag_text[k..v]).map_err(ctx())?;
+            append_attr_escaped(content, "v", &self.tag_text[v..e]).map_err(ctx())?;
+            writer.write_event(Event::Empty(BytesStart::from_content(content.as_str(), 3)))?;
         }
         writer.write_event(Event::End(BytesEnd::new(name)))?;
         Ok(())
@@ -159,24 +206,10 @@ impl ElementBuf {
             None
         };
 
-        self.head.clear();
-        self.head.push_str(kind.as_str());
-        append_int_attr(&mut self.head, "id", id);
-        if let Some((lat, lon)) = coords {
-            format_coord(&mut self.coord, from_decimicro(lat));
-            append_attr(&mut self.head, "lat", &self.coord);
-            format_coord(&mut self.coord, from_decimicro(lon));
-            append_attr(&mut self.head, "lon", &self.coord);
-        }
-        if has_meta {
-            self.meta
-                .append_attrs(&mut self.head)
-                .map_err(in_element(kind, id))?;
-        }
+        self.coords = coords;
+        self.has_meta = has_meta;
         self.structural.clear();
-        self.structural_ranges.clear();
-        self.tags.clear();
-        self.tag_ranges.clear();
+        self.roles.clear();
         self.tag_text.clear();
         self.tag_pairs.clear();
         self.id = id;
@@ -185,45 +218,26 @@ impl ElementBuf {
     }
 
     pub(crate) fn tag(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
-        let (kind, id) = (self.open()?, self.id);
-        let ctx = || in_element(kind, id);
-        let start = self.tags.len();
-        self.tags.push_str("tag");
+        self.open()?;
         // k then v, by the reader `parse_tag` shares.
         let k = self.tag_text.len();
         let v = append_tag(e, &mut self.tag_text)?;
-        let end = self.tag_text.len();
-        append_attr_escaped(&mut self.tags, "k", &self.tag_text[k..v]).map_err(ctx())?;
-        append_attr_escaped(&mut self.tags, "v", &self.tag_text[v..end]).map_err(ctx())?;
-        self.tag_ranges.push((start, self.tags.len()));
-        self.tag_pairs.push((k, v, end));
+        self.tag_pairs.push((k, v, self.tag_text.len()));
         Ok(())
     }
 
     pub(crate) fn nd(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         self.open()?;
-        let ref_id = parse_nd(e)?;
-        let start = self.structural.len();
-        self.structural.push_str("nd");
-        append_int_attr(&mut self.structural, "ref", ref_id);
-        self.structural_ranges.push((start, self.structural.len()));
+        self.structural.push(Structural::Nd(parse_nd(e)?));
         Ok(())
     }
 
     pub(crate) fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
-        let (rel_kind, id) = (self.open()?, self.id);
-        let ctx = || in_element(rel_kind, id);
-        let mut type_scratch = std::mem::take(&mut self.coord);
-        self.scratch.clear();
-        let parsed = parse_member_into(e, &mut type_scratch, &mut self.scratch);
-        self.coord = type_scratch;
-        let (kind, ref_id) = parsed?;
-        let start = self.structural.len();
-        self.structural.push_str("member");
-        append_attr(&mut self.structural, "type", kind.as_str());
-        append_int_attr(&mut self.structural, "ref", ref_id);
-        append_attr_escaped(&mut self.structural, "role", &self.scratch).map_err(ctx())?;
-        self.structural_ranges.push((start, self.structural.len()));
+        self.open()?;
+        let start = self.roles.len();
+        let (kind, ref_id) = parse_member_into(e, &mut self.coord, &mut self.roles)?;
+        self.structural
+            .push(Structural::Member(kind, ref_id, start, self.roles.len()));
         Ok(())
     }
 }

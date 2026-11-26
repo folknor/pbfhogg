@@ -1,5 +1,27 @@
 # Tags Filter
 
+### OSC tags-filter renders only kept changes (bygg, 2026-11-26, `1a2ca6bf` + change)
+
+The OSC byte sink now keeps each element as parsed values and formats it
+only when written, so a create or modify the filter drops is checked but
+never rendered. `tag-select --input-kind osc --input 4920` on planet,
+`w/highway=primary` (7045 of 3.53 M creates and modifies kept),
+`--iterations 1`, interleaved against `--commit HEAD`:
+
+| cell | baseline | variant |
+|---|---|---|
+| default `-j` | `3e1ec10c` 1376, `99dbcd06` 1333 ms, 4.0 cores | `3f133414` 1331, `763c8dab` 1337 ms, 3.2 cores |
+| `--jobs 2` | `d12af046` 1874, `24a71467` 1844 ms | `bf55ed61` 1617, `380083bd` 1610 ms |
+
+Default wall is unchanged: the one framing reader bounds it, not the
+workers (`-j 4` already 1382 ms at HEAD, `15453d76`). Process CPU drops by
+about a fifth (4.0 to 3.2 average cores), and with two workers the wall
+drops 13 %. An upper bound with every append removed (`79a9aa2b`, `-j 1`
+2333 against 3331 ms at HEAD, `b7686892`) put rendering at about a third
+of worker time. The all-render path is neutral: `merge-diffs --osc
+4914..4920` planet, `e644e593` 2905 / `884a32bf` 2875 ms against
+`561daf74` 2891 / `fbabfd30` 2883 ms.
+
 ### OSC gzip inflated ahead of the tokenizer (bygg, 2026-11-26, `1b3dfe61` + change)
 
 The one OSC reader now inflates a regular gzip file on a thread of its own

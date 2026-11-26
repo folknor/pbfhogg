@@ -1165,21 +1165,6 @@ by text. Medium-confidence: partition-owner counting instead of mutex shards.
 
 Kind: high conviction.
 
-## PERF-044 - tags-filter OSC formats every element before deciding to keep it
-
-Reported by: tags, osc.
-
-OSC tags-filter now streams on merge-changes' ordered drain with one gzip
-member per batch, so output is neither collected nor deflated serially. What
-remains: `ElementBuf` (`merge_changes/emit.rs`) formats an element's
-attributes and children as it reads them, before the keep predicate given to
-`ByteSink::filtered` decides, so a dropped create or modify pays the
-rendering. Redesign: check every element (validation must not be skipped for
-a dropped one) but render only survivors. Single-member gzip input remains a
-serial inflate.
-
-Kind: unmeasured, moderate conviction.
-
 ## PERF-046 - Location checking decompresses every way blob per partition
 
 Reported by: check.

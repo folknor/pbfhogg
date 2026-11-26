@@ -517,7 +517,7 @@ struct Grant {
 impl ProcessActions for Grant {
     fn fd_allowance(&self, wanted: u64) -> FdReservation {
         self.asked.lock().expect("requests").push(wanted);
-        FdReservation::unreserved(FdAllowance::host_grant(wanted - self.short))
+        crate::common::light_grant(FdAllowance::host_grant(wanted - self.short))
     }
 }
 
@@ -643,7 +643,7 @@ fn a_descriptor_refusal_names_the_callers_remedy() {
     struct Fixed(FdAllowance);
     impl ProcessActions for Fixed {
         fn fd_allowance(&self, _wanted: u64) -> FdReservation {
-            FdReservation::unreserved(self.0)
+            crate::common::light_grant(self.0)
         }
     }
     let refusal = |allowance: FdAllowance| {

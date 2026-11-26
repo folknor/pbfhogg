@@ -23,9 +23,12 @@
 //! accepts them, under a kernel limit leaving exactly the charge free);
 //! fault paths are bounded from the code, since no fault hook opens a
 //! descriptor. A test's `host::FdPool` is built only by [`pool`], which
-//! requires a ticket above the light grant. Test-local providers that
-//! replace a host's descriptor answers outright (rather than delegating to
-//! a ticket) are light by convention. A heavy scenario holds no descriptor
+//! requires a ticket above the light grant. A test-local provider that
+//! answers outright rather than delegating to a ticket answers through
+//! `common::light_grant`, which panics on an answer above the light grant
+//! (the textlint `outright-descriptor-answers-are-light` keeps the other
+//! reservation constructors to this file, `common/mod.rs` and the
+//! own-process `process_nofile.rs`). A heavy scenario holds no descriptor
 //! of its own across a run beyond the input pin the run shares. Light
 //! tests' descriptors are not requested or counted; the reserve covers
 //! them by assertion. Neither a count of
@@ -100,7 +103,10 @@ fn lock(gate: &Gate) -> MutexGuard<'_, State> {
 /// small grants could fit one charge), and it observes overlapping
 /// requests, not overlapping whole runs: an external join asks only for
 /// its stage-1 shard files, so two joins on one unit that overlap only
-/// after stage 1 are not caught.
+/// after stage 1 are not caught. Catching them needs a per-call hold taken
+/// at command entry by the library, which has no such hook; a permit around
+/// a test's closure would not, since two runs spawned inside one closure
+/// still share it.
 pub(crate) struct FdTicket {
     admission: Arc<Admission>,
 }
@@ -116,15 +122,24 @@ struct Admission {
 struct Hold(Arc<Admission>);
 
 impl Admission {
+    /// A refused request leaves the live count unchanged, so a refusal
+    /// caught by an unwinding run cannot inflate the count its scenario's
+    /// later requests are checked against.
     fn hold(self: &Arc<Self>) -> Hold {
-        let live = self.live.fetch_add(1, Ordering::AcqRel) + 1;
-        assert!(
-            live <= self.units,
-            "{}: {live} descriptor grants live at once on a ticket of {} unit(s); \
-             take a unit per simultaneous heavy run",
-            self.test,
-            self.units
-        );
+        let units = self.units;
+        if let Err(live) = self
+            .live
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < units).then_some(live + 1)
+            })
+        {
+            panic!(
+                "{}: {} descriptor grants live at once on a ticket of {units} unit(s); \
+                 take a unit per simultaneous heavy run",
+                self.test,
+                live + 1
+            );
+        }
         Hold(Arc::clone(self))
     }
 }
@@ -138,8 +153,7 @@ impl Drop for Hold {
 impl pbfhogg::host::ProcessActions for FdTicket {
     fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
         let hold = self.admission.hold();
-        let grant = heavy_grant(wanted);
-        pbfhogg::process::FdReservation::with_release(grant.allowance(), move || drop(hold))
+        pbfhogg::process::FdReservation::with_release(heavy_allowance(wanted), move || drop(hold))
     }
 }
 
@@ -202,13 +216,13 @@ impl pbfhogg::host::ProcessActions for Ticketed {
 }
 
 /// What every heavy host's provider grants a request: `min(wanted,
-/// TEST_FD_GRANT)`, reserving nothing. Shared with the own-process witness
-/// that runs the largest run this grant admits under a kernel limit of
-/// exactly `TEST_HEAVY_RUN_FDS` free descriptors (`process_nofile.rs`).
-pub(crate) fn heavy_grant(wanted: u64) -> pbfhogg::process::FdReservation {
-    pbfhogg::process::FdReservation::unreserved(pbfhogg::process::FdAllowance::host_grant(
-        wanted.min(super::TEST_FD_GRANT),
-    ))
+/// TEST_FD_GRANT)`. Shared with the own-process witness that runs the
+/// largest run this grant admits under a kernel limit of exactly
+/// `TEST_HEAVY_RUN_FDS` free descriptors (`process_nofile.rs`). It is an
+/// allowance, not an answer: in the shared binary only a ticket turns it
+/// into a reservation, so it cannot be handed to a run ungated.
+pub(crate) fn heavy_allowance(wanted: u64) -> pbfhogg::process::FdAllowance {
+    pbfhogg::process::FdAllowance::host_grant(wanted.min(super::TEST_FD_GRANT))
 }
 
 impl Drop for Admission {

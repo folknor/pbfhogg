@@ -583,6 +583,22 @@ test_code = "only"
 must_scan = ["crates/lib/tests/fd_pool.rs"]
 message = "Build a test FdPool with common::fd_gate::pool, which requires a descriptor ticket above the light grant"
 
+# A descriptor answer in the shared library binary is either a ticket's
+# (crates/lib/tests/common/fd_gate.rs) or outright through
+# common::light_grant, which refuses an answer above the light grant. Any
+# other reservation constructor, or the snapshot provider, would answer a
+# heavy request ungated. process_nofile.rs owns its process and its limit.
+[[textlint]]
+require_live_paths = true
+name = "outright-descriptor-answers-are-light"
+pattern = '\bFdReservation::unreserved\b|\bFdReservation::with_release\b|\bNoProcessActions\b'
+paths = ["crates/lib/tests/**/*.rs"]
+exclude = ["crates/lib/tests/common/mod.rs", "crates/lib/tests/common/fd_gate.rs", "crates/lib/tests/process_nofile.rs"]
+region = "code"
+test_code = "only"
+must_scan = ["crates/lib/tests/fault_cat_input.rs"]
+message = "Answer a descriptor request through a ticket (common::fd_gate) or common::light_grant"
+
 # FIFOs in the integration-test trees have two owners: creation is
 # crates/lib/tests/common/mod.rs make_fifo, draining is
 # crates/lib/tests/common/fifo_capture.rs, whose reader blocks in poll and is

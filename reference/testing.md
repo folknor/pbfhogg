@@ -336,7 +336,10 @@ NAME` list each harness in turn to find one test.
   this does not bound: the unit check sees overlapping requests, not
   overlapping whole runs (an external join requests only its stage-1
   shard files, so two joins on one unit overlapping after stage 1 pass
-  it); the per-run charge is witnessed only for the largest external
+  it; observing whole runs would need a per-call hold the library takes
+  at command entry, a lifecycle hook production does not have, since a
+  permit around a test's own closure only moves the convention to "one
+  run per closure"); the per-run charge is witnessed only for the largest external
   join a heavy grant admits (the `process_nofile` target forces every
   stage-1 fleet and the relation scan's input open at once, then every
   stage 3 worker's bucket file with stage 4's input and output open at
@@ -351,7 +354,12 @@ NAME` list each harness in turn to find one test.
   shared binary includes every concurrent test and light use grows with
   the runner's thread count; light tests' descriptors, every command
   that requests none, and test-local providers that answer outright
-  rather than delegating to a ticket are not counted; and a nested
+  rather than delegating to a ticket are not counted (an outright answer
+  goes through `common::light_grant`, which panics above
+  `TEST_LIGHT_FD_GRANT`, and the textlint
+  `outright-descriptor-answers-are-light` keeps every other reservation
+  constructor and the snapshot provider out of the shared binary's
+  tests, so such an answer is light by check); and a nested
   request from a thread the scenario spawned is not seen (it would wait
   on its own scenario and skip).
   The scenario runs inside `common::with_heavy_ticket`, which owns the

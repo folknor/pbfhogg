@@ -27,9 +27,9 @@ on any host whose memlock limit refuses the writer; the light reserve
 `TEST_LIGHT_FD_RESERVE` (a count in the shared binary is process-wide and light use
 scales with runner threads, so a check would fail on large hosts); a ticket's units
 versus its simultaneous whole runs (the ticket checks live grants, and an external
-join requests only stage 1, so two joins on one unit overlapping after stage 1 pass);
-test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
-`Grant` and `Fixed`) are light by convention.
+join requests only stage 1, so two joins on one unit overlapping after stage 1 pass;
+observing it needs a per-call hold the library takes at altw command entry, a
+lifecycle hook production does not have).
 
 ## VER-018 - Backend cells outside the pinned-cell driver can return unwitnessed
 

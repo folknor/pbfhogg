@@ -456,7 +456,9 @@ fn charge_arm(
     struct HeavyGrant;
     impl ProcessActions for HeavyGrant {
         fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
-            common::fd_gate::heavy_grant(wanted)
+            // Own process: no gate to count against, the kernel cap is the
+            // witness.
+            pbfhogg::process::FdReservation::unreserved(common::fd_gate::heavy_allowance(wanted))
         }
     }
 

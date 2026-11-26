@@ -1906,10 +1906,31 @@ pub(crate) struct FixedFdGrant;
 
 impl pbfhogg::host::ProcessActions for FixedFdGrant {
     fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
-        pbfhogg::process::FdReservation::unreserved(pbfhogg::process::FdAllowance::host_grant(
+        light_grant(pbfhogg::process::FdAllowance::host_grant(
             wanted.min(pbfhogg::TEST_LIGHT_FD_GRANT),
         ))
     }
+}
+
+/// The one way a provider in the shared library binary answers a request
+/// outright rather than through a descriptor ticket: `allowance` unchanged,
+/// reserving nothing, after checking it is light (at most
+/// `TEST_LIGHT_FD_GRANT` descriptors). An outright answer is not counted
+/// by the gate, so a larger one would run a heavy command outside it; this
+/// panics instead. The textlint `outright-descriptor-answers-are-light`
+/// keeps every other constructor of a snapshot answer out of the tree.
+#[track_caller]
+pub(crate) fn light_grant(
+    allowance: pbfhogg::process::FdAllowance,
+) -> pbfhogg::process::FdReservation {
+    assert!(
+        allowance.descriptors <= pbfhogg::TEST_LIGHT_FD_GRANT,
+        "an outright descriptor answer of {} exceeds the light grant {}; \
+         a heavier answer needs a ticket (common::fd_gate)",
+        allowance.descriptors,
+        pbfhogg::TEST_LIGHT_FD_GRANT
+    );
+    pbfhogg::process::FdReservation::unreserved(allowance)
 }
 
 /// An executor pool of the test's own: four workers, matching

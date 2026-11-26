@@ -56,20 +56,6 @@ pass every test. `direct_io_help_and_feature_refusal_cover_every_command` checks
 help text and feature refusal, not that the flag reaches the run. Derived from the
 code; not observed.
 
-## VER-161 - `process_nofile` runs every arm under one 20 s watchdog
-
-`crates/lib/tests/process_nofile.rs` runs all its scenarios in one libtest test,
-`descriptor_limit_scenarios`: the six injected counts, the held-descriptor cases and
-every charge-witness arm (External and Auto buffered, External O_DIRECT, External
-io_uring). The io_uring arm's `uring_admission` arms `TEST_HANG_BOUND` (10 s) plus
-its report grace over an unbounded `locked_memory_lease()` wait and the writer's
-run. Neither bound is set against what the earlier arms already used, so on a host
-whose memlock limit admits the writer, a lease held by a concurrent io_uring cell
-in another test binary can push the whole test past `brokkr check`'s fixed 20 s
-watchdog. The `tunables.rs` const assertions bound each wait alone, not their sum
-within one test. Not observed: on a memlock-refusing host the arm refuses quickly,
-and the gate has been green. Derived from the code.
-
 ## VER-133 - Geocode antimeridian and same-level paths the real-data check does not reach
 
 `pbfhogg-verify geocode` judges all four answer classes, and its admin model now assembles

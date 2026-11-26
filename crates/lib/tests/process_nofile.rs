@@ -15,8 +15,21 @@ mod common;
 /// The only libtest test in this process: every scenario below opens
 /// descriptors, and the last ones change the process-wide limit, so none
 /// may overlap another.
+///
+/// Being one libtest test, every scenario shares one runner watchdog, so one
+/// hang bound armed first covers them all, the io_uring arm's unbounded
+/// locked-memory lease wait included (taken before the writer refuses, so
+/// on memlock-refusing hosts too). A bound armed per arm would start after
+/// the earlier arms had spent their time and could outlast the watchdog.
+/// A stalled hook rendezvous in a later arm may now meet this abort before
+/// its own bound reports: the verdict is the same, the message less specific.
 #[test]
 fn descriptor_limit_scenarios() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "descriptor_limit_scenarios: every arm, the io_uring lease wait included",
+    );
     injected_descriptor_counts_refuse_external_join_without_procfs();
     no_process_actions_leave_rlimit_nofile_unchanged();
     #[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
@@ -501,7 +514,8 @@ fn charge_arm(
     // locked-memory lease for the writer's whole life, taken before the
     // descriptor baseline because the lease itself holds a descriptor.
     let uring = backend_is_uring(backend);
-    let _admission = uring.then(uring_admission);
+    // The lease's unbounded wait sits under the test's one hang bound.
+    let _lease = uring.then(pbfhogg_test_scratch::locked_memory_lease);
     let Some(limit) = cap_at_charge() else {
         return false;
     };
@@ -590,21 +604,6 @@ fn assert_shape(
         i64::try_from(stage3_workers).expect("small"),
         "{name}: the most stage 3 workers"
     );
-}
-
-/// The io_uring arm's hang bound and locked-memory lease, the bound armed
-/// first so the lease's unbounded wait is under it; dropped bound last.
-#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
-fn uring_admission() -> (
-    pbfhogg_test_scratch::LockedMemoryLease,
-    pbfhogg_test_scratch::HangBound,
-) {
-    let bound = pbfhogg_test_scratch::HangBound::arm(
-        pbfhogg::TEST_HANG_BOUND,
-        pbfhogg::TEST_HANG_REPORT_GRACE,
-        "charge witness io_uring arm",
-    );
-    (pbfhogg_test_scratch::locked_memory_lease(), bound)
 }
 
 #[cfg(all(target_os = "linux", pbfhogg_test_hooks))]

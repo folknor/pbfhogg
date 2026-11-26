@@ -14,24 +14,22 @@
 //! area: a relation with an outer or inner member way absent from the
 //! decoding, present with no nodes, or referring to a node the decoding
 //! holds no record of, a relation listing one way in both roles, and a
-//! relation with an assembled ring whose points all lie on one line. The
+//! relation whose topology the builder refuses (below). The
 //! decoding is `tags-filter` without `-R`, which copies every member way
 //! and every node of one, so absence there is absence in the input.
 //!
-//! Rings are assembled with no search, by node id: each member occurrence
-//! is an edge between its first and last node. A connected group of edges
-//! in which every endpoint is shared by exactly two edge ends forms exactly
-//! one closed walk whatever order it is followed in, and that walk is the
-//! ring; a group that is an
-//! open path forms none. The builder assembles over every node, not only
-//! endpoints, and refuses topology this walk cannot see, so a relation is
-//! left unmodelled where the two could differ: a group of any other shape
-//! (an endpoint shared by three or more member ends, a one-node way), a way
-//! listed twice in one role, a node of a member at an interior position
-//! that also occurs elsewhere among the role's members, a ring revisiting
-//! a coordinate, or a ring of fewer than three coordinates. A member node whose record carries no location leaves the
-//! relation's whole level unjudged, since its known coordinates do not
-//! bound where the builder's rings run.
+//! Rings are assembled by the builder's node-id rules, found by a different
+//! algorithm (`role_rings`): bridges are dropped, a walk touching itself at
+//! a node splits into its lobes, and a block that is neither a bridge nor a
+//! simple cycle, a ring revisiting a coordinate outside one run, a ring on
+//! one line, or two rings of one graph not shown disjoint refuse the
+//! relation, which is then withheld like an incomplete one. A way listed
+//! twice in one role counts once. The one verdict left unmodelled is
+//! two rings of one graph whose edge midpoints disagree on disjointness:
+//! the builder decides by the first such midpoint of its walk, so member
+//! order picks the answer. A member node whose record carries no location
+//! leaves the relation's whole level unjudged, since its known coordinates
+//! do not bound where the builder's rings run.
 //!
 //! Each outer ring is a polygon. An inner ring belongs to every outer ring
 //! whose trace contains its trace: that is decided only where the two
@@ -57,10 +55,10 @@
 //! level, which could hold any answer, or inside the box of an undecided
 //! hole of that level.
 //!
-//! An unmodelled group is not localised the same way, though any ring the
-//! builder makes of it lies inside the group's box: the builder withholds a
-//! relation whole when it refuses any of its topology, so the relation's
-//! other polygons may vanish and its whole box stays unjudged.
+//! An unmodelled relation is not localised to the undecided rings' box:
+//! the builder withholds a relation whole when it refuses any of its
+//! topology, so the relation's other polygons may vanish and its whole box
+//! stays unjudged.
 
 use std::collections::HashMap;
 
@@ -126,24 +124,6 @@ fn resolve(way: &Way, records: &NodeRecords) -> Result<Option<Resolved>, String>
     }))
 }
 
-/// Whether one role's members hold a shape the endpoint walk cannot judge
-/// against the builder's node-id assembly: a way listed twice, or a node at
-/// an interior position of a member that occurs anywhere else among them.
-fn needs_full_topology(ids: &[i64], ways: &[Vec<Node>]) -> bool {
-    let mut listed = std::collections::HashSet::new();
-    if !ids.iter().all(|id| listed.insert(*id)) {
-        return true;
-    }
-    let mut count: HashMap<i64, usize> = HashMap::new();
-    for w in ways {
-        for &(id, _) in w {
-            *count.entry(id).or_default() += 1;
-        }
-    }
-    ways.iter()
-        .any(|w| w.len() > 2 && w[1..w.len() - 1].iter().any(|(id, _)| count[id] > 1))
-}
-
 /// One polygon the model holds.
 pub(super) struct Polygon {
     pub(super) level: u8,
@@ -179,11 +159,11 @@ pub(super) enum Unmodelled {
     /// A member node's record carries no location; its whole level is
     /// unjudged.
     Unlocated,
-    /// Its outer or inner ways hold a shape the endpoint walk cannot judge:
-    /// an endpoint shared by three or more member ends, a one-node member,
-    /// a way listed twice in a role, a shared interior node, or a ring
-    /// revisiting a coordinate.
-    Junction,
+    /// Two rings of one connected member graph whose edge midpoints
+    /// disagree on whether one lies outside the other: the builder decides
+    /// by the first of them its walk reaches, which member order can move,
+    /// so it may publish the relation or withhold it.
+    UndecidedLobes,
     /// A hole comes within the clearance of an outer it may belong to; the
     /// relation is modelled and only the hole's box is unjudged.
     HoleClearance,
@@ -226,10 +206,15 @@ fn select(r: &Record<'_>) -> Option<Boundary> {
         if *kind != b'w' {
             continue;
         }
-        match role.as_ref() {
-            "" | "outer" => outer.push(*id),
-            "inner" => inner.push(*id),
-            _ => {}
+        // A way listed twice in one role is one boundary and counts once,
+        // at its first occurrence, as the builder counts it.
+        let list: &mut Vec<i64> = match role.as_ref() {
+            "" | "outer" => &mut outer,
+            "inner" => &mut inner,
+            _ => continue,
+        };
+        if !list.contains(id) {
+            list.push(*id);
         }
     }
     Some(Boundary {
@@ -250,63 +235,277 @@ fn bbox_of<'p>(points: impl Iterator<Item = &'p Pt>) -> Option<(i32, i32, i32, i
     })
 }
 
-/// The rings of one role's member ways, or `None` when they are not
-/// uniquely assembled.
-fn rings(ways: &[&[Node]]) -> Option<Vec<Vec<Pt>>> {
-    let mut ends: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (i, w) in ways.iter().enumerate() {
-        if w.len() < 2 {
-            return None;
+/// What one role's member ways assemble to under the builder's rules.
+#[derive(Debug)]
+enum RoleRings {
+    /// The builder refuses the role, whatever order its members come in.
+    Refused,
+    /// The builder's verdict on two rings of one graph follows member
+    /// order (see [`Unmodelled::UndecidedLobes`]).
+    Undecided,
+    /// Closed `(lat, lon)` rings.
+    Rings(Vec<Vec<Pt>>),
+}
+
+impl RoleRings {
+    /// Combine two independent graphs' outcomes: a refusal of either
+    /// refuses the role in every order, then an undecided one leaves it
+    /// undecided.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
+            (Self::Undecided, _) | (_, Self::Undecided) => Self::Undecided,
+            (Self::Rings(mut a), Self::Rings(b)) => {
+                a.extend(b);
+                Self::Rings(a)
+            }
         }
-        ends.entry(w[0].0).or_default().push(i);
-        ends.entry(w[w.len() - 1].0).or_default().push(i);
     }
-    let mut seen = vec![false; ways.len()];
-    let mut out = Vec::new();
-    for start in 0..ways.len() {
-        if seen[start] {
+}
+
+/// The rings the builder's node-id assembly makes of one role's member
+/// ways (each way once, first occurrence first), stated independently of
+/// its implementation.
+///
+/// The builder's rules (docs/cli/commands.md, and the module documentation
+/// of its ring assembly): members join by node id; each contributes the
+/// edges between consecutive distinct ids; a closed member (first id equal
+/// to last) is a graph of its own, all open members share one. Every
+/// biconnected block of a graph must be a single edge (a bridge, dropped)
+/// or a simple cycle (a ring); any other block is refused. A ring may
+/// visit one coordinate through several nodes only in one cyclic run, and
+/// must not lie on one line. Two rings of one connected graph must each be
+/// shown outside the other by an edge midpoint, of an edge with neither
+/// node on the other ring; the builder takes the first such edge of its
+/// walk.
+///
+/// Blocks are found here by chain decomposition (Schmidt), not by the
+/// builder's low-link search: over a DFS forest, each non-tree edge taken
+/// from its ancestor end in preorder, then up tree edges to the first
+/// vertex an earlier chain or this one marked. Every block is a bridge or
+/// a cycle exactly when every chain returns to the vertex it left; the
+/// cycles are then the chains, and the bridges the uncovered tree edges.
+fn role_rings(ways: &[Vec<Node>]) -> RoleRings {
+    let (closed, open): (Vec<&[Node]>, Vec<&[Node]>) = ways
+        .iter()
+        .map(Vec::as_slice)
+        .partition(|w| w.len() > 1 && w[0].0 == w[w.len() - 1].0);
+    let mut out = graph_rings(&open);
+    for w in closed {
+        out = out.and(graph_rings(&[w]));
+    }
+    out
+}
+
+/// The cycles of the graph `adjacency` (per vertex: neighbour, edge), each
+/// with its DFS component, by chain decomposition; `None` when a chain does
+/// not return to the vertex it left, so some block is neither a bridge nor
+/// a simple cycle.
+fn cycles(adjacency: &[Vec<(usize, usize)>]) -> Option<Vec<(usize, Vec<usize>)>> {
+    let n = adjacency.len();
+    // DFS forest: preorder, tree parent (vertex and edge), component.
+    let mut disc = vec![usize::MAX; n];
+    let mut parent = vec![(usize::MAX, usize::MAX); n];
+    let mut component = vec![0_usize; n];
+    let mut preorder = Vec::with_capacity(n);
+    for root in 0..n {
+        if disc[root] != usize::MAX {
             continue;
         }
-        // The connected group of `start`.
-        let mut group = vec![start];
-        seen[start] = true;
-        let mut k = 0;
-        while k < group.len() {
-            let w = ways[group[k]];
-            for end in [w[0].0, w[w.len() - 1].0] {
-                for &j in &ends[&end] {
-                    if !seen[j] {
-                        seen[j] = true;
-                        group.push(j);
-                    }
+        let mut stack = vec![(root, usize::MAX, usize::MAX)];
+        while let Some((v, from, edge)) = stack.pop() {
+            if disc[v] != usize::MAX {
+                continue;
+            }
+            disc[v] = preorder.len();
+            preorder.push(v);
+            parent[v] = (from, edge);
+            component[v] = root;
+            for &(w, e) in adjacency[v].iter().rev() {
+                if disc[w] == usize::MAX {
+                    stack.push((w, v, e));
                 }
             }
-            k += 1;
         }
-        let degrees: Vec<usize> = group
-            .iter()
-            .flat_map(|&i| [ways[i][0].0, ways[i][ways[i].len() - 1].0])
-            .map(|e| ends[&e].len())
-            .collect();
-        if degrees.iter().all(|&d| d == 2) {
-            let ring = walk(ways, &group, &ends)?;
-            // A coordinate visited twice, by distinct nodes, is a revisit
-            // the builder may refuse or keep apart, and a closed walk of
-            // fewer than three coordinates is one it refuses whole.
-            let mut at = std::collections::HashSet::new();
-            if ring.len() < 4 || !ring[..ring.len() - 1].iter().all(|p| at.insert(*p)) {
+    }
+    let tree = |v: usize, e: usize| parent[v].1 == e;
+    // Chains.
+    let mut marked = vec![false; n];
+    let mut rings: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &u in &preorder {
+        for &(w, e) in &adjacency[u] {
+            // Each non-tree edge once, from its ancestor end.
+            if tree(w, e) || tree(u, e) || disc[w] < disc[u] {
+                continue;
+            }
+            marked[u] = true;
+            let mut cycle = vec![u];
+            let mut x = w;
+            while !marked[x] {
+                marked[x] = true;
+                cycle.push(x);
+                x = parent[x].0;
+            }
+            if x != u {
                 return None;
             }
-            out.push(ring);
-        } else if degrees.iter().filter(|&&d| d == 1).count() == 2
-            && degrees.iter().all(|&d| d <= 2)
-        {
-            // An open path: no ring.
+            rings.push((component[u], cycle));
+        }
+    }
+    Some(rings)
+}
+
+/// One graph's rings: see [`role_rings`].
+fn graph_rings(members: &[&[Node]]) -> RoleRings {
+    let mut index: HashMap<i64, usize> = HashMap::new();
+    let mut ids: Vec<i64> = Vec::new();
+    let mut coords: Vec<Pt> = Vec::new();
+    let mut adjacency: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut edges = 0_usize;
+    for w in members {
+        let mut previous: Option<usize> = None;
+        for &(id, p) in *w {
+            let v = *index.entry(id).or_insert_with(|| {
+                ids.push(id);
+                coords.push(p);
+                adjacency.push(Vec::new());
+                ids.len() - 1
+            });
+            if let Some(u) = previous
+                && u != v
+            {
+                adjacency[u].push((v, edges));
+                adjacency[v].push((u, edges));
+                edges += 1;
+            }
+            previous = Some(v);
+        }
+    }
+    let Some(rings) = cycles(&adjacency) else {
+        return RoleRings::Refused;
+    };
+    let mut walked: Vec<(usize, Vec<i64>, Vec<Pt>)> = Vec::with_capacity(rings.len());
+    for (c, cycle) in rings {
+        let ring: Vec<Pt> = cycle.iter().map(|&v| coords[v]).collect();
+        if !one_run_per_point(&ring) {
+            return RoleRings::Refused;
+        }
+        let mut closed = ring;
+        closed.push(closed[0]);
+        if collinear(&closed) {
+            return RoleRings::Refused;
+        }
+        walked.push((c, cycle.iter().map(|&v| ids[v]).collect(), closed));
+    }
+    let mut undecided = false;
+    for (i, a) in walked.iter().enumerate() {
+        for b in &walked[i + 1..] {
+            if a.0 != b.0 {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, a)] {
+                match outside_by_midpoints(&x.1, &x.2, &y.1, &y.2) {
+                    Some(true) => {}
+                    Some(false) => return RoleRings::Refused,
+                    None => undecided = true,
+                }
+            }
+        }
+    }
+    if undecided {
+        return RoleRings::Undecided;
+    }
+    RoleRings::Rings(walked.into_iter().map(|(_, _, ring)| ring).collect())
+}
+
+/// Whether the open cyclic walk `ring` visits each point in one run.
+fn one_run_per_point(ring: &[Pt]) -> bool {
+    let n = ring.len();
+    let Some(start) = (0..n).find(|&i| ring[i] != ring[(i + n - 1) % n]) else {
+        // One point throughout: collinear, refused by the caller.
+        return true;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut previous = None;
+    for k in 0..n {
+        let p = ring[(start + k) % n];
+        if previous == Some(p) {
+            continue;
+        }
+        if !seen.insert(p) {
+            return false;
+        }
+        previous = Some(p);
+    }
+    true
+}
+
+/// Whether ring `a` is outside ring `b` by every eligible witness: each
+/// edge of `a` with neither node on `b`, its midpoint classified exactly.
+/// `Some(true)` when every witness is strictly outside, `Some(false)` when
+/// none is (or there is none), so the builder's first witness gives that
+/// answer whichever edge it is; `None` when they disagree.
+fn outside_by_midpoints(a_ids: &[i64], a: &[Pt], b_ids: &[i64], b: &[Pt]) -> Option<bool> {
+    let on_b: std::collections::HashSet<i64> = b_ids.iter().copied().collect();
+    let Some(bb) = bbox_of(b.iter()) else {
+        return Some(false);
+    };
+    let n = a_ids.len();
+    let (mut out, mut not_out) = (false, false);
+    for i in 0..n {
+        if on_b.contains(&a_ids[i]) || on_b.contains(&a_ids[(i + 1) % n]) {
+            continue;
+        }
+        let (p, q) = (a[i], a[i + 1]);
+        let (y2, x2) = (
+            i64::from(p.0) + i64::from(q.0),
+            i64::from(p.1) + i64::from(q.1),
+        );
+        let strictly_out = y2 < 2 * i64::from(bb.0)
+            || y2 > 2 * i64::from(bb.2)
+            || x2 < 2 * i64::from(bb.1)
+            || x2 > 2 * i64::from(bb.3)
+            || side_doubled(y2, x2, b) == Some(false);
+        if strictly_out {
+            out = true;
         } else {
+            not_out = true;
+        }
+        if out && not_out {
             return None;
         }
     }
     Some(out)
+}
+
+/// Exact even-odd side of the doubled point `(y2, x2)` against the closed
+/// ring `ring`: `Some(true)` strictly inside, `Some(false)` strictly
+/// outside, `None` on the boundary.
+fn side_doubled(y2: i64, x2: i64, ring: &[Pt]) -> Option<bool> {
+    let mut odd = false;
+    for e in ring.windows(2) {
+        let (ay, ax) = (2 * i64::from(e[0].0), 2 * i64::from(e[0].1));
+        let (by, bx) = (2 * i64::from(e[1].0), 2 * i64::from(e[1].1));
+        let cross =
+            i128::from(bx - ax) * i128::from(y2 - ay) - i128::from(by - ay) * i128::from(x2 - ax);
+        if cross == 0
+            && x2 >= ax.min(bx)
+            && x2 <= ax.max(bx)
+            && y2 >= ay.min(by)
+            && y2 <= ay.max(by)
+        {
+            return None;
+        }
+        if (ay > y2) != (by > y2) {
+            // Left of the edge's crossing at y2, sign-corrected for its
+            // direction.
+            let left = (cross > 0) == (by > ay);
+            if left {
+                odd = !odd;
+            }
+        }
+    }
+    Some(odd)
 }
 
 /// Whether every point of `ring` lies on one line, exactly.
@@ -328,26 +527,6 @@ fn collinear(ring: &[Pt]) -> bool {
         let (e0, e1) = d(p);
         d0 * e1 == d1 * e0
     })
-}
-
-/// The closed walk of a group whose every endpoint has degree two.
-fn walk(ways: &[&[Node]], group: &[usize], ends: &HashMap<i64, Vec<usize>>) -> Option<Vec<Pt>> {
-    let mut used = std::collections::HashSet::new();
-    let first = group[0];
-    used.insert(first);
-    let mut ring: Vec<Node> = ways[first].to_vec();
-    while used.len() < group.len() {
-        let end = ring[ring.len() - 1].0;
-        let &next = ends[&end].iter().find(|j| !used.contains(*j))?;
-        used.insert(next);
-        let w = ways[next];
-        if w[0].0 == end {
-            ring.extend_from_slice(&w[1..]);
-        } else {
-            ring.extend(w[..w.len() - 1].iter().rev());
-        }
-    }
-    Some(ring.into_iter().map(|(_, p)| p).collect())
 }
 
 /// Even-odd containment of `(y, x)` in decimicrodegrees.
@@ -571,31 +750,33 @@ impl AdminModel {
                     ));
                 }
             }
-            fn as_slices(v: &[Vec<Node>]) -> Vec<&[Node]> {
-                v.iter().map(Vec::as_slice).collect()
-            }
-            let assembled = if needs_full_topology(&b.outer, &outer_ways)
-                || needs_full_topology(&b.inner, &inner_ways)
-            {
-                None
-            } else {
-                rings(&as_slices(&outer_ways)).zip(rings(&as_slices(&inner_ways)))
+            // The builder assembles the outer role, contributes nothing when
+            // it has no ring, and only then assembles the inner role; a
+            // refusal of either withholds the relation. No edge spans half
+            // a turn here, so the raw ring is the reader's frame.
+            let outcome = match role_rings(&outer_ways) {
+                RoleRings::Refused => RoleRings::Refused,
+                RoleRings::Rings(o) if o.is_empty() => continue,
+                outer => match (outer, role_rings(&inner_ways)) {
+                    (_, RoleRings::Refused) => RoleRings::Refused,
+                    (RoleRings::Rings(o), RoleRings::Rings(i)) => {
+                        model.add_polygons(&r.id, &b, o, &i);
+                        continue;
+                    }
+                    _ => RoleRings::Undecided,
+                },
             };
-            let Some((outers, inners)) = assembled else {
-                model.unmodelled.push((b.level, member_box));
-                model
-                    .unmodelled_why
-                    .push((r.id.to_string(), b.level, Unmodelled::Junction));
-                continue;
-            };
-            // A ring whose points all lie on one line has no interior, and
-            // the builder refuses its relation whole. No edge spans half a
-            // turn here, so the raw ring is the reader's frame.
-            if outers.iter().chain(&inners).any(|ring| collinear(ring)) {
-                model.withheld += 1;
-                continue;
+            match outcome {
+                RoleRings::Refused => model.withheld += 1,
+                _ => {
+                    model.unmodelled.push((b.level, member_box));
+                    model.unmodelled_why.push((
+                        r.id.to_string(),
+                        b.level,
+                        Unmodelled::UndecidedLobes,
+                    ));
+                }
             }
-            model.add_polygons(&r.id, &b, outers, &inners);
         }
         model.index_edges()?;
         Ok(model)
@@ -952,46 +1133,199 @@ mod tests {
         }
     }
 
+    /// Members through the named nodes of `at`.
+    fn members(list: &[&[i64]], at: impl Fn(i64) -> Pt) -> Vec<Vec<Node>> {
+        list.iter()
+            .map(|w| w.iter().map(|&id| (id, at(id))).collect())
+            .collect()
+    }
+
+    /// The ring count, or the outcome when there are no rings to count.
+    fn count(list: &[&[i64]], at: impl Fn(i64) -> Pt) -> Result<usize, String> {
+        match role_rings(&members(list, at)) {
+            RoleRings::Rings(r) => Ok(r.len()),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// A square `[0, 10] x [0, 10]` with named corners, as `(lat, lon)`:
+    /// 1 (0,0), 2 (0,10), 3 (10,10), 4 (10,0); other IDs `lat * 100 + lon`.
+    fn grid(id: i64) -> Pt {
+        match id {
+            1 => (0, 0),
+            2 => (0, 10),
+            3 => (10, 10),
+            4 => (10, 0),
+            _ => (
+                i32::try_from(id / 100).unwrap(),
+                i32::try_from(id % 100).unwrap(),
+            ),
+        }
+    }
+
+    /// The builder's ring-assembly cases (its own unit tests), judged by
+    /// the independent oracle.
     #[test]
-    fn degree_two_groups_close_and_others_are_unmodelled() {
-        let s = ids(1, &square(0, 0, 10));
-        let (a, b) = (s[..3].to_vec(), s[2..].to_vec());
-        let r = rings(&[&a[..], &b[..]]).unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].len(), 5);
-        // A reversed member joins as well.
-        let rev: Vec<Node> = b.iter().rev().copied().collect();
-        assert_eq!(rings(&[&a[..], &rev[..]]).unwrap()[0].len(), 5);
-        // An open path forms nothing.
-        assert!(rings(&[&a[..]]).unwrap().is_empty());
-        // Three ends at one node: not modelled.
-        let spur = [s[0], (99, (-5, -5))];
-        assert!(rings(&[&a[..], &b[..], &spur[..]]).is_none());
-        // A one-node way: not modelled.
-        assert!(rings(&[&s[..], &[s[0]][..]]).is_none());
-        // Distinct nodes at the first coordinate close nothing by id.
-        let mut open = s.clone();
-        open[4].0 = 50;
-        assert!(rings(&[&open[..]]).unwrap().is_empty());
-        // A ring revisiting a coordinate through distinct nodes: not modelled.
-        let revisit = [
-            (1, (0, 0)),
-            (2, (0, 10)),
-            (3, (0, 0)),
-            (4, (10, 0)),
-            (1, (0, 0)),
-        ];
-        assert!(rings(&[&revisit[..]]).is_none());
+    fn the_oracle_assembles_as_the_builder_rules_say() {
+        let refused = Err("Refused".to_owned());
+        // Split members close one ring, reversed or not; a chain alone none.
+        assert_eq!(count(&[&[1, 2], &[3, 2], &[3, 4, 1]], grid), Ok(1));
+        assert_eq!(count(&[&[1, 2], &[2, 3]], grid), Ok(0));
+        // A spur and a one-node member are dropped, not refused.
+        assert_eq!(count(&[&[1, 2, 3, 4, 1], &[1, 9_999]], grid), Ok(1));
+        assert_eq!(count(&[&[1, 2, 3], &[3, 4, 1], &[1]], grid), Ok(1));
+        // Four paths between two nodes, and a theta: refused in any order.
+        let mut paths: Vec<&[i64]> = vec![&[1, 102, 2], &[1, 304, 2], &[1, 506, 2], &[1, 708, 2]];
+        for _ in 0..4 {
+            assert_eq!(count(&paths, grid), refused);
+            paths.rotate_left(1);
+        }
+        assert_eq!(count(&[&[1, 2], &[2, 3, 4, 1], &[2, 4]], grid), refused);
+        // A leaf beside many loops at one node: each closed loop is its own
+        // graph, never compared with the others, and the leaf is dropped.
+        let loops: Vec<Vec<i64>> = (1..=20)
+            .map(|k| vec![1, 100 * k + 1, 100 * k + 2, 1])
+            .collect();
+        let mut list: Vec<&[i64]> = vec![&[9_999, 1]];
+        list.extend(loops.iter().map(Vec::as_slice));
+        assert_eq!(count(&list, grid), Ok(20));
+        // Two triangles touching at a node are two rings.
+        let touch = |id: i64| {
+            [(0, 0), (10, 0), (5, 5), (10, 10), (0, 10)][usize::try_from(id - 1).unwrap()]
+        };
+        assert_eq!(
+            count(
+                &[&[1, 2], &[2, 3], &[3, 4], &[4, 5], &[5, 3], &[3, 1]],
+                touch
+            ),
+            Ok(2)
+        );
+        // Retraces and spikes.
+        assert_eq!(count(&[&[1, 2, 1]], grid), refused);
+        assert_eq!(count(&[&[1, 2], &[2, 1]], grid), refused);
+        assert_eq!(count(&[&[1, 2, 3, 1, 2, 3, 1]], grid), refused);
+        assert_eq!(count(&[&[1, 2, 3, 708, 3, 4, 1]], grid), refused);
+        // Distinct nodes at one coordinate close nothing.
+        let seven = |id: i64| if id == 7 { grid(1) } else { grid(id) };
+        assert_eq!(count(&[&[1, 2, 3], &[3, 4, 7]], seven), Ok(0));
+        // ... but adjacent ones are one run.
+        assert_eq!(count(&[&[1, 2, 3, 4, 7, 1]], seven), Ok(1));
+        // A revisit outside one run, and a collinear ring.
+        let eight = |id: i64| match id {
+            1 | 4 => (0, 0),
+            2 => (10, 10),
+            3 => (10, -10),
+            5 => (-10, -10),
+            _ => (-10, 10),
+        };
+        assert_eq!(count(&[&[1, 2, 3, 4, 5, 6, 1]], eight), refused);
+        let flat = |id: i64| (0, i32::try_from(id).unwrap() * 10);
+        assert_eq!(count(&[&[1, 2, 3, 1]], flat), refused);
+        // Lobes of one walk: disjoint ones split, a nested one refuses.
+        let lobes = |id: i64| match id {
+            1 => (5, 10),
+            2 => (0, 10),
+            3 => (0, 0),
+            4 => (10, 0),
+            5 => (10, 10),
+            6 => (4, 14),
+            7 => (6, 14),
+            8 => (4, 8),
+            _ => (6, 8),
+        };
+        assert_eq!(count(&[&[1, 2, 3, 4, 5, 1, 6, 7, 1]], lobes), Ok(2));
+        assert_eq!(count(&[&[1, 2, 3, 4, 5, 1, 8, 9, 1]], lobes), refused);
+        // A refusal in one closed member refuses the role.
+        assert_eq!(count(&[&[1, 2, 3, 4, 1], &[1, 2, 1]], grid), refused);
+    }
+
+    /// Two overlapping rectangles joined by a bridge: some midpoints of
+    /// one lie outside the other and some inside, so the builder's verdict
+    /// follows member order and the role is undecided.
+    #[test]
+    fn crossing_rings_of_one_graph_are_undecided() {
+        let at = |id: i64| match id {
+            1 => (0, 0),
+            2 => (0, 10),
+            3 => (10, 10),
+            4 => (10, 0),
+            11 => (2, 5),
+            12 => (2, 15),
+            13 => (8, 15),
+            _ => (8, 5),
+        };
+        let r = role_rings(&members(
+            &[&[1, 2, 3, 4, 1], &[3, 13], &[11, 12, 13, 14, 11]],
+            at,
+        ));
+        // Closed members are graphs of their own: never compared.
+        assert!(
+            matches!(r, RoleRings::Rings(ref v) if v.len() == 2),
+            "{r:?}"
+        );
+        let r = role_rings(&members(
+            &[
+                &[1, 2],
+                &[2, 3],
+                &[3, 4],
+                &[4, 1],
+                &[3, 13],
+                &[11, 12],
+                &[12, 13],
+                &[13, 14],
+                &[14, 11],
+            ],
+            at,
+        ));
+        assert!(matches!(r, RoleRings::Undecided), "{r:?}");
     }
 
     #[test]
-    fn repeated_and_shared_interior_members_need_full_topology() {
-        let s = ids(1, &square(0, 0, 10));
-        assert!(needs_full_topology(&[7, 7], &[s.clone(), s.clone()]));
-        assert!(!needs_full_topology(&[7], std::slice::from_ref(&s)));
-        // A bridge leaving the triangle at its corner node 1: A B C A D.
-        let bridged = vec![s[0], s[1], s[2], s[0], (9, (-5, -5))];
-        assert!(needs_full_topology(&[7], &[bridged]));
+    fn closed_members_never_meet_and_a_refused_inner_withholds() {
+        let at = |id: i64| match id {
+            1 => (0, 0),
+            2 => (0, 1_000_000),
+            3 => (1_000_000, 1_000_000),
+            4 => (1_000_000, 0),
+            11 => (200_000, 500_000),
+            12 => (200_000, 1_500_000),
+            13 => (800_000, 1_500_000),
+            _ => (800_000, 500_000),
+        };
+        let mut ways = HashMap::new();
+        for (id, refs) in [
+            (1, vec![1, 2]),
+            (2, vec![2, 3]),
+            (3, vec![3, 4]),
+            (4, vec![4, 1]),
+            (5, vec![3, 13]),
+            (6, vec![11, 12, 13, 14, 11]),
+            (7, vec![1, 2, 1]),
+            (8, vec![11, 12, 13]),
+            (9, vec![13, 14, 11]),
+        ] {
+            let nodes: Vec<Node> = refs.iter().map(|&r| (r, at(r))).collect();
+            ways.insert(id, way(&nodes));
+        }
+        let records = NodeRecords::new();
+        // Way 6 is closed, its own graph: the open square and it never meet.
+        let model =
+            AdminModel::build(&[relation("w1@,w2@,w3@,w4@,w5@,w6@,w6@")], &ways, &records).unwrap();
+        assert_eq!((model.polygons.len(), model.withheld), (2, 0));
+        // An inner role refused withholds whatever the outer is.
+        let model =
+            AdminModel::build(&[relation("w1@,w2@,w3@,w4@,w7@inner")], &ways, &records).unwrap();
+        assert_eq!((model.polygons.len(), model.withheld), (0, 1));
+        // Drawn by open ways, the bridged rectangles cross undecided: the
+        // relation's box is unjudged at its level.
+        let model =
+            AdminModel::build(&[relation("w1@,w2@,w3@,w4@,w5@,w8@,w9@")], &ways, &records).unwrap();
+        assert!(model.polygons.is_empty());
+        assert_eq!(model.unmodelled_why[0].2, Unmodelled::UndecidedLobes);
+        assert!(matches!(
+            model.expect(0.05, 0.05, 1.0).levels[2],
+            Level::Unjudged
+        ));
     }
 
     fn relation(members: &str) -> Record<'static> {
@@ -1101,6 +1435,32 @@ mod tests {
         let at = |lat: f64, lon: f64| model.expect(lat, lon, 1.0).levels[2].clone();
         assert!(matches!(at(0.005, 0.005), Level::Unjudged));
         assert!(matches!(at(0.05, 0.05), Level::Some { .. }));
+    }
+
+    /// Two nested same-level areas: the smaller is the answer, and naming
+    /// the larger one at the smaller's interior is judged wrong.
+    #[test]
+    fn same_level_competition_rejects_the_larger_area() {
+        let record = |line: &str| super::super::parse_record(line).unwrap().into_owned();
+        let mut ways = HashMap::new();
+        ways.insert(1, way(&ids(1, &square(0, 0, 1_000_000))));
+        ways.insert(2, way(&ids(11, &square(200_000, 200_000, 200_000))));
+        let relations = [
+            record("r1 v1 Tboundary=administrative,admin_level=8,name=Big Mw1@outer"),
+            record("r2 v1 Tboundary=administrative,admin_level=8,name=Small Mw2@outer"),
+        ];
+        let model = AdminModel::build(&relations, &ways, &NodeRecords::new()).unwrap();
+        let expect = model.expect(0.03, 0.03, 1.0);
+        let answer = |name: &str, area: f64| serde_json::json!([{ "admin_level": 8, "name": name, "country_code": null, "area": area }]);
+        let mut tally = AdminTally::default();
+        model
+            .judge(&expect, &answer("Small", 4e10), &mut tally)
+            .unwrap();
+        assert_eq!(tally.several, 1);
+        let why = model
+            .judge(&expect, &answer("Big", 1e12), &mut tally)
+            .unwrap_err();
+        assert!(why.contains("expected the least of"), "{why}");
     }
 
     #[test]

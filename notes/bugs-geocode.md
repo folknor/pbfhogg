@@ -78,6 +78,15 @@ order can choose between a boundary witness (refusal) and a strict one
 members. The hole-ownership witness rule (sorted witnesses, boundary
 abstains) would fix it the same way.
 
+Crossing rings flip it too, with no boundary witness at all (VER-133 spar):
+rectangles `[0,10] x [0,10]` and `[5,15] x [2,8]` drawn by open ways and
+joined by a bridge publish when each walk starts on an edge outside the
+other and are withheld when one starts on an edge inside it. Sorted
+witnesses alone would not settle that case; the rule has to say what two
+crossing rings of one graph are. Until it does, `pbfhogg-verify geocode`
+leaves a relation whose ring pairs have disagreeing midpoints unjudged over
+its box (germany at the time of filing: none).
+
 ## GEO-032 - Ranking area of a crossing ring varies with its start at roundoff
 
 Reported by: the GEO-019/GEO-020 spar (codex, reproduced arithmetic).

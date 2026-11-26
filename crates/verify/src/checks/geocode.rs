@@ -1189,6 +1189,38 @@ fn build_indexes(
     Ok(())
 }
 
+/// Account for the admin model's unjudged boxes: a count per cause, and
+/// the coarse ones by relation.
+fn report_unmodelled(harness: &mut Harness, admin: &admin::AdminModel) {
+    let of = |cause: admin::Unmodelled| {
+        admin
+            .unmodelled_why
+            .iter()
+            .filter(|(_, _, why)| *why == cause)
+            .count()
+    };
+    harness.msg(&format!(
+        "  unjudged boxes by cause: {} undecided lobes, {} undecided holes, {} \
+         levels with an unlocated member node",
+        of(admin::Unmodelled::UndecidedLobes),
+        of(admin::Unmodelled::HoleClearance),
+        of(admin::Unmodelled::Unlocated),
+    ));
+    // Every unmodelled relation makes its level unjudged across its box, so
+    // name the coarse ones: a run says which relation a gap comes from.
+    for ((id, level, why), (_, b)) in admin.unmodelled_why.iter().zip(&admin.unmodelled) {
+        if *level <= 4 {
+            harness.msg(&format!(
+                "    unmodelled level {level} {id} ({why:?}), box {:.4},{:.4} to {:.4},{:.4}",
+                f64::from(b.0) * 1e-7,
+                f64::from(b.1) * 1e-7,
+                f64::from(b.2) * 1e-7,
+                f64::from(b.3) * 1e-7,
+            ));
+        }
+    }
+}
+
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("geocode")?;
     harness.msg("=== verify geocode (address, street, interpolation and admin answers) ===");
@@ -1223,7 +1255,8 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     harness.msg(&format!(
         "  model: {} address points, {} street segments, {} interpolation ranges from {} \
          resolved ways ({} refused), {} admin polygons from {} boundary relations ({} \
-         withheld as incomplete or listing a way in both roles, {} unjudged boxes of \
+         withheld as incomplete, listing a way in both roles or refused as topology, {} \
+         unjudged boxes of \
          unmodelled relations and undecided holes)",
         model.addresses.len(),
         model.segments.len(),
@@ -1235,19 +1268,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         admin.withheld,
         admin.unmodelled.len(),
     ));
-    // Every unmodelled relation makes its level unjudged across its box, so
-    // name the coarse ones: a run says which relation a gap comes from.
-    for ((id, level, why), (_, b)) in admin.unmodelled_why.iter().zip(&admin.unmodelled) {
-        if *level <= 4 {
-            harness.msg(&format!(
-                "    unmodelled level {level} {id} ({why:?}), box {:.4},{:.4} to {:.4},{:.4}",
-                f64::from(b.0) * 1e-7,
-                f64::from(b.1) * 1e-7,
-                f64::from(b.2) * 1e-7,
-                f64::from(b.3) * 1e-7,
-            ));
-        }
-    }
+    report_unmodelled(harness, &admin);
     let queries = harness.timed("query draw", || queries(&model, &admin))?;
     let points = outdir.join("points.txt");
     {

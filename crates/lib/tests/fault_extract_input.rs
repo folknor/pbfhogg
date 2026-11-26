@@ -15,8 +15,9 @@
 //!
 //! - simple, sorted: the sortedness probe, the schedule walk, the header
 //!   read, then per kind (nodes, ways, relations) the fused pass's
-//!   descriptor (these fixtures carry disjoint indexdata ID ranges; a kind
-//!   without them takes a classify and a write descriptor instead).
+//!   descriptor (these fixtures carry indexdata ID ranges the fused planner
+//!   admits; a kind it refuses takes a classify and a write descriptor
+//!   instead).
 //! - simple, unsorted: the probe, one reader per kind's classify sweep, the
 //!   write pass's reader.
 //! - complete and smart: the indexdata front read, pass 1's sortedness

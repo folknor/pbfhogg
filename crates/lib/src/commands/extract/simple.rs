@@ -344,12 +344,13 @@ fn extract_simple_two_pass(
 /// kind (nodes, ways, relations), each kind's ID set frozen before the next
 /// kind reads it.
 ///
-/// A kind whose blobs carry pairwise-disjoint indexdata ID ranges runs fused
+/// A kind whose blobs all carry indexdata ID ranges runs fused
 /// (`fused::fused_pass`): each blob is read, decompressed and decoded once,
-/// selected and framed on its worker. Any other kind (an unindexed blob, or
-/// ranges that overlap, as a history file's repeated IDs make them) runs a
-/// classify pool that fills the kind's ID set, then a write pool that
-/// rereads and writes by it.
+/// selected and framed on its worker, blobs whose ranges overlap (a history
+/// file's versions straddling a blob cut) read together as one component.
+/// A kind the planner refuses (an unindexed blob, an overlap that skips a
+/// blob, too long a run) runs a classify pool that fills the kind's ID set,
+/// then a write pool that rereads and writes by it.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_single_pass(
@@ -461,13 +462,14 @@ fn extract_simple_single_pass(
     let mut matched_way_ids = IdSet::new();
 
     // Each kind runs fused (one decode per blob, selecting and framing on
-    // the worker) when its schedule's ID ranges prove every ID's occurrences
-    // lie in one blob; otherwise classify, then write (see `fused`).
-    if super::fused::fusable(&node_schedule) {
+    // the worker) when its schedule's ID ranges plan every ID's occurrences
+    // into one component task; otherwise classify, then write (see `fused`).
+    if let Some(components) = super::fused::fusable(&node_schedule) {
         host.invocation.marker("SIMPLE_NODE_FUSED_START");
         super::fused::fused_pass(
             input,
             &node_schedule,
+            &components,
             &super::fused::Select::Nodes {
                 region,
                 exact: &exact_bbox,
@@ -494,11 +496,12 @@ fn extract_simple_single_pass(
     }
 
     // --- Phase 2: ways ---
-    if super::fused::fusable(&way_schedule) {
+    if let Some(components) = super::fused::fusable(&way_schedule) {
         host.invocation.marker("SIMPLE_WAY_FUSED_START");
         super::fused::fused_pass(
             input,
             &way_schedule,
+            &components,
             &super::fused::Select::Ways {
                 nodes: &bbox_node_ids,
                 coords,
@@ -525,12 +528,13 @@ fn extract_simple_single_pass(
     }
 
     // --- Phase 3: relations ---
-    if super::fused::fusable(&relation_schedule) {
+    if let Some(components) = super::fused::fusable(&relation_schedule) {
         host.invocation.marker("SIMPLE_REL_FUSED_START");
         let mut unused = IdSet::new();
         super::fused::fused_pass(
             input,
             &relation_schedule,
+            &components,
             &super::fused::Select::Relations {
                 nodes: &bbox_node_ids,
                 ways: &matched_way_ids,

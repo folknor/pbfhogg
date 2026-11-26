@@ -625,9 +625,10 @@ fn parse_extract_geometry(
 ///
 /// On a sorted input every strategy, cleaned or not, serves every region
 /// from one run over the input rather than one extract per region (simple
-/// reads each blob of a kind once when the kind's indexdata ID ranges are
-/// pairwise disjoint, refusing a blob whose range or count is not exact,
-/// and otherwise visits the kind twice, a classify pass and a write pass;
+/// reads each blob of a kind once when every blob of the kind carries an
+/// indexdata ID range, blobs whose ranges overlap read together, refusing a
+/// blob whose range or count is not exact, and otherwise (an overlap the
+/// planner refuses) visits the kind twice, a classify pass and a write pass;
 /// complete-ways
 /// and smart classify every kind into shared region masks, smart sweeps the
 /// way blobs once more, and one write pass follows). That run writes every

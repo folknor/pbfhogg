@@ -1015,6 +1015,16 @@ pub(crate) const EXTRACT_MULTI_EXTRA_FDS: u64 = 8;
 /// collects before its workers decode and write them.
 pub(crate) const EXTRACT_SIMPLE_BATCH_SIZE: usize = 64;
 
+/// Largest overlap component (blobs whose claimed ID ranges overlap, in a
+/// contiguous schedule run) a sorted simple extract's fused kind pass reads
+/// as one task, holding every member's decoded block until the component's
+/// ID union is known. A kind with a larger component runs classify, then
+/// write. History files make components where an ID's versions straddle a
+/// blob cut; their length is geometric in the straddle rate, so 8 is rarely
+/// reached, and the pool window is divided by the kind's largest component
+/// so the blobs admitted at once never exceed the plain window.
+pub(crate) const EXTRACT_FUSED_COMPONENT_MAX: usize = 8;
+
 /// Region count from which multi-extract builds a `RegionGrid` to prune
 /// candidates instead of testing every region linearly.
 pub(crate) const GRID_REGION_THRESHOLD: usize = 16;

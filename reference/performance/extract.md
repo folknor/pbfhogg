@@ -31,8 +31,24 @@ want the continent box pass `--bbox` explicitly.
 Sorted simple extract runs one phase per kind (nodes, ways, relations). On
 indexed input each phase is fused: one read, decompression and decode per
 blob, selected and re-encoded on its worker; only node blobs verified
-wholly inside the region are copied raw. A kind without disjoint ID ranges
-classifies, then rereads and writes.
+wholly inside the region are copied raw. Blobs whose ID ranges overlap (a
+history file's versions straddling a blob cut) are read as one component
+task; a kind the planner refuses (an unindexed blob, an overlap skipping a
+blob, more than 8 overlapping blobs in a run) classifies, then rereads and
+writes.
+
+### Overlap components in the fused kind pass (bygg, 2026-11-26, variant uncommitted against `61e55c62`)
+
+The whole-kind disjointness gate replaced by a planner that groups
+overlapping blobs into contiguous component tasks; on disjoint input every
+component is one blob. Matched `--iterations 1` cells, interleaved, after one
+fstrim at the head of the suite. Single region,
+`region-extract --dataset planet --strategy simple --bbox=-25,34,45,72`:
+baseline 96.17 s (`a31fe38f`) and 93.94 s (`e66d16e6`), variant 94.72 s
+(`9212ef9d`) and 94.05 s (`5c533917`). Verdict: neutral on normal input.
+Multi-extract cells are in multi-extract.md. No indexed history input is
+registered on any host, so the history-side saving (one decode per blob
+instead of a classify and a write pass per kind) is unmeasured.
 
 ### Fused kind passes for sorted simple extract (bygg, 2026-11-24, variant uncommitted against `ac9b331b`)
 
@@ -54,8 +70,7 @@ within the run-to-run band (node phase 2.38 GB against 2.24/2.33 GB).
 Per-kind numbers are the `71e0d208` and `2d84567e` pair. The saving is
 smaller than the removed classify spans: the fused selection walk over the
 decoded block costs most of what the scanner classify cost, and what goes
-is the second pread and decompression. Multi-extract keeps its classify and
-write passes per kind.
+is the second pread and decompression.
 
 ### Unsorted simple extract: kind skips and worker decode (bygg, 2026-11-25, variant uncommitted against `e48ff097`)
 

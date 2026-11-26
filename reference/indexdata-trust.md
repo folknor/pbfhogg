@@ -189,31 +189,38 @@ range hands a neighbour's upsert to the blob as well.
   cannot name it): a descent is `Unsorted`. Sparse does not depend on order
   and does not check it.
 - **`extract --simple`**, single region, sorted header: a kind whose blobs
-  all carry ID ranges that are pairwise disjoint decodes each blob once and
-  decides its ID-selection rule (one selected occurrence writes every
-  occurrence of the ID) inside the blob, which is sound only if no ID
-  occurs in two blobs. Every blob of such a kind, a raw-copy candidate
+  all carry ID ranges decodes each blob once. Blobs whose closed ranges
+  overlap form a component (`extract/fused.rs` `components`), read as one
+  task, and the ID-selection rule (one selected occurrence writes every
+  occurrence of the ID) is decided over the component's union, which is
+  sound only if no ID occurs in two components: exactly what disjoint
+  component ranges claim. Every blob of such a kind, a raw-copy candidate
   included, is tallied over its elements of the kind and its claim must be
-  exact before the blob's output leaves the worker. Order is not required:
-  an equal or descending step inside the blob switches it to a blob-local
-  ID set. A kind with an unindexed blob or overlapping ranges reads no
-  range and is classified, then written, as before.
+  exact before its component's output leaves the worker. Order is not
+  required: an equal or descending step inside a one-blob component
+  switches it to a blob-local ID set. A kind with an unindexed blob, a
+  component that is not a contiguous run of the schedule, or a component of
+  more than `EXTRACT_FUSED_COMPONENT_MAX` blobs reads no range and is
+  classified, then written.
 - **`extract --simple --config`** (multi-extract), sorted header: the same
-  gate, per kind, over the shared schedule (`extract/multi_fused.rs`). The
-  rule is decided per region inside the blob, and each blob's claim must be
-  exact before any region's output of it leaves the worker. A raw-copy
+  plan, per kind, over the shared schedule (`extract/multi_fused.rs`). The
+  rule is decided per region inside the component, over a table built only
+  from each blob's admitted hits, and a blob emits an ID to a region only
+  where that blob is itself read for the region; each blob's claim must be
+  exact before any region's output of its component leaves the worker. A raw-copy
   candidate is copied to each region it is nominated for (the region's
   inside box holds the claimed bbox, as in that region's single extract)
   whose hits, counted over each node occurrence before the blob-local
   union, include every occurrence; the blob is rebuilt for the other
   regions that read it. The classify-then-write form applies the same
   per-region rule. A repeated or
-  descending ID switches the blob to a blob-local `(ID, region)` table.
-  The gate is judged over the shared schedule, the node blobs any region
-  reads, not over each region's own: a region whose single extract would
-  fuse, and so refuse an inexact node ID range or count, can run
-  classify-then-write here because another region's blob overlaps the
-  range, and its inexact claim then passes unchecked. Accepted: exact
+  descending ID switches a one-blob component to a blob-local `(ID,
+  region)` table. The plan is judged over the shared schedule, the node
+  blobs any region reads, not over each region's own: a region whose single
+  extract would fuse, and so refuse an inexact node ID range or count, can
+  run classify-then-write here because another region's blob makes the
+  shared plan refuse (an overlap that skips a blob, or too long a run), and
+  its inexact claim then passes unchecked. Accepted: exact
   claims select the same occurrences either way, and tallying every blob a
   region would fuse costs per-element work on normal input.
 - **`diff`** and `diff --format osc`, on the indexed route, every block a

@@ -4,12 +4,22 @@
 //!
 //! The rule is single extract's (`fused.rs`), per region: an occurrence is
 //! written to region `r` when any scheduled occurrence of its kind and ID
-//! matched `r`. [`super::fused::ranges_disjoint`] proves before the kind
-//! starts that every blob of the kind carries an ID range and the ranges are
-//! pairwise disjoint, so an ID's occurrences all lie in one blob, and each
-//! blob's claim is checked exactly at decode (`IdTally::refuse_inexact`,
-//! ADR-0013 consequence 4) before anything of it leaves the worker. A kind
-//! that fails the gate runs the classify-then-write form in `multi.rs`.
+//! matched `r`. [`super::fused::components`] plans before the kind starts:
+//! every blob of the kind carries an ID range, and blobs whose ranges
+//! overlap (history files, where an ID's versions straddle a blob cut) form
+//! one component, read as one task, so an ID's occurrences all lie in one
+//! task. Each blob's claim is checked exactly at decode
+//! (`IdTally::refuse_inexact`, ADR-0013 consequence 4) before anything of
+//! its component leaves the worker. A kind the planner refuses runs the
+//! classify-then-write form in `multi.rs`.
+//!
+//! A component of more than one blob selects every blob first, then builds
+//! one `(id, region)` table from the blobs' admitted hits (a node blob's
+//! hits are already thinned to the regions it is read for), emits each blob
+//! through it intersected with that blob's own admission, and installs the
+//! table once. Raw-copy eligibility stays each blob's own: a blob whose
+//! every occurrence hits a candidate region by its own coordinates has every
+//! ID selected there whatever the union adds.
 //!
 //! Each blob is walked twice on its worker. The selection walk records each
 //! occurrence's regions as sparse hits, `(occurrence, region)` in occurrence
@@ -68,6 +78,13 @@ pub(super) struct FusedBlob<'a> {
     pub(super) claim: BlobIndex,
     pub(super) candidates: Option<&'a [u64]>,
     pub(super) admit: Option<&'a [u64]>,
+}
+
+/// A fused kind: its blobs in schedule order and the overlap components
+/// (`fused::components`), each a contiguous run of `blobs` read as one task.
+pub(super) struct FusedKind<'a> {
+    pub(super) blobs: Vec<FusedBlob<'a>>,
+    pub(super) components: Vec<std::ops::Range<usize>>,
 }
 
 /// What decides an occurrence of the pass's kind, per region.
@@ -139,6 +156,8 @@ struct Local {
     dense_hits: Vec<(u32, u32)>,
     plain_hits: Vec<(u32, u32)>,
     table: Vec<(i64, u32)>,
+    /// A multi-blob component's sorted `(id, region)` union.
+    union: Vec<(i64, u32)>,
     acc: Vec<u64>,
     regs: Vec<u32>,
     way: crate::owned::WayScratch,
@@ -152,7 +171,7 @@ struct Local {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn multi_fused_pass(
     input: &InputFile,
-    blobs: &[FusedBlob<'_>],
+    kind: &FusedKind<'_>,
     select: &MultiSelect<'_>,
     n: usize,
     clean: &crate::cat::CleanAttrs,
@@ -180,12 +199,18 @@ pub(super) fn multi_fused_pass(
         demoted: 0,
         cancel: &host.invocation,
     };
+    let largest = kind
+        .components
+        .iter()
+        .map(ExactSizeIterator::len)
+        .max()
+        .unwrap_or(1);
     let mut workers = vec![(); decode_threads];
     crate::ordered_pool::run_ordered(
-        blobs.len(),
+        kind.components.len(),
         &mut workers,
         crate::ordered_pool::PoolConfig {
-            window: crate::ordered_pool::default_window(decode_threads),
+            window: super::fused::component_window(decode_threads, largest),
             cancel: &host.invocation,
             waits: crate::ordered_pool::Waits::default(),
         },
@@ -202,17 +227,54 @@ pub(super) fn multi_fused_pass(
             dense_hits: Vec::new(),
             plain_hits: Vec::new(),
             table: Vec::new(),
+            union: Vec::new(),
             acc: vec![0u64; mw],
             regs: Vec::new(),
             way: crate::owned::WayScratch::default(),
             builder: BatchBuilder::new(n),
         },
-        |(), local: &mut Local, position| {
-            let blob = &blobs[position];
-            let result = fuse_blob(input, blob, select, n, clean, framing, collect, local)
-                .map_err(|e| input.locate_blob(&blob.entry, e));
-            local.read_buf.release_outlier(&host.invocation);
-            result
+        |(), local: &mut Local, task| {
+            let blobs = &kind.blobs[kind.components[task].clone()];
+            let mut prepared = Vec::with_capacity(blobs.len());
+            for blob in blobs {
+                if !prepared.is_empty() {
+                    host.invocation.check()?;
+                }
+                let one = prepare(input, blob, select, n, local)
+                    .map_err(|e| input.locate_blob(&blob.entry, e));
+                local.read_buf.release_outlier(&host.invocation);
+                prepared.push(one?);
+            }
+            // A larger component selects by the union of its blobs'
+            // admitted hits.
+            let union = prepared.len() > 1;
+            if union {
+                local.union.clear();
+                for p in &prepared {
+                    local.union.extend(p.pairs());
+                }
+                local.union.sort_unstable();
+                local.union.dedup();
+            }
+            let mut out = Vec::with_capacity(prepared.len());
+            for (i, (blob, p)) in blobs.iter().zip(prepared).enumerate() {
+                out.push(
+                    finish(
+                        p,
+                        blob,
+                        union,
+                        i == 0,
+                        select,
+                        n,
+                        clean,
+                        framing,
+                        collect,
+                        local,
+                    )
+                    .map_err(|e| input.locate_blob(&blob.entry, e))?,
+                );
+            }
+            Ok(out)
         },
         &mut consumer,
     )?;
@@ -264,27 +326,24 @@ fn strictly_increasing(ids: &[i64]) -> bool {
         .all(|w| crate::osm_id::osm_id_key(w[0]) < crate::osm_id::osm_id_key(w[1]))
 }
 
-/// Read, decompress, decode, select and frame one blob.
+/// Read, decompress, decode and select one blob: its selection walk, its
+/// admission, its exact claim check and its raw-copy decision.
 ///
 /// Occurrence indices and region numbers are `u32`: a validated block's
 /// decompressed size bound keeps its element count far below `u32::MAX`, and
 /// the region grid already numbers regions as `u32`.
 #[allow(
     clippy::cast_possible_truncation,
-    clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::cognitive_complexity
 )]
-fn fuse_blob(
+fn prepare(
     input: &InputFile,
     blob: &FusedBlob<'_>,
     select: &MultiSelect<'_>,
     n: usize,
-    clean: &crate::cat::CleanAttrs,
-    framing: &RegionFraming<'_>,
-    collect: bool,
     local: &mut Local,
-) -> crate::error::Result<Fused> {
+) -> crate::error::Result<Prepared> {
     let entry = &blob.entry;
     // A candidate reads its whole frame, so a verified one is copied from
     // the very bytes whose body was validated.
@@ -489,18 +548,101 @@ fn fuse_blob(
         }),
         None => None,
     };
+    Ok(Prepared {
+        block,
+        dense_ids: std::mem::take(&mut local.dense_ids),
+        plain_ids: std::mem::take(&mut local.plain_ids),
+        dense_hits: std::mem::take(&mut local.dense_hits),
+        plain_hits: std::mem::take(&mut local.plain_hits),
+        raw,
+        demoted,
+    })
+}
+
+/// One blob after its selection walk and claim check, before emission: its
+/// block, its occurrence IDs and admitted hits (moved out of the worker's
+/// scratch), and its raw-copy part.
+struct Prepared {
+    block: crate::PrimitiveBlock,
+    dense_ids: Vec<i64>,
+    plain_ids: Vec<i64>,
+    dense_hits: Vec<(u32, u32)>,
+    plain_hits: Vec<(u32, u32)>,
+    raw: Option<RawPart>,
+    demoted: bool,
+}
+
+impl Prepared {
+    /// Every admitted `(id, region)` hit of the blob.
+    fn pairs(&self) -> impl Iterator<Item = (i64, u32)> + '_ {
+        let dense = self
+            .dense_hits
+            .iter()
+            .map(|&(occ, region)| (self.dense_ids[occ as usize], region));
+        let plain = self
+            .plain_hits
+            .iter()
+            .map(|&(occ, region)| (self.plain_ids[occ as usize], region));
+        dense.chain(plain)
+    }
+}
+
+/// Emit one prepared blob. `union` is `None` for a one-blob component; for
+/// a larger one it is the component's sorted `(id, region)` table in
+/// `local.union`, built only from admitted hits, and emission reads it less
+/// the regions this blob is not read for.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
+fn finish(
+    prepared: Prepared,
+    blob: &FusedBlob<'_>,
+    union: bool,
+    install: bool,
+    select: &MultiSelect<'_>,
+    n: usize,
+    clean: &crate::cat::CleanAttrs,
+    framing: &RegionFraming<'_>,
+    collect: bool,
+    local: &mut Local,
+) -> crate::error::Result<Fused> {
+    let Prepared {
+        block,
+        dense_ids,
+        plain_ids,
+        dense_hits,
+        plain_hits,
+        raw,
+        demoted,
+    } = prepared;
+    local.dense_ids = dense_ids;
+    local.plain_ids = plain_ids;
+    local.dense_hits = dense_hits;
+    local.plain_hits = plain_hits;
     // Every region the blob is read for copies it raw: no emission walk.
     if let Some(part) = &raw
         && (0..n).all(|r| !admits(blob.admit, r) || admits(Some(&part.mask), r))
     {
-        let batch = collect.then(|| {
-            for &(occ, region) in &local.dense_hits {
-                local
-                    .builder
-                    .push(local.dense_ids[occ as usize], region as usize);
-            }
-            local.builder.finish()
-        });
+        let batch = if union {
+            (collect && install).then(|| {
+                for &(id, region) in &local.union {
+                    local.builder.push(id, region as usize);
+                }
+                local.builder.finish()
+            })
+        } else {
+            collect.then(|| {
+                for &(occ, region) in &local.dense_hits {
+                    local
+                        .builder
+                        .push(local.dense_ids[occ as usize], region as usize);
+                }
+                local.builder.finish()
+            })
+        };
         return Ok(Fused {
             frames: None,
             raw,
@@ -510,10 +652,22 @@ fn fuse_blob(
     }
     let skip = raw.as_ref().map(|part| part.mask.as_slice());
 
-    let unique = (local.plain_ids.is_empty() && strictly_increasing(&local.dense_ids))
-        || (local.dense_ids.is_empty() && strictly_increasing(&local.plain_ids));
-    local.table.clear();
-    if !unique {
+    let unique = !union
+        && ((local.plain_ids.is_empty() && strictly_increasing(&local.dense_ids))
+            || (local.dense_ids.is_empty() && strictly_increasing(&local.plain_ids)));
+    if union {
+        // The component's union, less the regions this blob is not read
+        // for: its single extract of such a region never reads the blob.
+        local.table.clear();
+        let admit = blob.admit;
+        local.table.extend(
+            local
+                .union
+                .iter()
+                .filter(|&&(_, region)| admits(admit, region as usize)),
+        );
+    } else if !unique {
+        local.table.clear();
         for &(occ, region) in &local.dense_hits {
             local.table.push((local.dense_ids[occ as usize], region));
         }
@@ -523,7 +677,9 @@ fn fuse_blob(
         local.table.sort_unstable();
         local.table.dedup();
     }
-    let batch = collect.then(|| {
+    // A component's table installs once, from its first blob: the union of
+    // admitted hits is what each blob's own batch would install together.
+    let batch = (collect && (!union || install)).then(|| {
         if unique {
             for &(occ, region) in &local.dense_hits {
                 local
@@ -536,7 +692,8 @@ fn fuse_blob(
                     .push(local.plain_ids[occ as usize], region as usize);
             }
         } else {
-            for &(id, region) in &local.table {
+            let table = if union { &local.union } else { &local.table };
+            for &(id, region) in table {
                 local.builder.push(id, region as usize);
             }
         }
@@ -657,9 +814,9 @@ struct Cursors {
 impl Cursors {
     /// Fill `local.regs` with the next occurrence's regions (ascending) from
     /// the dense or plain list: its run of hits when `unique`, else its ID's
-    /// slice of the blob-local table, less the regions in `skip` (those the
-    /// blob is copied raw to, so nothing of it is rebuilt or converted for
-    /// them).
+    /// slice of the blob-local (or component) table, less the regions in
+    /// `skip` (those the blob is copied raw to, so nothing of it is rebuilt
+    /// or converted for them).
     #[inline]
     fn regions(
         &mut self,
@@ -734,8 +891,17 @@ struct Consumer<'a> {
     cancel: &'a crate::host::Recorder,
 }
 
-impl crate::ordered_pool::OrderedConsumer<Fused> for Consumer<'_> {
-    fn consume(&mut self, _task: usize, item: Fused) -> crate::Result<()> {
+impl crate::ordered_pool::OrderedConsumer<Vec<Fused>> for Consumer<'_> {
+    fn consume(&mut self, _task: usize, items: Vec<Fused>) -> crate::Result<()> {
+        for item in items {
+            self.consume_blob(item)?;
+        }
+        Ok(())
+    }
+}
+
+impl Consumer<'_> {
+    fn consume_blob(&mut self, item: Fused) -> crate::Result<()> {
         let Fused {
             frames,
             raw,

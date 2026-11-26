@@ -1,6 +1,7 @@
 //! Multi-extract: one run over a sorted input for every region (simple
-//! strategy). A kind with disjoint indexdata ID ranges reads each blob once
-//! (`multi_fused.rs`); any other kind classifies, then writes.
+//! strategy). A kind whose blobs all carry indexdata ID ranges reads each
+//! blob once (`multi_fused.rs`, overlapping blobs read together); a kind the
+//! planner refuses classifies, then writes.
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
@@ -26,10 +27,11 @@ use super::{ExtractStats, Region};
 use crate::owned::{dense_node_metadata, element_metadata};
 
 /// Try single-pass multi-extract: one run over the input for all N regions
-/// rather than one extract per region. A kind whose blobs all carry
-/// pairwise disjoint ID ranges is read once (`multi_fused::multi_fused_pass`);
-/// any other kind is visited twice, a classify pass into the shared
-/// membership and a write pass to the N outputs. Returns `None` to fall back to sequential if the input isn't
+/// rather than one extract per region. A kind whose blobs all carry ID
+/// ranges the planner admits (`fused::components`) is read once
+/// (`multi_fused::multi_fused_pass`); any other kind is visited twice, a
+/// classify pass into the shared membership and a write pass to the N
+/// outputs. Returns `None` to fall back to sequential if the input isn't
 /// sorted.
 ///
 /// Simple strategy only: complete-ways and smart need dependency passes,
@@ -272,9 +274,10 @@ pub(super) fn try_extract_multi_single_pass(
         .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
         .collect();
     let grid = region_grid(&region_bboxes, host);
-    // A kind whose blobs all carry disjoint ID ranges reads each blob once:
-    // selection, emission and the exact claim check on the worker
-    // (multi_fused.rs). Any other kind classifies, freezes, then rereads.
+    // A kind the fused planner admits reads each blob once: selection,
+    // emission and the exact claim check on the worker, overlapping blobs
+    // read together (multi_fused.rs). Any other kind classifies, freezes,
+    // then rereads.
     let node_fused = fused_blobs(node_blobs.iter().map(|blob| {
         (
             blob.entry,
@@ -1127,9 +1130,9 @@ struct KindBlob {
     claim: Option<crate::blob_meta::BlobIndex>,
 }
 
-/// The fused pass's blobs for a kind whose claims are all present and
-/// pairwise disjoint (`fused::ranges_disjoint`), else `None`: the kind then
-/// runs the classify-then-write form.
+/// The fused pass's blobs and overlap components for a kind the planner
+/// admits (`fused::components`), else `None`: the kind then runs the
+/// classify-then-write form.
 fn fused_blobs<'a>(
     blobs: impl ExactSizeIterator<
         Item = (
@@ -1139,11 +1142,9 @@ fn fused_blobs<'a>(
             Option<&'a [u64]>,
         ),
     > + Clone,
-) -> Option<Vec<super::multi_fused::FusedBlob<'a>>> {
-    if !super::fused::ranges_disjoint(blobs.clone().map(|(_, claim, _, _)| claim)) {
-        return None;
-    }
-    blobs
+) -> Option<super::multi_fused::FusedKind<'a>> {
+    let components = super::fused::components(blobs.clone().map(|(_, claim, _, _)| claim))?;
+    let blobs = blobs
         .map(|(entry, claim, candidates, admit)| {
             Some(super::multi_fused::FusedBlob {
                 entry,
@@ -1152,7 +1153,8 @@ fn fused_blobs<'a>(
                 admit,
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    Some(super::multi_fused::FusedKind { blobs, components })
 }
 
 /// Node write phase with raw passthrough for verified blobs.

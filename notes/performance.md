@@ -616,22 +616,6 @@ comparison, not a fingerprint.
 
 Kind: high potential for the stated workload.
 
-## PERF-017 - Simple extract classifies then rewrites any kind with overlapping ID ranges
-
-Reported by: pipeline, indexdata, spatial.
-
-Sorted simple extract, single region (`extract/fused.rs`) and multi-extract
-(`extract/multi_fused.rs`), reads each blob once only for a kind whose
-indexdata ID ranges are all present and pairwise disjoint
-(`fused::ranges_disjoint`). One overlapping pair, as in history files, or one
-unindexed blob sends the whole kind back to classify, freeze, then reread and
-decode every blob. Interval components would narrow that: preclassify only
-the blobs whose ranges overlap another, install their IDs, and fuse the rest.
-Unmeasured; on a history kind most blobs may overlap, so the payoff depends
-on how localized the overlap is.
-
-Kind: low conviction; no history-input measurement yet.
-
 ## PERF-019 - Complete-ways and smart extract decode the same payloads repeatedly
 
 Reported by: spatial, framing.
@@ -2199,3 +2183,18 @@ with the 8 KiB OPL readers exists to set against it; the readers are now
 
 Kind: local.
 
+## PERF-086 - Extract on an indexed history file has no bench input
+
+Reported by: the overlap-component change to sorted simple extract.
+
+Sorted simple extract and multi-extract now read overlapping-range blobs (a
+history file's versions straddling a blob cut) as one component task, so an
+indexed history input decodes each blob once instead of classifying and
+writing per kind. No host registers an indexed history input: bygg's
+`planet` snapshot `history2` has `pbf.raw` only, and `region-extract`
+defaults to `--variant indexed`. Registering one (a `cat` of history2, then
+`pbfhogg-datasets promote --producer cat --as-snapshot`) would let a matched
+pair measure the saving and the component-length distribution, including how
+often the 8-blob cap sends a kind back to two passes.
+
+Kind: measurement gap; the change is neutral on normal input.

@@ -1757,11 +1757,14 @@ region, and its nodes are selected for, and written to, only the regions
 its bbox meets, so a node ID repeated in several blobs (history-shaped input)
 reaches each region from the blobs its single-region extract reads. A node blob copied raw is first decoded to prove every node lies in
 the region, but keeps its input `BlobHeader`. `--simple` on sorted input,
-single region or through `--config`, decodes each blob of a kind once when the kind's indexdata ID
-ranges are pairwise disjoint, and then refuses a blob whose ID range or count
-is not exact for what it holds (nothing is published); a kind without such
-ranges is read twice, a classify pass and a write pass, and its ranges are not
-consulted. Through `--config` that choice is made per kind over the blobs any
+single region or through `--config`, decodes each blob of a kind once when
+every blob of the kind carries indexdata, and then refuses a blob whose ID
+range or count is not exact for what it holds (nothing is published). Blobs
+whose ID ranges overlap, as where a history file's versions of one ID straddle
+a blob boundary, are read together, so each is still decoded once. A kind
+with an unindexed blob, an overlap that skips a blob, or a run of more than 8
+overlapping blobs is read twice, a classify pass and a write pass, and its
+ranges are not consulted. Through `--config` that choice is made per kind over the blobs any
 region reads, so an inexact node ID range or count that a single-region
 extract would refuse can pass unchecked; `check --index` verifies the claims.
 See

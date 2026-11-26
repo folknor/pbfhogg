@@ -39,22 +39,27 @@
 - **Simple multi-extract decodes each blob once on sorted indexed input,
   and refuses an inexact ID range it relies on.** `extract --simple
   --config` now selects and writes every region from one read,
-  decompression and decode per blob when a kind's indexdata ID ranges are
-  pairwise disjoint, as single-region simple extract already did: planet
+  decompression and decode per blob when a kind's blobs carry indexdata
+  ID ranges, as single-region simple extract already did: planet
   with five longitude strips about 68 s to 52 s. Such a blob whose ID range
   or count is not exact for what it holds is now refused (exit `2`, no
-  region published); `cat --reindex` repairs it. Inputs whose ranges
-  overlap or carry no indexdata run as before.
+  region published); `cat --reindex` repairs it. Blobs whose ranges
+  overlap, as in an indexed history file, are read together and still
+  decoded once, with their claims checked the same way. Inputs without
+  indexdata run as before.
 
 - **`extract --simple` decodes each blob once on sorted indexed input, and
   refuses an inexact ID range it relies on.** A single-region simple
   extract of a sorted input now reads, decompresses and decodes each blob
   of a kind once, rather than once to classify and again to write, when the
-  kind's indexdata ID ranges are pairwise disjoint: about 9 % faster at
+  kind's blobs carry indexdata ID ranges: about 9 % faster at
   planet with a continent box. Such a blob whose ID range or count is not
   exact for what it holds is now refused (exit `2`, nothing published);
-  `cat --reindex` repairs it. Inputs whose ranges overlap (history files)
-  or carry no indexdata run as before.
+  `cat --reindex` repairs it. Blobs whose ranges overlap, as where an
+  indexed history file's versions of one ID straddle a blob boundary, are
+  read together and still decoded once, with their claims checked the same
+  way; only an overlap that skips a blob or runs longer than 8 blobs falls
+  back to two passes. Inputs without indexdata run as before.
 
 - **`extract`, `tags-filter`, `getid` and `getparents` keep
   `LocationsOnWays`.** On an input declaring it, every written way now keeps

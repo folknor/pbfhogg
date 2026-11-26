@@ -3,8 +3,9 @@
 ## Multi-extract
 
 Simple strategy on sorted input: one run over the PBF for all N regions,
-each kind read once when its indexdata ID ranges are pairwise disjoint
-(the fused pass below) and classified then rewritten otherwise; each
+each kind read once when its blobs carry indexdata ID ranges the fused
+planner admits (overlapping blobs read together as one component task) and
+classified then rewritten otherwise; each
 region's blocks are compressed and framed in the pool's tasks and the frames
 written to N sync-mode PbfWriters (publication syncs each output after the
 final flush, between `PUBLISH_START` and `PUBLISH_END`; the
@@ -14,6 +15,27 @@ kind's membership is frozen. Older rows below predate the per-output sync,
 the 256 KiB per-output buffer, the shared region membership (they used one
 `IdSet` per region and kind) and the fused pass. 5 disjoint longitude strips
 per configured bench.
+
+### Overlap components in the fused pass (bygg, 2026-11-26, against `61e55c62`)
+
+The whole-kind disjointness gate replaced by overlap component tasks (a
+component's `(id, region)` union, each blob emitting only to regions it is
+read for). Default 5 strips, `--iterations 1`, interleaved, baseline first,
+after one fstrim at the head of the suite (shared with the extract.md
+cells).
+
+| Form | planet baseline | planet variant | europe baseline | europe variant |
+|------|-----------------|----------------|-----------------|----------------|
+| admission checked per occurrence in emission | 49.19 s (`f46d422f`), 49.46 s (`bbacd277`), 50.01 s (`2399c7f2`) | 51.00 s (`c04fad88`), 50.94 s (`b3cea44f`), 51.44 s (`d1a2f12d`) | | |
+| admission applied once per blob to the component table (landed) | | | 73.13 s (`1bc567c0`), 73.37 s (`3ad18301`) | 73.14 s (`698561c3`), 73.06 s (`62ab00cb`) |
+
+The first form was about 3 % slower on planet, sign consistent in three
+pairs, all in the node phase (`MULTI_NODE_FUSED` 28.9 s against 30.1 s,
+27.4 cores both), which points at the per-occurrence region call. The
+landed form keeps that call as it was and is neutral on Europe, node phase
+36.31 s against 36.16 s. It was not rerun on planet: the item had used its
+planet cell budget. No indexed history input is registered, so the
+history-side saving is unmeasured.
 
 ### Per-region raw copy of node blobs (bygg, 2026-11-25, against `5e1e8843`)
 

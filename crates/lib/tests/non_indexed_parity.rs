@@ -309,10 +309,9 @@ fn extract_simple_non_indexed_parity() {
 
 /// Simple extract selects by ID: one in-region occurrence of a node ID
 /// writes every occurrence of it. On indexed sorted input each kind runs
-/// fused, one decode per blob, when the blobs' ID ranges are disjoint, and
-/// a repeated ID inside one blob takes the blob-local ID set; a repeat
-/// across blobs overlaps two ranges and sends the kind to classify then
-/// write. Both must match the non-indexed run, which always classifies
+/// fused, one decode per blob, and a repeated ID inside one blob takes the
+/// blob-local ID set; a repeat across blobs overlaps two ranges, and the two
+/// blobs are read as one component selecting by their union. Both must match the non-indexed run, which always classifies
 /// first, and both write the out-of-region twin.
 #[cfg(feature = "commands")]
 #[test]

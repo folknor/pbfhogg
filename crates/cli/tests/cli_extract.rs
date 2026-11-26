@@ -2101,7 +2101,7 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
     let honest = dir.path().join("honest.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
-    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    write_multi_block_test_pbf(&honest, &inside_nodes(30, 1), &[], &[], 10);
     CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
@@ -2109,6 +2109,20 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
         .arg(&input)
         .arg("--corrupt-indexdata")
         .assert_success();
+    // The inflated claims would be refused where a run relies on them (the
+    // fused kind pass); a non-contiguous overlap keeps the node kind on the
+    // classify-then-write route, which counts the copied blobs.
+    let corrupt = std::fs::read(&input).expect("read corrupt input");
+    // Frame 2's inflated range overlaps both others; moved apart, it leaves
+    // frames 1 and 3 overlapping around it.
+    let apart = crate::common::adversarial::forge_indexdata_range(
+        &corrupt,
+        2,
+        i64::MAX - 1,
+        i64::MAX,
+        None,
+    );
+    std::fs::write(&input, classify_then_write(&apart)).expect("write input");
 
     let out = run_extract(
         &input,
@@ -2118,11 +2132,11 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
     );
     assert_eq!(
         node_ids(&read_all_elements(&output)),
-        (1..=20).collect::<Vec<_>>()
+        (1..=30).collect::<Vec<_>>()
     );
     assert!(
         out.stderr_str()
-            .contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+            .contains("Extract (simple): 30 nodes (30 in bbox, 0 from ways)"),
         "the summary must count decoded nodes, not the inflated claim; stderr:\n{}",
         out.stderr_str()
     );
@@ -2130,7 +2144,7 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
     // count rather than the decode path.
     let input_bytes = std::fs::read(&input).expect("read input");
     let output_bytes = std::fs::read(&output).expect("read output");
-    for frame in [1, 2] {
+    for frame in [1, 2, 3] {
         assert_eq!(
             indexdata_of(&output_bytes, frame),
             indexdata_of(&input_bytes, frame),
@@ -2142,15 +2156,15 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
     let out = run_extract_multi(&input, &config, Strategy::Simple);
     assert_eq!(
         node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
-        (1..=20).collect::<Vec<_>>()
+        (1..=30).collect::<Vec<_>>()
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("node blobs: 2 passthrough, 0 decoded"),
+        stderr.contains("node blobs: 3 passthrough, 0 decoded"),
         "stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        stderr.contains("Extract (simple): 30 nodes (30 in bbox, 0 from ways)"),
         "multi-extract must count decoded nodes too; stderr:\n{stderr}"
     );
 }
@@ -2162,14 +2176,14 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
 /// one only the first, so the second blob is a candidate for the wide region
 /// alone: it must still be copied raw there (its framing kept) and rebuilt
 /// for the narrow one. Run on the fused route, then on the classify-then-
-/// write route (blob 2's claimed ID range widened to overlap blob 1's, an
-/// inexact claim that route neither relies on nor checks), and with a
-/// polygon region beside the bboxes.
+/// write route (claimed ranges forged into an overlap the fused planner
+/// refuses), and with a polygon region beside the bboxes. A third blob, in
+/// the wide region only, is what lets the overlap skip a blob.
 #[test]
 fn multi_extract_copies_a_blob_raw_to_each_region_containing_it() {
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
-    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    write_multi_block_test_pbf(&honest, &inside_nodes(30, 1), &[], &[], 10);
     let pbf = std::fs::read(&honest).expect("read fixture");
     // The offset moves each blob's northmost node 37 nanodegrees north, so
     // its claimed max latitude (bytes 30..34) grows one decimicrodegree to
@@ -2188,11 +2202,7 @@ fn multi_extract_copies_a_blob_raw_to_each_region_containing_it() {
     let fused = dir.path().join("fused.osm.pbf");
     std::fs::write(&fused, &framed).expect("write fused input");
     let overlapping = dir.path().join("overlapping.osm.pbf");
-    std::fs::write(
-        &overlapping,
-        crate::common::adversarial::forge_indexdata_range(&framed, 2, 1, 20, None),
-    )
-    .expect("write overlapping input");
+    std::fs::write(&overlapping, classify_then_write(&framed)).expect("write overlapping input");
     let wide = "12.4,55.6,12.7,55.8";
     let narrow = "12.4,55.6,12.7,55.7";
     for (tag, input) in [("fused", &fused), ("two-phase", &overlapping)] {
@@ -2332,54 +2342,94 @@ fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
         tags: vec![],
         meta: None,
     }));
+    nodes.extend(inside_nodes(10, 200));
     write_multi_block_test_pbf(&honest, &nodes, &[], &[], 10);
-    // Give the outside blob (frame 2) the inside blob's (frame 1) index,
-    // bbox included.
+    // Give the outside blob (frame 2) the inside blob's (frame 1) bbox.
     let pbf = std::fs::read(&honest).expect("read fixture");
-    let inside_index = indexdata_of(&pbf, 1);
+    let inside_bbox = indexdata_of(&pbf, 1)[26..42].to_vec();
     let lying = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 2, |ix| {
+        ix[26..42].copy_from_slice(&inside_bbox);
+    });
+    for (tag, bytes) in [
+        ("fused", lying.clone()),
+        ("two-phase", classify_then_write(&lying)),
+    ] {
+        let sub = dir.path().join(tag);
+        std::fs::create_dir(&sub).expect("variant dir");
+        let input = sub.join("input.osm.pbf");
+        std::fs::write(&input, bytes).expect("write lying fixture");
+        lying_bbox_case(tag, &sub, &input, &sub.join("output.osm.pbf"));
+    }
+    // The whole inside index copied, range included, overlaps blob 1: the
+    // fused pass reads both as one component and refuses the false range.
+    let inside_index = indexdata_of(&pbf, 1);
+    let copied = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, 2, |ix| {
         ix.clone_from(&inside_index);
     });
-    std::fs::write(&input, lying).expect("write lying fixture");
+    std::fs::write(&input, copied).expect("write copied fixture");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--bbox", BBOX_STR, "--simple"])
+        .assert_failed()
+        .assert_stderr_contains("this run places and counts the blob by its claim");
+}
 
-    let want: Vec<i64> = (1..=10).collect();
-    let out = run_extract(
-        &input,
-        &output,
-        &RegionArg::Bbox(BBOX_STR),
-        Strategy::Simple,
-    );
+/// One variant of [`a_lying_indexdata_bbox_does_not_smuggle_nodes_through`].
+fn lying_bbox_case(
+    tag: &str,
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    output: &std::path::Path,
+) {
+    let want: Vec<i64> = (1..=10).chain(200..=209).collect();
+    let out = run_extract(input, output, &RegionArg::Bbox(BBOX_STR), Strategy::Simple);
     assert_eq!(
-        node_ids(&read_all_elements(&output)),
+        node_ids(&read_all_elements(output)),
         want,
-        "the outside nodes must not ride in on the lying bbox"
+        "{tag}: the outside nodes must not ride in on the lying bbox"
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("Extract (simple): 10 nodes (10 in bbox, 0 from ways)"),
-        "stderr:\n{stderr}"
+        stderr.contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        "{tag}: stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("filtered instead of copied raw"),
-        "the failed verification must be reported; stderr:\n{stderr}"
+        "{tag}: the failed verification must be reported; stderr:\n{stderr}"
     );
 
-    let config = single_region_config(dir.path());
-    let out = run_extract_multi(&input, &config, Strategy::Simple);
+    let config = single_region_config(dir);
+    let out = run_extract_multi(input, &config, Strategy::Simple);
     assert_eq!(
-        node_ids(&read_all_elements(&dir.path().join("m.osm.pbf"))),
+        node_ids(&read_all_elements(&dir.join("m.osm.pbf"))),
         want,
-        "multi-extract must not trust the lying bbox either"
+        "{tag}: multi-extract must not trust the lying bbox either"
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("Extract (simple): 10 nodes (10 in bbox, 0 from ways)"),
-        "stderr:\n{stderr}"
+        stderr.contains("Extract (simple): 20 nodes (20 in bbox, 0 from ways)"),
+        "{tag}: stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("filtered instead of copied raw"),
-        "stderr:\n{stderr}"
+        "{tag}: stderr:\n{stderr}"
     );
+}
+
+/// `pbf` (frames 1 to 3 holding three blobs of one kind, frame 2's range
+/// disjoint from both others) with frame 3 claiming frame 1's ID range: the
+/// component of frames 1 and 3 is not a contiguous schedule run, so the
+/// fused planner refuses it and a run whose schedule holds all three blobs
+/// classifies, then writes, never consulting the ranges.
+fn classify_then_write(pbf: &[u8]) -> Vec<u8> {
+    let first = indexdata_of(pbf, 1);
+    let min = i64::from_le_bytes(first[2..10].try_into().unwrap());
+    let max = i64::from_le_bytes(first[10..18].try_into().unwrap());
+    crate::common::adversarial::forge_indexdata_range(pbf, 3, min, max, None)
 }
 
 /// A passthrough candidate whose block the decoder refuses must not reach

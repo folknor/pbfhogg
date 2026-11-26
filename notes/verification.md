@@ -31,18 +31,6 @@ join requests only stage 1, so two joins on one unit overlapping after stage 1 p
 test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
 `Grant` and `Fixed`) are light by convention.
 
-## VER-158 - sort's restructured way blocks with inline coordinates have no witness
-
-A block no single index describes (several kinds, or one kind no single index
-covers) becomes one `restructured` entry per kind, and `Sweep::open` reads it
-through sorted views exactly as it reads an internally unsorted blob, so on an input
-declaring `LocationsOnWays` its ways are re-encoded with their coordinates. No test
-or configured input drives that: `cli_cat.rs`'s restructured fixtures carry no
-declaration, and the declaring sort tests (`cli_sort.rs`, `merge_pbf.rs`) use
-single-kind blocks. A witness is a mixed-kind frame with ascending way IDs and
-inline coordinates under the declaration, so the restructuring alone is the reason
-to rewrite, asserting the tally and every way's own coordinates.
-
 ## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 
 Every `fault_*_input` reference run asserts the exact transport of each pinned

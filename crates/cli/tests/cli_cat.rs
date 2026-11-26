@@ -2443,6 +2443,149 @@ fn merge_engine_places_blocks_no_single_index_describes() {
     }
 }
 
+/// Two frames no single index describes, each holding ways with inline
+/// coordinates: dense nodes 1-4 then ways 10 and 11, and way 12 then
+/// relation 20. Way IDs ascend and the frames' way ranges are disjoint, so
+/// restructuring is the only reason the merge engine rewrites them. Way 11
+/// carries refs and no coordinates when `strip_way_11`.
+fn write_restructured_located_ways(path: &Path, strip_way_11: bool) {
+    let meta = pb::info(3, 8);
+    let way_11_locations: &[(i64, i64)] = &[(14, 24), (13, 23), (12, 22)];
+    write_raw_block_pbf(
+        path,
+        true,
+        &["LocationsOnWays"],
+        &[
+            (
+                false,
+                pb::block(&[
+                    vec![(2, pb::dense(&[(1, 3), (2, 3), (3, 3), (4, 3)], 8))],
+                    vec![
+                        (3, pb::way(10, &[1, 2], Some(&[(11, 21), (12, 22)]), &meta)),
+                        (
+                            3,
+                            pb::way(
+                                11,
+                                &[4, 3, 2],
+                                (!strip_way_11).then_some(way_11_locations),
+                                &meta,
+                            ),
+                        ),
+                    ],
+                ]),
+            ),
+            (
+                false,
+                pb::block(&[
+                    vec![(3, pb::way(12, &[3, 1], Some(&[(13, 23), (11, 21)]), &meta))],
+                    vec![(4, pb::relation(20, &[(10, 1, 7)], &meta))],
+                ]),
+            ),
+        ],
+    );
+}
+
+/// A way as `(id, refs, inline decimicro coordinates)`.
+type LocatedWay = (i64, Vec<i64>, Vec<(i32, i32)>);
+
+/// Every way of a PBF, in file order.
+fn located_ways(path: &Path) -> Vec<LocatedWay> {
+    let mut ways = Vec::new();
+    for blob in pbfhogg::BlobReader::from_path(path).expect("open") {
+        let blob = blob.expect("blob");
+        let pbfhogg::BlobDecode::OsmData(block) = blob.decode().expect("decode") else {
+            continue;
+        };
+        for element in block.elements() {
+            if let pbfhogg::Element::Way(w) = element {
+                let locs = w
+                    .node_locations()
+                    .map(|l| {
+                        (
+                            l.decimicro_lat().expect("representable"),
+                            l.decimicro_lon().expect("representable"),
+                        )
+                    })
+                    .collect();
+                ways.push((w.id(), w.refs().collect(), locs));
+            }
+        }
+    }
+    ways
+}
+
+/// `sort` and `cat --dedupe` rewrite the way entries of a restructured
+/// frame through the sweep's sorted views; on an input declaring
+/// `LocationsOnWays` each way keeps its own inline coordinates and the
+/// output keeps the declaration.
+#[test]
+fn merge_engine_restructured_way_rewrite_keeps_inline_way_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("restructured-located.osm.pbf");
+    write_restructured_located_ways(&input, false);
+    let want = vec![
+        (10, vec![1, 2], vec![(11, 21), (12, 22)]),
+        (11, vec![4, 3, 2], vec![(14, 24), (13, 23), (12, 22)]),
+        (12, vec![3, 1], vec![(13, 23), (11, 21)]),
+    ];
+    assert_eq!(located_ways(&input), want, "fixture ways");
+
+    let dedupe_out = dir.path().join("dedupe.osm.pbf");
+    let sort_out = dir.path().join("sort.osm.pbf");
+    let dedupe = run_dedupe(&[&input], &dedupe_out);
+    let sort = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&sort_out)
+        .arg("--force")
+        .run();
+    for (name, out) in [("dedupe", &dedupe), ("sort", &sort)] {
+        assert!(out.status.success(), "{name}:\n{}", out.stderr_str());
+        out.assert_stderr_contains("Note: 2 blobs held blocks no single index describes");
+        let stderr = out.stderr_str();
+        assert!(
+            !stderr.contains("which the output does not declare"),
+            "{name} warned of a loss: {stderr}"
+        );
+    }
+    dedupe.assert_stderr_contains(
+        "Merged 8 elements: 4 nodes, 3 ways, 1 relations \
+         (2 blobs: 0 passthrough, 2 rewritten, 0 duplicates removed)",
+    );
+    sort.assert_stderr_contains(
+        "Sorted 4 nodes, 3 ways, 1 relations (2 blobs: 0 passthrough, 2 rewritten)",
+    );
+    for output in [&dedupe_out, &sort_out] {
+        let header = crate::common::read_header(output);
+        assert!(header.has_locations_on_ways());
+        assert!(header.is_sorted());
+        assert_eq!(located_ways(output), want);
+    }
+}
+
+/// The restructured rewrite refuses a way with refs and no coordinates in
+/// an input declaring `LocationsOnWays`, as the overlap and intra-blob
+/// rewrites do.
+#[test]
+fn merge_engine_restructured_way_rewrite_refuses_a_way_without_the_declared_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("restructured-stripped.osm.pbf");
+    write_restructured_located_ways(&input, true);
+    let dedupe = run_dedupe(&[&input], &dir.path().join("dedupe.osm.pbf"));
+    assert_eq!(dedupe.status.code(), Some(2), "{}", dedupe.stderr_str());
+    dedupe.assert_stderr_contains("0 inline location(s)");
+    CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.path().join("sort.osm.pbf"))
+        .arg("--force")
+        .assert_refused("0 inline location(s)");
+}
+
 /// A malformed payload keeps its own error through the merge engine's scan,
 /// located at its frame, rather than the old "failed to scan block IDs".
 #[test]

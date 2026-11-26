@@ -354,8 +354,10 @@ as evidence of a kind; every kind decision reads
 
 Anything sized from a claim must survive the claim being wrong (ADR-0013,
 consequence 2). `check --refs` and `check --ids --full` (for a kind its
-order pass found out of order; a kind in strict order is proven
-duplicate-free from the decoded IDs alone and gets no set) pre-allocate their
+order pass found out of order with blobs that may share an ID, judged by
+the decoded IDs' canonical intervals, never by claimed ranges; a kind in
+strict order, or whose disorder is only strict blobs with disjoint
+intervals, is proven duplicate-free and gets no set) pre-allocate their
 ID bitsets to the claimed `max_id` bounded by the input file's size,
 floored at the live-OSM ID range (`id_alloc_bound` in
 `crates/lib/src/commands/check/mod.rs`), and insert any decoded ID the

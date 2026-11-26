@@ -651,6 +651,13 @@
 
 ### Changed
 
+- **`check --ids --full` on a file out of ID order rereads only the blobs
+  that could hold a duplicate**: blobs out of order inside themselves and
+  blobs whose ID ranges overlap, not the whole kind (denmark unsorted
+  about half the wall). Reports are unchanged. `--max-errors` now also
+  bounds the violation details held while scanning, so a file with
+  millions of violations no longer holds them all in memory.
+
 - **`digest --form content` is about 10 % faster** (planet 54 s to 48 s);
   `--form content-locations` shares the change, unmeasured. Digests are
   unchanged and keep their form versions.

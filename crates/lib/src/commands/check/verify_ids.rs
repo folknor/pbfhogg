@@ -35,8 +35,10 @@ fn not_after(id: i64, prev: i64) -> bool {
 /// Configuration for the `verify_ids` command.
 pub struct VerifyIdsOptions {
     /// Maximum number of violations to retain in the report. Zero means
-    /// unlimited. This bounds the detail list, not the check's working
-    /// memory: scanning and exact counting continue past it.
+    /// unlimited. Scanning and exact counting continue past it. It also
+    /// bounds the details retained while scanning (at most this many per
+    /// blob and per kind), though not the rest of the check's working
+    /// memory, such as the duplicate pass's ID sets.
     pub max_errors: usize,
     /// Read the input's front (header and first-blob probe) with `O_DIRECT`.
     /// The blob reads are parallel preads of unaligned blob ranges that
@@ -402,16 +404,26 @@ pub(super) fn selects(filter: &TypeFilter, kind: ElementKind) -> bool {
     }
 }
 
-/// One selected kind's merged findings: its element count, its violations in
-/// file order (stored up to `max_errors`, all counted), and how many of them
-/// are order violations, which decides whether `--full` needs its ID set.
+/// One selected kind's merged findings: its element count, its order
+/// violations in file order (stored up to `max_errors`, all counted), its
+/// duplicates (`--full`'s replay only), and the blobs that replay must read.
 pub(super) struct KindScan {
+    elem_type: &'static str,
     count: u64,
     violations: Vec<IdViolation>,
+    /// The order violations, all counted.
     total: u64,
-    non_monotonic: u64,
     /// Some element ID of the kind is negative.
     negative: bool,
+    /// The canonically smallest duplicates, at least as many as the report
+    /// can store, in no order; [`Scanned::into_report`] selects and sorts.
+    duplicates: Vec<i64>,
+    /// Every duplicate, one per extra copy, counted.
+    duplicate_total: u64,
+    /// The schedule positions of the blobs that may share an ID with
+    /// another blob of the kind or within themselves, ascending: empty on a
+    /// kind in strict order. See [`replay_plan`].
+    replay: Vec<usize>,
 }
 
 /// What both modes scan: the type-order findings and each selected kind's,
@@ -424,11 +436,13 @@ pub(super) struct Scanned {
 
 impl Scanned {
     /// The counts, and the violations in report order (type order, then
-    /// nodes, ways and relations), stored up to `max_errors` and all
-    /// counted. Each component already holds a prefix of at most
-    /// `max_errors`, so truncating the concatenation once stores what a
-    /// running remaining-limit would.
+    /// nodes, ways and relations, each kind's order violations in file order
+    /// followed by its duplicates canonically smallest first), stored up to
+    /// `max_errors` and all counted. Each component already holds a prefix
+    /// of at most `max_errors`, so truncating the concatenation once stores
+    /// what a running remaining-limit would.
     pub(super) fn into_report(self, max_errors: usize) -> Findings {
+        let limit = effective_error_limit(max_errors);
         let mut counts = [0; 3];
         let mut violations = self.type_order;
         let mut total = self.type_order_total;
@@ -436,9 +450,23 @@ impl Scanned {
         for (count, kind) in counts.iter_mut().zip(self.kinds) {
             if let Some(kind) = kind {
                 *count = kind.count;
-                total += kind.total;
+                total += kind.total + kind.duplicate_total;
                 negative |= kind.negative;
+                let mut duplicates = kind.duplicates;
+                let room = limit.map_or(duplicates.len(), |limit| {
+                    limit
+                        .saturating_sub(kind.violations.len())
+                        .min(duplicates.len())
+                });
+                keep_smallest(&mut duplicates, room);
+                duplicates.sort_unstable_by(|a, b| osm_id_cmp(*a, *b));
+                let elem_type = kind.elem_type;
                 violations.extend(kind.violations);
+                violations.extend(
+                    duplicates
+                        .into_iter()
+                        .map(|id| IdViolation::Duplicate { elem_type, id }),
+                );
             }
         }
         if let Some(limit) = effective_error_limit(max_errors) {
@@ -535,7 +563,7 @@ fn scan_kinds(
                 let index = usize::from(kind.ordinal());
                 let (start, end) = KIND_MARKERS[index];
                 host.invocation.marker(start);
-                let per_blob = kind_phase(file, schedule, kind, sets[index].take(), host)?;
+                let per_blob = kind_phase(file, schedule, kind, sets[index].take(), limit, host)?;
                 scanned.kinds[index] = Some(merge_kind(per_blob, kind, limit)?);
                 host.invocation.marker(end);
             }
@@ -543,7 +571,7 @@ fn scan_kinds(
         KindSchedules::Unindexed(blobs) => {
             host.invocation.marker("VERIFYIDS_UNINDEXED_START");
             let sets = sets.each_ref().map(|set| set.as_deref());
-            let (per_kind, spans) = unindexed_pass(file, blobs, type_filter, sets, host)?;
+            let (per_kind, spans) = unindexed_pass(file, blobs, type_filter, sets, limit, host)?;
             check_type_order(
                 &spans,
                 &mut scanned.type_order,
@@ -601,20 +629,24 @@ fn verify_ids_streaming_parallel(
 // ---------------------------------------------------------------------------
 
 /// One blob's judgement of the IDs of one kind, fed in element-walk order:
-/// the blob's first and last ID, count and order violations, and with the
-/// kind's `IdSet` (`--full`) its duplicates and the IDs outside the set's
-/// allocation, every negative among them.
+/// the blob's first and last ID, count and order violations, its canonical
+/// interval once it is out of order, and with the kind's `IdSet` (`--full`)
+/// its duplicates and the IDs outside the set's allocation, every negative
+/// among them. Details are retained up to `limit` (`None`: all), every one
+/// counted, since the merge stores no more than that of any one list.
 pub(super) struct KindJudge {
     elem_type: &'static str,
     prev: Option<i64>,
+    limit: Option<usize>,
     pub(super) r: BlobVerifyResult,
 }
 
 impl KindJudge {
-    pub(super) fn new(kind: ElementKind) -> Self {
+    pub(super) fn new(kind: ElementKind, limit: Option<usize>) -> Self {
         Self {
             elem_type: kind.as_str(),
             prev: None,
+            limit,
             r: BlobVerifyResult::empty(),
         }
     }
@@ -628,14 +660,9 @@ impl KindJudge {
             r.first_id = Some(id);
         }
         r.last_id = Some(id);
-        if let Some(p) = self.prev
-            && not_after(id, p)
-        {
-            r.within_violations.push(IdViolation::NonMonotonic {
-                elem_type: self.elem_type,
-                id,
-                prev_id: p,
-            });
+        let unordered = self.prev.filter(|&p| not_after(id, p) || !r.strict);
+        if let Some(p) = unordered {
+            self.out_of_order(id, p);
         }
         self.prev = Some(id);
         // Retain the IDs the bounded atomic allocation does not cover (those
@@ -643,10 +670,64 @@ impl KindJudge {
         if let Some(atomic_ids) = atomic_ids {
             match atomic_ids.try_insert_atomic_if_new(id) {
                 Some(true) => {}
-                Some(false) => r.duplicate_ids.push(id),
-                None => r.overflow_ids.push(id),
+                Some(false) => self.r.record_duplicate(id, self.limit),
+                None => self.r.overflow_ids.push(id),
             }
         }
+    }
+
+    /// `id`, after `p`, in a blob that is out of order: at or before `p`,
+    /// or anywhere once an earlier ID was. Kept out of line, off the
+    /// ordered input's element loop.
+    #[cold]
+    #[inline(never)]
+    fn out_of_order(&mut self, id: i64, p: i64) {
+        let r = &mut self.r;
+        if not_after(id, p) {
+            r.within_total += 1;
+            if should_store_violation(r.within_violations.len(), self.limit) {
+                r.within_violations.push(IdViolation::NonMonotonic {
+                    elem_type: self.elem_type,
+                    id,
+                    prev_id: p,
+                });
+            }
+            if r.strict {
+                // Strict so far: the first ID is the least, the previous
+                // the greatest.
+                r.strict = false;
+                r.lo = r.first_id.unwrap_or(p);
+                r.hi = p;
+            }
+        }
+        if not_after(id, r.lo) {
+            r.lo = id;
+        }
+        if not_after(r.hi, id) {
+            r.hi = id;
+        }
+    }
+}
+
+/// Keep the `room` canonically smallest of `ids`, in no order.
+fn keep_smallest(ids: &mut Vec<i64>, room: usize) {
+    if room == 0 {
+        ids.clear();
+    } else if room < ids.len() {
+        ids.select_nth_unstable_by(room - 1, |a, b| osm_id_cmp(*a, *b));
+        ids.truncate(room);
+    }
+}
+
+/// Append `id` to a duplicate list retained up to `limit`: past twice the
+/// limit the list is cut back to its `limit` canonically smallest, which
+/// holds every one a report can store (equal IDs being equal details).
+fn push_bounded(ids: &mut Vec<i64>, id: i64, limit: Option<usize>) {
+    ids.push(id);
+    if let Some(limit) = limit
+        && ids.len() >= limit.saturating_mul(2).max(1)
+    {
+        keep_smallest(ids, limit);
     }
 }
 
@@ -658,10 +739,11 @@ fn verify_blob(
     buffer: BlockBuffer<'_>,
     kind: ElementKind,
     atomic_ids: Option<&IdSet>,
+    limit: Option<usize>,
     scratch: &mut IdScratch,
 ) -> Result<BlobVerifyResult> {
     let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
-    let mut judge = KindJudge::new(kind);
+    let mut judge = KindJudge::new(kind, limit);
     scratch.each(accepted.bytes(), |_, id| {
         judge.push(id, atomic_ids);
         Ok(())
@@ -680,6 +762,7 @@ fn kind_phase(
     schedule: &[crate::scan::classify::ScheduledBlob],
     kind: ElementKind,
     id_set: Option<&mut IdSet>,
+    limit: Option<usize>,
     host: &crate::host::Entered<'_>,
 ) -> Result<Vec<Option<BlobVerifyResult>>> {
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
@@ -690,9 +773,9 @@ fn kind_phase(
         schedule,
         None,
         IdScratch::default,
-        |_, buffer, scratch| verify_blob(buffer, kind, atomic_ids, scratch),
+        |_, buffer, scratch| verify_blob(buffer, kind, atomic_ids, limit, scratch),
         |seq, mut r| {
-            settle_overflow(&mut overflow, &mut r, host);
+            settle_overflow(&mut overflow, &mut r, limit, host);
             per_blob[seq] = Some(r);
         },
         host,
@@ -717,6 +800,7 @@ fn unindexed_pass(
     blobs: &[crate::scan::classify::ScheduledBlob],
     type_filter: &TypeFilter,
     sets: [Option<&IdSet>; 3],
+    limit: Option<usize>,
     host: &crate::host::Entered<'_>,
 ) -> Result<(PerKind, KindSpans<(usize, usize)>)> {
     let mut kinds = crate::element_kind::ElementKindSet::default();
@@ -736,7 +820,7 @@ fn unindexed_pass(
         |_, buffer, scratch| -> Result<([BlobVerifyResult; 3], KindSpans<usize>)> {
             let ((KindIds { .. }, groups), accepted) = buffer
                 .project(|_, _| (KindIds::new(kinds, &mut *scratch), GroupKinds::default()))?;
-            let mut judges = KINDS.map(KindJudge::new);
+            let mut judges = KINDS.map(|kind| KindJudge::new(kind, limit));
             scratch.each(accepted.bytes(), |kind, id| {
                 let index = usize::from(kind.ordinal());
                 judges[index].push(id, sets[index]);
@@ -747,7 +831,7 @@ fn unindexed_pass(
         },
         |seq, (results, groups)| {
             for ((slots, overflow), mut r) in per_kind.iter_mut().zip(&mut overflow).zip(results) {
-                settle_overflow(overflow, &mut r, host);
+                settle_overflow(overflow, &mut r, limit, host);
                 slots[seq] = Some(r);
             }
             fold_group_spans(&mut spans, seq, groups);
@@ -828,8 +912,10 @@ impl crate::read::block::GroupProjection for GroupKinds {
 
 /// Merge one kind's per-blob results: counts summed, the order violations in
 /// file order (each blob's step down from the previous blob's last ID, at its
-/// first element, then the blob's own), then every duplicate in canonical ID
-/// order, stored up to `max_errors_remaining` and all counted.
+/// first element, then the blob's own), stored up to `max_errors_remaining`
+/// and all counted; the duplicates, which [`Scanned::into_report`] lists
+/// after them in canonical ID order; and, on a kind out of order, the
+/// [`replay_plan`] `--full`'s duplicate pass reads.
 ///
 /// Which occurrence of a repeated ID a worker calls the duplicate follows
 /// completion order: the atomic setters let whichever blob inserts second
@@ -853,7 +939,10 @@ pub(super) fn merge_kind(
     let mut prev_last: Option<i64> = None;
     let mut negative = false;
     let mut duplicates: Vec<i64> = Vec::new();
-    for slot in per_blob {
+    let mut duplicate_total: u64 = 0;
+    // Each nonempty blob's position, canonical interval and strictness.
+    let mut intervals: Vec<BlobInterval> = Vec::new();
+    for (position, slot) in per_blob.into_iter().enumerate() {
         let Some(r) = slot else {
             return Err(crate::error::Error::internal(
                 "id check: classify phase left a blob slot unfilled",
@@ -874,39 +963,88 @@ pub(super) fn merge_kind(
                 });
             }
         }
+        total_violations += r.within_total;
+        non_monotonic += r.within_total;
         for v in r.within_violations {
-            total_violations += 1;
-            non_monotonic += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(v);
+            if !should_store_violation(violations.len(), max_errors_remaining) {
+                break;
             }
+            violations.push(v);
         }
-        duplicates.extend(r.duplicate_ids);
-        if r.last_id.is_some() {
-            prev_last = r.last_id;
+        duplicate_total += r.duplicate_total;
+        for id in r.duplicate_ids {
+            push_bounded(&mut duplicates, id, max_errors_remaining);
+        }
+        if let (Some(first), Some(last)) = (r.first_id, r.last_id) {
+            let (lo, hi) = if r.strict {
+                (first, last)
+            } else {
+                (r.lo, r.hi)
+            };
+            intervals.push(BlobInterval {
+                position,
+                lo,
+                hi,
+                strict: r.strict,
+            });
+            prev_last = Some(last);
         }
     }
-    total_violations += duplicates.len() as u64;
-    let room = max_errors_remaining.map_or(duplicates.len(), |limit| {
-        limit.saturating_sub(violations.len()).min(duplicates.len())
-    });
-    if room < duplicates.len() && room > 0 {
-        duplicates.select_nth_unstable_by(room - 1, |a, b| osm_id_cmp(*a, *b));
-    }
-    duplicates.truncate(room);
-    duplicates.sort_unstable_by(|a, b| osm_id_cmp(*a, *b));
-    violations.extend(
-        duplicates
-            .into_iter()
-            .map(|id| IdViolation::Duplicate { elem_type, id }),
-    );
+    let replay = if non_monotonic > 0 {
+        replay_plan(intervals)
+    } else {
+        Vec::new()
+    };
     Ok(KindScan {
+        elem_type,
         count,
         violations,
         total: total_violations,
-        non_monotonic,
         negative,
+        duplicates,
+        duplicate_total,
+        replay,
     })
+}
+
+/// One nonempty blob of a kind: its schedule position, the canonically
+/// least and greatest of its IDs, and whether they are in strict order.
+struct BlobInterval {
+    position: usize,
+    lo: i64,
+    hi: i64,
+    strict: bool,
+}
+
+/// The blobs of a kind `--full`'s duplicate pass must read again, by
+/// schedule position, ascending. Under canonical order (a strict total order
+/// over every `i64`), two copies of one ID lie in one blob, which is then not
+/// in strict order, or in two blobs whose closed intervals both hold it. So
+/// a blob in strict order whose interval meets no other blob's holds no
+/// duplicate, whatever its place in the file, and is skipped; every other
+/// blob, sweeping the intervals by their least ID into overlapping
+/// components, is read. Only observed IDs bound an interval, never a claim.
+fn replay_plan(mut intervals: Vec<BlobInterval>) -> Vec<usize> {
+    intervals.sort_unstable_by(|a, b| osm_id_cmp(a.lo, b.lo));
+    let mut replay = Vec::new();
+    let mut start = 0;
+    while start < intervals.len() {
+        let mut hi = intervals[start].hi;
+        let mut end = start + 1;
+        while end < intervals.len() && not_after(intervals[end].lo, hi) {
+            if not_after(hi, intervals[end].hi) {
+                hi = intervals[end].hi;
+            }
+            end += 1;
+        }
+        let component = &intervals[start..end];
+        if component.len() > 1 || !component[0].strict {
+            replay.extend(component.iter().map(|blob| blob.position));
+        }
+        start = end;
+    }
+    replay.sort_unstable();
+    replay
 }
 
 // ---------------------------------------------------------------------------
@@ -918,24 +1056,32 @@ pub(super) fn merge_kind(
 /// The main-thread merge sees one of these per blob and aggregates in
 /// schedule order. Each result follows the contents of its input blob and
 /// streams back over the parallel_classify_phase channel.
-// The detail limit is applied by the ordered merge, not by these three
-// per-blob lists. On hostile input their retained storage grows with the
-// number of violations across the schedule. Capping them alone would lose
-// exact totals: a bounded redesign must carry separate totals for each list
-// and budget retained examples across blobs while preserving merge order.
-// Replacing the measured classify/merge path needs throughput validation;
-// max_errors is a display-detail limit, not a whole-check memory guarantee.
+// Both detail lists are retained only up to the detail limit, with exact
+// totals beside them: the merge stores the first `limit` order violations in
+// file order, so no blob needs more than its own first `limit`, and the
+// `limit` canonically smallest duplicates, which lie among each blob's own
+// smallest `limit`. With `max_errors` 0 (unlimited) every detail is kept.
 pub(super) struct BlobVerifyResult {
     first_id: Option<i64>,
     last_id: Option<i64>,
     count: u64,
-    /// Non-monotonic violations observed *within* this blob.
+    /// Every ID so far followed its predecessor in canonical order.
+    strict: bool,
+    /// Once not `strict`, the canonically least and greatest ID; while
+    /// `strict` these are `first_id` and `last_id`, and these unset.
+    lo: i64,
+    hi: i64,
+    /// The first non-monotonic violations observed *within* this blob, up
+    /// to the detail limit.
     within_violations: Vec<IdViolation>,
-    /// IDs that were already set in the shared IdSet when this blob
-    /// tried to insert them. One entry per collision (not deduplicated -
-    /// distinct duplicate occurrences count separately, matching the
-    /// pre-swap RoaringTreemap::insert-returns-false semantics).
+    /// Every one of them, counted.
+    within_total: u64,
+    /// IDs that were already set in the shared IdSet when this blob tried
+    /// to insert them, one per collision, the canonically smallest retained
+    /// as [`push_bounded`] keeps them.
     duplicate_ids: Vec<i64>,
+    /// Every collision, counted.
+    duplicate_total: u64,
     /// IDs the parallel allocation does not cover: those above it and every
     /// negative. `settle_overflow` takes them into the phase's overflow set
     /// as the result arrives, for exact duplicate detection.
@@ -950,11 +1096,21 @@ impl BlobVerifyResult {
             first_id: None,
             last_id: None,
             count: 0,
+            strict: true,
+            lo: 0,
+            hi: 0,
             within_violations: Vec::new(),
+            within_total: 0,
             duplicate_ids: Vec::new(),
+            duplicate_total: 0,
             overflow_ids: Vec::new(),
             negative: false,
         }
+    }
+
+    fn record_duplicate(&mut self, id: i64, limit: Option<usize>) {
+        self.duplicate_total += 1;
+        push_bounded(&mut self.duplicate_ids, id, limit);
     }
 }
 
@@ -1015,10 +1171,14 @@ fn verify_ids_full_parallel(
         .into_report(header_sorted, indexed, true))
 }
 
-/// `--full`'s duplicate pass, over the kinds the proof pass in `scanned`
-/// found out of order only, each read again with its ID set. Its findings
-/// replace that kind's wholesale: they include the order violations the
-/// proof pass found, so combining the two would count them twice.
+/// `--full`'s duplicate pass: of the kinds the proof pass in `scanned` found
+/// out of order, the blobs each kind's replay plan names (those that may
+/// share an ID, see [`replay_plan`]) are read again with the kind's ID set.
+/// Only the duplicates are taken from that read; every other finding is the
+/// proof pass's, which read every blob. On an unindexed file one read covers
+/// the union of the kinds' plans, and IDs of a kind from a blob only another
+/// kind's plan named are inserted too: they collide with nothing, a blob
+/// left out of a plan holding no ID that occurs twice.
 pub(super) fn duplicate_pass(
     scanned: &mut Scanned,
     shared_file: &crate::read::input::InputFile,
@@ -1037,10 +1197,8 @@ pub(super) fn duplicate_pass(
         let index = usize::from(kind.ordinal());
         if scanned.kinds[index]
             .as_ref()
-            .is_some_and(|k| k.non_monotonic > 0)
+            .is_some_and(|k| !k.replay.is_empty())
         {
-            // Released before the sets are allocated.
-            scanned.kinds[index] = None;
             match kind {
                 ElementKind::Node => dup_filter.nodes = true,
                 ElementKind::Way => dup_filter.ways = true,
@@ -1066,10 +1224,34 @@ pub(super) fn duplicate_pass(
                 set.pre_allocate(super::id_alloc_bound(max_ids[index], floor, file_len));
             }
         }
+        let replays = scanned
+            .kinds
+            .each_ref()
+            .map(|kind| kind.as_ref().map_or(&[][..], |k| k.replay.as_slice()));
+        let subset = |schedule: &[crate::scan::classify::ScheduledBlob], replay: &[usize]| {
+            replay.iter().map(|&p| schedule[p]).collect::<Vec<_>>()
+        };
+        let replayed = match schedules {
+            KindSchedules::Indexed {
+                nodes,
+                ways,
+                relations,
+            } => KindSchedules::Indexed {
+                nodes: subset(nodes, replays[0]),
+                ways: subset(ways, replays[1]),
+                relations: subset(relations, replays[2]),
+            },
+            KindSchedules::Unindexed(blobs) => {
+                let mut union: Vec<usize> = replays.concat();
+                union.sort_unstable();
+                union.dedup();
+                KindSchedules::Unindexed(subset(blobs, &union))
+            }
+        };
         let [nodes, ways, relations] = &mut sets;
         let dup = scan_kinds(
             shared_file,
-            schedules,
+            &replayed,
             &dup_filter,
             [
                 dup_filter.nodes.then_some(nodes),
@@ -1081,8 +1263,9 @@ pub(super) fn duplicate_pass(
         )?;
         drop(sets);
         for (slot, kind) in scanned.kinds.iter_mut().zip(dup.kinds) {
-            if kind.is_some() {
-                *slot = kind;
+            if let (Some(slot), Some(kind)) = (slot.as_mut(), kind) {
+                slot.duplicates = kind.duplicates;
+                slot.duplicate_total = kind.duplicate_total;
             }
         }
         host.invocation.marker("VERIFYIDS_DUPLICATES_END");
@@ -1104,13 +1287,14 @@ pub(super) fn duplicate_pass(
 pub(super) fn settle_overflow(
     overflow: &mut IdSet,
     r: &mut BlobVerifyResult,
+    limit: Option<usize>,
     host: &crate::host::Entered<'_>,
 ) {
     let mut inserted: u64 = 0;
     for id in std::mem::take(&mut r.overflow_ids) {
         inserted += 1;
         if !overflow.insert_if_new(id) {
-            r.duplicate_ids.push(id);
+            r.record_duplicate(id, limit);
         }
     }
     #[cfg(pbfhogg_test_hooks)]

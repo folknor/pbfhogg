@@ -156,6 +156,12 @@ fn compare(
         },
         if expected { "pass" } else { "fail" }
     ));
+    // Plain and --full are separate invocations on purpose: each mode's
+    // exit and report are the claim under test, so they cannot share one
+    // order proof. On an ordered case --full costs what plain does (no
+    // duplicate pass), and on a disordered one its duplicate pass reads
+    // only the blobs whose ID ranges overlap or that are out of order
+    // inside themselves, so there is no whole-kind reread left to share.
     for full in [false, true] {
         let mode = if full {
             "check --ids --full"

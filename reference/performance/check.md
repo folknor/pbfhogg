@@ -1,5 +1,38 @@
 # Check
 
+## check --ids --full rereads only blobs that may share an ID (bygg, 2026-11-26, against `99c4743c`)
+
+The proof pass now keeps each blob's canonical ID interval and whether it
+is in strict order. A kind out of order has its duplicate pass read only
+the blobs in overlapping interval components and the blobs out of order
+inside themselves; a strict blob whose interval meets no other is skipped.
+Retained violation details are also capped at the detail limit per blob
+and per kind. `brokkr bench --iterations 1 id-order`, interleaved, the
+variant uncommitted (dirty rows), base by `--commit HEAD`.
+
+`--dataset denmark --snapshot unsorted --full yes` (every kind out of
+order; `degrade --unsort` overlaps one adjacent blob pair per kind):
+
+| Arm | UUID | Wall |
+|---|---|---:|
+| base | `438c6c94` | 418 ms (first after build, cold) |
+| variant | `59f5baef` | 111 ms |
+| base | `68651343` | 238 ms |
+| variant | `87c82986` | 112 ms |
+| variant | `89bfb91b` | 107 ms |
+| base | `fdc09a07` | 234 ms |
+
+-53 %: the duplicate pass (`VERIFYIDS_DUPLICATES`) takes 6 ms where it
+reread every blob of all three kinds.
+
+`--dataset germany`, plain `check --ids`, sorted, the cost of the interval
+bookkeeping on ordered input (final variant, the out-of-order path out of
+line): base `2daf671e` 879 ms, `8ce05b85` 888 ms; variant `d73d70b6` 888
+ms, `ca0696f5` 899 ms, `46f820df` 902 ms. +1.6 % on medians, noise. A first
+variant with the bookkeeping inline in the element loop measured 922 to
+936 ms against 883 to 892 ms (+4 %, every pair the same sign), which is
+why the out-of-order path is a cold function.
+
 ## check --locations skips ways a partition does not own (bygg, 2026-11-26, against `3789a66a`)
 
 Input: planet `altw-keep-untagged` (10,447,738,627 node records,

@@ -473,6 +473,113 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     );
 }
 
+#[cfg(pbfhogg_test_hooks)]
+fn overflow_insertions(host: &pbfhogg::host::Host) -> u64 {
+    host.invocation
+        .faults()
+        .check_overflow_ids
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn duplicates_of(report: &pbfhogg::check::verify_ids::VerifyIdsReport) -> Vec<i64> {
+    report
+        .violations
+        .iter()
+        .filter_map(|v| match v {
+            pbfhogg::check::verify_ids::IdViolation::Duplicate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Two blobs in strict order whose ID intervals are disjoint share no ID
+/// whatever their file order: the step down is reported and neither blob is
+/// read again, so the high ID never reaches the duplicate pass's side set.
+#[test]
+fn check_ids_full_does_not_reread_disjoint_blobs_out_of_order() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("swapped.osm.pbf");
+    let nodes = [node(HIGH_NODE), node(1)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+    let host = crate::common::test_host();
+    let report = verify_ids_full(&input, 0, &host);
+    assert!(!report.passed);
+    assert_eq!(report.total_violations, 1);
+    assert!(duplicates_of(&report).is_empty());
+    #[cfg(pbfhogg_test_hooks)]
+    assert_eq!(overflow_insertions(&host), 0);
+}
+
+/// Only the blobs whose intervals overlap are read again: of
+/// `[H] | [1] | [H] | [H+5]`, the two holding `H`.
+#[test]
+fn check_ids_full_rereads_only_overlapping_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("overlap.osm.pbf");
+    let nodes = [
+        node(HIGH_NODE),
+        node(1),
+        node(HIGH_NODE),
+        node(HIGH_NODE + 5),
+    ];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+    let host = crate::common::test_host();
+    let report = verify_ids_full(&input, 0, &host);
+    assert_eq!(report.total_violations, 2, "one step down, one duplicate");
+    assert_eq!(duplicates_of(&report), vec![HIGH_NODE]);
+    #[cfg(pbfhogg_test_hooks)]
+    assert_eq!(overflow_insertions(&host), 2);
+}
+
+/// A blob out of order spans from its least to its greatest ID, not from
+/// its first to its last: `[1, H, 2]` reaches `H`, so it overlaps the
+/// strict `[H, H+1, H+2]` and the duplicate `H` is found.
+#[test]
+fn check_ids_full_bounds_an_unordered_blob_by_its_extrema() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("extrema.osm.pbf");
+    let nodes = [
+        node(1),
+        node(HIGH_NODE),
+        node(2),
+        node(HIGH_NODE),
+        node(HIGH_NODE + 1),
+        node(HIGH_NODE + 2),
+    ];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 3);
+    let host = crate::common::test_host();
+    let report = verify_ids_full(&input, 0, &host);
+    assert_eq!(duplicates_of(&report), vec![HIGH_NODE]);
+}
+
+/// A capped report keeps the details an unlimited one lists first, and the
+/// exact total, however many details the input holds.
+#[test]
+fn check_ids_full_caps_details_and_keeps_exact_totals() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("many.osm.pbf");
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        for id in (1..=40).rev() {
+            nodes.push(node(id));
+        }
+    }
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 40);
+    let host = crate::common::test_host();
+    let all = verify_ids_full(&input, 0, &host);
+    let capped = verify_ids_full(&input, 5, &host);
+    assert_eq!(all.total_violations, capped.total_violations);
+    assert_eq!(capped.violations.len(), 5);
+    let all_keys = id_details(&all);
+    assert_eq!(id_details(&capped)[..], all_keys[..5]);
+    // Three blobs of 40 descending IDs: 39 steps each (each blob's first
+    // ID follows the previous blob's last, 1, in order) and two extra
+    // copies of every ID.
+    assert_eq!(all.total_violations, 3 * 39 + 80);
+    let wide = verify_ids_full(&input, 130, &host);
+    assert_eq!(id_details(&wide)[..], all_keys[..130]);
+}
+
 fn verify_ids_full(
     path: &std::path::Path,
     max_errors: usize,

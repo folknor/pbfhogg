@@ -1292,29 +1292,29 @@ before whole-block UTF-8 validation).
 
 Kind: medium.
 
-## PERF-048 - Full ID verification rereads a whole kind after any disorder
+## PERF-048 - Index and inspect scans compute observations they discard
 
 Reported by: check.
 
-Mechanism: any order violation makes `verify_ids_full_parallel` reread the
-affected kind with a shared atomic set; workers retain full violation vectors
-before `merge_kind` applies `max_errors` (`BlobVerifyResult`).
+Narrowed 2026-11-26: `check --ids --full` now rereads only blobs whose
+canonical ID intervals overlap or that are out of order inside themselves,
+and retained details are capped per blob and per kind with exact totals;
+denmark unsorted `--full` -53 %, see reference/performance/check.md "check
+--ids --full rereads only blobs that may share an ID". Refused: sharing one
+order proof between the verifier's plain and `--full` runs (they are
+separate invocations whose exits are each under test; comment in
+`crates/verify/src/checks/check_ids.rs`). Word-batched membership for
+`check --refs` stays with PERF-025.
 
-Redesign: the proof pass keeps each blob's observed canonical interval and
-internal strictness; only non-strict blobs and overlapping components need
-duplicate checking; use observed bounds, not claims or signed comparison. Local:
-bound examples at production with exact totals; word-mask membership batches;
-request fewer index observations (sortedness and coordinate extents computed
-then discarded); narrow inspect getters (timestamp-only enables the full
-census).
+Mechanism (residue, unmeasured): `check --index` computes intra-blob
+sortedness and then discards it (`check/index.rs`, `observed.map(|(index,
+_sorted)| index)`), and computes coordinate extents even where no stored
+bbox needs comparison; an `inspect --get` of a timestamp-only key
+(`data.timestamp.first` / `.last`) maps to `InspectGetNeed::Extended` and
+enables the whole extended census, ID ranges and coordinate bounds
+included.
 
-Kind: medium-priority redesign; local changes.
-
-2026-11-21 verifier hunt (other-codex): `verify check-ids` runs plain and
-`--full` on each of four dataset-sized cases, and both execute the same order
-proof before `--full` rereads the disordered kinds. Share the ID projection
-between the two consumers, keeping validated ID columns for any kind that
-needs duplicate replay.
+Kind: local changes.
 
 ## PERF-049 - Renumber ID sets materialise a 4 MiB bitmap per touched chunk
 

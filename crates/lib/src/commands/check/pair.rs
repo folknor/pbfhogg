@@ -40,9 +40,9 @@
 //! way phase unless `check_relations`), and are dropped before any later
 //! phase and before `--full`'s duplicate pass allocates its own sets, so
 //! those never coexist. What does coexist with the reference sets is the ID
-//! check's per-blob results, one slot per scheduled blob of the phase; on a
-//! file with many order violations their retained vectors grow with the
-//! violation count, as they do in the ID check alone.
+//! check's per-blob results, one slot per scheduled blob of the phase, each
+//! retaining at most `--max-errors` violation details (all of them when it
+//! is 0), as in the ID check alone.
 //!
 //! # Unindexed input
 //!
@@ -326,7 +326,14 @@ fn pair_inner(
                 PairScratch::default,
                 |_, buffer, scratch| {
                     let sets = sets.filter(|_| !refs_dead.load(Ordering::Relaxed));
-                    judge_blob(kind, buffer, scratch, ids_reads, sets, judge)
+                    judge_blob(
+                        kind,
+                        buffer,
+                        scratch,
+                        ids_reads.then_some(limit),
+                        sets,
+                        judge,
+                    )
                 },
                 |seq, blob| {
                     if let Some(r) = blob.ids {
@@ -497,19 +504,20 @@ const PHASE_MARKERS: [(&str, &str); 3] = [
 ];
 
 /// Validate one blob of `kind`'s phase once and judge it for each check
-/// reading it: the ID check (`ids`) by [`KindJudge`], the reference check
-/// (`sets`, `None` when it does not read the phase or has failed) as its
-/// own phase judges it. A validation failure is the phase's; the reference
-/// judgement's failure rides in the result.
+/// reading it: the ID check (`ids`, its detail limit when it reads the
+/// phase) by [`KindJudge`], the reference check (`sets`, `None` when it does
+/// not read the phase or has failed) as its own phase judges it. A
+/// validation failure is the phase's; the reference judgement's failure
+/// rides in the result.
 fn judge_blob(
     kind: ElementKind,
     buffer: crate::read::block::BlockBuffer<'_>,
     scratch: &mut PairScratch,
-    ids: bool,
+    ids: Option<Option<usize>>,
     sets: Option<&Sets>,
     judge: Judge,
 ) -> Result<PairBlob> {
-    let mut ids_judge = ids.then(|| KindJudge::new(kind));
+    let mut ids_judge = ids.map(|limit| KindJudge::new(kind, limit));
     let refs = match (kind, sets) {
         (ElementKind::Node, sets) => {
             let (KindIds { .. }, accepted) =
@@ -677,7 +685,7 @@ fn unindexed_pass(
                 })?;
                 let bytes = accepted.bytes();
                 let ids_blob = if ids_reads {
-                    let mut judges = KINDS.map(KindJudge::new);
+                    let mut judges = KINDS.map(|kind| KindJudge::new(kind, limit));
                     ids.each(bytes, |kind, id| {
                         if ids_selects(kind) {
                             judges[usize::from(kind.ordinal())].push(id, None);

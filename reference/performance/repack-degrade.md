@@ -1,5 +1,13 @@
 # Repack Degrade
 
+## Tagless dense groups omit keys_vals (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Denmark `reencode-pbf`, `--iterations 1` interleaved: default `1361533e`
+838 ms `b27aeb81`, `da1f1a55` 842 ms `9f5370a6`; `--force-repack yes`
+`1361533e` 837 ms `60e80d99`, `da1f1a55` 840 ms `bc54016f`. Neutral. The
+one-decode `degrade --drop-ids --force` selection has no bench cell:
+`perturb-pbf` exposes neither flag.
+
 ### degrade --unsort moves ID runs (plantasjen, 2026-11-21, against `9bbd64df`)
 
 `perturb-pbf --unsort yes` on Denmark, interleaved `--iterations 1` cells,

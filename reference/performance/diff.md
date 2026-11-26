@@ -1,5 +1,20 @@
 # Diff
 
+## Reused OSC writer buffers and owned text chunks (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+OSC writers format numbers into reused buffers; the text sink fills owned
+chunks instead of copying each piece out; gzip members reuse a per-thread
+deflate state. Planet `diff-pair --from base --to 20260411`,
+`--iterations 1` interleaved:
+
+| Format | `1361533e` | `da1f1a55` |
+|---|---|---|
+| `osc` | 2m14s `efca6bad`, 2m16s `37eb3a93` | 2m17s `5ee91039`, 2m15s `6d04d7cd` |
+| text | 1m47s `c436fe0d`, 1m47s `f9bfe496` | 1m50s `579eb41b`, 1m49s `6a01eace` |
+
+Both neutral (text within 2-3 %). The gzip member reuse is not on these
+cells: the bench writes plain `diff.osc` (no `.osc.gz` cell exists).
+
 The pbfhogg CLI command is `diff` (single command). Its performance
 shape depends on the inputs: two PBFs with byte-level blob overlap
 (e.g. one derived from the other via `apply-changes`) trigger a

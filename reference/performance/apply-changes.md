@@ -1,5 +1,24 @@
 # Apply Changes
 
+## Grouped rewritten-frame writes and hit-driven refresh (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+The drain now submits consecutive rewritten frames in groups (up to
+`APPLY_CHANGES_REWRITE_GROUP_BYTES` or 16 frames) as one vectored write,
+`pwritev` in the positional pool; refreshed ways reuse `evaluate_way`'s
+hits instead of probing every ref again. Planet OSC 4913, `--iterations
+1` cells interleaved, after one trim:
+
+| Workload | `1361533e` | `da1f1a55` |
+|---|---|---|
+| plain | 3m17s `d3f8cc13`, 3m21s `02b0ed18` | 3m20s `84244671` (3m18s, 3m21s dirty-tree cells `a8acc49e`, `08ab0ac2`) |
+| `-l`, `altw-keep-untagged` | 4m23s `e08643ec`, 4m23s `de917190` | 4m23s `6841f3bb`, 4m23s `3250410d` |
+
+Wall neutral on both. Grouping removes the drain's send stall
+(`writer_pipeline_send_wait_ns` 27.7 s to 1.7 s, `02b0ed18` against
+`84244671`), but both arms run the streaming phase at 29.2 cores: the node
+phase is CPU-bound on this host, not writer-bound, so the stall was not on
+the critical path. Kept, since it costs nothing and removes the stall.
+
 ## Merge (apply-changes)
 
 Best results per dataset.

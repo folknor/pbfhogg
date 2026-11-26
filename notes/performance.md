@@ -697,24 +697,6 @@ Risks: aggregate budget fairness.
 
 Kind: high conviction (as part of PERF-011); local change (output).
 
-## PERF-022 - Export's remaining per-feature work
-
-Reported by: spatial, decode.
-
-Export formats on the decode workers and writes on one ordered consumer
-(landed 2026-11-24; numbers in `reference/performance/export.md`). What the
-original finding proposed and was not done:
-
-- An escaped string-table cache per block: every key and value occurrence is
-  still escaped through serde_json on its own.
-- Fusing the walks over a way: `is_area_way` walks the refs, `--bbox` walks
-  the locations, then formatting walks them again.
-- Expression and tag-key blob pruning was refused, not deferred: the summary
-  counts untagged elements of every selected kind before any expression, and
-  a blob skipped on its key set would drop them (comment at `ExportBlocks`).
-
-Kind: local, low conviction once the consumer's write path is the bound.
-
 ## PERF-023 - Export should consume the ALTW join directly
 
 Reported by: spatial.
@@ -744,17 +726,10 @@ Reported by: indexdata, altw-sparse, tags, check.
 
 Sparse ALTW pass 0 is done: workers insert word-batched and atomically over a
 claim-sized reservation (planet pass 0 36.5 s to 15.3 s,
-`reference/performance/add-locations-to-ways.md`). What remains:
+`reference/performance/add-locations-to-ways.md`), and tags-filter pass 1
+took the same shape (planet invert-match 4m45s to 3m03s,
+`reference/performance/tags-filter.md`). What remains:
 
-- tags-filter pass 1 and the way-dependency walk still send
-  `(id, Vec<refs>)` and one consumer calls `insert` per reference. Default
-  queries ran pass 1 at 30 cores (planet `w/highway=primary`, `49cf423f`),
-  so not consumer-bound there; invert-match ran pass 1 at 7.5 cores with
-  workers parked on result send (`185cdb38`, 2026-11-09, before the signed
-  set and two-read closure). Needs a fresh invert-match planet cell and a
-  consumer-time counter (tags-filter has none) before building; the
-  pass-0 shape (reserve from the split walk's node `max_id`, insert after
-  the block is classified, spill uncovered IDs) carries over.
 - Under `--inject-prepass` the reservation factor is halved across the two
   sets, so a dense extract leaves its top chunks to the serial union (Japan
   spilled 97 M of 323 M refs, 617 ms serial). Raising it is a memory
@@ -1167,79 +1142,6 @@ figures. The verifier runs this check several times per `verify all`.
 
 Kind: scaling payoff (check), smaller than first filed.
 
-## PERF-047 - Digest builds elements and hashes on one consumer
-
-Reported by: check.
-
-Narrowed 2026-11-26: node prefix hashed once and the dense content record
-written as one fixed prefix, planet content -10.6 %; see
-reference/performance/digest.md "Content-form node records". The parallel
-XXH3 stripe variant stays refused (code comment at the hashing site): the
-consumer waits on its receive 74 % of wall on germany.
-
-Mechanism (residue): decode workers are the gate, record production 56 of 80
-worker core-s on germany content (node blocks 32.6, way blocks 23.2). Dense
-metadata is decoded in full for content forms that need only the user index
-(upper bound 4.5 core-s); dense tag runs are scanned then read again; plain
-messages and `Info` are parsed again after construction validated them.
-
-Candidates, each needing its own measured variant: a user_sid cursor in
-lockstep with the dense writer (keep error order user, ID order, record;
-the full form still checks the user unconditionally); a way writer, measured
-separately for message reuse and ref emission; a projection for all kinds
-only if message reuse pays (the `GroupProjection` hooks see provisional data
-before whole-block UTF-8 validation).
-
-Kind: medium.
-
-## PERF-048 - Index and inspect scans compute observations they discard
-
-Reported by: check.
-
-Narrowed 2026-11-26: `check --ids --full` now rereads only blobs whose
-canonical ID intervals overlap or that are out of order inside themselves,
-and retained details are capped per blob and per kind with exact totals;
-denmark unsorted `--full` -53 %, see reference/performance/check.md "check
---ids --full rereads only blobs that may share an ID". Refused: sharing one
-order proof between the verifier's plain and `--full` runs (they are
-separate invocations whose exits are each under test; comment in
-`crates/verify/src/checks/check_ids.rs`). Word-batched membership for
-`check --refs` stays with PERF-025.
-
-Mechanism (residue, unmeasured): `check --index` computes intra-blob
-sortedness and then discards it (`check/index.rs`, `observed.map(|(index,
-_sorted)| index)`), and computes coordinate extents even where no stored
-bbox needs comparison; an `inspect --get` of a timestamp-only key
-(`data.timestamp.first` / `.last`) maps to `InspectGetNeed::Extended` and
-enables the whole extended census, ID ranges and coordinate bounds
-included.
-
-Kind: local changes.
-
-## PERF-049 - Renumber ID sets materialise a 4 MiB bitmap per touched chunk
-
-Reported by: sort.
-
-Narrowed 2026-11-26: the per-node atomic is now one atomic per word run
-(`AtomicWordBatch`), pass 1 rewrite worker time -44 % on planet; worker-owned
-ranges and parallel rank building were refused (rank builds take
-milliseconds, the way-shard merge is gone); see
-reference/performance/renumber.md "Word-batched ID set insertion".
-
-Mechanism (residue): the node and way sets reserve up to the file-size bound
-(`RENUMBER_PREALLOC_IDS_PER_BYTE`), and a reserved chunk materialises its
-whole 4 MiB bit array on its first write. Sparse IDs under the bound can thus
-cost up to 8 bitmap bytes per input byte per set (plus one chunk of
-rounding), with both sets live in stage 2d; spill-path chunks and directory
-and rank storage come on top, and chunks at or above 2^43 are allocated
-eagerly. Planet is dense and unaffected.
-
-Redesign: sparse pages for the atomic path (an array-chunk form atomic
-writers can fill, or a per-chunk density decision), covering the eager
-high-ID path too.
-
-Kind: medium conviction; matters only for sparse-ID inputs.
-
 ## PERF-050 - Renumber lookups are scalar and touch separate arrays
 
 Reported by: sort.
@@ -1274,37 +1176,13 @@ Second consumer: sparse add-locations-to-ways pass 2 (`SparseArrayIndex::get`,
 the layout for it too: resident-store CPU (rank sits on the dependency chain
 of every coordinate load while the store is cached, e.g. japan) separately
 from near-residency page traffic (a larger index can evict store pages; past
-residency pass 2 is fault-bound). Baselines to beat before crediting
-interleaving: an array chunk's `rank_if_set` runs `binary_search` for
-membership and then `partition_point` for rank, where the found index already
-is the rank; a bit array's membership load could feed the masked popcount.
-Sparse pass 1 is decode-bound and was measured indifferent to rank cost
+residency pass 2 is fault-bound). The two local baselines are in (array
+chunks rank from the found index, bit chunks reuse the membership word;
+planet renumber neutral, reference/performance/renumber.md "Paged ID
+sets"), so interleaving is measured against them. Sparse pass 1 is decode-bound and was measured indifferent to rank cost
 (reference/performance/add-locations-to-ways.md, rank cursor).
 
 Kind: strong hypothesis.
-
-## PERF-051 - time-filter selects on full decode
-
-Reported by: pipeline, copy.
-
-Mechanism: both paths build a validated `PrimitiveBlock` and select through
-`block.elements()`. Element iteration is lazy for plain nodes, ways and
-relations (tags, refs and members are not decoded by selection), but dense
-iteration advances every coordinate and metadata column and walks
-`keys_vals` per node even though selection reads only ID, version,
-timestamp and visibility. The history path then walks the block a second
-time to encode its winners (the alternative ending no longer re-encodes; it
-forks the builder).
-
-Redesign: a selection projection riding on the validator (dense nodes visit
-last in validation order, so selection must keep iteration order and raise
-its errors only after validation succeeds), handing the encoder the winner
-positions directly. Copying unchanged fields instead of re-encoding them is
-PERF-007, not this entry.
-
-Kind: hypothesis, unsized. The path is CPU-bound on bygg's planet `history2`
-(about 27 cores), but the hotpath cell does not split selection from
-encoding inside `select_blob`; validation stays either way.
 
 ## PERF-053 - Geocode admin lookup reconstructs polygons per query
 
@@ -1410,20 +1288,16 @@ Kind: reuse join algorithms; generalize later.
 
 ## PERF-057 - Geocode local changes
 
-Reported by: geocode.
+Reported by: geocode. Narrowed 2026-11-26: format 10 persists the
+interpolation prefixes (germany query -12 %), pass 2 classifies address
+keys once per string entry, and the CLI answers in ordered parallel
+batches (reference/performance/geocode.md).
 
-- Fuse dense validation, decode and address extraction, classifying address keys
-  once per string-table entry (pass 2 uses ordinary elements; a projection alone
-  still repeats array walks; the ALTW tuple scanner lacks tags and has different
-  refusals).
-- Persist interpolation total and per-segment prefix lengths at build time
-  (an improving candidate triggers a full section scan, then a prefix walk),
-  computed in the same accumulation order to keep rounding; stop indexing
-  unresolved sections.
-- CLI queries run serially, build `serde_json::Value` trees and keep the whole
-  report; `Reader` is `Send + Sync`, so ordered parallel batches with direct
-  serialization (optionally spatially grouped), preserving order, bytes and
-  no-output-on-interrupt.
+- Fusing dense validation with decode and address extraction is not done:
+  it needs a validator projection in `read/`, and the build wall did not
+  move with the per-entry classification alone (germany 6.2 s both arms).
+- The CLI's parallel query path is unmeasured: the `geocode-query` bench
+  drives the library lookup serially and bypasses it.
 
 ## PERF-059 - Read-side local changes
 
@@ -1445,62 +1319,20 @@ measurement covers; both unmeasured.
   buffer needs a borrowing transform contract first. The 2026-03 pool revert
   (`a6ebbfe5`) was a different pool and gives no number for this one.
 
-## PERF-060 - Write-side local changes
-
-Reported by: output, encoding, apply-locations, apply-core. Every bullet is
-unmeasured.
-
-- `compress_one` (`parallel_gzip.rs`) builds a new `GzEncoder` and output per
-  member. Members are not all large: `Unit::finish_into` (`diff/derive.rs`)
-  emits every nonempty section remainder per unit, and `GlueMembers`
-  compresses small document-framing fragments, so per-member deflate setup on
-  indexed `.osc.gz` output is an open cost. Two shapes: reuse deflate state
-  with member bytes unchanged, or aggregate same-section remainders across
-  ordered units (fewer members, which changes member boundaries).
-- Dense groups always write field 10 with one 0 delimiter per node. A
-  run-local form keeps the column empty until the first tagged node, then
-  backfills delimiters; it changes output bytes and the dense-versus-plain
-  size comparison for optional runs. How often a whole dense run is tagless
-  on real data is unmeasured (runs split on metadata shape, so 8000 is a
-  ceiling, not the run size). The reader and libosmium accept the absent
-  column.
-- The apply-changes drain submits rewritten frames one `write_raw_owned` at a
-  time (`drain.rs`). Grouping them saves reservations and channel handoffs,
-  but the backends expand `write_raw_chunks` into one write per chunk, so the
-  sink work remains unless a sink consumes groups. The planet `6ce554e3` cell
-  shows 21.7 s of `writer_pipeline_send` (permit and window waits under
-  0.1 s), and the node phase is writer-bound. Precedent: vectored buffered
-  writes once improved Japan by 21.9 % and regressed Europe by 3.8 %
-  (306.8 to 318.5 s) under an older framing shape. Per-frame
-  `record_data_frame` and `rewrite_blocks_written` must stay.
-- `refreshed_locations` (`apply_changes/refresh.rs`) decodes refs and probes
-  every ref again after `evaluate_way` already found the hits; the sorted
-  per-way `hits` list could drive coordinate output instead (an empty slice
-  where the probe was skipped, full rescaling kept for non-default framing,
-  repeated refs and coordinate validation preserved). The denominator is the
-  refs traversed on the second pass, not recorded. Preserving untouched
-  packed deltas under default framing is PERF-008's wire edit.
-
 ## PERF-061 - Copy-shaped local changes
 
 Reported by: copy, osc, merge. Narrowed 2026-11-26: plain cat's unindexed
 scan now runs on the frame pool, the dedupe sweep's loser validation stages
 no members, the interner and tags-count kind-filter proposals were declined
 at their code sites, and the `CompactSink` staging item joined PERF-036.
-Every payoff below is unmeasured.
+Further narrowed 2026-11-26: forced `degrade --drop-ids` selects in one
+`KindIds` pass, the OSC writers and the text diff sink no longer allocate
+or copy per value or piece (planet diff neutral, reference/performance/
+diff.md), and dedupe winners stream relation members (denmark neutral).
+What remains is unmeasured.
 
-- Degrade `--drop-ids` on forced unindexed input sends every blob through all
-  three per-kind selection phases (`into_replicated`); one all-kind selection
-  pass would drop two of three inflates, and the `KindIds` projection
-  (`check/verify_ids.rs`) could replace full element iteration. Keep signed
-  IDs, distinct `(kind, id)` selection and the all-occurrence count. The
-  global fold is one serial `BTreeSet` capped at N, taking up to N
-  candidates from each block, not a heap.
-- `osc/write.rs` borrowed writers make a numeric `String` per attribute, way
-  ref and member, a `BytesStart` per element and child, and clone coordinate
-  text. They run on diff units (and serially on the unindexed OSC route); the
-  planet osc cell `3d544246` (bygg, `31c482e2`) shows 74 s consumer receive
-  wait, so a slow head unit can hold the run and worker cost is not ruled out.
+- Forced `degrade --drop-ids` has no bench cell: `perturb-pbf` exposes
+  neither `--drop-ids` nor `--force`.
 - Simplified OSC (`merge_changes/simplify.rs`) collects every chunk in
   `all_chunks` before the drain; for plain `.osc` that is a second XML copy of
   every survivor. An ordered windowed drain was measured on `.osc.gz` and is
@@ -1508,36 +1340,9 @@ Every payoff below is unmeasured.
   2026-11-26), so only the plain `.osc` case remains: a memory win there,
   unmeasured (the bench has no plain-output option), is the sole reason
   left to carry it.
-- Text diff `TextUnitSink` copies every full 1 MiB piece out of its buffer and
-  the tail again; a chunking writer filling owned pieces would avoid it, but
-  handing the buffer over whole retains oversized capacity that the overflow
-  allowance charges.
-- The dedupe sweep's winner path (`blob_merge/sweep.rs` `Output::encode`)
-  allocates a member vector per relation; reuse needs builder-owned scratch of
-  IDs and interned roles, since the entries borrow the item's block.
 - The serial diff planner reads both payload streams on one thread; the
   denmark common-output record already shows planner and head delays, with no
   evidence it limits planet today.
-
-## PERF-063 - Geocode Pass 1.5 overflow lists are unbounded per worker
-
-Reported by: the negative-ID geocode change.
-
-Mechanism: `record_referenced_node` (`geocode_index/builder/pass1_5.rs`)
-spills every node ref the size-bounded pre-allocation does not cover
-(above it, or negative) onto a per-worker `Vec<i64>`. Compaction sorts and
-dedups only once a list has doubled, keeps its capacity, and workers can
-hold the same IDs; every list lives until the scan joins. A file whose
-relevant refs mostly spill (an all-negative file, or IDs far above 64 per
-input byte) holds about 8 bytes per spilled ref per worker at peak, and
-distinct dangling spills stay in the final set. Sign-neutral: large
-positive IDs had the same shape before negatives joined it; ordinary
-positive input spills nothing new.
-
-Redesign: bounded batches folded into one shared accumulator, or a
-scratch-backed sort and dedupe where the final set also needs a bound.
-
-Payoff: bounded memory on exotic ID layouts; nothing on planet-shaped input.
 
 # pbfhogg-verify (2026-11-21 hunt)
 
@@ -1811,21 +1616,19 @@ Reported by: heavy-opus, heavy-codex, engine-codex. Narrowed 2026-11-22.
 Landed: every warm case, drop and unsort included, is decided from the
 output's stored summary against a stream predicted from the expected file
 (reference/verify.md "Decoding summaries"); warm denmark degrade 1m55s to
-1m13-1m17s (reference/performance/verifier.md).
+1m13-1m17s (reference/performance/verifier.md). Since 2026-11-26 the
+warm drop case inflates once, `partition` reads once and reuses grouped
+input, the stripped expected file is built once per run, and the layout
+predictors walk the claims once (warm denmark degrade 56.4 s to 41 s,
+repack 32.5 s to 22.2 s).
 
 Residue:
 
 - A cold run, or an output whose bytes changed, still decodes and merges
   every case. A cheaper cold path (hash-scan the output decoding, merge
   only on mismatch) is unmeasured.
-- A warm drop case inflates its output twice with the verifier's frame
-  decoder: once for the survivor candidate, once in `index_truth`.
-- `partition` reads the input decoding three times (once per kind) and
-  rewrites it whole even when the input is already grouped, and repack and
-  degrade each build the same stripped expected file in their own check.
-- Each audited output still gets `index_truth`, `check --index`, a claims
-  walk and layout work, and the layout predictors walk the input claims
-  once per kind per case (the frame-reader half is PERF-077).
+- Each audited output still gets `index_truth`, `check --index` and a
+  claims walk as separate passes.
 - No test reaches the summary-decided sequence walk end to end: repack and
   degrade are driven only by the encoding fixture, which runs fresh
   because its fake osmium decodes by file name, and its 3-object input
@@ -1918,30 +1721,23 @@ Kind: high-conviction rewrite (other-codex).
 Reported by: engine-opus, engine-codex, heavy-opus, heavy-codex,
 orchestration-opus.
 
-Mechanism:
+Narrowed 2026-11-26: `index_truth` reads through one open file and
+inflates on a worker pool folding in file order, and header-only walks use
+positional reads with `POSIX_FADV_RANDOM` (verifier.md, "Shared expected
+file and the pooled frame reader").
 
-- `pbf_frames::index_truth` walks claims serially, then for each blob calls
-  `read_block`, which opens the file, seeks, allocates and inflates with
-  `flate2`'s default miniz backend on one thread (about 7,700 opens on
-  denmark).
+Residue:
+
 - `blob_ids_and_shape` walks the groups again.
-- It runs on the input in degrade and repack and on every repack and degrade
-  output, about a dozen whole-file inflates per run (estimate: several seconds
-  each).
-- Header-only walks use a `BufReader` plus `seek`, so readahead pulls in
-  payloads the walk skips.
+- Results are not memoized per file digest, so each audited output is
+  inflated again by each check that judges it.
 - Dedupe passthrough allocates buffers per payload pair.
 
-Redesign: read the frames once and inflate on a worker pool, folding in file
-order so the first violation stays stable. Copy the shape of pbfhogg's
-`read/pipeline.rs` without linking it. Return count, kind, extrema and shape in
-one pass and memoize per file digest. Use `pread` plus `POSIX_FADV_RANDOM` for
-header walks, as `read/header_walker.rs` does. Use an inflater that is not
-pbfhogg's (system zlib or zlib-ng) to keep the decode independent. Fuse with
-the claims walks that judge the same output (`output_blobs`, `LayoutCheck`,
-`judge_header`). codex-engine adds reusing decode results for byte-equal
-payloads across related files while judging each occurrence's framing
-separately.
+Redesign (residue): return count, kind, extrema and shape in one pass and
+memoize per file digest; fuse with the claims walks that judge the same
+output (`output_blobs`, `LayoutCheck`, `judge_header`). codex-engine adds
+reusing decode results for byte-equal payloads across related files while
+judging each occurrence's framing separately.
 
 Risks: sharing buffers only where both interpretations see the bytes they need;
 keep `check --index` and the header-only paths.
@@ -2051,20 +1847,6 @@ Redesigns:
   field-policies need not gate later work, only later verdicts.
 
 Kind: low value.
-
-## PERF-083 - Verifier-wide small costs
-
-Reported by: engine-opus, heavy-opus, orchestration-opus, orchestration-codex.
-
-The PASS line's steps now time the verifier's own OPL reading
-(`opl merge`, `opl order scan`, `opl derive model`) apart from the decodes.
-What remains is the measurement those labels exist for: one denmark `all`,
-read for the split between `osmium cat` and the merge, before any redesign of
-the comparison path is argued from cost. No baseline
-with the 8 KiB OPL readers exists to set against it; the readers are now
-1 MiB.
-
-Kind: local.
 
 ## PERF-086 - Extract on an indexed history file has no bench input
 

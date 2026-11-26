@@ -670,6 +670,14 @@
   change for tagless groups (element content does not), so a byte or hash
   comparison against output of an earlier release differs.
 
+- **`tags-filter` with `--invert-match` is about a third faster on
+  planet.** Pass 1 now inserts way references on its decode workers
+  instead of on one consumer (planet `-i w/highway=primary` 4m45s to
+  3m03s).
+
+- **Geocode lookups are faster.** Format 10's stored interpolation
+  prefixes cut a germany query batch by about 12 %.
+
 - **`geocode-query` answers points in parallel.** Queries run in ordered
   batches on every core and each answer is serialized directly; the output
   is byte-identical and is still written only once every query has

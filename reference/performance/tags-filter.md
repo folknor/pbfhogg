@@ -1,5 +1,23 @@
 # Tags Filter
 
+### Pass 1 inserts way refs on the workers (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Pass 1 and the relation-member way walk used to send `(id, Vec<refs>)`
+to one consumer that inserted each ref; workers now insert word-batched
+and atomically into a reservation sized from the header walk's node
+`max_id`, with negative and above-bound refs in a signed spill set.
+Planet `tag-select --filter w/highway=primary --invert-match yes`,
+`--iterations 1` cells interleaved baseline first:
+
+| Arm | Cells |
+|---|---|
+| `1361533e` | 4m44s `ac445483`, 4m46s `196f918d` |
+| `da1f1a55` | 3m03s `7f6e7720`, 3m04s `16aff743` |
+
+About 36 % faster: invert-match pass 1 was consumer-bound, as the
+7.5-core reading at `185cdb38` suggested. Pass 1 now also emits consumer
+busy and worker send-wait counters.
+
 ### OSC reader frames spans, workers tokenize (bygg, 2026-11-26, `a1d7434a` + change)
 
 Before the change, `perf record` of `tag-select --input-kind osc --input

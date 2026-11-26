@@ -1,5 +1,22 @@
 # pbfhogg-verify
 
+## Shared expected file and the pooled frame reader (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Degrade and repack share one expected file per run and reuse input
+claims, warm drop cases inflate once, and the frame reader uses one open
+file with pooled inflation. Denmark, warm cache, the same pbfhogg binary
+on both arms (`brokkr run --commit 1361533e` builds only the verifier):
+
+| Check | `1361533e` | `da1f1a55` |
+|---|---|---|
+| `degrade` | 56.4 s | 40.4 s, 41.9 s |
+| `repack` | 32.5 s | 22.2 s, 22.2 s |
+
+About 27 % and 32 % faster. A full denmark `verify all` on `da1f1a55`
+ran 6m24s, 25 of 25 PASS; its step walls put osmium `cat` and the OPL
+merge as the largest costs of the slowest checks (cold degrade: osmium
+cat 18.4 s, merge 16.3 s of 59.5 s).
+
 Wall time of the real-data cross-validation checks (`brokkr run --with
 pbfhogg pbfhogg-verify -- CHECK --dataset denmark`), read from each check's
 PASS line: the check wall and its step walls. All cells below are denmark on

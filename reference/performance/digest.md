@@ -1,5 +1,13 @@
 # Digest
 
+## Dense user_sid cursor for content forms (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Content forms decode only the dense `user_sid` column instead of full
+dense metadata. Germany `canonical-digest --form content`, `--iterations
+1` interleaved: `1361533e` 3.1 s `8dd08e6e`, 3.1 s `179cc91a`; `da1f1a55`
+3.0 s `699767b8`, 3.0 s `95ed4517`. Within noise; the upper bound the
+residue named (4.5 core-s of 80) was small to begin with.
+
 ## Content-form node records (bygg, 2026-11-26, against `ec2b2dc0`)
 
 Where the content form's time goes, germany `--form content`, hotpath

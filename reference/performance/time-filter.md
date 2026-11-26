@@ -1,5 +1,13 @@
 # time-filter
 
+## Projected selection with winner positions (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Selection reads only ID, version, timestamp and visibility from a
+projection, and the history encoder gets winner positions directly.
+Planet `time-snapshot --snapshot history2 --variant raw`, `--iterations
+1` interleaved: `1361533e` 2m41s `f750c3c1`, 2m46s `f6d3e5b7`;
+`da1f1a55` 2m30s `d5a86eac`, 2m35s `0112d9c6`. About 6 % faster.
+
 Current baselines first; History after. The snapshot path's older planet
 cells (claim checks, exact timestamps) are in
 [cross-command](cross-command.md), and its memory cells in

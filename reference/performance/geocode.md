@@ -1,5 +1,22 @@
 # Geocode
 
+## Format 10: persisted interpolation prefixes (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Format 10 stores each interpolation section's total and segment prefix
+lengths and drops unresolved ways; Pass 1.5 spills fold into one shared
+set; Pass 2 classifies address keys once per string entry. Germany,
+`--iterations 1` interleaved:
+
+| Bench | `1361533e` | `da1f1a55` |
+|---|---|---|
+| `geocode-build` | 7.5 s `db0e2f48` (cold), 6.2 s `bf1d66e6` | 6.1 s `fcd069b0`, 6.2 s `be3ce6c5` |
+| `geocode-query`, measured call | 12.8 s `a1361a74`, 12.8 s `2f2c19f9` | 11.2 s `047c39f7`, 11.3 s `455be5b9` |
+
+Build neutral; query about 12 % faster. The index has 2,417 interpolation
+records instead of 2,724 (307 unresolved ways no longer written). The CLI's
+parallel `geocode-query` path is not measured: this bench drives the
+library lookup serially.
+
 ## build-geocode-index
 
 Reverse geocoding index build. 4-pass pipeline: nodes (address points + dense

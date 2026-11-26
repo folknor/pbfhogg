@@ -1,5 +1,14 @@
 # export
 
+## Escaped string cache and the fused way walk (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Each string-table entry is escaped at most once per block, and a way's
+refs and locations are read in one walk. Germany `geojson-export`
+(geojsonseq, no bbox), `--iterations 1` interleaved: `1361533e` 8.9 s
+`270b27e9`, 8.8 s `7a336892`; `da1f1a55` 8.9 s `ab486fc9`, 8.7 s
+`2a9859b2`. Neutral: the ordered consumer's write path bounds the run, as
+expected. The bbox case has no bench param and is unmeasured.
+
 `pbfhogg export` to GeoJSON, measured with the `geojson-export` script bench
 (output to an iteration-owned file on scratch). All cells below: host bygg
 (16c/32t, 30 GB, one NVMe for data, scratch and target), default

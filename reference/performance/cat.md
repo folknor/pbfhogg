@@ -1,5 +1,11 @@
 # Cat
 
+## Dedupe winner relations without a member vector (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Denmark `copy-pbf --dedupe yes`, `--iterations 1` interleaved: `1361533e`
+1.2 s `3806bf9d`, 1.1 s `14a0fb04`; `da1f1a55` 1.2 s `83b51430`, 1.2 s
+`8788f3aa`. Neutral at this resolution.
+
 ## Cat passthrough (indexdata generation)
 
 No `--type` filter. Decompresses each blob to scan IDs/tags, reframes BlobHeader

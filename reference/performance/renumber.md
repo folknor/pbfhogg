@@ -1,5 +1,15 @@
 # Renumber
 
+## Paged ID sets and the single-search rank (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Reserved chunks now materialise 64 KiB pages on first write instead of a
+whole 4 MiB bitmap, and `rank_if_set` reuses the found index and the
+membership word. Planet `id-remap`, `--iterations 1` interleaved:
+`1361533e` 66 s `94e21544`, 67 s `62701660`; `da1f1a55` 68 s `7a838d85`,
+67 s `c648d2e7`. Neutral on dense input, as required; the change is for
+sparse-ID inputs, which no registered dataset has (a unit test bounds a
+sparse set's materialised storage).
+
 ## Renumber (external mode)
 
 Planet-scale renumber uses O(1) lookups in ranked ID sets

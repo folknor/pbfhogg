@@ -1,5 +1,13 @@
 # Check
 
+## check --index stops computing what it discards (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+
+Intra-blob sortedness is no longer tracked and coordinate extents only
+where a stored bbox is compared. Germany `index-integrity`, `--iterations
+1` interleaved: `1361533e` 1.3 s `33a3c276` (cold), 974 ms `696fd9ee`;
+`da1f1a55` 934 ms `ee1e53c0`, 927 ms `3049b003`. About 4 % against the warm
+baseline cell.
+
 ## check --ids --full rereads only blobs that may share an ID (bygg, 2026-11-26, against `99c4743c`)
 
 The proof pass now keeps each blob's canonical ID interval and whether it

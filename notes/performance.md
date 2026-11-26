@@ -758,30 +758,32 @@ geometry as export hot paths; there was nothing there to assess.
 
 Reported by: indexdata, altw-sparse, tags, check.
 
-Mechanism: sparse ALTW `scan_way_refs` decodes refs into per-way scratch, the
-caller copies them into a per-blob `Vec<i64>`, sends it over the result
-channel, and one consumer calls `referenced.set()` per reference; under prepass
-injection the same consumer detects shared references. tags-filter sends
-`(id, Vec<refs>)` and one consumer inserts. Reference checking does one atomic
-op per observed ID; dense nearby IDs hit the same words. This is O(total
-references) on one core; more decoders only feed it faster. The `Mutex`
-receiver is per blob, the insertion loop per reference.
+Sparse ALTW pass 0 is done: workers insert word-batched and atomically over a
+claim-sized reservation (planet pass 0 36.5 s to 15.3 s,
+`reference/performance/add-locations-to-ways.md`). What remains:
 
-Redesign: decoder workers partition bounded reference batches by node-ID chunk;
-each chunk has one owner building its disjoint bitmap part; dense updates as
-word masks, sparse as offsets; completed chunks move into the frozen directory
-(`IdSet::chunk_of` and consuming merge exist); memory bounded by queued bytes,
-not a planet-wide set per worker. Direct checked atomic insertion
-(`IdSet` atomic setters, the geocode `pass1_5` collector) is a smaller
-alternative where a bounded dense allocation fits.
+- tags-filter pass 1 and the way-dependency walk still send
+  `(id, Vec<refs>)` and one consumer calls `insert` per reference. Default
+  queries ran pass 1 at 30 cores (planet `w/highway=primary`, `49cf423f`),
+  so not consumer-bound there; invert-match ran pass 1 at 7.5 cores with
+  workers parked on result send (`185cdb38`, 2026-11-09, before the signed
+  set and two-read closure). Needs a fresh invert-match planet cell and a
+  consumer-time counter (tags-filter has none) before building; the
+  pass-0 shape (reserve from the split walk's node `max_id`, insert after
+  the block is classified, spill uncovered IDs) carries over.
+- Under `--inject-prepass` the reservation factor is halved across the two
+  sets, so a dense extract leaves its top chunks to the serial union (Japan
+  spilled 97 M of 323 M refs, 617 ms serial). Raising it is a memory
+  envelope decision, not a tuning one.
+- `check --refs` `replay_nodes` does one `try_insert_atomic` per node on
+  the workers (not a serial consumer); node IDs ascend within a blob, so
+  `AtomicWordBatch` applies as in renumber. Unmeasured; check refs planet
+  is 20 s with the consumer waiting on workers.
 
-Payoff: removes a serial pass over billions of references and an expanded
-intermediate.
-
-Risks: chunk skew, batching overhead, cache coherence on sparse workloads; no
-full ID-space bitmap per worker; header maxima are not safe allocation bounds
-and dangling refs can exceed the max node ID; ALTW multiplicity (seen and seen
-again) and closed-ring terminal exclusion must survive batch compaction.
+Chunk-partitioned owners were considered for pass 0 and not built:
+atomic insertion over a bounded reservation removed the serial union with
+no second channel layer; owners stay the answer only if a sparse-ID input
+needs occupancy-driven chunks with parallel insertion.
 
 Kind: high conviction.
 

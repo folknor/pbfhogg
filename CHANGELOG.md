@@ -651,6 +651,12 @@
 
 ### Changed
 
+- **Sparse `add-locations-to-ways` collects way references on every
+  decode worker.** Its first pass recorded every way reference on one
+  thread; workers now record them directly, for indexed input. Planet on a
+  32-thread host: that pass from about 36.5 s to about 15.3 s, peak memory
+  in it about 0.7 GB lower. Unindexed input collects as before.
+
 - **`renumber` sizes its node and way rewrite stages from the host.** They
   ran a fixed 4 and 6 workers; they now use the host's cores (the node
   stage capped at 12), and the way stage records way IDs in one shared

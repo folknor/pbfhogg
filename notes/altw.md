@@ -505,31 +505,12 @@ Note `c6f08ff` predates the `altw_pass0_union_ms` counter and emits no
 `pass0` counters at all, so its "4.3 ns/ref" was inferred from the phase
 wall, not measured. The 6.6 ns/ref figure is directly confirmed.
 
-### P2. Pass-0 parallel union via `set_atomic_if_new`
+### P2. Pass-0 parallel union - LANDED 2026-11-26
 
-Replace the serial main-thread union with worker-side atomic bit
-sets. Shared-node detection stays exactly correct:
-`if !referenced.set_atomic_if_new(id) { shared.set_atomic(id) }` -
-the fetch_or linearizes, exactly one occurrence observes "new", every
-other lands in `shared`. Closure-ref trimming stays where it is
-(before emission).
-
-Constraints (codex catch): `IdSet::pre_allocate` needs an upper id
-bound before workers start and allocates every chunk through that
-bound. Shape: indexed input derives the bound from the largest node
-blob `max_id`; refs above the bound fall back to the existing
-per-blob vectors and a tiny serial merge after the join (preserves
-dangling-ref behaviour); unindexed input keeps the serial union.
-`shared` needs the same pre-allocation under prepass.
-
-Ceiling: the whole 63 s europe phase; realistic win is tens of
-seconds (4.7 B locked byte-RMWs do not scale linearly to 22 cores;
-hot shared nodes cause coherence traffic). Japan expect flat (2.5 s
-phase). Measure before building: worker result-channel stall time on
-the current shape, then A/B pass-0 wall, avg cores, chunk allocation
-count, peak anon, and exact set-equality against the serial
-implementation (closure ways, repeated refs, dangling high refs,
-corrupt-indexdata fixtures).
+Built as worker-side word-batched atomic insertion (`AtomicWordBatch`,
+and `AtomicRepeatBatch` for prepass shared detection) over a
+claim-sized reservation; planet pass 0 36.5 s to 15.3 s. Numbers in
+`reference/performance/add-locations-to-ways.md`.
 
 ### P3. `MADV_RANDOM` probe on the pass-2 coord mmap - MEASURED 2026-07-16, KEEP (`25cb0df`)
 

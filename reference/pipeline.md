@@ -445,7 +445,11 @@ Embeds node coordinates in ways. Index strategies (`--index-type`, default
 [performance/add-locations-to-ways.md](performance/add-locations-to-ways.md) for measured comparisons):
 
 **Sparse**: rank-indexed flat mmap. Builds an `IdSet` of
-way-referenced nodes; pass 1 workers store packed `(lat, lon)` at byte
+way-referenced nodes (pass 0: workers insert each admitted way blob's refs
+word-batched and atomically into a set reserved from the node blobs'
+claimed `max_id`, capped by the input size; refs outside the reservation,
+and every ref of an unindexed input, are unioned serially on the calling
+thread); pass 1 workers store packed `(lat, lon)` at byte
 offset `numeric_rank_if_set(node_id) << 3` via relaxed `AtomicU64::swap`
 (a duplicate ID whose coordinates disagree is refused)
 directly into a pre-allocated, `MmapMut`-mapped values file

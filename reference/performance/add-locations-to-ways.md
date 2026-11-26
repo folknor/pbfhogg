@@ -1,5 +1,35 @@
 # Add Locations To Ways
 
+### Sparse pass 0 inserts on the workers (bygg, 2026-11-26, baseline `ae651451`)
+
+Pass 0 used to union every way reference on the calling thread
+(`altw_pass0_union_ms` was the whole scan: 26.4 s of a 26.5 s planet scan
+at `8b260ad2`). Workers now insert each admitted blob's refs into the
+shared sets themselves, word-batched atomically, over a reservation sized
+from the node blobs' claimed highest ID and capped at 8 IDs per input byte
+across the sets (4 each under `--inject-prepass`); refs it does not cover
+are unioned serially as before. `embed-locations --index-type sparse
+--stop ALTW_PASS0_END`, `--iterations 1`, interleaved baseline
+(`--commit HEAD`) and uncommitted variant, after `brokkr fstrim`:
+
+| Dataset | Arm | UUID | Run wall | ALTW_PASS0 | Scan after the walk | Peak anon |
+|---|---|---|---|---|---|---|
+| planet | baseline | `322568c2` | 36.7 s | 36.5 s | 29.6 s | 3.03 GB |
+| planet | variant | `a7b832b8` | 15.5 s | 15.3 s | 9.3 s at 30.4 cores | 2.30 GB |
+| planet | variant | `8b1f4c75` | 15.7 s | | | |
+| planet | baseline | `a62ae20e` | 36.6 s | | | |
+
+Planet variant counters: 11,614,930,354 refs, 0 spilled,
+`altw_pass0_worker_insert_ms` 86.0 s summed over workers, serial union
+1 ms. Japan, best of 3 (warm): plain 0.50 s (`b848489a`) against 1.0 s
+(`e773b4ea`); `--inject-prepass` 1.0 s (`75716230`) against 2.0 s
+(`e149d1a2`). Under prepass the halved factor leaves Japan's top chunks
+uncovered: 97.4 M of 322.8 M refs spilled and the serial union took
+617 ms, so prepass on extracts of Japan's density is still partly serial;
+the factor is the memory envelope (bitmap bytes at most the input size),
+not a tuning knob to raise without that argument. Verdict: kept, pass 0
+2.4x faster at planet.
+
 ### Output blocks pass through the shared cut (bygg, 2026-11-24, baseline `bce05b91`)
 
 Every block a pass-2 or stage-4 worker produces now goes through

@@ -364,6 +364,10 @@ covers) after the parallel phase. A claim therefore cannot cause an
 unbounded allocation, and an ID beyond the allocation is still tracked
 correctly; a wrong claim can change the run's memory and time, not its
 answer.
+Sparse `add-locations-to-ways` pass 0 reserves its way-reference sets the
+same way, from the node blobs' claimed `max_id` bounded at
+`ALTW_PASS0_PREALLOC_IDS_PER_BYTE` per input byte, and unions the refs the
+reservation does not cover serially; an unindexed input reserves nothing.
 `repack` bounds its `BlockBuilder` pre-allocation the same way. `renumber`
 pre-allocates its node set to the smaller of the claimed `max_id` and a
 file-size bound and inserts any ID above it afterwards, so an overstated or

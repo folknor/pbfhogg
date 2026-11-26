@@ -728,6 +728,19 @@ pub(crate) const ALTW_STAGE2_WORKERS_CAP: usize = 6;
 /// scratch precheck counts one payload file per worker.
 pub(crate) const ALTW_STAGE3_WORKERS_CAP: usize = 4;
 
+/// Node IDs sparse pass 0's shared way-reference bitmaps may cover per input
+/// byte, all its sets together, passed to `IdSet::file_bounded_max_id`
+/// against the node blobs' claimed `max_id`. Workers insert covered refs
+/// atomically; refs above the bound (and negative ones) fall back to the
+/// serial union. Every chunk a covered ref touches becomes a 4 MiB bit
+/// array even where today's array chunk would hold it (at most 1024
+/// members), so the factor is what bounds that growth: 8 IDs per byte is
+/// one bit per ID, at most the input's own size in bitmap bytes. Under
+/// `--inject-prepass` the two sets share it (4 each). Planet and
+/// country-sized extracts are covered whole; a thin extract covers its low
+/// chunks and unions the rest serially.
+pub(crate) const ALTW_PASS0_PREALLOC_IDS_PER_BYTE: u64 = 8;
+
 // ---------------------------------------------------------------------------
 // Renumber
 // ---------------------------------------------------------------------------

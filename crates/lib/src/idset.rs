@@ -790,6 +790,23 @@ impl Bitmap {
         }
     }
 
+    /// Whether [`Self::dense_for_atomic`] would return a chunk for `key`,
+    /// without materialising a reserved one.
+    #[inline]
+    fn covers_atomic(&self, key: NonNegId) -> bool {
+        let (cid, _) = key.split();
+        let chunk = if cid < DIRECT_CHUNKS {
+            let i = cid as usize;
+            if i < self.reserved {
+                return true;
+            }
+            self.chunks.get(i).and_then(Cell::as_ref)
+        } else {
+            self.overflow.get(&cid)
+        };
+        matches!(chunk, Some(Chunk::Dense(_)))
+    }
+
     /// The highest chunk id an atomic setter can write - reserved, or a
     /// bit array a plain insert promoted outside the reservation - for the
     /// atomic setters' panic message. It says nothing about holes below it.
@@ -1756,6 +1773,106 @@ impl Drop for AtomicWordBatch<'_> {
     }
 }
 
+/// A word-batching recorder of "seen" and "seen again" over two sets
+/// pre-allocated to the same bound: after every batch writing them has
+/// finished and the writers have joined, `seen` holds every recorded ID and
+/// `again` exactly those recorded at least twice, across all batches and in
+/// any interleaving.
+///
+/// Per pending word, `mask` collects the IDs and `dup` those met a second
+/// time inside the word. Publication ORs `mask` into the `seen` word and
+/// takes the previous value: a bit already set there was recorded by an
+/// earlier publication (the `fetch_or`s on one word are totally ordered, so
+/// exactly one publication of an ID sees its bit clear), so `prev & mask`
+/// plus `dup` are the repeats, ORed into the `again` word. The `again`
+/// chunk is only touched when a repeat exists, so it materialises only
+/// where one does.
+///
+/// An ID either set cannot take atomically is refused (`insert` returns
+/// `false`) and recorded nowhere: coverage depends only on the ID and the
+/// two reservations, so every occurrence of it is refused alike and the
+/// caller counts its multiplicity elsewhere.
+///
+/// The final word is published by [`Self::finish`], which the writer must
+/// call; there is deliberately no publication on drop, which would carry
+/// a release check into `Drop`.
+#[must_use = "an unfinished batch loses its pending word"]
+pub(crate) struct AtomicRepeatBatch<'a> {
+    seen: &'a IdSet,
+    again: &'a IdSet,
+    key: i64,
+    word: Option<&'a AtomicU64>,
+    mask: u64,
+    dup: u64,
+}
+
+impl<'a> AtomicRepeatBatch<'a> {
+    pub(crate) fn new(seen: &'a IdSet, again: &'a IdSet) -> Self {
+        Self {
+            seen,
+            again,
+            key: 0,
+            word: None,
+            mask: 0,
+            dup: 0,
+        }
+    }
+
+    /// Record one occurrence of `id`; `false`, recording nothing, for an ID
+    /// either set cannot take atomically.
+    #[inline]
+    pub(crate) fn insert(&mut self, id: i64) -> bool {
+        let key = id >> 6;
+        if self.word.is_some() && key == self.key {
+            let bit = 1u64 << (id & 63);
+            self.dup |= self.mask & bit;
+            self.mask |= bit;
+            return true;
+        }
+        self.publish();
+        let covered = NonNegId::new(id).is_some_and(|k| self.again.nonneg.covers_atomic(k));
+        if !covered {
+            return false;
+        }
+        let Some((words, off)) = self.seen.dense_for_atomic(id) else {
+            return false;
+        };
+        self.word = Some(&words[(off >> 6) as usize]);
+        self.key = key;
+        self.mask = 1u64 << (off & 63);
+        self.dup = 0;
+        true
+    }
+
+    /// Publish the pending word. Must be called once the batch's IDs are
+    /// all inserted.
+    pub(crate) fn finish(mut self) {
+        self.publish();
+    }
+
+    #[inline]
+    fn publish(&mut self) {
+        let Some(word) = self.word.take() else {
+            return;
+        };
+        let prev = word.fetch_or(self.mask, Relaxed);
+        let repeats = (prev & self.mask) | self.dup;
+        if repeats == 0 {
+            return;
+        }
+        // `insert` checked that `again` covers this word without
+        // materialising it, and nothing can shrink a reservation under a
+        // shared borrow, so the lookup succeeds.
+        let Some((words, off)) = self.again.dense_for_atomic(self.key << 6) else {
+            panic!(
+                "AtomicRepeatBatch: the again set stopped covering word {}",
+                self.key
+            );
+        };
+        words[(off >> 6) as usize].fetch_or(repeats, Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1901,6 +2018,68 @@ mod tests {
             }
         });
         assert_eq!(shared.len(), 1_000);
+    }
+
+    /// The repeat batch records "seen" and "seen at least twice" exactly as
+    /// the serial get-then-insert does, refuses the same IDs the plain
+    /// setter spills, and across threads counts a repeat split between two
+    /// batches.
+    #[test]
+    fn repeat_batch_matches_serial_multiplicity() {
+        let chunk = 1i64 << ID_SHIFT;
+        let mut ids: Vec<i64> = vec![5, 5, 6, 70, 6, 7, 64, 63, 63, 63, 0, 0, -3, -3];
+        ids.extend((chunk - 10)..(chunk + 10));
+        ids.extend([chunk + 1, 3 * chunk, 3 * chunk, 2 * chunk + 1, 9]);
+        let bound = 2 * chunk + 5;
+        let (mut seen, mut again) = (IdSet::new(), IdSet::new());
+        seen.pre_allocate(bound);
+        again.pre_allocate(bound);
+        let mut spilled = Vec::new();
+        let mut batch = AtomicRepeatBatch::new(&seen, &again);
+        for &id in &ids {
+            if !batch.insert(id) {
+                spilled.push(id);
+            }
+        }
+        batch.finish();
+        assert_eq!(spilled, vec![-3, -3, 3 * chunk, 3 * chunk]);
+        let mut want_seen = BTreeSet::new();
+        let mut want_again = BTreeSet::new();
+        for &id in ids.iter().filter(|id| !spilled.contains(id)) {
+            if !want_seen.insert(id) {
+                want_again.insert(id);
+            }
+        }
+        let members = |s: &IdSet| s.iter_canonical().collect::<BTreeSet<_>>();
+        assert_eq!(members(&seen), want_seen);
+        assert_eq!(members(&again), want_again);
+        // Chunk 2 holds no repeat, so `again` never materialised it.
+        assert_eq!(again.nonneg.allocated_chunk_count(), 2);
+
+        let (mut seen, mut again) = (IdSet::new(), IdSet::new());
+        seen.pre_allocate(1_000);
+        again.pre_allocate(1_000);
+        std::thread::scope(|scope| {
+            for t in 0..8i64 {
+                let (seen, again) = (&seen, &again);
+                scope.spawn(move || {
+                    let mut batch = AtomicRepeatBatch::new(seen, again);
+                    // Every thread records 0..500 once; t < 4 also 500..1000.
+                    for id in 0..500 {
+                        assert!(batch.insert(id));
+                    }
+                    if t < 4 {
+                        for id in (500 + t..1_000).step_by(4) {
+                            assert!(batch.insert(id));
+                        }
+                    }
+                    batch.finish();
+                });
+            }
+        });
+        assert_eq!(seen.len(), 1_000);
+        assert_eq!(again.len(), 500);
+        assert!((0..500).all(|id| again.get(id)));
     }
 
     #[test]

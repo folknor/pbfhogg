@@ -1116,20 +1116,84 @@ fn emit_stats_counters(stats: &Stats, invocation: &crate::host::Recorder) {
 // Pass 1: Build node coordinate index
 // ---------------------------------------------------------------------------
 
+/// Reserve pass 0's sets for the worker-side atomic insertion, from the
+/// node blobs' claimed highest ID capped by the input's size
+/// ([`ALTW_PASS0_PREALLOC_IDS_PER_BYTE`](crate::tunables::ALTW_PASS0_PREALLOC_IDS_PER_BYTE),
+/// shared by both sets under prepass). Both sets get the same bound, which
+/// is what lets one repeat batch write them.
+fn reserve_pass0_sets(
+    file: &crate::read::input::InputFile,
+    claim: i64,
+    referenced: &mut IdSet,
+    shared: Option<&mut IdSet>,
+) -> Result<()> {
+    let file_len = file
+        .file()
+        .metadata()
+        .map_err(|e| {
+            crate::Error::from(e).context(format!("failed to stat {}", file.path().display()))
+        })?
+        .len();
+    let per_byte =
+        crate::tunables::ALTW_PASS0_PREALLOC_IDS_PER_BYTE / if shared.is_some() { 2 } else { 1 };
+    // Below 2^43 a reservation is lazy (chunks materialise on first write);
+    // above it `pre_allocate` would allocate eagerly.
+    let bound = IdSet::file_bounded_max_id(claim, file_len, per_byte).min((1i64 << 43) - 1);
+    referenced.pre_allocate(bound);
+    if let Some(shared) = shared {
+        shared.pre_allocate(bound);
+    }
+    Ok(())
+}
+
+/// Insert one admitted blob's (closed-ring-trimmed) refs into the reserved
+/// sets, returning the refs the reservation does not cover, in order, for
+/// the serial union. With no reservation every ref spills, so the buffer
+/// itself is handed over rather than a copy held beside it.
+fn insert_admitted_refs(
+    refs: &mut Vec<i64>,
+    reserved: bool,
+    referenced: &IdSet,
+    shared: Option<&IdSet>,
+) -> Vec<i64> {
+    if !reserved {
+        return std::mem::take(refs);
+    }
+    let mut spill = Vec::new();
+    match shared {
+        Some(shared) => {
+            let mut batch = crate::idset::AtomicRepeatBatch::new(referenced, shared);
+            for &node_id in refs.iter() {
+                if !batch.insert(node_id) {
+                    spill.push(node_id);
+                }
+            }
+            batch.finish();
+        }
+        None => {
+            let mut batch = crate::idset::AtomicWordBatch::new(referenced);
+            for &node_id in refs.iter() {
+                if !batch.insert(node_id) {
+                    spill.push(node_id);
+                }
+            }
+        }
+    }
+    spill
+}
+
 /// Collect all node IDs referenced by ways (pass 0).
 ///
-/// Uses `build_classify_schedule(Way)` to obtain a way-only blob schedule
-/// via the pread-only `HeaderWalker`, then fans work out to
-/// `parallel_scan_blobs_raw` workers. Each worker decompresses one blob
-/// and walks the wire format directly via `scan_way_refs` - skipping
-/// `PrimitiveBlock` construction (no StringTable parse, no
-/// `(u32, u32)` group_ranges allocation). The main thread unions
-/// per-blob `Vec<i64>`s into a single `IdSet`.
-///
-/// Per-blob refs are emitted into fresh `Vec<i64>`s that the main thread
-/// consumes and drops immediately after the union, so transient worker-side
-/// memory stays bounded to in-flight blob refs rather than all completed
-/// blobs. Store size and peak memory depend on the input; see
+/// Uses `build_classify_schedules_split` to obtain the way blob schedule
+/// and the node blobs' claimed highest ID via the pread-only
+/// `HeaderWalker`, then fans work out to `parallel_scan_blobs_raw`
+/// workers. Each worker decompresses one blob and walks the wire format
+/// directly via `scan_way_refs` - skipping `PrimitiveBlock` construction
+/// (no StringTable parse, no `(u32, u32)` group_ranges allocation) - and,
+/// once the blob is admitted, inserts its refs into the shared sets
+/// word-batched and atomically, as far as the claim-sized reservation
+/// covers them. Uncovered refs come back per blob and the main thread
+/// unions them serially. Store size and peak memory depend on the input; see
 /// `reference/performance/add-locations-to-ways.md` for measurements.
 ///
 /// `direct_io` is intentionally dropped on this path: the blob bodies are
@@ -1142,12 +1206,20 @@ fn collect_way_referenced_node_ids(
     inject_prepass: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<(IdSet, Option<IdSet>)> {
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+    let (schedules, shared_file, max_ids) = crate::scan::classify::build_classify_schedules_split(
         input,
-        Some(crate::ElementKind::Way),
         crate::scan::classify::KindClaims::Refuse,
         host,
     )?;
+    // The node blobs' claimed highest ID sizes the sets the workers write
+    // atomically; an unindexed file (or one without node blobs) has no
+    // claim, reserves nothing, and every ref takes the serial union below.
+    let (schedule, node_claim) = match schedules {
+        crate::scan::classify::KindSchedules::Indexed { nodes, ways, .. } => {
+            (ways, (!nodes.is_empty()).then_some(max_ids[0]))
+        }
+        crate::scan::classify::KindSchedules::Unindexed(blobs) => (blobs, None),
+    };
     let mut referenced = IdSet::new();
     // Prepass needs two independent facts: whether an ID has been seen at
     // all, and whether it was referenced again (a closed ring's repeated last
@@ -1160,19 +1232,40 @@ fn collect_way_referenced_node_ids(
     // opt-in cost rather than replacing measured default-path membership
     // with a multi-state encoding or a per-worker duplicate set.
     let mut shared = inject_prepass.then(IdSet::new);
-    // Union-side attribution: the drain below runs on the main thread
-    // and is a suspected pass-0 bottleneck at scale. Timed per drained
-    // blob so `altw_pass0_union_ms` vs the phase wall separates
-    // serial-union cost from worker scan cost.
+    let reserved = node_claim.is_some();
+    if let Some(claim) = node_claim {
+        reserve_pass0_sets(&shared_file, claim, &mut referenced, shared.as_mut())?;
+    }
+    // Refs the reservation does not cover (negative, above the bound, or
+    // every ref of an unindexed file) are unioned serially into these, by
+    // the loop the parallel path replaced; coverage depends only on the ID,
+    // so each ID's occurrences all land on one side and the two halves
+    // merge disjointly after the scan.
+    let mut spill_referenced = IdSet::new();
+    let mut spill_shared = inject_prepass.then(IdSet::new);
+    // Union-side attribution: `altw_pass0_union_ms` is the serial union of
+    // spilled refs on the calling thread, `altw_pass0_worker_insert_ms`
+    // the worker-side pass over each admitted blob's refs - atomic inserts
+    // plus routing uncovered refs to the spill - summed over workers (it
+    // can exceed the phase wall).
     let mut union_ns: u64 = 0;
     let mut union_refs_total: u64 = 0;
+    let mut spilled_refs_total: u64 = 0;
+    let worker_insert_ns = std::sync::atomic::AtomicU64::new(0);
+    let (referenced_ref, shared_ref) = (&referenced, shared.as_ref());
     crate::scan::classify::parallel_scan_blobs_raw(
         &shared_file,
         &schedule,
         None,
-        || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-        |_position, decompressed, (refs_buf, group_starts), gate| {
-            let mut refs_vec: Vec<i64> = Vec::new();
+        || {
+            (
+                Vec::<i64>::new(),
+                Vec::<(usize, usize)>::new(),
+                Vec::<i64>::new(),
+            )
+        },
+        |_position, decompressed, (refs_buf, group_starts, blob_refs), gate| {
+            blob_refs.clear();
             let kinds = crate::scan::way::scan_way_refs(
                 decompressed,
                 refs_buf,
@@ -1185,37 +1278,46 @@ fn collect_way_referenced_node_ids(
                     };
                     // Every ref, either sign: the set is signed, and the
                     // store ranks negatives like any other ID.
-                    refs_vec.extend_from_slice(refs);
+                    blob_refs.extend_from_slice(refs);
                 },
             )?;
             // The walker reads only ways, so nodes or relations under a way
             // claim would be copied through the reframe unindexed and
             // unscanned. The way claim's range and count are checked where
             // the reframe counts them (`passthrough::decode_one`).
-            Ok((gate.admit(kinds)?, refs_vec))
+            let admitted = gate.admit(kinds)?;
+            // Shared writes only after admission: the refs were buffered
+            // above so that a blob whose kinds contradict its claim writes
+            // nothing.
+            let blob_ref_count = blob_refs.len() as u64;
+            let t_insert = crate::counters::Stopwatch::start();
+            let spill = insert_admitted_refs(blob_refs, reserved, referenced_ref, shared_ref);
+            worker_insert_ns.fetch_add(t_insert.elapsed_ns(), std::sync::atomic::Ordering::Relaxed);
+            Ok((admitted, (blob_ref_count, spill)))
         },
-        |_seq, refs_vec| {
+        |_seq, (blob_ref_count, refs_vec)| {
             let t_union = crate::counters::Stopwatch::start();
-            union_refs_total += refs_vec.len() as u64;
+            union_refs_total += blob_ref_count;
+            spilled_refs_total += refs_vec.len() as u64;
             // Split on `shared` rather than branching per ref: the plain
             // path must not pay the shared-detection `get`, which only
             // exists to feed prepass injection. Branching inside the loop
             // was measured at ~2.3 ns/ref on every ref regardless of the
             // flag (union 6.6 ns/ref vs 4.3), since `get` is a real probe of
             // a large set and the branch predictor cannot elide it.
-            match &mut shared {
-                Some(shared) => {
+            match &mut spill_shared {
+                Some(spill_shared) => {
                     for &node_id in &refs_vec {
-                        if referenced.get(node_id) {
-                            shared.insert(node_id);
+                        if spill_referenced.get(node_id) {
+                            spill_shared.insert(node_id);
                         } else {
-                            referenced.insert(node_id);
+                            spill_referenced.insert(node_id);
                         }
                     }
                 }
                 None => {
                     for &node_id in &refs_vec {
-                        referenced.insert(node_id);
+                        spill_referenced.insert(node_id);
                     }
                 }
             }
@@ -1223,10 +1325,20 @@ fn collect_way_referenced_node_ids(
         },
         host,
     )?;
+    referenced.merge(spill_referenced);
+    if let (Some(shared), Some(spill_shared)) = (&mut shared, spill_shared) {
+        shared.merge(spill_shared);
+    }
     host.invocation
         .counter("altw_pass0_union_ms", union_ns / 1_000_000);
+    host.invocation.counter(
+        "altw_pass0_worker_insert_ms",
+        worker_insert_ns.into_inner() / 1_000_000,
+    );
     host.invocation
         .counter("altw_pass0_refs_total", union_refs_total);
+    host.invocation
+        .counter("altw_pass0_spilled_refs", spilled_refs_total);
     if let Some(shared_set) = &shared {
         host.invocation
             .counter("altw_pass0_shared_node_ids", shared_set.len());

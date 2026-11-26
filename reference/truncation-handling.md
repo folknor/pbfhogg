@@ -566,6 +566,12 @@ Shape 5 is enforced during decompression, not after it:
   error. `flate2` reports it as `Ok(Status::BufError)` rather than
   `Err`, so the inflate loop terminates on "no input consumed and
   no output produced" instead of spinning.
+- A zstd payload that is empty, ends inside a frame, or carries
+  trailing bytes that are not a frame is a typed error; zstd's
+  one-shot decoder requires the whole payload to be consumed.
+  Concatenated and skippable frames decode. A corruption inside a
+  frame without a checksum can decode to wrong bytes; the
+  `raw_size` comparison below catches one that changes the length.
 - The `MAX_BLOB_MESSAGE_SIZE` cap is applied *during* inflation
   for both zlib and zstd. A blob whose declared `datasize` passes
   the 32 MiB pre-read guard can still inflate to orders of

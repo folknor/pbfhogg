@@ -1,5 +1,25 @@
 # Read Pipeline
 
+### Zstd blobs decoded one-shot on a reused context (bygg, 2026-11-26, uncommitted against `7140a8ed`)
+
+Zstd decode moved from a per-blob `zstd::stream::read::Decoder` read
+through `take(..).read_to_end(..)` to one-shot `ZSTD_decompressDCtx` on a
+thread-local context, decoding into a destination bounded at one byte past
+the cap. No registered dataset is zstd, so the input was denmark repacked
+with `--compression zstd:3` and promoted as snapshot `zstd3`. Library
+scenario `decode-sequential`, `--iterations 1`, interleaved, HEAD via
+`--commit HEAD`:
+
+| Pair | HEAD | Variant |
+|---|---|---|
+| 1 | 2,004.7 ms (`d7dce129`) | 1,977.9 ms (`ad985c2a`) |
+| 2 | 1,985.9 ms (`55a9d2f0`) | 1,942.9 ms (`e9671be9`) |
+
+Sign-consistent, 1.3 % and 2.2 %: below the noise floor, so no wall claim.
+Decompression is a small share of this single-threaded decode next to block
+parsing. Kept for removing the per-blob context and streaming copy, not for
+a measured win.
+
 ### Blob envelope fields matched by wire type (plantasjen, 2026-11-20, uncommitted against `70cc559a`)
 
 One borrowed Blob envelope parser, matching field number and wire type

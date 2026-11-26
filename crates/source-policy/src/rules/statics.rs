@@ -97,6 +97,12 @@ pub const INVENTORY: &[(&str, &str, usize)] = &[
         "static ZLIB_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));",
         1,
     ),
+    (
+        "crates/lib/src/read/decompress.rs",
+        "static ZSTD_DECOMPRESS: RefCell<Option<zstd_safe::DCtx<'static>>> = \
+         const { RefCell::new(None) };",
+        1,
+    ),
     // Mounted into the library's unit tests by `#[path]` from
     // `test_support.rs`: the gate's backend requirement, read once.
     (

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use flate2::Decompress;
 use std::cell::RefCell;
+use zstd::zstd_safe;
 
 use crate::error::{BlobError, Error, Result, new_blob_error};
 use crate::tunables::{
@@ -22,6 +23,9 @@ thread_local! {
     /// Reset via `Decompress::reset(true)` between blobs instead of allocating
     /// a fresh instance each time.
     static ZLIB_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
+    /// Per-thread reusable zstd decompression context, created on first use
+    /// (creation can fail, which a `const` initializer could not report).
+    static ZSTD_DECOMPRESS: RefCell<Option<zstd_safe::DCtx<'static>>> = const { RefCell::new(None) };
 }
 
 // Buffers rejected by a pool limit (`DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`,
@@ -244,27 +248,156 @@ pub(super) fn clamp_capacity_hint(hint: usize) -> usize {
     hint.min(cap)
 }
 
-/// Decompress zstd data into `buf`, bounded during inflation.
-///
-/// `zstd::stream::copy_decode` runs to completion before any size check can
-/// fire, so a small blob declaring a huge dictionary-free expansion (zstd
-/// reaches ratios around 10^5 trivially) would exhaust memory ahead of the
-/// guard. Reading through a `take` capped at one byte past
-/// `MAX_BLOB_MESSAGE_SIZE` bounds the allocation at the cap and still leaves
-/// exactly enough evidence (one surplus byte) to distinguish "at the cap" from
-/// "over the cap".
-fn zstd_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
-    use std::io::Read as _;
+/// The zstd error codes the decode loop tells apart, as `size_t` values
+/// (`-ZSTD_error_*`), the form `SafeResult` carries.
+const ZSTD_DST_TOO_SMALL: usize =
+    (zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall as usize).wrapping_neg();
+const ZSTD_MEMORY_ALLOCATION: usize =
+    (zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_memory_allocation as usize).wrapping_neg();
 
+/// Decompress zstd data into `buf` (appending after its current length),
+/// bounded during decompression, on the thread's reusable context.
+///
+/// The payload is already in memory, so this is one-shot
+/// `ZSTD_decompressDCtx`, which decodes every frame of the payload
+/// (concatenated and skippable frames included) straight into the
+/// destination, with no streaming window copy and no per-blob context.
+/// Truncated frames and trailing bytes that are not a frame are refused by
+/// zstd itself, which requires the whole input to be consumed.
+///
+/// # The bound
+///
+/// One-shot decoding writes at most the destination's size, so the
+/// destination is the bound, and it is never larger than the budget
+/// (`MAX_BLOB_MESSAGE_SIZE + 1` bytes past `start`; the surplus byte tells
+/// "at the cap" from "over the cap"):
+///
+/// * Normally the destination is `buf`'s spare capacity, used only while
+///   that is at most the budget. A caller's recycled buffer can carry more
+///   spare capacity than the budget, which is why capacity alone is not
+///   trusted (the same hazard `zlib_decompress_into` documents).
+/// * A destination too small for the output (an absent or low `raw_size`
+///   with a frame that records no content size) grows geometrically up to
+///   the budget and the payload is decoded again from the start. Only
+///   size-unknown input pays this; pbfhogg's writer records the content size.
+///   Hostile input can make the retries rescan a long payload, a cost bounded
+///   by the cap and paid only by input that is refused or mis-declared.
+/// * If the capacity ever reaches past the budget, `buf` is resized to the
+///   budget and the payload decoded into that explicitly bounded slice.
+///
+/// On every error `buf` is truncated back to `start`. For a payload that is
+/// both corrupt and over the cap, which refusal wins is zstd's order of
+/// detection; both are hard errors.
+fn zstd_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     let start = buf.len();
-    let limit = MAX_BLOB_MESSAGE_SIZE + 1;
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))?;
-    decoder.take(limit).read_to_end(buf)?;
-    let size = (buf.len() - start) as u64;
+    let result = ZSTD_DECOMPRESS.with_borrow_mut(|slot| {
+        let dctx = match slot {
+            Some(dctx) => dctx,
+            None => slot.insert(
+                zstd_safe::DCtx::try_create()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?,
+            ),
+        };
+        zstd_decode_bounded(dctx, compressed, buf, start)
+    });
+    if result.is_err() {
+        buf.truncate(start);
+    }
+    result
+}
+
+#[allow(clippy::cast_possible_truncation)] // MAX_BLOB_MESSAGE_SIZE is 32 MiB
+fn zstd_decode_bounded(
+    dctx: &mut zstd_safe::DCtx<'static>,
+    compressed: &[u8],
+    buf: &mut Vec<u8>,
+    start: usize,
+) -> Result<()> {
+    let budget = MAX_BLOB_MESSAGE_SIZE as usize + 1;
+    if compressed.is_empty() {
+        return Err(Error::io_kind(
+            std::io::ErrorKind::UnexpectedEof,
+            "zstd payload is empty: no frame to decode",
+        ));
+    }
+    // The first frame's recorded content size is the exact size for a
+    // single-frame payload; reserve it when the caller's hint fell short.
+    if let Ok(Some(n)) = zstd_safe::get_frame_content_size(compressed)
+        && let Ok(n) = usize::try_from(n)
+        && n < budget
+        && buf.capacity() - start < n
+    {
+        buf.reserve_exact(n);
+    }
+    loop {
+        let spare = buf.capacity() - start;
+        if spare > budget {
+            return zstd_decode_into_slice(dctx, compressed, buf, start, budget);
+        }
+        let mut dst = Cursor::new(&mut *buf);
+        // Position the cursor at the end of the content, which is `start`.
+        std::io::Seek::seek(&mut dst, std::io::SeekFrom::End(0))?;
+        match dctx.decompress(&mut dst, compressed) {
+            Ok(n) => return zstd_size_within_cap(n),
+            Err(ZSTD_DST_TOO_SMALL) if spare >= budget => {
+                return Err(zstd_too_big());
+            }
+            Err(ZSTD_DST_TOO_SMALL) => {
+                // `buf.len()` is still `start`: a failed call sets no length.
+                let want = spare.saturating_mul(2).max(64 * 1024).min(budget);
+                buf.reserve_exact(want);
+            }
+            Err(code) => return Err(zstd_error(code)),
+        }
+    }
+}
+
+/// The rare path: decode into `buf[start..start + budget]`, resized once
+/// (zeroing at most the budget), so the slice length bounds the output
+/// whatever `buf`'s capacity. Truncates to the decoded end on success.
+fn zstd_decode_into_slice(
+    dctx: &mut zstd_safe::DCtx<'static>,
+    compressed: &[u8],
+    buf: &mut Vec<u8>,
+    start: usize,
+    budget: usize,
+) -> Result<()> {
+    buf.resize(start + budget, 0);
+    match dctx.decompress(&mut buf[start..], compressed) {
+        Ok(n) => {
+            buf.truncate(start + n);
+            zstd_size_within_cap(n)
+        }
+        Err(ZSTD_DST_TOO_SMALL) => Err(zstd_too_big()),
+        Err(code) => Err(zstd_error(code)),
+    }
+}
+
+fn zstd_size_within_cap(n: usize) -> Result<()> {
+    let size = n as u64;
     if size > MAX_BLOB_MESSAGE_SIZE {
         return Err(new_blob_error(BlobError::MessageTooBig { size }));
     }
     Ok(())
+}
+
+/// The output ran out of the budget: decoding stopped at the bound, so the
+/// true size is unknown by design and `size` reports the boundary, as the
+/// zlib branch does.
+fn zstd_too_big() -> Error {
+    new_blob_error(BlobError::MessageTooBig {
+        size: MAX_BLOB_MESSAGE_SIZE + 1,
+    })
+}
+
+fn zstd_error(code: usize) -> Error {
+    if code == ZSTD_MEMORY_ALLOCATION {
+        return Error::io_kind(std::io::ErrorKind::OutOfMemory, "zstd could not allocate");
+    }
+    Error::invalid_data(format!(
+        "zstd decompress error: {}",
+        zstd_safe::get_error_name(code)
+    ))
 }
 
 /// Decompress zlib data into `buf` using the thread-local reusable decompressor.
@@ -828,6 +961,91 @@ mod tests {
 
             assert_too_big(decompress_blob(&blob, None).map(|_| ()), over_len as u64);
         }
+    }
+
+    /// A payload with a known content (frame records its size).
+    fn zstd_sized(data: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(data, 1).unwrap()
+    }
+
+    /// The one-shot decoder's input shapes: a size-recorded frame, a
+    /// streaming frame (no content size) into an empty buffer, concatenated
+    /// and skippable frames, each appended after an existing prefix.
+    #[test]
+    fn zstd_decodes_every_frame_shape_after_a_prefix() {
+        let a: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let b = b"second frame".repeat(1000);
+        let mut concatenated = zstd_compress(&a);
+        // A skippable frame: magic 0x184D2A50, 4-byte length, payload.
+        concatenated.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        concatenated.extend_from_slice(&3u32.to_le_bytes());
+        concatenated.extend_from_slice(b"xyz");
+        concatenated.extend_from_slice(&zstd_sized(&b));
+        let mut both = a.clone();
+        both.extend_from_slice(&b);
+        for (input, expected) in [
+            (zstd_sized(&a), &a),
+            (zstd_compress(&a), &a),
+            (concatenated, &both),
+        ] {
+            let mut buf = b"prefix".to_vec();
+            super::zstd_decompress_into(&input, &mut buf).unwrap();
+            assert_eq!(&buf[..6], b"prefix");
+            assert_eq!(&buf[6..], &expected[..]);
+        }
+    }
+
+    /// Corrupt input is refused, the buffer is rolled back to its prefix,
+    /// and the thread's context decodes the next valid payload correctly.
+    #[test]
+    fn zstd_refusals_roll_back_and_leave_the_context_usable() {
+        let data = b"payload bytes ".repeat(5000);
+        let good = zstd_sized(&data);
+        let truncated = good[..good.len() - 3].to_vec();
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(b"junk");
+        // A flipped byte is not in the list: without a frame checksum zstd
+        // cannot see every corruption, and neither could the streaming
+        // decoder this replaced.
+        let empty_refusal = super::zstd_decompress_into(&[], &mut Vec::new());
+        assert!(
+            matches!(
+                empty_refusal.as_ref().map_err(crate::error::Error::kind),
+                Err(ErrorKind::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof
+            ),
+            "{empty_refusal:?}"
+        );
+        for bad in [Vec::new(), truncated, trailing, b"not zstd".to_vec()] {
+            let mut buf = b"keep".to_vec();
+            let refusal = super::zstd_decompress_into(&bad, &mut buf);
+            let kind = refusal.as_ref().map_err(crate::error::Error::kind);
+            assert!(
+                matches!(kind, Err(ErrorKind::InvalidData { .. } | ErrorKind::Io(_))),
+                "{refusal:?}"
+            );
+            assert_eq!(buf, b"keep");
+            let mut next = Vec::new();
+            super::zstd_decompress_into(&good, &mut next).unwrap();
+            assert_eq!(next, data);
+        }
+    }
+
+    /// A buffer carrying more spare capacity than the budget cannot widen
+    /// the bound: a bomb still stops at one byte past the cap, and a normal
+    /// payload still decodes on that buffer.
+    #[test]
+    fn a_prewarmed_buffer_cannot_widen_the_zstd_bound() {
+        let cap = MAX_BLOB_MESSAGE_SIZE as usize;
+        let bomb = zstd_compress(&vec![0u8; cap + 4096]);
+        let mut buf: Vec<u8> = Vec::with_capacity(cap * 2);
+        assert_too_big(
+            super::zstd_decompress_into(&bomb, &mut buf),
+            MAX_BLOB_MESSAGE_SIZE + 1,
+        );
+        assert!(buf.is_empty());
+        let data = b"small".repeat(100);
+        super::zstd_decompress_into(&zstd_sized(&data), &mut buf).unwrap();
+        assert_eq!(buf, data);
     }
 
     /// Hand-encode a `Blob` protobuf from `(field, payload)` pairs, so a test

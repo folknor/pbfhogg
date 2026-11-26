@@ -172,6 +172,13 @@ download_date = "2026-11-08"
 [bygg.datasets.denmark.snapshot.twin.pbf.indexed]
 file = "denmark-twin-with-indexdata.osm.pbf"
 
+[bygg.datasets.denmark.snapshot.zstd3]
+download_date = "2026-11-26"
+
+[bygg.datasets.denmark.snapshot.zstd3.pbf.indexed]
+file = "denmark-zstd3-indexed-be36259ac211e5281a90153d3e1cc24b.osm.pbf"
+xxhash = "be36259ac211e5281a90153d3e1cc24b"
+
 [bygg.datasets.denmark.expect.diff-snapshots]
 "41e60ca3c5fdcf3593f9e86bfbefd755+55760485369644887ae34df411b8034e" = "same"
 "55760485369644887ae34df411b8034e+821b40d87bd637a45c07fde6b42f6f27" = "same"

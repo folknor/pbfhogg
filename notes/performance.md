@@ -1553,22 +1553,6 @@ Reported by: geocode.
   serialization (optionally spatially grouped), preserving order, bytes and
   no-output-on-interrupt.
 
-## PERF-058 - Zstd decompression builds a streaming decoder per blob
-
-Reported by: decode.
-
-Mechanism: `decompress.rs` creates a streaming decoder per blob and uses
-`Read::take(..).read_to_end(..)` despite holding the payload in memory.
-
-Redesign: a worker-owned bulk context decoding into a bounded destination.
-
-Risks: keep output limits, raw-size checks, concatenated-frame behaviour and
-corruption detection; an oversized recycled `Vec` is not a valid bound.
-
-Kind: local change. (Decode ranks a different whole-buffer DEFLATE backend,
-the decompression-pool mutex, offset-table layout and fused inflate-plus-parse
-below this; none is recommended first.)
-
 ## PERF-059 - Read-side local changes
 
 Reported by: framing, pipeline.

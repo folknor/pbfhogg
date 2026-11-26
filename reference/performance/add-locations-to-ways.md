@@ -23,6 +23,32 @@ The streaming span moves -0.5 % and +4.4 %, opposite signs: no cost
 measurable on normal input. Sparse was not measured; its pass 2 gained the
 same per-blob call.
 
+### Sparse pass 1 rank cursor, refused (bygg, 2026-11-26, baseline `406d8e1f`)
+
+Variant: per node blob, seed an iterator at the first node ID with
+`iter_numeric_from` and its rank with `numeric_rank`, then advance it along
+an ascending node stream counting the members passed, falling back to
+`numeric_rank_if_set` on the first descent or after a 64-member gap. It
+replaced the per-node `numeric_rank_if_set` (chunk lookup, membership bit,
+block prefix plus up to seven word popcounts). Japan,
+`embed-locations --index-type sparse --stop ALTW_PASS1_END`,
+`--iterations 1`, interleaved uncommitted variant and `--commit HEAD`
+cells. `ALTW_PASS1` span from `--durations`:
+
+| Cell | Arm | UUID | ALTW_PASS1 |
+|---|---|---|---|
+| 1 | variant | `3d6e4083` | 597 ms |
+| 2 | baseline | `cbabe6f7` | 608 ms |
+| 3 | variant | `75647aa2` | 592 ms |
+| 4 | baseline | `a0af6941` | 597 ms |
+
+Medians 594.5 against 602.5 ms, 1.3 %: noise, and both arms kept 28 to 29
+cores busy through pass 1. Pass 1 is bound by decode, not by the rank
+arithmetic; the cursor was not landed. Not measured: planet, where a larger
+rank working set could weigh differently, and a word-aware cursor that skips
+members by popcount instead of stepping them. A re-attempt needs a pass-1
+attribution showing rank cost first.
+
 ### Sparse pass 1 swaps instead of storing (plantasjen, 2026-11-21, baseline `59bfcae3`)
 
 The sparse store's per-slot write became `AtomicU64::swap`, so a duplicate

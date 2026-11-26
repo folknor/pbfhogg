@@ -2,8 +2,9 @@
 //!
 //! Pre-allocates a `referenced.total_count() * 8`-byte temp file and
 //! mmaps it `MmapMut`. Pass 1 workers write `(lat, lon)` at byte offset
-//! `rank_if_set(node_id) << 3` via `AtomicU64::store(Relaxed)` directly
-//! into the mmap; pass 2's `get(node_id)` is `rank_if_set(node_id)` plus
+//! `numeric_rank_if_set(node_id) << 3` via `AtomicU64::swap(Relaxed)`
+//! directly into the mmap; pass 2's `get(node_id)` is
+//! `numeric_rank_if_set(node_id)` plus
 //! an `AtomicU64::load(Relaxed)` at the same offset. No chunk format,
 //! no `start_pad`, no sentinel padding inside chunks (unwritten slots
 //! stay zero, which is the existing sentinel).
@@ -342,6 +343,17 @@ pub(super) fn build_node_index_sparse(
         None,
         || -> Scratch { (Vec::new(), Vec::new()) },
         |position, decompressed, (tuples, group_starts), gate| {
+            // The blob is decoded into tuples first and the store written
+            // after, not fed from the scanner's callback: a shared slot
+            // write must wait for `gate.admit`, which needs the whole blob's
+            // kinds, so the tuple buffer is what keeps admission ahead of
+            // every shared write. Each node is ranked from scratch with
+            // `numeric_rank_if_set`; a per-blob merge cursor over
+            // `iter_numeric_from` seeded with `numeric_rank` was measured
+            // neutral (japan, pass 1 597 and 592 ms against 608 and 597 ms
+            // at 406d8e1f, bygg; see the add-locations-to-ways performance
+            // record): pass 1 is decode-bound and rank arithmetic is not
+            // what it waits on.
             tuples.clear();
             let kinds = crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
             let admitted = gate.admit(kinds)?;

@@ -446,11 +446,12 @@ Embeds node coordinates in ways. Index strategies (`--index-type`, default
 
 **Sparse**: rank-indexed flat mmap. Builds an `IdSet` of
 way-referenced nodes; pass 1 workers store packed `(lat, lon)` at byte
-offset `rank_if_set(node_id) << 3` via relaxed `AtomicU64::store`
+offset `numeric_rank_if_set(node_id) << 3` via relaxed `AtomicU64::swap`
+(a duplicate ID whose coordinates disagree is refused)
 directly into a pre-allocated, `MmapMut`-mapped values file
 (`referenced_count * 8` bytes) - no chunk format, no
 serial writer bottleneck. Pass 2's `get(node_id)` is
-`rank_if_set(node_id)` plus an `AtomicU64::load` at the same offset;
+`numeric_rank_if_set(node_id)` plus an `AtomicU64::load` at the same offset;
 once pass 1 finishes, the store is advised `MADV_RANDOM` so pass 2's
 genuinely-random per-ref lookups stop paying kernel readahead
 speculation. The effect on disk reads and wall time depends on the dataset

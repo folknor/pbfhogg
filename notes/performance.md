@@ -859,24 +859,6 @@ versus bounded correctly is higher confidence.
 
 Kind: high conviction (routing); medium (hybrid).
 
-## PERF-029 - Sparse ALTW per-node tuples and per-reference rank arithmetic
-
-Reported by: altw-sparse, sort.
-
-Mechanism: node collection materializes a 16-byte `NodeTuple` per node and
-revisits it for membership and rank; `rank_within` scans up to seven bitmap
-words and popcounts; `rank_if_set` tests membership separately; counters call
-`referenced.iter().count()` though `IdSet::len()` popcounts words and
-`RankedIdSet::total_count()` exists.
-
-Redesign: feed the store from `extract_node_coords` with a fallible sink; on
-verified sorted ranges merge the node stream with `RankedIdSet::iter_from` and
-`rank(start)` and advance a cursor (missing referenced nodes still consume
-ranks); a frozen index with per-word prefixes combining membership with the
-target-word popcount; use `len()` / `total_count()`.
-
-Kind: medium-value local changes.
-
 ## PERF-030 - External ALTW sorts every occurrence by node ID
 
 Reported by: altw-external.
@@ -1381,6 +1363,18 @@ sequential R1 tail; sort keys as compact records instead of `Element` views.
 
 Risks: roughly double bitmap storage; cache and TLB footprint; batch scratch;
 orphan detection and per-kind shift and overflow for missing refs.
+
+Second consumer: sparse add-locations-to-ways pass 2 (`SparseArrayIndex::get`,
+`numeric_rank_if_set` per way ref) shares the `RankedIdSet` layout, so judge
+the layout for it too: resident-store CPU (rank sits on the dependency chain
+of every coordinate load while the store is cached, e.g. japan) separately
+from near-residency page traffic (a larger index can evict store pages; past
+residency pass 2 is fault-bound). Baselines to beat before crediting
+interleaving: an array chunk's `rank_if_set` runs `binary_search` for
+membership and then `partition_point` for rank, where the found index already
+is the rank; a bit array's membership load could feed the masked popcount.
+Sparse pass 1 is decode-bound and was measured indifferent to rank cost
+(reference/performance/add-locations-to-ways.md, rank cursor).
 
 Kind: strong hypothesis.
 

@@ -315,3 +315,18 @@ entry.restructured` in `crates/lib/src/commands/blob_merge/sweep.rs`),
 so the list reads as complete and is not. Name restructured entries in
 both places.
 
+## DOC-062 - The performance README names one host for every baseline
+
+Reported by: the spar accounting of the zstd decoder item, from a scout
+lateral (2026-11-26); read from source.
+
+`reference/performance/README.md` opens with "## Host: plantasjen" and a
+hardware block, presented as the host of the file set's current baselines.
+Current cells across `reference/performance/` (read-pipeline.md,
+cross-command.md and the README itself) are measured on bygg, and each
+recorded cell already carries its own hostname per the conventions. The
+header reads as true of every number and is not. Reword it so no single
+host is claimed for the set, for example as a per-host hardware list
+with each cell's own label deciding, rather than renaming it to today's
+host.
+

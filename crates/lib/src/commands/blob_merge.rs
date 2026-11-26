@@ -31,7 +31,7 @@
 use crate::Element;
 use crate::ElementKind;
 use crate::blob::{
-    BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
+    BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_raw,
 };
 use crate::blob_meta::{
     BboxClaim, BlobIndex, IdOrder, TagIndex, try_scan_block_ids_and_tags,
@@ -706,12 +706,12 @@ fn scan_blob(
                 .data_buf
                 .read_exact_at(&*file, offset, size)
                 .map_err(Error::from)
-                .and_then(|data| decompress_blob_data_into(data, &mut scratch.decompress_buf));
+                .and_then(|data| decompress_blob_raw(data, &mut scratch.decompress_buf));
             scratch.data_buf.release_outlier(recorder);
             read
         }
         Payload::Read(read) => {
-            read.and_then(|data| decompress_blob_data_into(&data, &mut scratch.decompress_buf))
+            read.and_then(|data| decompress_blob_raw(&data, &mut scratch.decompress_buf))
         }
     };
     let outcome = decompressed.and_then(|()| decide(scratch, claimed, carried_tags, rules, cancel));

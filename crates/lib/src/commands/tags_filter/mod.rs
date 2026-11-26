@@ -561,6 +561,12 @@ fn tags_filter_single_pass(
     let limits = crate::commands::split::Limits::new(writer.compression());
     reader.for_each_fused_block(
         |block| {
+            // A builder per blob, deliberately. Keeping one per decode worker
+            // across blobs (a worker-local slot, taken and put back) was
+            // measured on germany `-R w/highway` (bygg, 2026-11-26, against
+            // 908626e7): 2374 and 2396 ms against 2377 and 2375 ms, no
+            // difference; the per-blob preallocation is lost in the decode.
+            // `DecodeTransform` therefore gets no worker-local state surface.
             let mut bb = BlockBuilder::new();
             let mut output = Vec::new();
             let block_stats =

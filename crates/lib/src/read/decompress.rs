@@ -564,17 +564,6 @@ fn zlib_size_within_cap(start: usize, end: usize) -> Result<()> {
     Ok(())
 }
 
-/// Decompress raw blob bytes into a caller-provided buffer.
-///
-/// Takes raw bytes (not a parsed `WireBlob`) and decompresses directly,
-/// allocating a new `Vec` each time. For loops that decompress many blobs,
-/// this avoids repeated large allocations -- the buffer grows to high-water
-/// mark and stays there.
-pub(crate) fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
-    let blob = WireBlob::parse_slice(blob_bytes)?;
-    decompress_parsed_blob_into(&blob, buf)
-}
-
 /// Decompress a parsed Blob protobuf into a caller-provided buffer.
 #[allow(clippy::cast_sign_loss)]
 pub(super) fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()> {
@@ -595,7 +584,7 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
             // `decompress_wire_blob_into` / `decompress_blob_raw` / `decompress_blob`
             // Raw checks. This gives every decompression helper identical
             // boundary semantics; the earlier strict `<` here made the pipelined
-            // path (via `decompress_blob_data_into`) reject an exact-cap Raw blob
+            // path (then through a copying slice helper) reject an exact-cap Raw blob
             // that the sequential and pread paths accepted.
             let size = bytes.len() as u64;
             if size > MAX_BLOB_MESSAGE_SIZE {
@@ -916,8 +905,8 @@ mod tests {
     /// one byte over is rejected with `MessageTooBig`, for Raw, Zlib, and Zstd -
     /// across every helper that decodes a `WireBlob`. This pins the boundary the
     /// copy-removal refactor had to preserve: the sequential
-    /// (`decompress_wire_blob_into`) and pipelined (`decompress_parsed_blob_into`,
-    /// via `decompress_blob_data_into`) routes must agree with each other and with
+    /// (`decompress_wire_blob_into`) and pipelined (`decompress_parsed_blob_into`)
+    /// routes must agree with each other and with
     /// the `decompress_blob` Bytes route on the exact-cap decision. Before the
     /// fix, `decompress_parsed_blob_into` used a strict `<` for Raw and rejected an
     /// exact-cap Raw blob the other helpers accepted.

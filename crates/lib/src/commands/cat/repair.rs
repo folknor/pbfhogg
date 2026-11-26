@@ -31,7 +31,7 @@
 //! for; plain `cat`, `--clean` and `--type` without `--repair` run exactly
 //! as before.
 
-use crate::blob::decompress_blob_data_into;
+use crate::blob::decompress_blob_raw;
 use crate::block_builder::OwnedBlock;
 use crate::error::{Error, Result};
 use crate::read::block::{NoProjection, validate_in_place};
@@ -360,7 +360,7 @@ pub(super) fn repair_frame(
     metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<Repaired> {
     scratch.payload.clear();
-    decompress_blob_data_into(frame.blob_bytes(), &mut scratch.payload)?;
+    decompress_blob_raw(frame.blob_bytes(), &mut scratch.payload)?;
     let refused = validate_in_place(
         &scratch.payload,
         &mut scratch.st,

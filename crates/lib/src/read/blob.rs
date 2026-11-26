@@ -15,8 +15,8 @@ use std::sync::Arc;
 // `crate::blob::DecompressPool` keep resolving.
 use super::decompress::decompress_parsed_blob_into;
 pub(crate) use super::decompress::{
-    BlobDecodeKey, DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
-    decompress_wire_blob_into, pool_get, pool_wrap, raw_blob_payload, release_decode_outlier,
+    BlobDecodeKey, DecompressPool, decompress_blob, decompress_blob_raw, decompress_wire_blob_into,
+    pool_get, pool_wrap, raw_blob_payload, release_decode_outlier,
 };
 
 // Blob-level wire-format parsers live in the sibling `blob_wire` module.
@@ -876,12 +876,18 @@ impl<R: Read + Send> BlobReader<R> {
         //
         // The advised range is the whole consumed prefix `0..offset`, re-issued
         // per blob, where `prev_offset..offset` would express the same intent
-        // over a bounded range. That looks like an easy win and is left alone
-        // deliberately: the cost was never measured, and changing which pages
-        // get dropped changes the cache state every subsequent benchmark on a
-        // host observes, so it is not a change to make on inspection alone:
-        // it wants a matched A/B of both ranges on a planet-sized input with
-        // the cache state recorded before it is narrowed.
+        // over a bounded range. That looks like an easy win and was measured:
+        // advising only the delta since the last advice once a byte
+        // watermark had accumulated (unrounded blob offsets, a tail flush at
+        // clean EOF) came out inside +/-3 % and slightly slower on every
+        // planet-8k mode at 1.45 M blobs, where the per-blob calls are most
+        // numerous, and was reverted (2026-07,
+        // `reference/performance/read-pipeline.md`, "Env-gated read-path
+        // batch"). The kernel side is cheap per already-evicted page. A
+        // page-aligned variant was not built; it is not expected to differ,
+        // and changing which pages get dropped changes the cache state every
+        // later benchmark on the host observes, so it wants a new reason
+        // before another planet A/B.
         self.evict_behind();
 
         Some(Ok(RawFrame {
@@ -1203,13 +1209,13 @@ impl BlobReader<BufReader<File>> {
 
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
 pub(crate) fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
-    let blob = WireBlob::parse_slice(blob_bytes)?;
-    // Decompress into an owned Vec and parse in place via `from_vec`, avoiding
-    // the second whole-buffer `to_vec()` copy that `PrimitiveBlock::new` pays.
-    // `decompress_wire_blob_into` keeps the same `> MAX_BLOB_MESSAGE_SIZE` Raw
+    // Decompress straight from the borrowed envelope into an owned Vec and
+    // parse in place via `from_vec`: no copy of the compressed bytes into a
+    // `Bytes`, and no second whole-buffer `to_vec()` as `PrimitiveBlock::new`
+    // pays. `decompress_blob_raw` keeps the same `> MAX_BLOB_MESSAGE_SIZE` Raw
     // boundary as `decompress_blob`, so decode semantics are unchanged.
     let mut buf = Vec::new();
-    decompress_wire_blob_into(&blob, &mut buf)?;
+    decompress_blob_raw(blob_bytes, &mut buf)?;
     crate::PrimitiveBlock::from_vec(buf)
 }
 

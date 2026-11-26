@@ -18,7 +18,7 @@
 //! it no indexdata would leave a partially indexed file every command
 //! refuses, and re-encoding it, as plain `cat` does, is not lossless.
 
-use crate::blob::{BlobKind, decompress_blob_data_into};
+use crate::blob::{BlobKind, decompress_blob_raw};
 use crate::error::{Error, Result};
 use crate::file_reader::FileReader;
 use crate::read::frame::{Frames, RawBlobFrame};
@@ -99,7 +99,7 @@ fn reindex_to(
         return Err(crate::error::new_missing_header(path));
     }
     let mut header_block = Vec::new();
-    decompress_blob_data_into(header.blob_bytes(), &mut header_block)
+    decompress_blob_raw(header.blob_bytes(), &mut header_block)
         .map_err(|e| frames.locate(header.id, e))?;
     // The header is forwarded, but the indexes are derived from payloads it
     // may declare unreadable: an unsupported required feature is refused.
@@ -176,7 +176,7 @@ struct Changed {
 /// The reframed bytes of one OSMData frame and what the rewrite changed.
 fn reindex_frame(frame: &RawBlobFrame, scratch: &mut ReindexScratch) -> Result<(Vec<u8>, Changed)> {
     scratch.payload.clear();
-    decompress_blob_data_into(frame.blob_bytes(), &mut scratch.payload)?;
+    decompress_blob_raw(frame.blob_bytes(), &mut scratch.payload)?;
     let (index, tags) = crate::blob_meta::scan_block_ids_and_tags(&scratch.payload)?;
     let Some(index) = index else {
         return Err(Error::invalid_data(

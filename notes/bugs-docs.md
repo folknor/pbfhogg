@@ -385,3 +385,32 @@ renumber pass 1 and sparse ALTW pass 0 (`reference/performance/renumber.md`,
 `reference/performance/add-locations-to-ways.md`). Mark the sentence as an
 unmeasured judgement scoped to the `&mut` classify hot loop, or drop it.
 
+## DOC-067 - renumber.md cites whole-run writer waits as pass 1 evidence
+
+Reported by: the spar accounting of the renumber pass 1 width item, from a
+scout lateral (2026-11-26); read from source and the stored cells.
+
+`reference/performance/renumber.md` "Pass 1 at host width" says that at 30
+workers "the writer becomes the constraint: consumer write time 21-23 s of
+the span, `ordered_pool_result_send` 84 s, `writer_pipeline_send` 198 s".
+The consumer write time is the per-stage `pass1_consumer_write_ns`, but the
+other two are engine-wide counters, cumulative across pass 1, stage 2d and
+R2D of the run (`--stalls` takes their maximum, i.e. the run total), and
+stage 2d also runs at host width. Either read the two at the
+`RENUMBER_EXT_PASS1_END` snapshot or say they are whole-run figures. The
+per-stage `pass1_*` counters do not have this property; the engine-wide
+`ordered_pool_*_wait_ns` do, which any per-stage reading of a multi-stage
+command has to account for.
+
+## DOC-068 - apply-changes.md says 18.8 GB exceeds a 30 GB page cache
+
+Reported by: the spar accounting of the write-side local changes item, from
+a scout lateral (2026-11-26); read from source.
+
+`reference/performance/apply-changes.md`, the io_uring crossover paragraph,
+says "At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O
+delivers 12-20% improvement." 18.8 GB does not exceed 30 GB. Whatever the
+original reasoning was (input plus output plus scratch, or a smaller cache
+on the host of the day), the parenthesis as written is false; reword it to
+the working set that actually exceeded the cache, or drop the parenthesis.
+

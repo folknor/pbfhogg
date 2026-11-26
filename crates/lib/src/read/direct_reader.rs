@@ -569,6 +569,8 @@ pub(crate) fn read_aligned_in(
 /// it through an `Arc`, stays on the thread that made it.
 pub(crate) struct DirectPositional {
     file: File,
+    /// The file's direct I/O alignment, for reads through another scratch.
+    align: usize,
     /// Owns the file's direct I/O alignment too.
     scratch: RefCell<AlignedScratch>,
     /// The invocation the scratch's releases count into.
@@ -581,16 +583,30 @@ impl DirectPositional {
     pub(crate) fn new(file: File, align: usize, invocation: &crate::host::Recorder) -> Self {
         Self {
             file,
+            align,
             scratch: RefCell::new(AlignedScratch::new(align)),
             permit: invocation.permit(),
         }
     }
 
+    /// The `O_DIRECT` file itself.
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// The file's direct I/O alignment (a power of two).
+    pub(crate) fn align(&self) -> usize {
+        self.align
+    }
+
     /// Fill `buf` exactly with the bytes at `offset`; `UnexpectedEof` when
     /// the file ends first. The bytes are copied out of the aligned scratch,
     /// so the scratch follows the read buffers' retention limit after every
-    /// read, failed ones included: a large payload read does not pin its
-    /// span here for the rest of the walk.
+    /// read, failed ones included: a large read does not pin its span here
+    /// for the rest of the walk. This serves the walker's header probes and
+    /// windows; payload reads into a `ReadBuf` go through
+    /// `Positional::read_into`, which lends them from the buffer's own
+    /// aligned scratch instead of copying.
     pub(crate) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt as _;
         let mut scratch = self.scratch.borrow_mut();

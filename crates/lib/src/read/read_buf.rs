@@ -49,7 +49,16 @@ use crate::tunables::READ_BUF_MAX_RETAINED_CAPACITY;
 /// and transport rules.
 #[derive(Default)]
 pub(crate) struct ReadBuf {
+    /// The plain buffer. Its length is the high-water mark of the reads into
+    /// this allocation, not the current read's: every byte up to it has been
+    /// initialised once (zeroed on first reach, then overwritten by reads),
+    /// so a later read of any size within it pays no zero fill. The current
+    /// read's bytes are `buf[..len]`.
     buf: Vec<u8>,
+    /// The length of the last buffered read's bytes in `buf`; 0 when `buf`
+    /// holds no current bytes (a failed read, a direct read, a `take`, a
+    /// release).
+    len: usize,
     /// The aligned scratch direct inputs are read through, made on the first
     /// direct read (and remade when an input's alignment differs).
     #[cfg(feature = "linux-direct-io")]
@@ -63,9 +72,9 @@ pub(crate) struct ReadBuf {
 
 impl ReadBuf {
     /// Read exactly `len` bytes at `offset` from `src` and return them,
-    /// growing the buffer exactly when `len` exceeds its capacity. A read
-    /// within the capacity zero fills only the part beyond the previous
-    /// read's length.
+    /// growing the buffer exactly when `len` exceeds its capacity. Each byte
+    /// of an allocation is zero filled at most once, the first time a read
+    /// reaches it; the `pread` overwrites it on every read after that.
     pub(crate) fn read_exact_at<P: Positional + ?Sized>(
         &mut self,
         src: &P,
@@ -76,18 +85,49 @@ impl ReadBuf {
         {
             self.direct = None;
         }
+        self.len = 0;
         if len > self.buf.capacity() {
             // Free the old buffer before allocating its replacement, so the
             // two are never held at once.
             drop(std::mem::take(&mut self.buf));
             self.buf = Vec::with_capacity(len);
         }
-        self.buf.resize(len, 0);
-        if let Err(e) = src.pread_exact(&mut self.buf, offset) {
-            self.buf.clear();
-            return Err(e);
+        if self.buf.len() < len {
+            self.buf.resize(len, 0);
         }
-        Ok(&self.buf)
+        src.pread_exact(&mut self.buf[..len], offset)?;
+        self.len = len;
+        Ok(&self.buf[..len])
+    }
+
+    /// Read exactly `len` bytes at `offset` of an `O_DIRECT` `file` whose
+    /// alignment is `align`, through the aligned scratch (made on first use,
+    /// remade when the alignment differs), and return them borrowed from
+    /// where they landed; `UnexpectedEof` when the file ends first.
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn read_direct_at(
+        &mut self,
+        file: &std::fs::File,
+        align: usize,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<&[u8]> {
+        use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
+        use std::os::unix::fs::FileExt as _;
+        self.direct = None;
+        // The plain buffer holds no current bytes from here on.
+        self.len = 0;
+        let scratch = match &mut self.scratch {
+            Some(s) if s.align() == align => s,
+            slot => slot.insert(AlignedScratch::new(align)),
+        };
+        read_aligned_in(len, offset, scratch, |dst, at| file.read_at(dst, at))?;
+        // `read_aligned_in` leaves the bytes at the offset's distance past
+        // its aligned block (`align` is a power of two).
+        #[allow(clippy::cast_possible_truncation)]
+        let lead = (offset & (align as u64 - 1)) as usize;
+        self.direct = Some(lead..lead + len);
+        Ok(self.bytes())
     }
 
     /// Read exactly `len` bytes at `offset` of `input` in the input's own
@@ -101,23 +141,7 @@ impl ReadBuf {
     ) -> std::io::Result<&[u8]> {
         #[cfg(feature = "linux-direct-io")]
         if let Some(align) = input.direct_align() {
-            use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
-            use std::os::unix::fs::FileExt as _;
-            self.direct = None;
-            // The plain buffer holds no current bytes from here on.
-            self.buf.clear();
-            let scratch = match &mut self.scratch {
-                Some(s) if s.align() == align => s,
-                slot => slot.insert(AlignedScratch::new(align)),
-            };
-            let file = input.file();
-            read_aligned_in(len, offset, scratch, |dst, at| file.read_at(dst, at))?;
-            // `read_aligned_in` leaves the bytes at the offset's distance
-            // past its aligned block (`align` is a power of two).
-            #[allow(clippy::cast_possible_truncation)]
-            let lead = (offset & (align as u64 - 1)) as usize;
-            self.direct = Some(lead..lead + len);
-            return Ok(self.bytes());
+            return self.read_direct_at(input.file(), align, offset, len);
         }
         self.read_exact_at(&**input.file(), offset, len)
     }
@@ -128,7 +152,7 @@ impl ReadBuf {
         if let (Some(range), Some(scratch)) = (&self.direct, &self.scratch) {
             return scratch.held_bytes(range.clone());
         }
-        &self.buf
+        &self.buf[..self.len]
     }
 
     /// The capacity held across both allocations (the aligned one with its
@@ -160,6 +184,8 @@ impl ReadBuf {
             self.direct = None;
             return out;
         }
+        self.buf.truncate(self.len);
+        self.len = 0;
         std::mem::take(&mut self.buf)
     }
 
@@ -185,6 +211,7 @@ impl ReadBuf {
         let capacity = self.buf.capacity();
         if capacity > limit {
             self.buf = Vec::new();
+            self.len = 0;
             invocation
                 .metrics()
                 .decompress
@@ -253,6 +280,35 @@ mod tests {
         assert_eq!(bytes[1000], byte(1000));
         assert_eq!(read.capacity(), 1001);
         assert_eq!(read.bytes().len(), 1001);
+    }
+
+    /// The plain buffer keeps its high-water length, so the visible bytes
+    /// must follow the current read alone: a shorter read after a longer one
+    /// shows only its own bytes, a failed read shows none, and `take` hands
+    /// on exactly the current read's bytes.
+    #[test]
+    fn a_shorter_read_after_a_longer_one_shows_only_its_bytes() {
+        let src = Pattern(4000);
+        let mut read = ReadBuf::default();
+        read.read_exact_at(&src, 0, 3000).unwrap();
+        let short = read.read_exact_at(&src, 7, 10).unwrap();
+        assert_eq!(short.len(), 10);
+        assert_eq!(short[0], byte(7));
+        assert_eq!(read.bytes().len(), 10);
+        assert_eq!(
+            read.read_exact_at(&src, 3990, 20).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(
+            read.bytes().is_empty(),
+            "a failed read leaves no bytes visible"
+        );
+        read.read_exact_at(&src, 100, 50).unwrap();
+        let taken = read.take();
+        assert_eq!(taken.len(), 50);
+        assert_eq!(taken[0], byte(100));
+        assert!(read.bytes().is_empty());
+        assert_eq!(read.capacity(), 0);
     }
 
     #[test]

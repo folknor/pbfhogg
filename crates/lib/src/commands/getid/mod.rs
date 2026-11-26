@@ -812,7 +812,15 @@ fn filter_by_id_walker(
                         // something this command observed. It goes in its own
                         // counter rather than into `*_written`.
                         stats.passthrough_claimed += idx.count;
-                        w.write_raw_owned(frame_buf.take())?;
+                        // A direct walker lends the frame from this buffer's
+                        // aligned scratch, which `take` copies and leaves
+                        // behind; it follows the retention line like any
+                        // other read buffer, released before the writer
+                        // call so an oversized scratch and its copy are not
+                        // both held while the writer waits.
+                        let frame = frame_buf.take();
+                        frame_buf.release_outlier(&host.invocation);
+                        w.write_raw_owned(frame)?;
                         blobs_passthrough += 1;
                         continue;
                     }
@@ -824,7 +832,7 @@ fn filter_by_id_walker(
                     .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
                     .map_err(locate)?;
                 decompress_buf.clear();
-                let decoded = crate::blob::decompress_blob_data_into(data, &mut decompress_buf);
+                let decoded = crate::blob::decompress_blob_raw(data, &mut decompress_buf);
                 // Done with the compressed bytes; the read buffer follows its
                 // retention limit (read/read_buf.rs).
                 data_buf.release_outlier(&host.invocation);
@@ -1044,8 +1052,7 @@ fn filter_by_id_streaming(
                 frames.read_payload(&mut payload)?;
                 let locate = |e: Error| frames.locate(id, e);
                 decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(&payload, &mut decompress_buf)
-                    .map_err(locate)?;
+                crate::blob::decompress_blob_raw(&payload, &mut decompress_buf).map_err(locate)?;
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.

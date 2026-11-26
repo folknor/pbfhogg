@@ -491,8 +491,10 @@ impl WireBlob {
     }
 
     /// Parse a Blob from `&[u8]`, copying the input internally.
-    /// Slice-based decode helpers need owned payload slices after parsing;
-    /// callers already holding `Bytes` should use `parse` to avoid the copy.
+    /// Test-only: production code decoding from a borrowed slice goes
+    /// through `decompress_blob_raw`, which parses the same envelope without
+    /// the copy; callers already holding `Bytes` use `parse`.
+    #[cfg(test)]
     pub fn parse_slice(data: &[u8]) -> Result<Self> {
         let bytes = Bytes::copy_from_slice(data);
         Self::parse(&bytes)

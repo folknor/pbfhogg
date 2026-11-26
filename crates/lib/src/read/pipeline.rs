@@ -132,11 +132,18 @@ impl AdmissionGate {
         }
     }
 
-    fn acquire(&self) -> bool {
+    /// Take one permit, waiting while the cap is reached. Returns `None` when
+    /// a permit was free, else the nanoseconds spent from first finding the
+    /// cap full to taking one (spurious wakes included): the clock starts
+    /// only on that slow path, so an admission that does not wait reads no
+    /// clock.
+    fn acquire(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut blocked = false;
+        let mut blocked: Option<crate::counters::Stopwatch> = None;
         while state.count >= self.cap.get() {
-            blocked = true;
+            if blocked.is_none() {
+                blocked = Some(crate::counters::Stopwatch::start());
+            }
             #[cfg(test)]
             state.parked.enter(&self.observer);
             state = self
@@ -147,7 +154,7 @@ impl AdmissionGate {
             state.parked.leave();
         }
         state.count += 1;
-        blocked
+        blocked.map(|watch| watch.elapsed_ns())
     }
 
     fn release(&self) {
@@ -477,18 +484,20 @@ where
     }
 }
 
-/// Forwards a reader error as a sequenced item. The wait is recorded whether
-/// or not the send succeeds, like every other timed send in the engine.
+/// Forwards a reader error as a sequenced item. Only a send that finds the
+/// channel full records its wait, like every other send in the engine.
 fn send_direct_error<T>(
     tx: &SyncSender<DecodedItem<T>>,
     seq: usize,
     e: crate::error::Error,
     metrics: &PipelineMetrics,
 ) -> bool {
-    let t_send = crate::counters::Stopwatch::start();
-    let sent = tx.send((seq, Some(Err(e)), None)).is_ok();
-    t_send.record_ns(&metrics.decoded_send_wait_ns);
-    sent
+    crate::counters::send_recording_wait(
+        tx,
+        (seq, Some(Err(e)), None),
+        &metrics.decoded_send_wait_ns,
+    )
+    .is_ok()
 }
 
 struct DecodeTask<'scope, X: DecodeTransform> {
@@ -567,16 +576,23 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         // true index and offset; `seq` is a pipeline-internal ordering key
         // and is never reported as a location.
         let item = item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
-        let t_send = crate::counters::Stopwatch::start();
         // A failed send hands the permit back; it is released only after
         // `shutdown` is stored, so the dispatcher its release wakes sees the
-        // flag and admits no further decode task.
-        if let Err(std::sync::mpsc::SendError((_, _, permit))) = tx.send((seq, item, Some(permit)))
+        // flag (it checks again after every admission) rather than spawning
+        // the task that release admitted. A sender failing just after that
+        // check can still see one more task spawned; it fails its own send
+        // and returns its permit, so the window costs one decode, never a
+        // leak or a hang.
+        if let Err(std::sync::mpsc::SendError((_, _, permit))) =
+            crate::counters::send_recording_wait(
+                &tx,
+                (seq, item, Some(permit)),
+                &metrics.decoded_send_wait_ns,
+            )
         {
             shutdown.store(true, Relaxed);
             drop(permit);
         }
-        t_send.record_ns(&metrics.decoded_send_wait_ns);
     });
 }
 
@@ -620,9 +636,7 @@ where
     let metrics = &cancel.metrics().pipeline;
     loop {
         cancel.check()?;
-        let t_recv = crate::counters::Stopwatch::start();
-        let next = decoded_rx.recv();
-        t_recv.record_ns(&metrics.decoded_recv_wait_ns);
+        let next = crate::counters::recv_recording_wait(&decoded_rx, &metrics.decoded_recv_wait_ns);
         let (seq, item, permit) = match next {
             Ok(pair) => pair,
             Err(_) => break,
@@ -752,9 +766,11 @@ where
         let reader = move || {
             for (seq, blob_result) in std::iter::from_fn(|| blob_reader.next_blob()).enumerate() {
                 unindexed.observe(&blob_result, &diagnostics, invocation);
-                let t_send = crate::counters::Stopwatch::start();
-                let send_result = raw_tx.send((seq, blob_result));
-                t_send.record_ns(&metrics.raw_send_wait_ns);
+                let send_result = crate::counters::send_recording_wait(
+                    &raw_tx,
+                    (seq, blob_result),
+                    &metrics.raw_send_wait_ns,
+                );
                 if send_result.is_err() {
                     break; // receiver dropped, pipeline shutting down
                 }
@@ -834,6 +850,18 @@ where
             // Tasks borrow the reader's path from this scope: one capture per
             // pipeline, no refcounting per blob.
             let source = source.as_ref();
+            // One rayon task per admitted blob, submitted from this thread.
+            // Replacing that hop with long-lived workers claiming admitted
+            // work was proposed on source reading alone. The nearest
+            // measured shape, a byte-bounded ordered batch engine with
+            // long-lived workers that replaced the per-blob channel, task,
+            // admission and reorder seams together (2026-07, planet-8k at
+            // 1.45 M blobs, reverted), found those seams were not the
+            // binding cost and gave its savings back in its own
+            // coordination (`reference/performance/read-pipeline.md`,
+            // "Env-gated read-path batch"). That does not isolate the
+            // submission itself, but nothing since attributes wall to it:
+            // a rewrite of this hop wants that attribution first.
             #[allow(
                 clippy::disallowed_methods,
                 reason = "the read's own joined decode pool, not the host executor"
@@ -845,13 +873,19 @@ where
                     }
                     match blob_result {
                         Ok(blob) => {
-                            let t_admit = crate::counters::Stopwatch::start();
-                            let blocked = gate.acquire();
-                            t_admit.record_ns(&metrics.decode_admit_wait_ns);
-                            if blocked {
+                            if let Some(waited_ns) = gate.acquire() {
+                                metrics.decode_admit_wait_ns.fetch_add(waited_ns, Relaxed);
                                 metrics.decode_admit_blocked.fetch_add(1, Relaxed);
                             }
                             let permit = Permit(Arc::clone(&gate));
+                            // A decode task that failed its send set
+                            // `shutdown` before releasing the permit this
+                            // admission may have waited for: spawn nothing
+                            // more (the permit releases on drop).
+                            if shutdown.load(Relaxed) {
+                                drop(permit);
+                                break;
+                            }
                             metrics.decode_tasks.fetch_add(1, Relaxed);
                             spawn_decode_task(
                                 task_scope,
@@ -1547,8 +1581,8 @@ mod tests {
     #[test]
     fn gate_blocks_at_cap_and_release_unblocks() {
         let gate = Arc::new(AdmissionGate::new(NonZeroUsize::new(2).unwrap()));
-        assert!(!gate.acquire());
-        assert!(!gate.acquire());
+        assert!(gate.acquire().is_none());
+        assert!(gate.acquire().is_none());
 
         let (blocked, ()) = crate::test_support::with_parked_thread(
             "the child did not acquire after release",
@@ -1567,7 +1601,7 @@ mod tests {
                 gate.release();
             },
         );
-        assert!(blocked, "the child acquired without blocking");
+        assert!(blocked.is_some(), "the child acquired without blocking");
     }
 
     #[test]
@@ -1584,10 +1618,10 @@ mod tests {
     fn permit_drop_releases() {
         let gate = Arc::new(AdmissionGate::new(NonZeroUsize::new(1).unwrap()));
         {
-            assert!(!gate.acquire());
+            assert!(gate.acquire().is_none());
             let _permit = Permit(Arc::clone(&gate));
         }
-        assert!(!gate.acquire());
+        assert!(gate.acquire().is_none());
         gate.release();
     }
 }

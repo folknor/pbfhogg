@@ -1545,29 +1545,23 @@ Reported by: geocode.
 
 ## PERF-059 - Read-side local changes
 
-Reported by: framing, pipeline.
+Reported by: framing, pipeline. Narrowed 2026-11-26 to the two bullets no
+measurement covers; both unmeasured.
 
-- `decompress_blob_data_into` calls `WireBlob::parse_slice`, copying the
-  input into `Bytes`; `decompress_blob_raw` already parses from `&[u8]`.
-  Reached by check-index, cat indexing, reindexing and repair, getid and some
-  merge work.
-- `DirectPositional::read_exact_at` copies out of aligned scratch;
-  `read_aligned_in` returns the slice (used by blob merge `FrameBuf::read`).
-- `evict_consumed_prefix` advises `0..offset` after every blob; batch by a
-  page-aligned watermark respecting cache policy and lease lifetimes.
-- `ReadBuf::read_exact_at` resizes before reading, zeroing bytes `pread`
-  overwrites.
-- Raw blobs are copied into a `Vec` because block construction appends lookup
-  tables to mutable payload; immutable input plus separate metadata would allow
-  leases (uncompressed workloads only).
-- Remove the read dispatcher's per-blob rayon submission hop.
-- `DecodeTransform::apply(&self, ..)` has no worker-local state, so tags-filter
-  builds builders per blob.
-- The read pipeline reads clocks and updates shared atomics around every send,
-  receive and gate acquisition, so its wait totals include fast-path overhead
-  (`pipeline.rs` completion, `counters.rs` `Stopwatch`).
-- The shared mutex-protected `DecompressPool` serves fused paths that drop the
-  buffer locally.
+- Raw (uncompressed) blobs are copied into a mutable `Vec`
+  (`decompress_parsed_blob_body`, `decompress_blob_raw` Raw arms) because
+  block construction appends its lookup tables to the payload. The
+  table-append measurement (`read-pipeline.md`, "Cost of appending the offset
+  tables") prices the append, not this copy, so it does not settle it. No
+  registered dataset is uncompressed; a measurement first needs one
+  (`repack --compression none`, promoted as a snapshot).
+- The shared `Mutex` `DecompressPool` takes its lock on checkout and on
+  return for every pooled decode, including fused projections that finish
+  with the buffer on the worker. The escaping lifetime is real for `Blocks`
+  and the owned iterator (the `Bytes` keeps the allocation and the pool's
+  permit alive past the worker), not for every projection; a worker-local
+  buffer needs a borrowing transform contract first. The 2026-03 pool revert
+  (`a6ebbfe5`) was a different pool and gives no number for this one.
 
 ## PERF-060 - Write-side local changes
 

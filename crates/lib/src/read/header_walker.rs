@@ -187,6 +187,19 @@ pub(crate) trait Positional {
     /// byte, EOF and error. Returns the bytes advised, a prefix from
     /// `offset` (0 when no advice was issued), as `fadvise::will_need`.
     fn will_need(&self, offset: u64, len: u64, invocation: &crate::host::Invocation) -> u64;
+
+    /// Read exactly `len` bytes at `offset` into `buf` and return them, in
+    /// the transport's own way: a buffered source preads into the plain
+    /// buffer; a direct one reads through `buf`'s aligned scratch and lends
+    /// the bytes from there, with no copy out.
+    fn read_into<'b>(
+        &self,
+        buf: &'b mut crate::read::read_buf::ReadBuf,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<&'b [u8]> {
+        buf.read_exact_at(self, offset, len)
+    }
 }
 
 /// What [`Positional::read_cached`] found.
@@ -270,6 +283,17 @@ impl Positional for crate::read::direct_reader::DirectPositional {
     /// No advice: `O_DIRECT` reads never come from the page cache.
     fn will_need(&self, _offset: u64, _len: u64, _invocation: &crate::host::Invocation) -> u64 {
         0
+    }
+
+    /// Payload reads go through the caller's own aligned scratch and are
+    /// lent from it, not copied out of this source's probe scratch.
+    fn read_into<'b>(
+        &self,
+        buf: &'b mut crate::read::read_buf::ReadBuf,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<&'b [u8]> {
+        buf.read_direct_at(self.file(), self.align(), offset, len)
     }
 }
 
@@ -897,7 +921,7 @@ impl<P: Positional> HeaderWalker<P> {
         size: usize,
         buf: &'b mut crate::read::read_buf::ReadBuf,
     ) -> Result<&'b [u8]> {
-        Ok(buf.read_exact_at(&*self.file, offset, size)?)
+        Ok(self.file.read_into(buf, offset, size)?)
     }
 }
 

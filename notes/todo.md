@@ -347,26 +347,6 @@ Remaining open findings from the closed hunt.
   (the attributes themselves are the list). Low urgency; folds into the lint
   exemptions item above.
 
-### Read path
-
-- [ ] **An evicting `BlobReader` advises `POSIX_FADV_DONTNEED` over `0..offset`.**
-  The API half is closed - eviction is opt-in on the public readers
-  (`BlobReader::evict_page_cache(bool)`, `ElementReader::evict_page_cache(bool)`,
-  `ElementReader::from_path_with_eviction`), and commands follow
-  `Host::page_cache`, which the CLI sets to `Evict`. What remains open is the
-  syscall shape: the
-  advised range is the whole consumed prefix `0..current_offset`, re-issued per
-  blob, so a run issues one `posix_fadvise` call per blob, each nominally covering a
-  growing prefix where `offset_prev..offset` would express the same intent over
-  a bounded range. The kernel side is cheap per already-evicted page, so this
-  may well be worth nothing. **Do not "fix" it on inspection.** Changing *which*
-  pages get dropped changes the page-cache state every subsequent benchmark on
-  the host observes, so the measurement perturbs its own baseline: closing this
-  means a scheduled interleaved matched A/B at planet scale on a trimmed drive,
-  with the host's cache state accepted as spent for the duration. It has
-  survived four rounds untouched for that reason.
-
-
 ### Spatial and node-location resolution
 
 

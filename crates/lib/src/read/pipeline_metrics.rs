@@ -37,21 +37,25 @@ use crate::counters::record_max;
 crate::counters::counter_set! {
     pub(crate) struct PipelineMetrics {
         /// Cumulative time stage-1 (I/O reader) blocked on a full
-        /// `read_ahead` raw-blob channel.
+        /// `read_ahead` raw-blob channel. Like every `*_wait_ns` here, only
+        /// an operation that found the channel or gate unready is timed
+        /// (`crate::counters` gated helpers), so an uncontended run adds
+        /// nothing; runs recorded before 2026-11-26 timed every call.
         pub raw_send_wait_ns => "pipeline_raw_send_wait_ns",
         /// Cumulative time stage-2 dispatcher spent waiting for decode
-        /// admission permits. This is where backpressure from the decode
-        /// cap is accounted.
+        /// admission permits, from first finding the cap full. This is where
+        /// backpressure from the decode cap is accounted.
         pub decode_admit_wait_ns => "pipeline_decode_admit_wait_ns",
-        /// Number of decode admission acquisitions that actually blocked.
-        /// This is the gate-engaged signal; `decode_admit_wait_ns` can be
-        /// nonzero from uncontended lock overhead alone.
+        /// Number of decode admission acquisitions that found the cap full,
+        /// the gate-engaged signal; each adds its wait to
+        /// `decode_admit_wait_ns`.
         pub decode_admit_blocked => "pipeline_decode_admit_blocked",
         /// Cumulative time stage-2 decode workers blocked sending decoded
         /// blocks toward the reorder buffer (channel bound by `decode_ahead`).
         pub decoded_send_wait_ns => "pipeline_decoded_send_wait_ns",
         /// Cumulative time stage-3 (consumer thread, runs `block_fn`)
-        /// spent waiting in `decoded_rx.recv()` for the next decoded block.
+        /// spent blocked in `decoded_rx.recv()` on an empty channel for the
+        /// next decoded block.
         /// Combined with `block_fn`'s own time this localises whether the
         /// consumer is starved by decode or by its own work.
         pub decoded_recv_wait_ns => "pipeline_decoded_recv_wait_ns",

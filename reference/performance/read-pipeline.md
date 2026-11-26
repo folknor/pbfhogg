@@ -1,5 +1,31 @@
 # Read Pipeline
 
+### Read-side copies, zero fills and fast-path clocks removed (bygg, 2026-11-26, uncommitted against `908626e7`)
+
+Four CPU-only changes measured together: slice-framed decodes (check
+`--index`, cat reindex and repair, getid, degrade, blob merge) parse the
+borrowed envelope instead of copying the blob into `Bytes`; a direct
+header walker's payload reads are lent from the read buffer's own aligned
+scratch instead of copied out; `ReadBuf` zero fills each byte of an
+allocation once instead of re-zeroing on every longer read; and the read
+pipeline's `*_wait_ns` counters time only operations that found the
+channel or admission gate unready. Germany, `--iterations 1`, interleaved,
+HEAD via `--commit HEAD` (each first HEAD cell, a cold one, dropped):
+
+| Bench | HEAD | Variant |
+|---|---|---|
+| `file-info --mode extended` | 1,468.6 ms (`4d5ba9c2`), 1,394.3 ms (`85668ee1`) | 1,481.2 ms (`c15ff5d5`), 1,400.6 ms (`b24c4aa2`), 1,404.6 ms (`1eaecde1`) |
+| `index-integrity` | 970 ms (`4b7751ed`) | 954 ms (`946dd31d`), 968 ms (`131caae0`) |
+| `id-select --direct-io yes --invert yes` | 1.2 s (`a67db52f`) | 1.2 s (`c0337acf`, `19a76724`) |
+
+No wall difference: every pair is inside noise, as expected of walks
+bound on decode or on disk. Kept as removed work, not a measured win. The
+counter change is visible: `pipeline_decoded_send_wait_ns` went from
+67.5 ms (`85668ee1`) to 0 (`1eaecde1`), its whole old value having been
+fast-path clock overhead summed over the decode workers; the raw-send,
+admission and receive waits, genuine blocks, barely moved. Pipeline wait
+totals from before this change are not comparable with later ones.
+
 ### Zstd blobs decoded one-shot on a reused context (bygg, 2026-11-26, uncommitted against `7140a8ed`)
 
 Zstd decode moved from a per-blob `zstd::stream::read::Decoder` read

@@ -88,7 +88,7 @@ use crate::blob::BlobKind;
 use crate::blob_meta::{BboxClaim, BlobBbox, BlobIndex};
 use crate::error::Result;
 use crate::file_reader::FileReader;
-use crate::read::decompress::decompress_blob_data_into;
+use crate::read::decompress::decompress_blob_raw;
 use crate::read::frame::{Frames, RawBlobFrame};
 use crate::read::input::InputSource;
 
@@ -534,7 +534,7 @@ fn verify_blob(ordinal: u64, frame: &RawBlobFrame, block: &mut Vec<u8>) -> Resul
     // Unconditional decode: the stored metadata is under test, so it must
     // not be allowed to decide which blobs get looked at.
     block.clear();
-    decompress_blob_data_into(frame.blob_bytes(), block)?;
+    decompress_blob_raw(frame.blob_bytes(), block)?;
     // A malformed payload is an error even when no metadata was stored.
     // Valid unsupported shapes remain unindexable rather than malformed. One
     // walk yields both the index and, where readable tagdata wants comparing,

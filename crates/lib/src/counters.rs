@@ -312,9 +312,9 @@ impl Stopwatch {
 // its own fast path) and touches no clock and no counter. Only the slow path
 // reads the clock twice and adds once.
 //
-// Several older `*_wait_ns` counters (the read pipeline's, the ordered pool's
-// timers) time every call, blocked or not; they keep that for continuity.
-// New stall counters go through these.
+// Some older `*_wait_ns` counters (the ordered pool's timers) time every
+// call, blocked or not; they keep that for continuity. The read pipeline's
+// moved onto these. New stall counters go through these.
 
 /// Lock `mutex`, adding the time spent blocked behind another holder to
 /// `wait_ns`. An uncontended lock records nothing.

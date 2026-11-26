@@ -61,13 +61,3 @@ The empty-stream test in `write/parallel_gzip.rs` deliberately requires zero
 output bytes, with not even an empty gzip member. The current OSC caller
 always writes document framing, so the hunter found no CLI trigger.
 
-## FMT-026 - decompress_blob_data_into copies the whole serialized Blob
-
-Reported by: read-framing (optimization observation).
-
-`decompress_blob_data_into` (`read/decompress.rs`) copies the entire
-serialized Blob through `parse_slice`, even though it already receives
-borrowed bytes and caller-owned output storage. The shared borrowed parser
-`BlobEnvelope::parse` (`read/blob_wire.rs`) now exists, and
-`decompress_blob_raw` already decodes from it without a copy.
-

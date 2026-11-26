@@ -1,5 +1,17 @@
 # Tags Filter
 
+### Single-pass builder kept per decode worker: not kept (bygg, 2026-11-26, variant against `908626e7`)
+
+The `-R` single pass builds a `BlockBuilder` (8000-element preallocation)
+per decoded blob. A variant kept one per decode worker in a worker-local
+slot, taken and put back around each blob. Germany `tag-select
+--omit-referenced yes --filter w/highway`, `--iterations 1`, interleaved:
+HEAD 2,377.1 ms (`90a8ccfd`), 2,374.6 ms (`7e8e92ac`); variant 2,373.7 ms
+(`c2d949e3`), 2,395.6 ms (`1d9522a6`); the variant also carried the
+read-side changes in `read-pipeline.md` of the same date. No difference; the per-blob
+preallocation is lost in the decode. Not kept, so `DecodeTransform` gets
+no worker-local state surface; the closure carries the ruling.
+
 ### Substring keys prune on tagdata; pass 2 skips node blobs with no node included (bygg, 2026-11-25, `c5898bd3` + change)
 
 A non-empty substring key (`*foo`, `*foo*`) now skips a blob whose stored

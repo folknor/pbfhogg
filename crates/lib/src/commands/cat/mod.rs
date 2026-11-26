@@ -8,7 +8,7 @@ use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, require_indexdata,
 };
-use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
+use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_raw};
 use crate::blob_meta::scan_block_ids_and_tags;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
@@ -493,8 +493,7 @@ fn cat_passthrough(
                         // The walk owns the provenance.
                         let id = frame.id;
                         let locate = |e: Error| frames.locate(id, e);
-                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)
-                            .map_err(locate)?;
+                        decompress_blob_raw(blob_bytes, &mut decompress_buf).map_err(locate)?;
                         payloads_opened += 1;
                         let (index, tagdata) =
                             scan_block_ids_and_tags(&decompress_buf).map_err(locate)?;
@@ -943,8 +942,7 @@ fn cat_type_passthrough(
                         decompress_buf.clear();
                         let id = frame.id;
                         let locate = |e: Error| frames.locate(id, e);
-                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)
-                            .map_err(locate)?;
+                        decompress_blob_raw(blob_bytes, &mut decompress_buf).map_err(locate)?;
                         // Take the decompressed Vec straight into the block: no
                         // Bytes round-trip, no second whole-buffer copy (the
                         // dropped `new_with_scratch(Bytes)` route paid a `to_vec`).

@@ -668,7 +668,7 @@ fn passthrough_header_bytes(
         return Err(crate::error::new_missing_header(input));
     }
     let mut header_block = Vec::new();
-    crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)
+    crate::read::decompress::decompress_blob_raw(frame.blob_bytes(), &mut header_block)
         .map_err(locate)?;
     super::output_header::verbatim(&header_block, flags.strip_bbox, overrides).map_err(locate)
 }

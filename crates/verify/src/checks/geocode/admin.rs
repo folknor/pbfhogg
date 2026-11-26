@@ -55,25 +55,69 @@
 //! level, which could hold any answer, or inside the box of an undecided
 //! hole of that level.
 //!
-//! An unmodelled relation is not localised to the undecided rings' box:
-//! the builder withholds a relation whole when it refuses any of its
-//! topology, so the relation's other polygons may vanish and its whole box
-//! stays unjudged.
+//! An unmodelled relation is not localised to the undecided pair: the
+//! builder withholds a relation whole when it refuses any of its topology,
+//! so every ring of the relation may vanish, and each ring's box stays
+//! unjudged at its level.
+//!
+//! The antimeridian, as docs/cli/commands.md states it. Every ring is
+//! judged in the frame containment tests it in: as given when no edge
+//! (the closing one included) spans more than half a turn of longitude,
+//! otherwise with its longitudes unwrapped from its first vertex, where a
+//! query is tried at its own longitude and a turn either way. A relation
+//! with a ring that winds round a pole, whose unwrapped longitudes span a
+//! full turn, or with an edge of exactly half a turn is withheld: its
+//! answer would depend on where its walk starts. In the unwrapped frame
+//! +180 and -180 are one point, for the run and line rules as for
+//! containment. Where a rule reads a point's spelling (the disjointness
+//! midpoint, folded to the query range, against a ring that does not
+//! unwrap), a verdict that depends on which spelling the builder's walk
+//! produces is undecided. Bands, boxes and distances are measured over
+//! every image of the query a turn apart.
+//!
+//! Same-level competition is aimed at, not only met by chance: after the
+//! model is built, sites where two areas of one level may overlap are
+//! sought (proper edge crossings, vertices strictly inside the other ring,
+//! points of the intersection of their boxes, over every whole-turn
+//! alignment), and witnesses near them are kept where the model finds two
+//! containing areas of a level with one certified larger. The search finds
+//! what it finds; it claims no overlap is missed.
 
 use std::collections::HashMap;
 
-use super::{EARTH_RADIUS_M, Record, tag};
+use super::{Draw, EARTH_RADIUS_M, Record, lon, tag};
+use crate::tunables::{
+    GEOCODE_ADMIN_TOLERANCE_M, GEOCODE_ADMIN_WITNESS_REACH_M, GEOCODE_OVERLAP_ATTEMPTS,
+    GEOCODE_OVERLAP_WITNESSES,
+};
 
 /// Levels the answer can carry, 2 to 11.
 pub(super) const LEVELS: std::ops::RangeInclusive<u8> = 2..=11;
+
+/// The band left unjudged round a boundary of the non-zero tolerance build.
+pub(super) const TOLERANCE_BAND_M: f64 = GEOCODE_ADMIN_TOLERANCE_M * 1.01 + 1.0;
 
 /// Clearance below which hole ownership is not decided, decimicrodegrees.
 const OWNERSHIP_CLEARANCE_E7: f64 = 1.0;
 
 /// The edge grid's cell, decimicrodegrees (about 5.5 km).
-const EDGE_GRID_E7: i32 = 500_000;
+const EDGE_GRID_E7: i64 = 500_000;
 
+/// Edge grid columns per turn of longitude.
+const EDGE_COLUMNS: i64 = lon::TURN_E7 / EDGE_GRID_E7;
+
+const TURN: i64 = lon::TURN_E7;
+const HALF: i64 = lon::HALF_E7;
+
+/// A node coordinate as decoded, `(lat, lon)` decimicrodegrees.
 type Pt = (i32, i32);
+
+/// A ring point in its ring's frame, `(lat, lon)` decimicrodegrees; an
+/// unwrapped longitude can leave the `i32` range.
+type Fp = (i64, i64);
+
+/// `(min_lat, min_lon, max_lat, max_lon)` in some frame.
+type Bbox = (i64, i64, i64, i64);
 
 /// A located member node: its id and coordinates.
 type Node = (i64, Pt);
@@ -129,28 +173,120 @@ pub(super) struct Polygon {
     pub(super) level: u8,
     pub(super) name: String,
     pub(super) country_code: Option<String>,
-    pub(super) outer: Vec<Pt>,
-    pub(super) holes: Vec<Vec<Pt>>,
+    pub(super) outer: Ring,
+    pub(super) holes: Vec<Ring>,
     /// Least and greatest stored area a correct computation can give.
     pub(super) area: (f64, f64),
-    bbox: (i32, i32, i32, i32),
+}
+
+/// One assembled ring, closed, in the frame containment tests it in.
+#[derive(Debug, Clone)]
+pub(super) struct Ring {
+    pub(super) pts: Vec<Fp>,
+    /// Unwrapped: a point is tried at its longitude and a turn either way.
+    wraps: bool,
+    bbox: Bbox,
+    /// The builder's answer for it does not depend on where its walk starts.
+    invariant: bool,
+}
+
+impl Ring {
+    /// The frame of the closed raw ring `raw`.
+    fn new(raw: &[Pt]) -> Self {
+        let wraps = raw
+            .windows(2)
+            .any(|w| (i64::from(w[1].1) - i64::from(w[0].1)).abs() > HALF);
+        let mut pts: Vec<Fp> = Vec::with_capacity(raw.len());
+        let mut previous: Option<i64> = None;
+        for &(lat, lon) in raw {
+            let mut x = i64::from(lon);
+            if wraps && let Some(p) = previous {
+                while x - p > HALF {
+                    x -= TURN;
+                }
+                while x - p < -HALF {
+                    x += TURN;
+                }
+            }
+            pts.push((i64::from(lat), x));
+            previous = Some(x);
+        }
+        let bbox = bbox_of(pts.iter()).unwrap_or((0, 0, 0, 0));
+        Self {
+            pts,
+            wraps,
+            bbox,
+            invariant: start_invariant(raw),
+        }
+    }
+
+    /// The longitude shifts a point is tried at.
+    fn images(&self) -> &'static [i64] {
+        if self.wraps { &[0, TURN, -TURN] } else { &[0] }
+    }
+
+    /// The query predicate: even-odd containment of `(y, x)` (a query's own
+    /// longitude, decimicrodegrees) at each image.
+    fn contains(&self, y: f64, x: f64) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        self.images()
+            .iter()
+            .any(|&k| inside(&self.pts, y, x + k as f64))
+    }
+}
+
+/// Whether the closed raw ring's frame answers the same whichever vertex
+/// its walk starts at, as the documented withholding rule reads: no edge
+/// spans half a turn, or else, lifting each edge the shorter way, none is
+/// exactly half a turn, the lift closes, and it spans less than a turn.
+fn start_invariant(raw: &[Pt]) -> bool {
+    let d = |w: &[Pt]| i64::from(w[1].1) - i64::from(w[0].1);
+    if raw.windows(2).all(|w| d(w).abs() < HALF) {
+        return true;
+    }
+    let (mut at, mut lo, mut hi) = (0_i64, 0_i64, 0_i64);
+    for w in raw.windows(2) {
+        let step = match d(w) {
+            s if s > HALF => s - TURN,
+            s if s < -HALF => s + TURN,
+            s => s,
+        };
+        if step.abs() == HALF {
+            return false;
+        }
+        at += step;
+        lo = lo.min(at);
+        hi = hi.max(at);
+    }
+    at == 0 && hi - lo < TURN
 }
 
 /// What the relations make.
 #[derive(Default)]
 pub(super) struct AdminModel {
     pub(super) polygons: Vec<Polygon>,
-    /// `(level, bbox)` not judged: each unmodelled relation's member
-    /// coordinates, and each undecided hole.
-    pub(super) unmodelled: Vec<(u8, (i32, i32, i32, i32))>,
+    /// `(level, bbox)` not judged, each box in its ring's frame: every ring
+    /// of an unmodelled relation, and each undecided hole.
+    pub(super) unmodelled: Vec<(u8, Bbox)>,
     /// The id, level and why of each `unmodelled` box, for the run's account.
     pub(super) unmodelled_why: Vec<(String, u8, Unmodelled)>,
     pub(super) relations: usize,
     /// Selected relations the builder withholds whole, judged as no area.
     pub(super) withheld: usize,
-    /// Every ring edge, `(polygon, a, b)`, and the grid over them.
-    edges: Vec<(u32, Pt, Pt)>,
-    edge_cells: HashMap<(i32, i32), Vec<u32>>,
+    /// Every ring edge, `(polygon, a, b)` in its ring's frame, and the grid
+    /// over them, columns periodic.
+    edges: Vec<(u32, Fp, Fp)>,
+    edge_cells: HashMap<(i64, i64), Vec<u32>>,
+}
+
+/// What the same-level overlap search found.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct OverlapAccount {
+    /// Pairs of polygons of one level whose boxes meet in some alignment.
+    pub(super) pairs: usize,
+    pub(super) seeds: usize,
+    /// Witnesses kept.
+    pub(super) kept: usize,
 }
 
 /// Why a relation is not modelled.
@@ -226,7 +362,7 @@ fn select(r: &Record<'_>) -> Option<Boundary> {
     })
 }
 
-fn bbox_of<'p>(points: impl Iterator<Item = &'p Pt>) -> Option<(i32, i32, i32, i32)> {
+fn bbox_of<'p>(points: impl Iterator<Item = &'p Fp>) -> Option<Bbox> {
     points.fold(None, |b, &(lat, lon)| {
         Some(match b {
             None => (lat, lon, lat, lon),
@@ -240,11 +376,10 @@ fn bbox_of<'p>(points: impl Iterator<Item = &'p Pt>) -> Option<(i32, i32, i32, i
 enum RoleRings {
     /// The builder refuses the role, whatever order its members come in.
     Refused,
-    /// The builder's verdict on two rings of one graph follows member
-    /// order (see [`Unmodelled::UndecidedLobes`]).
-    Undecided,
-    /// Closed `(lat, lon)` rings.
-    Rings(Vec<Vec<Pt>>),
+    /// The rings, and whether the builder's verdict on two rings of one
+    /// graph follows member order (see [`Unmodelled::UndecidedLobes`]), so
+    /// it may refuse the role instead of returning them.
+    Rings { rings: Vec<Ring>, undecided: bool },
 }
 
 impl RoleRings {
@@ -254,10 +389,21 @@ impl RoleRings {
     fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
-            (Self::Undecided, _) | (_, Self::Undecided) => Self::Undecided,
-            (Self::Rings(mut a), Self::Rings(b)) => {
+            (
+                Self::Rings {
+                    rings: mut a,
+                    undecided: x,
+                },
+                Self::Rings {
+                    rings: b,
+                    undecided: y,
+                },
+            ) => {
                 a.extend(b);
-                Self::Rings(a)
+                Self::Rings {
+                    rings: a,
+                    undecided: x || y,
+                }
             }
         }
     }
@@ -384,18 +530,17 @@ fn graph_rings(members: &[&[Node]]) -> RoleRings {
     let Some(rings) = cycles(&adjacency) else {
         return RoleRings::Refused;
     };
-    let mut walked: Vec<(usize, Vec<i64>, Vec<Pt>)> = Vec::with_capacity(rings.len());
+    let mut walked: Vec<(usize, Vec<i64>, Ring)> = Vec::with_capacity(rings.len());
     for (c, cycle) in rings {
-        let ring: Vec<Pt> = cycle.iter().map(|&v| coords[v]).collect();
-        if !one_run_per_point(&ring) {
-            return RoleRings::Refused;
-        }
-        let mut closed = ring;
+        let mut closed: Vec<Pt> = cycle.iter().map(|&v| coords[v]).collect();
         closed.push(closed[0]);
-        if collinear(&closed) {
+        // The run and line rules read the ring in its containment frame,
+        // where an unwrapped ring has +180 and -180 as one point.
+        let ring = Ring::new(&closed);
+        if !one_run_per_point(&ring.pts[..ring.pts.len() - 1]) || collinear(&ring.pts) {
             return RoleRings::Refused;
         }
-        walked.push((c, cycle.iter().map(|&v| ids[v]).collect(), closed));
+        walked.push((c, cycle.iter().map(|&v| ids[v]).collect(), ring));
     }
     let mut undecided = false;
     for (i, a) in walked.iter().enumerate() {
@@ -412,14 +557,14 @@ fn graph_rings(members: &[&[Node]]) -> RoleRings {
             }
         }
     }
-    if undecided {
-        return RoleRings::Undecided;
+    RoleRings::Rings {
+        rings: walked.into_iter().map(|(_, _, ring)| ring).collect(),
+        undecided,
     }
-    RoleRings::Rings(walked.into_iter().map(|(_, _, ring)| ring).collect())
 }
 
 /// Whether the open cyclic walk `ring` visits each point in one run.
-fn one_run_per_point(ring: &[Pt]) -> bool {
+fn one_run_per_point(ring: &[Fp]) -> bool {
     let n = ring.len();
     let Some(start) = (0..n).find(|&i| ring[i] != ring[(i + n - 1) % n]) else {
         // One point throughout: collinear, refused by the caller.
@@ -445,10 +590,25 @@ fn one_run_per_point(ring: &[Pt]) -> bool {
 /// `Some(true)` when every witness is strictly outside, `Some(false)` when
 /// none is (or there is none), so the builder's first witness gives that
 /// answer whichever edge it is; `None` when they disagree.
-fn outside_by_midpoints(a_ids: &[i64], a: &[Pt], b_ids: &[i64], b: &[Pt]) -> Option<bool> {
+///
+/// Each midpoint is taken in `a`'s frame and folded back to the longitude
+/// range a query carries, then tried against `b` at every image `b`'s frame
+/// tries. A midpoint folding onto the antimeridian keeps whichever spelling
+/// the walk's lift gave it, and a ring that does not unwrap tells the two
+/// apart, so there both spellings are tried, and a witness they disagree on
+/// is undecided: the builder's walk may start where either is produced.
+fn outside_by_midpoints(a_ids: &[i64], a: &Ring, b_ids: &[i64], b: &Ring) -> Option<bool> {
     let on_b: std::collections::HashSet<i64> = b_ids.iter().copied().collect();
-    let Some(bb) = bbox_of(b.iter()) else {
-        return Some(false);
+    let bb = b.bbox;
+    let strictly_out = |y2: i64, x2: i64| {
+        b.images().iter().all(|&k| {
+            let x2 = x2 + 2 * k;
+            y2 < 2 * bb.0
+                || y2 > 2 * bb.2
+                || x2 < 2 * bb.1
+                || x2 > 2 * bb.3
+                || side_doubled(y2, x2, &b.pts) == Some(false)
+        })
     };
     let n = a_ids.len();
     let (mut out, mut not_out) = (false, false);
@@ -456,17 +616,19 @@ fn outside_by_midpoints(a_ids: &[i64], a: &[Pt], b_ids: &[i64], b: &[Pt]) -> Opt
         if on_b.contains(&a_ids[i]) || on_b.contains(&a_ids[(i + 1) % n]) {
             continue;
         }
-        let (p, q) = (a[i], a[i + 1]);
-        let (y2, x2) = (
-            i64::from(p.0) + i64::from(q.0),
-            i64::from(p.1) + i64::from(q.1),
-        );
-        let strictly_out = y2 < 2 * i64::from(bb.0)
-            || y2 > 2 * i64::from(bb.2)
-            || x2 < 2 * i64::from(bb.1)
-            || x2 > 2 * i64::from(bb.3)
-            || side_doubled(y2, x2, b) == Some(false);
-        if strictly_out {
+        let (p, q) = (a.pts[i], a.pts[i + 1]);
+        let (y2, mut x2) = (p.0 + q.0, p.1 + q.1);
+        while x2 > 2 * HALF {
+            x2 -= 2 * TURN;
+        }
+        while x2 < -2 * HALF {
+            x2 += 2 * TURN;
+        }
+        let verdict = strictly_out(y2, x2);
+        if !b.wraps && x2.abs() == 2 * HALF && strictly_out(y2, -x2) != verdict {
+            return None;
+        }
+        if verdict {
             out = true;
         } else {
             not_out = true;
@@ -481,11 +643,11 @@ fn outside_by_midpoints(a_ids: &[i64], a: &[Pt], b_ids: &[i64], b: &[Pt]) -> Opt
 /// Exact even-odd side of the doubled point `(y2, x2)` against the closed
 /// ring `ring`: `Some(true)` strictly inside, `Some(false)` strictly
 /// outside, `None` on the boundary.
-fn side_doubled(y2: i64, x2: i64, ring: &[Pt]) -> Option<bool> {
+fn side_doubled(y2: i64, x2: i64, ring: &[Fp]) -> Option<bool> {
     let mut odd = false;
     for e in ring.windows(2) {
-        let (ay, ax) = (2 * i64::from(e[0].0), 2 * i64::from(e[0].1));
-        let (by, bx) = (2 * i64::from(e[1].0), 2 * i64::from(e[1].1));
+        let (ay, ax) = (2 * e[0].0, 2 * e[0].1);
+        let (by, bx) = (2 * e[1].0, 2 * e[1].1);
         let cross =
             i128::from(bx - ax) * i128::from(y2 - ay) - i128::from(by - ay) * i128::from(x2 - ax);
         if cross == 0
@@ -509,14 +671,14 @@ fn side_doubled(y2: i64, x2: i64, ring: &[Pt]) -> Option<bool> {
 }
 
 /// Whether every point of `ring` lies on one line, exactly.
-fn collinear(ring: &[Pt]) -> bool {
+fn collinear(ring: &[Fp]) -> bool {
     let Some(&a) = ring.first() else {
         return true;
     };
     let Some(&b) = ring.iter().find(|&&p| p != a) else {
         return true;
     };
-    let d = |p: Pt| {
+    let d = |p: Fp| {
         (
             i128::from(p.0) - i128::from(a.0),
             i128::from(p.1) - i128::from(a.1),
@@ -530,13 +692,14 @@ fn collinear(ring: &[Pt]) -> bool {
 }
 
 /// Even-odd containment of `(y, x)` in decimicrodegrees.
-fn inside(ring: &[Pt], y: f64, x: f64) -> bool {
+#[allow(clippy::cast_precision_loss)]
+fn inside(ring: &[Fp], y: f64, x: f64) -> bool {
     let mut odd = false;
     let n = ring.len();
     let mut j = n - 1;
     for i in 0..n {
-        let (yi, xi) = (f64::from(ring[i].0), f64::from(ring[i].1));
-        let (yj, xj) = (f64::from(ring[j].0), f64::from(ring[j].1));
+        let (yi, xi) = (ring[i].0 as f64, ring[i].1 as f64);
+        let (yj, xj) = (ring[j].0 as f64, ring[j].1 as f64);
         if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
             odd = !odd;
         }
@@ -545,17 +708,18 @@ fn inside(ring: &[Pt], y: f64, x: f64) -> bool {
     odd
 }
 
-fn orient(a: Pt, b: Pt, c: Pt) -> i128 {
+fn orient(a: Fp, b: Fp, c: Fp) -> i128 {
     let (ax, ay) = (i128::from(a.1), i128::from(a.0));
     let (bx, by) = (i128::from(b.1), i128::from(b.0));
     let (cx, cy) = (i128::from(c.1), i128::from(c.0));
     ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)).signum()
 }
 
-fn point_segment(p: Pt, a: Pt, b: Pt) -> f64 {
-    let (px, py) = (f64::from(p.1), f64::from(p.0));
-    let (ax, ay) = (f64::from(a.1), f64::from(a.0));
-    let (dx, dy) = (f64::from(b.1) - ax, f64::from(b.0) - ay);
+#[allow(clippy::cast_precision_loss)]
+fn point_segment(p: Fp, a: Fp, b: Fp) -> f64 {
+    let (px, py) = (p.1 as f64, p.0 as f64);
+    let (ax, ay) = (a.1 as f64, a.0 as f64);
+    let (dx, dy) = (b.1 as f64 - ax, b.0 as f64 - ay);
     let len = dx * dx + dy * dy;
     let t = if len == 0.0 {
         0.0
@@ -567,7 +731,7 @@ fn point_segment(p: Pt, a: Pt, b: Pt) -> f64 {
 
 /// The planar distance between two segments, decimicrodegrees: zero when
 /// they meet (exactly).
-fn segment_segment(a: Pt, b: Pt, c: Pt, d: Pt) -> f64 {
+fn segment_segment(a: Fp, b: Fp, c: Fp, d: Fp) -> f64 {
     let (o1, o2, o3, o4) = (
         orient(a, b, c),
         orient(a, b, d),
@@ -583,56 +747,104 @@ fn segment_segment(a: Pt, b: Pt, c: Pt, d: Pt) -> f64 {
         .min(point_segment(d, a, b))
 }
 
-fn edge_cells(a: Pt, b: Pt) -> impl Iterator<Item = (i32, i32)> {
-    let c = |v: i32| v.div_euclid(EDGE_GRID_E7);
+/// The grid cells, in the edge's own frame, an edge's box touches.
+fn frame_cells(a: Fp, b: Fp) -> impl Iterator<Item = (i64, i64)> {
+    let c = |v: i64| v.div_euclid(EDGE_GRID_E7);
     let (r0, r1) = (c(a.0.min(b.0)), c(a.0.max(b.0)));
     let (c0, c1) = (c(a.1.min(b.1)), c(a.1.max(b.1)));
     (r0..=r1).flat_map(move |r| (c0..=c1).map(move |k| (r, k)))
 }
 
+/// An edge whose box covers more cells than this is listed under
+/// [`EVERYWHERE`], which every band search reads, so one long edge cannot
+/// fill the grid.
+const LONG_EDGE_CELLS: i64 = 4096;
+
+const EVERYWHERE: (i64, i64) = (i64::MIN, 0);
+
+/// The periodic grid cells an edge's box touches, each once.
+fn edge_cells(a: Fp, b: Fp) -> Vec<(i64, i64)> {
+    let c = |v: i64| v.div_euclid(EDGE_GRID_E7);
+    let rows = c(a.0.max(b.0)) - c(a.0.min(b.0)) + 1;
+    let width = (c(a.1.max(b.1)) - c(a.1.min(b.1)) + 1).min(EDGE_COLUMNS);
+    if rows * width > LONG_EDGE_CELLS {
+        return vec![EVERYWHERE];
+    }
+    let cols = lon::columns(c(a.1.min(b.1)), c(a.1.max(b.1)), EDGE_COLUMNS);
+    (c(a.0.min(b.0))..=c(a.0.max(b.0)))
+        .flat_map(|r| cols.iter().map(move |&k| (r, k)))
+        .collect()
+}
+
+/// Whether two boxes meet once `b` is shifted `k` in longitude, with
+/// `margin` of slack.
+fn boxes_meet(a: Bbox, b: Bbox, k: i64, margin: i64) -> bool {
+    !(b.0 > a.2 + margin || b.2 < a.0 - margin || b.1 + k > a.3 + margin || b.3 + k < a.1 - margin)
+}
+
+/// Whole-turn shifts of a ring in some frame. Every frame lies within a
+/// turn and a half of zero, so two turns either way reach every alignment.
+const ALIGNMENTS: [i64; 5] = [0, TURN, -TURN, 2 * TURN, -2 * TURN];
+
 /// Whether `hole` is decided against `outer`: `Some(owned)`, or `None` when
-/// the traces come nearer than the clearance.
-fn owned(hole: &[Pt], outer: &[Pt], outer_box: (i32, i32, i32, i32)) -> Option<bool> {
-    let hole_box = bbox_of(hole.iter())?;
+/// the traces come nearer than the clearance in some alignment of the two
+/// frames. Decided, one vertex of the hole, folded to the query range with
+/// the antimeridian spelled +180, is tried as the builder tries a witness:
+/// at every image when the outer unwraps, else at its own longitude and, on
+/// the antimeridian, its other spelling.
+fn owned(hole: &Ring, outer: &Ring) -> Option<bool> {
     let margin = 2;
-    if hole_box.0 > outer_box.2 + margin
-        || hole_box.2 < outer_box.0 - margin
-        || hole_box.1 > outer_box.3 + margin
-        || hole_box.3 < outer_box.1 - margin
-    {
+    let shifts: Vec<i64> = ALIGNMENTS
+        .into_iter()
+        .filter(|&k| boxes_meet(outer.bbox, hole.bbox, k, margin))
+        .collect();
+    if shifts.is_empty() {
         return Some(false);
     }
-    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-    for i in 0..outer.len() {
-        let (a, b) = (outer[i], outer[(i + 1) % outer.len()]);
-        for key in edge_cells(a, b) {
+    let ring = &outer.pts;
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for i in 0..ring.len() - 1 {
+        for key in frame_cells(ring[i], ring[i + 1]) {
             grid.entry(key).or_default().push(i);
         }
     }
-    for i in 0..hole.len() {
-        let (c, d) = (hole[i], hole[(i + 1) % hole.len()]);
-        let mut checked = std::collections::HashSet::new();
-        for (r, k) in edge_cells(c, d) {
-            for dr in -1..=1 {
-                for dk in -1..=1 {
-                    for &e in grid.get(&(r + dr, k + dk)).into_iter().flatten() {
-                        if !checked.insert(e) {
-                            continue;
-                        }
-                        let (a, b) = (outer[e], outer[(e + 1) % outer.len()]);
-                        if segment_segment(a, b, c, d) < OWNERSHIP_CLEARANCE_E7 {
-                            return None;
+    for k in shifts {
+        let shift = |p: Fp| (p.0, p.1 + k);
+        for i in 0..hole.pts.len() - 1 {
+            let (c, d) = (shift(hole.pts[i]), shift(hole.pts[i + 1]));
+            let mut checked = std::collections::HashSet::new();
+            for (r, col) in frame_cells(c, d) {
+                for dr in -1..=1 {
+                    for dk in -1..=1 {
+                        for &e in grid.get(&(r + dr, col + dk)).into_iter().flatten() {
+                            if checked.insert(e)
+                                && segment_segment(ring[e], ring[e + 1], c, d)
+                                    < OWNERSHIP_CLEARANCE_E7
+                            {
+                                return None;
+                            }
                         }
                     }
                 }
             }
         }
     }
-    Some(inside(outer, f64::from(hole[0].0), f64::from(hole[0].1)))
+    let (y, x) = (hole.pts[0].0, lon::fold_e7(hole.pts[0].1));
+    let xs: Vec<i64> = if outer.wraps {
+        vec![x, x + TURN, x - TURN]
+    } else if x == HALF {
+        vec![x, -HALF]
+    } else {
+        vec![x]
+    };
+    Some(
+        xs.into_iter()
+            .any(|x| side_doubled(2 * y, 2 * x, ring) == Some(true)),
+    )
 }
 
 /// `|doubled area|` exactly.
-fn doubled_area(ring: &[Pt]) -> u128 {
+fn doubled_area(ring: &[Fp]) -> u128 {
     let n = ring.len();
     let mut sum: i128 = 0;
     for i in 0..n {
@@ -646,18 +858,33 @@ fn doubled_area(ring: &[Pt]) -> u128 {
 /// can store: the exact area widened by the accumulated rounding bound
 /// `n * W * H * gamma(2n + 1)` (each of the 2n products is at most `W * H`
 /// in magnitude), then by one f32 step either side for the cast.
-fn area_interval(ring: &[Pt], bbox: (i32, i32, i32, i32)) -> (f64, f64) {
+///
+/// An unwrapped ring is measured from degree coordinates, converted,
+/// lifted by turns and taken about its first vertex before the products, so
+/// each local coordinate carries an error of at most `DELTA_E7`; each of the
+/// 2n products then errs by up to `delta * (W + H) + delta^2` more, the
+/// products are bounded by the perturbed `(W + 2 delta) * (H + 2 delta)`, and
+/// the rescale from square degrees adds a relative rounding.
+fn area_interval(ring: &Ring) -> (f64, f64) {
+    /// A generous bound on one local degree coordinate's rounding, in
+    /// decimicrodegrees: under ten roundings of a value below 540 degrees.
+    const DELTA_E7: f64 = 540.0 * 1e7 * 10.0 * f64::EPSILON;
+    let bbox = ring.bbox;
     #[allow(clippy::cast_precision_loss)]
-    let exact = doubled_area(ring) as f64 / 2.0;
+    let exact = doubled_area(&ring.pts) as f64 / 2.0;
     #[allow(clippy::cast_precision_loss)]
-    let n = ring.len() as f64;
+    let n = ring.pts.len() as f64;
     let u = f64::EPSILON / 2.0;
     let k = 2.0 * n + 1.0;
     let gamma = k * u / (1.0 - k * u);
-    let w = f64::from(bbox.3) - f64::from(bbox.1);
-    let h = f64::from(bbox.2) - f64::from(bbox.0);
-    // The bound, the exact area's own rounding to f64, and outward slack.
-    let bound = (n * w * h * gamma + exact * 4.0 * u) * 1.000_001 + 1.0;
+    #[allow(clippy::cast_precision_loss)]
+    let (w, h) = ((bbox.3 - bbox.1) as f64, (bbox.2 - bbox.0) as f64);
+    let delta = if ring.wraps { DELTA_E7 } else { 0.0 };
+    let products = (w + 2.0 * delta) * (h + 2.0 * delta);
+    let coordinates = 2.0 * n * (delta * (w + h) + delta * delta);
+    // The bound, the exact area's own rounding to f64 and the rescale's, and
+    // outward slack.
+    let bound = (n * products * gamma + coordinates + exact * 6.0 * u) * 1.000_001 + 1.0;
     let (lo, hi) = ((exact - bound).max(0.0), exact + bound);
     #[allow(clippy::cast_possible_truncation)]
     let (lo32, hi32) = (lo as f32, hi as f32);
@@ -716,88 +943,73 @@ impl AdminModel {
             }
             if !located {
                 // The known coordinates do not bound the builder's rings.
-                let world = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+                let world = (i64::MIN / 4, i64::MIN / 4, i64::MAX / 4, i64::MAX / 4);
                 model.unmodelled.push((b.level, world));
                 model
                     .unmodelled_why
                     .push((r.id.to_string(), b.level, Unmodelled::Unlocated));
                 continue;
             }
-            let Some(member_box) = bbox_of(members.iter().flatten()) else {
-                continue;
-            };
-            for p in members.iter().flatten() {
-                if p.0.abs() > 850_000_000 || p.1.abs() > 1_700_000_000 {
-                    return Err(format!(
-                        "{}: boundary coordinate {p:?} is outside the modelled domain",
-                        r.id
-                    ));
-                }
-            }
-            // The reader unwraps a ring with an edge spanning half a turn of
-            // longitude; the model does not. Ring edges are member edges
-            // (rings close through shared endpoints), so checking members
-            // covers every ring, and the box of an unmodelled relation too.
-            for w in &members {
-                if let Some(pair) = w
-                    .windows(2)
-                    .find(|p| (i64::from(p[1].1) - i64::from(p[0].1)).abs() >= 1_800_000_000)
-                {
-                    return Err(format!(
-                        "{}: a boundary edge from {:?} to {:?} spans half a turn of longitude, \
-                         outside the modelled domain",
-                        r.id, pair[0], pair[1]
-                    ));
-                }
-            }
-            // The builder assembles the outer role, contributes nothing when
-            // it has no ring, and only then assembles the inner role; a
-            // refusal of either withholds the relation. No edge spans half
-            // a turn here, so the raw ring is the reader's frame.
-            let outcome = match role_rings(&outer_ways) {
-                RoleRings::Refused => RoleRings::Refused,
-                RoleRings::Rings(o) if o.is_empty() => continue,
-                outer => match (outer, role_rings(&inner_ways)) {
-                    (_, RoleRings::Refused) => RoleRings::Refused,
-                    (RoleRings::Rings(o), RoleRings::Rings(i)) => {
-                        model.add_polygons(&r.id, &b, o, &i);
-                        continue;
-                    }
-                    _ => RoleRings::Undecided,
-                },
-            };
-            match outcome {
-                RoleRings::Refused => model.withheld += 1,
-                _ => {
-                    model.unmodelled.push((b.level, member_box));
-                    model.unmodelled_why.push((
-                        r.id.to_string(),
-                        b.level,
-                        Unmodelled::UndecidedLobes,
-                    ));
-                }
-            }
+            model.assemble(&r.id, &b, &outer_ways, &inner_ways);
         }
         model.index_edges()?;
         Ok(model)
     }
 
+    /// The builder's order: the outer role assembles, contributes nothing
+    /// when it has no ring, and only then the inner role does; a refusal of
+    /// either withholds the relation, and so does any ring of either role
+    /// whose answer depends on where its walk starts, whatever an undecided
+    /// pair would have made of the rest. Only then does an undecided pair
+    /// leave every ring's box unjudged.
+    fn assemble(&mut self, id: &str, b: &Boundary, outer: &[Vec<Node>], inner: &[Vec<Node>]) {
+        let RoleRings::Rings {
+            rings: outers,
+            undecided: outer_undecided,
+        } = role_rings(outer)
+        else {
+            self.withheld += 1;
+            return;
+        };
+        if outers.is_empty() {
+            return;
+        }
+        let RoleRings::Rings {
+            rings: inners,
+            undecided: inner_undecided,
+        } = role_rings(inner)
+        else {
+            self.withheld += 1;
+            return;
+        };
+        if !outers.iter().chain(&inners).all(|r| r.invariant) {
+            self.withheld += 1;
+            return;
+        }
+        if outer_undecided || inner_undecided {
+            for ring in outers.iter().chain(&inners) {
+                self.unmodelled.push((b.level, ring.bbox));
+                self.unmodelled_why
+                    .push((id.to_owned(), b.level, Unmodelled::UndecidedLobes));
+            }
+            return;
+        }
+        self.add_polygons(id, b, outers, &inners);
+    }
+
     /// One polygon per assembled outer ring of `b`, with its decided holes.
-    fn add_polygons(&mut self, id: &str, b: &Boundary, outers: Vec<Vec<Pt>>, inners: &[Vec<Pt>]) {
+    fn add_polygons(&mut self, id: &str, b: &Boundary, outers: Vec<Ring>, inners: &[Ring]) {
         let mut undecided = vec![false; inners.len()];
         for outer in outers {
-            let Some(bbox) = bbox_of(outer.iter()) else {
-                continue;
-            };
             let mut holes = Vec::new();
             for (h, hole) in inners.iter().enumerate() {
-                match owned(hole, &outer, bbox) {
+                match owned(hole, &outer) {
                     Some(true) => holes.push(hole.clone()),
                     Some(false) => {}
                     None => undecided[h] = true,
                 }
             }
-            let area = area_interval(&outer, bbox);
+            let area = area_interval(&outer);
             self.polygons.push(Polygon {
                 level: b.level,
                 name: b.name.clone(),
@@ -805,7 +1017,6 @@ impl AdminModel {
                 outer,
                 holes,
                 area,
-                bbox,
             });
         }
         // A hole whose ownership by some outer is undecided is left out of
@@ -814,11 +1025,9 @@ impl AdminModel {
         // unjudged at the level. Ownership changes no ring and no stored
         // area, and every decided attachment stands.
         for (hole, _) in inners.iter().zip(&undecided).filter(|(_, u)| **u) {
-            if let Some(hole_box) = bbox_of(hole.iter()) {
-                self.unmodelled.push((b.level, hole_box));
-                self.unmodelled_why
-                    .push((id.to_owned(), b.level, Unmodelled::HoleClearance));
-            }
+            self.unmodelled.push((b.level, hole.bbox));
+            self.unmodelled_why
+                .push((id.to_owned(), b.level, Unmodelled::HoleClearance));
         }
     }
 
@@ -826,8 +1035,8 @@ impl AdminModel {
         for (p, polygon) in self.polygons.iter().enumerate() {
             let p = u32::try_from(p).map_err(|_| "too many polygons")?;
             for ring in std::iter::once(&polygon.outer).chain(&polygon.holes) {
-                for i in 0..ring.len() {
-                    let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+                for w in ring.pts.windows(2) {
+                    let (a, b) = (w[0], w[1]);
                     let n = u32::try_from(self.edges.len()).map_err(|_| "too many edges")?;
                     for key in edge_cells(a, b) {
                         self.edge_cells.entry(key).or_default().push(n);
@@ -839,36 +1048,69 @@ impl AdminModel {
         Ok(())
     }
 
-    /// The polygons with an edge within `band_m` of the query.
-    fn near_edges(&self, lat: f64, lon: f64, band_m: f64) -> std::collections::HashSet<u32> {
+    /// The polygons with an edge within `band_m` of the query, measured
+    /// over the query's images a turn apart.
+    pub(super) fn near_edges(
+        &self,
+        lat: f64,
+        lon: f64,
+        band_m: f64,
+    ) -> std::collections::HashSet<u32> {
+        #[allow(clippy::cast_precision_loss)]
+        let (turn, half) = (TURN as f64, HALF as f64);
         let (y, x) = (lat * 1e7, lon * 1e7);
         let cos = lat.to_radians().cos();
         let to_m = 1e-7_f64.to_radians() * EARTH_RADIUS_M;
-        #[allow(clippy::cast_possible_truncation)]
-        let (r, c) = (
-            (y.floor() as i32).div_euclid(EDGE_GRID_E7),
-            (x.floor() as i32).div_euclid(EDGE_GRID_E7),
-        );
+        let band_lat = (band_m / EARTH_RADIUS_M).to_degrees() * 1e7;
+        let band_lon = if cos > 0.0 {
+            band_lat / cos
+        } else {
+            f64::INFINITY
+        };
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let index = |v: f64| (v / EDGE_GRID_E7 as f64).floor() as i64;
+        let rows = index(y - band_lat) - 1..=index(y + band_lat) + 1;
+        let cols = if band_lon >= half {
+            (0..EDGE_COLUMNS).collect()
+        } else {
+            lon::columns(
+                index(x - band_lon) - 1,
+                index(x + band_lon) + 1,
+                EDGE_COLUMNS,
+            )
+        };
         let mut near = std::collections::HashSet::new();
-        for dr in -1..=1 {
-            for dc in -1..=1 {
-                for &e in self.edge_cells.get(&(r + dr, c + dc)).into_iter().flatten() {
+        let keys = rows
+            .flat_map(|r| cols.iter().map(move |&c| (r, c)))
+            .chain(std::iter::once(EVERYWHERE));
+        {
+            for key in keys {
+                for &e in self.edge_cells.get(&key).into_iter().flatten() {
                     let (p, a, b) = self.edges[e as usize];
                     if near.contains(&p) {
                         continue;
                     }
-                    // The flat frame at the query: longitude scaled by its
-                    // cosine.
-                    let (ax, ay) = ((f64::from(a.1) - x) * cos, f64::from(a.0) - y);
-                    let (bx, by) = ((f64::from(b.1) - x) * cos, f64::from(b.0) - y);
-                    let (dx, dy) = (bx - ax, by - ay);
-                    let len = dx * dx + dy * dy;
-                    let t = if len == 0.0 {
-                        0.0
-                    } else {
-                        (-(ax * dx + ay * dy) / len).clamp(0.0, 1.0)
-                    };
-                    let d = ((ax + t * dx).powi(2) + (ay + t * dy).powi(2)).sqrt() * to_m;
+                    #[allow(clippy::cast_precision_loss)]
+                    let (a, b) = ((a.0 as f64, a.1 as f64), (b.0 as f64, b.1 as f64));
+                    // The query's image nearest `a`, and one a turn either way.
+                    let near_x = a.1 + ((x - a.1 + half).rem_euclid(turn) - half);
+                    let d = [near_x, near_x + turn, near_x - turn]
+                        .into_iter()
+                        .map(|qx| {
+                            // The flat frame at the query: longitude scaled
+                            // by its cosine.
+                            let (ax, ay) = ((a.1 - qx) * cos, a.0 - y);
+                            let (bx, by) = ((b.1 - qx) * cos, b.0 - y);
+                            let (dx, dy) = (bx - ax, by - ay);
+                            let len = dx * dx + dy * dy;
+                            let t = if len == 0.0 {
+                                0.0
+                            } else {
+                                (-(ax * dx + ay * dy) / len).clamp(0.0, 1.0)
+                            };
+                            ((ax + t * dx).powi(2) + (ay + t * dy).powi(2)).sqrt() * to_m
+                        })
+                        .fold(f64::INFINITY, f64::min);
                     if d <= band_m {
                         near.insert(p);
                     }
@@ -884,12 +1126,20 @@ impl AdminModel {
         let (y, x) = (lat * 1e7, lon * 1e7);
         // The band and a unit, in decimicrodegrees of each axis.
         let band_lat = (band_m / EARTH_RADIUS_M).to_degrees() * 1e7 + 2.0;
-        let band_lon = band_lat / lat.to_radians().cos();
-        let in_box = |b: (i32, i32, i32, i32)| {
-            y >= f64::from(b.0) - band_lat
-                && y <= f64::from(b.2) + band_lat
-                && x >= f64::from(b.1) - band_lon
-                && x <= f64::from(b.3) + band_lon
+        let cos = lat.to_radians().cos();
+        let band_lon = if cos > 0.0 {
+            band_lat / cos
+        } else {
+            f64::INFINITY
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let in_box = |b: Bbox| {
+            y >= b.0 as f64 - band_lat
+                && y <= b.2 as f64 + band_lat
+                && ALIGNMENTS.iter().any(|&k| {
+                    let x = x + k as f64;
+                    x >= b.1 as f64 - band_lon && x <= b.3 as f64 + band_lon
+                })
         };
         // Per level: unjudged, boxed, a hole excluded the query, containing.
         let mut unjudged = [false; 12];
@@ -903,7 +1153,7 @@ impl AdminModel {
         }
         for (p, polygon) in self.polygons.iter().enumerate() {
             let level = usize::from(polygon.level);
-            if unjudged[level] || !in_box(polygon.bbox) {
+            if unjudged[level] || !in_box(polygon.outer.bbox) {
                 continue;
             }
             boxed[level] = true;
@@ -912,10 +1162,10 @@ impl AdminModel {
                 unjudged[level] = true;
                 continue;
             }
-            if !inside(&polygon.outer, y, x) {
+            if !polygon.outer.contains(y, x) {
                 continue;
             }
-            if polygon.holes.iter().any(|h| inside(h, y, x)) {
+            if polygon.holes.iter().any(|h| h.contains(y, x)) {
                 in_hole[level] = true;
                 continue;
             }
@@ -939,6 +1189,212 @@ impl AdminModel {
             };
         }
         out
+    }
+}
+
+/// A frame point back in query coordinates, folded, as `(lat, lon)`
+/// decimicrodegrees.
+#[allow(clippy::cast_possible_truncation)]
+fn folded(p: Fp) -> Pt {
+    (p.0 as i32, lon::fold_e7(p.1) as i32)
+}
+
+/// The proper crossing of segments `a`-`b` and `c`-`d`, if they cross.
+#[allow(clippy::cast_precision_loss)]
+fn crossing(a: Fp, b: Fp, c: Fp, d: Fp) -> Option<(f64, f64)> {
+    if !(orient(a, b, c) * orient(a, b, d) < 0 && orient(c, d, a) * orient(c, d, b) < 0) {
+        return None;
+    }
+    let f = |p: Fp| (p.0 as f64, p.1 as f64);
+    let (a, b, c, d) = (f(a), f(b), f(c), f(d));
+    let den = (b.1 - a.1) * (d.0 - c.0) - (b.0 - a.0) * (d.1 - c.1);
+    let t = ((c.1 - a.1) * (d.0 - c.0) - (c.0 - a.0) * (d.1 - c.1)) / den;
+    Some((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)))
+}
+
+impl AdminModel {
+    /// The vertices admin witnesses are drawn near: every hole vertex and
+    /// every 64th of an outer's (at least one each), folded.
+    pub(super) fn witness_vertices(&self) -> Vec<Pt> {
+        self.polygons
+            .iter()
+            .flat_map(|p| {
+                p.holes
+                    .iter()
+                    .flat_map(|h| h.pts.iter())
+                    .chain(p.outer.pts.iter().step_by((p.outer.pts.len() / 64).max(1)))
+            })
+            .map(|&p| folded(p))
+            .collect()
+    }
+
+    /// Seed sites where two polygons of one level may overlap, in decimal
+    /// degrees, and how many pairs were looked at.
+    fn overlap_seeds(&self) -> (Vec<(f64, f64)>, usize) {
+        #[allow(clippy::cast_precision_loss)]
+        let deg = |lat: f64, lon: f64| (lat * 1e-7, lon::fold_deg(lon * 1e-7));
+        let mut seeds = Vec::new();
+        let mut pairs = std::collections::HashSet::new();
+        for level in LEVELS {
+            let mut of: Vec<usize> = (0..self.polygons.len())
+                .filter(|&i| self.polygons[i].level == level)
+                .collect();
+            of.sort_by_key(|&i| self.polygons[i].outer.bbox.0);
+            for (n, &i) in of.iter().enumerate() {
+                let a = &self.polygons[i].outer;
+                for &j in &of[n + 1..] {
+                    let b = &self.polygons[j].outer;
+                    if b.bbox.0 > a.bbox.2 {
+                        break;
+                    }
+                    for k in ALIGNMENTS {
+                        if !boxes_meet(a.bbox, b.bbox, k, 0) {
+                            continue;
+                        }
+                        pairs.insert((i, j));
+                        let shift = |p: Fp| (p.0, p.1 + k);
+                        // Points of the boxes' intersection inside both
+                        // outers: these find overlaps along shared lines,
+                        // where nothing crosses and no vertex is inside.
+                        let b_pts: Vec<Fp> = b.pts.iter().map(|&p| shift(p)).collect();
+                        let lo = (a.bbox.0.max(b.bbox.0), a.bbox.1.max(b.bbox.1 + k));
+                        let hi = (a.bbox.2.min(b.bbox.2), a.bbox.3.min(b.bbox.3 + k));
+                        #[allow(clippy::cast_precision_loss)]
+                        for (u, v) in [
+                            (0.5, 0.5),
+                            (0.25, 0.25),
+                            (0.25, 0.75),
+                            (0.75, 0.25),
+                            (0.75, 0.75),
+                        ] {
+                            let (y, x) = (
+                                lo.0 as f64 + u * (hi.0 - lo.0) as f64,
+                                lo.1 as f64 + v * (hi.1 - lo.1) as f64,
+                            );
+                            if inside(&a.pts, y, x) && inside(&b_pts, y, x) {
+                                seeds.push(deg(y, x));
+                            }
+                        }
+                        // A vertex of either strictly inside the other: a
+                        // few spread over each ring, those inside the
+                        // other's box only, since each test walks a ring.
+                        let b_box = (b.bbox.0, b.bbox.1 + k, b.bbox.2, b.bbox.3 + k);
+                        for (pts, other, other_box) in
+                            [(&a.pts, &b_pts, b_box), (&b_pts, &a.pts, a.bbox)]
+                        {
+                            let step = (pts.len() / 4).max(1);
+                            let hit = pts.iter().step_by(step).find(|p| {
+                                p.0 > other_box.0
+                                    && p.0 < other_box.2
+                                    && p.1 > other_box.1
+                                    && p.1 < other_box.3
+                                    && side_doubled(2 * p.0, 2 * p.1, other) == Some(true)
+                            });
+                            #[allow(clippy::cast_precision_loss)]
+                            if let Some(&p) = hit {
+                                seeds.push(deg(p.0 as f64, p.1 as f64));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.crossing_seeds(&mut seeds);
+        // The cells are a hash map: order the seeds so the draw is fixed.
+        seeds.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        seeds.dedup();
+        (seeds, pairs.len())
+    }
+
+    /// Proper crossings between edges of two polygons of one level that
+    /// share a grid cell, the second aligned to the first, in degrees.
+    fn crossing_seeds(&self, seeds: &mut Vec<(f64, f64)>) {
+        let deg = |lat: f64, lon: f64| (lat * 1e-7, lon::fold_deg(lon * 1e-7));
+        // An edge two polygons share (neighbours share their border as a
+        // rule) crosses nothing the other's own edges do not, so shared
+        // edges are left out before the pairs are tried.
+        let level_of = |e: u32| self.polygons[self.edges[e as usize].0 as usize].level;
+        let segment = |e: u32| {
+            let (_, a, b) = self.edges[e as usize];
+            (level_of(e), a.min(b), a.max(b))
+        };
+        for list in self.edge_cells.values() {
+            let mut owners: HashMap<(u8, Fp, Fp), (u32, bool)> = HashMap::new();
+            for &e in list {
+                let p = self.edges[e as usize].0;
+                owners
+                    .entry(segment(e))
+                    .and_modify(|(first, shared)| *shared |= *first != p)
+                    .or_insert((p, false));
+            }
+            let mut list: Vec<u32> = list
+                .iter()
+                .copied()
+                .filter(|&e| !owners[&segment(e)].1)
+                .collect();
+            list.sort_by_key(|&e| level_of(e));
+            for (n, &e) in list.iter().enumerate() {
+                let (p, a, b) = self.edges[e as usize];
+                for &f in &list[n + 1..] {
+                    if level_of(f) != level_of(e) {
+                        break;
+                    }
+                    let (q, c, d) = self.edges[f as usize];
+                    if p == q {
+                        continue;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let k = ((a.1 + b.1 - c.1 - d.1) as f64 / (2.0 * TURN as f64)).round();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let k = k as i64 * TURN;
+                    if let Some((y, x)) = crossing(a, b, (c.0, c.1 + k), (d.0, d.1 + k)) {
+                        seeds.push(deg(y, x));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Witnesses near the overlap seeds, drawn from `draw`, each kept only
+    /// where the model alone, at the non-zero tolerance's band, finds two
+    /// or more containing areas of a level with one certified larger than
+    /// another.
+    pub(super) fn overlap_witnesses(&self, draw: &mut Draw) -> (Vec<(f64, f64)>, OverlapAccount) {
+        let (seeds, pairs) = self.overlap_seeds();
+        let mut account = OverlapAccount {
+            pairs,
+            seeds: seeds.len(),
+            kept: 0,
+        };
+        let mut out = Vec::new();
+        if seeds.is_empty() {
+            return (out, account);
+        }
+        for _ in 0..GEOCODE_OVERLAP_ATTEMPTS {
+            if out.len() >= GEOCODE_OVERLAP_WITNESSES {
+                break;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let (lat, lon) = seeds[(draw.next() % seeds.len() as u64) as usize];
+            let reach = draw.unit() * GEOCODE_ADMIN_WITNESS_REACH_M;
+            let bearing = draw.unit() * std::f64::consts::TAU;
+            let (lat, lon) = lon::destination(lat, lon, reach / EARTH_RADIUS_M, bearing);
+            let (_, lat, lon) = super::point(lat, lon);
+            let expect = self.expect(lat, lon, TOLERANCE_BAND_M);
+            let competing = expect.levels.iter().any(|l| match l {
+                Level::Some { candidates, .. } => candidates.iter().any(|&i| {
+                    candidates
+                        .iter()
+                        .any(|&j| self.polygons[i].area.1 < self.polygons[j].area.0)
+                }),
+                _ => false,
+            });
+            if competing {
+                out.push((lat, lon));
+            }
+        }
+        account.kept = out.len();
+        (out, account)
     }
 }
 
@@ -971,6 +1427,11 @@ pub(super) struct AdminTally {
     pub(super) empty_boxed: usize,
     pub(super) in_owned_hole: usize,
     pub(super) several: usize,
+    /// Judged answers with some other containing candidate certified
+    /// larger (its least possible area above the answer's greatest).
+    pub(super) ruled_out: usize,
+    /// Judged answers certified smaller than every other candidate.
+    pub(super) unique: usize,
     pub(super) postal: usize,
     pub(super) country_code: usize,
     pub(super) unjudged: usize,
@@ -1082,6 +1543,15 @@ impl AdminModel {
                     tally.containing += 1;
                     if candidates.len() > 1 {
                         tally.several += 1;
+                        let larger = |j: &usize| {
+                            *j != i && self.polygons[i].area.1 < self.polygons[*j].area.0
+                        };
+                        if candidates.iter().any(larger) {
+                            tally.ruled_out += 1;
+                        }
+                        if candidates.iter().filter(|&&j| j != i).all(larger) {
+                            tally.unique += 1;
+                        }
                     }
                     if *in_hole {
                         tally.in_owned_hole += 1;
@@ -1143,7 +1613,10 @@ mod tests {
     /// The ring count, or the outcome when there are no rings to count.
     fn count(list: &[&[i64]], at: impl Fn(i64) -> Pt) -> Result<usize, String> {
         match role_rings(&members(list, at)) {
-            RoleRings::Rings(r) => Ok(r.len()),
+            RoleRings::Rings {
+                rings,
+                undecided: false,
+            } => Ok(rings.len()),
             other => Err(format!("{other:?}")),
         }
     }
@@ -1260,7 +1733,7 @@ mod tests {
         ));
         // Closed members are graphs of their own: never compared.
         assert!(
-            matches!(r, RoleRings::Rings(ref v) if v.len() == 2),
+            matches!(r, RoleRings::Rings { ref rings, undecided: false } if rings.len() == 2),
             "{r:?}"
         );
         let r = role_rings(&members(
@@ -1277,7 +1750,16 @@ mod tests {
             ],
             at,
         ));
-        assert!(matches!(r, RoleRings::Undecided), "{r:?}");
+        assert!(
+            matches!(
+                r,
+                RoleRings::Rings {
+                    undecided: true,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
     }
 
     #[test]
@@ -1407,12 +1889,12 @@ mod tests {
 
     #[test]
     fn hole_ownership_needs_clearance() {
-        let outer = square(0, 0, 100);
-        let b = bbox_of(outer.iter()).unwrap();
-        assert_eq!(owned(&square(10, 10, 10), &outer, b), Some(true));
-        assert_eq!(owned(&square(200, 200, 10), &outer, b), Some(false));
+        let r = |s: Vec<Pt>| Ring::new(&s);
+        let outer = r(square(0, 0, 100));
+        assert_eq!(owned(&r(square(10, 10, 10)), &outer), Some(true));
+        assert_eq!(owned(&r(square(200, 200, 10)), &outer), Some(false));
         // Sharing the outer's corner: undecided.
-        assert_eq!(owned(&square(0, 0, 10), &outer, b), None);
+        assert_eq!(owned(&r(square(0, 0, 10)), &outer), None);
     }
 
     #[test]
@@ -1465,13 +1947,118 @@ mod tests {
 
     #[test]
     fn the_area_interval_holds_the_exact_area() {
-        let ring = square(550_000_000, 120_000_000, 1_000_000);
-        let b = bbox_of(ring.iter()).unwrap();
-        let (lo, hi) = area_interval(&ring, b);
+        let (lo, hi) = area_interval(&Ring::new(&square(550_000_000, 120_000_000, 1_000_000)));
         let exact = 1e12;
         assert!(lo <= exact && exact <= hi, "{lo} {hi}");
         #[allow(clippy::cast_possible_truncation)]
         let stored = f64::from(exact as f32);
         assert!(lo <= stored && stored <= hi);
+    }
+
+    /// A ring across the antimeridian, closed in `(lat, lon)`.
+    fn seam_ring(lat: i32, height: i32, east: i32) -> Vec<Pt> {
+        vec![
+            (lat, east),
+            (lat, -east),
+            (lat + height, -east),
+            (lat + height, east),
+            (lat, east),
+        ]
+    }
+
+    #[test]
+    fn rings_across_the_antimeridian_are_judged_unwrapped() {
+        let seam = Ring::new(&seam_ring(0, 1_000_000, 1_799_000_000));
+        assert!(seam.wraps && seam.invariant);
+        assert!(seam.contains(500_000.0, 1_799_500_000.0));
+        assert!(seam.contains(500_000.0, -1_799_500_000.0));
+        assert!(seam.contains(500_000.0, 1_800_000_000.0));
+        assert!(!seam.contains(500_000.0, 0.0));
+        // The unwrapped area is the ring's own, not the rest of the world's.
+        let (lo, hi) = area_interval(&seam);
+        assert!(lo <= 2e12 && 2e12 <= hi, "{lo} {hi}");
+        // A ring touching the antimeridian from the east does not unwrap.
+        assert!(!Ring::new(&square(0, -1_800_000_000, 1_000_000)).wraps);
+        // A ring winding round a pole and one with a half-turn edge depend
+        // on where their walk starts.
+        let winding = [
+            (800_000_000, 0),
+            (800_000_000, 1_200_000_000),
+            (800_000_000, -1_200_000_000),
+            (800_000_000, 0),
+        ];
+        assert!(!start_invariant(&winding));
+        assert!(!start_invariant(&[
+            (0, 0),
+            (0, 1_800_000_000),
+            (10, 0),
+            (0, 0)
+        ]));
+    }
+
+    #[test]
+    fn an_owned_hole_across_the_antimeridian_is_decided() {
+        let outer = Ring::new(&seam_ring(0, 1_000_000, 1_790_000_000));
+        let hole = Ring::new(&seam_ring(400_000, 200_000, 1_799_000_000));
+        assert_eq!(owned(&hole, &outer), Some(true));
+        // Lifted from its western side, the same hole is the same answer.
+        let mut west = seam_ring(400_000, 200_000, 1_799_000_000);
+        west.rotate_left(1);
+        let last = west[0];
+        west[4] = last;
+        assert_eq!(owned(&Ring::new(&west), &outer), Some(true));
+        let far = Ring::new(&square(400_000, 0, 200_000));
+        assert_eq!(owned(&far, &outer), Some(false));
+    }
+
+    /// A midpoint on the antimeridian against a ring that does not unwrap:
+    /// one spelling is on its edge, the other outside, so the walk's start
+    /// decides and the verdict is undecided.
+    #[test]
+    fn a_seam_midpoint_whose_spelling_decides_is_undecided() {
+        let a = Ring::new(&seam_ring(0, 1_000_000, 1_799_000_000));
+        let a_ids = [1, 2, 3, 4];
+        let b = Ring::new(&square(-500_000, -1_800_000_000, 900_000));
+        let b_ids = [11, 12, 13, 14];
+        assert_eq!(outside_by_midpoints(&a_ids, &a, &b_ids, &b), None);
+        // Clear of the edge, both spellings agree.
+        let c = Ring::new(&square(-5_000_000, -1_700_000_000, 1_000_000));
+        assert_eq!(outside_by_midpoints(&a_ids, &a, &b_ids, &c), Some(true));
+    }
+
+    /// Two areas of one level overlapping along collinear edges, with no
+    /// proper crossing and no vertex strictly inside the other, are still
+    /// found, and every witness kept has the larger certified larger.
+    #[test]
+    fn a_collinear_overlap_is_witnessed() {
+        let record = |line: &str| super::super::parse_record(line).unwrap().into_owned();
+        let rect = |lon: i32, width: i32| {
+            vec![
+                (0, lon),
+                (0, lon + width),
+                (1_000_000, lon + width),
+                (1_000_000, lon),
+                (0, lon),
+            ]
+        };
+        let mut ways = HashMap::new();
+        ways.insert(1, way(&ids(1, &rect(0, 2_000_000))));
+        ways.insert(2, way(&ids(11, &rect(1_000_000, 3_000_000))));
+        let relations = [
+            record("r1 v1 Tboundary=administrative,admin_level=8,name=A Mw1@outer"),
+            record("r2 v1 Tboundary=administrative,admin_level=8,name=B Mw2@outer"),
+        ];
+        let model = AdminModel::build(&relations, &ways, &NodeRecords::new()).unwrap();
+        let (points, account) = model.overlap_witnesses(&mut Draw(1));
+        assert_eq!(account.pairs, 1);
+        assert!(!points.is_empty(), "{account:?}");
+        for (lat, lon) in points {
+            let Level::Some { candidates, .. } =
+                &model.expect(lat, lon, TOLERANCE_BAND_M).levels[8]
+            else {
+                panic!("{lat} {lon}");
+            };
+            assert_eq!(candidates.len(), 2);
+        }
     }
 }

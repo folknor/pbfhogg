@@ -197,6 +197,13 @@ struct DiffArgs {
     osc: Option<PathBuf>,
 }
 
+/// A check that builds its own input: no dataset, only the I/O choice.
+#[derive(ClapArgs)]
+struct FixtureArgs {
+    #[arg(long)]
+    direct_io: bool,
+}
+
 #[derive(ClapArgs)]
 struct RenumberArgs {
     #[command(flatten)]
@@ -226,6 +233,8 @@ enum Check {
     InspectTags(PbfArgs),
     /// Check geocode-query address, street, interpolation and admin answers against an input model
     Geocode(PbfArgs),
+    /// The geocode check on a fixed fixture across the antimeridian and past 85 degrees of latitude
+    GeocodeSeam(FixtureArgs),
     MergeChanges(MergeArgs),
     Getparents(PbfArgs),
     #[command(alias = "getid")]
@@ -438,6 +447,10 @@ fn execute(args: &Args, mut life: process::Lifecycle) -> Result<ExitCode, Error>
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per check; the arms that need more live in their own dispatch functions"
+)]
 fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Error> {
     match check {
         Check::CleanReferences => Err(Error::tool(
@@ -459,6 +472,7 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
             })?))
         }
         Check::TagsFilter(args) => dispatch_tags(b, h, args),
+        Check::GeocodeSeam(args) => seam(h, args.direct_io),
         Check::MergeChanges(args) => dispatch_merge(b, h, args),
         Check::ApplyChanges(args) => dispatch_apply(b, h, args),
         Check::Sort(pbf) => {
@@ -539,6 +553,13 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
         }
         Check::All(suite) => dispatch_all(b, h, suite),
     }
+}
+
+/// The geocode check on its own seam fixture: no input to resolve.
+fn seam(h: &mut Harness, direct_io: bool) -> Result<Ending, Error> {
+    Ok(Ending::Single(h.run_check("geocode-seam", |h| {
+        checks::geocode::seam::run(h, direct_io)
+    })?))
 }
 
 /// The name and entry point of a check that reads one PBF.
@@ -793,6 +814,12 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(["x", name, "--input", "fixture.pbf"]).is_ok());
         }
+        // A check that builds its own input takes none.
+        assert!(Args::try_parse_from(["x", "geocode-seam", "--direct-io"]).is_ok());
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "geocode-seam", "--input", "fixture.pbf"]),
+            "unexpected argument '--input' found",
+        );
         for mode in ["sparse", "external", "all"] {
             assert!(Args::try_parse_from(["x", "add-locations-to-ways", "--mode", mode]).is_ok());
         }

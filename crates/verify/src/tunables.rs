@@ -133,3 +133,14 @@ pub(crate) const GEOCODE_ADMIN_EXACT_BAND_M: f64 = 1e-3;
 pub(crate) const GEOCODE_ADMIN_WITNESSES: usize = 600;
 /// Geocode check: farthest an admin witness is placed from its vertex (meters).
 pub(crate) const GEOCODE_ADMIN_WITNESS_REACH_M: f64 = 300.0;
+/// Geocode check: same-level overlap witnesses kept, each a point the model
+/// finds inside two areas of one level with one certified larger.
+pub(crate) const GEOCODE_OVERLAP_WITNESSES: usize = 300;
+/// Geocode check: candidate overlap witness points tried before giving up.
+/// Each costs one admin expectation, a scan of every polygon's box.
+pub(crate) const GEOCODE_OVERLAP_ATTEMPTS: usize = 6000;
+/// Geocode check: total length (radians) under which the reader leaves an
+/// interpolation range unusable, mirrored so the model expects no answer
+/// from one (pbfhogg's `INTERP_MIN_TOTAL_LEN`; the verifier links no
+/// pbfhogg code, so the value is restated here).
+pub(crate) const GEOCODE_INTERP_MIN_TOTAL_LEN: f64 = 1e-15;

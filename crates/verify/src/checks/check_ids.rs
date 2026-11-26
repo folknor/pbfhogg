@@ -367,18 +367,20 @@ fn fixture_case(
 
 /// Write `opl` as `<stem>.opl`, convert it with osmium to `<stem>.osm.pbf`
 /// (no indexdata), and rewrite that with pbfhogg cat to
-/// `<stem>-indexed.osm.pbf`. Returns both PBFs.
-fn build_fixture(
+/// `<stem>-indexed.osm.pbf`. Returns both PBFs. `label` names the osmium
+/// run.
+pub(crate) fn build_fixture(
     harness: &mut Harness,
     outdir: &Path,
     stem: &str,
     opl: &str,
+    label: &str,
 ) -> Result<(PathBuf, PathBuf), Error> {
     let source = outdir.join(format!("{stem}.opl"));
     std::fs::write(&source, opl)?;
     let unindexed = outdir.join(format!("{stem}.osm.pbf"));
     let captured = harness.reference(
-        &ToolRun::osmium("check-ids-fixture.1")
+        &ToolRun::osmium(label)
             .arg("cat")
             .input(&source, Origin::Other)
             .arg("-o")
@@ -486,9 +488,11 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     ));
 
     harness.msg("--- check --ids: building the fixed fixtures ---");
-    let (inversion, inversion_indexed) = build_fixture(harness, &outdir, "inversion", INVERSION)?;
-    let (repeat, repeat_indexed) = build_fixture(harness, &outdir, "repeat", REPEAT)?;
-    let (_, empty_claim) = build_fixture(harness, &outdir, "empty-claim", ORDERED)?;
+    let label = "check-ids-fixture.1";
+    let (inversion, inversion_indexed) =
+        build_fixture(harness, &outdir, "inversion", INVERSION, label)?;
+    let (repeat, repeat_indexed) = build_fixture(harness, &outdir, "repeat", REPEAT, label)?;
+    let (_, empty_claim) = build_fixture(harness, &outdir, "empty-claim", ORDERED, label)?;
     // pbfhogg cat wrote the file and the verifier appends to it: its framing
     // is held as pbfhogg's before the append, as the verifier's after. Only
     // the framing is held before: a payload defect pbfhogg cat wrote would

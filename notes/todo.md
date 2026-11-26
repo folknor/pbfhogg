@@ -430,18 +430,14 @@ cells land. This section tracks the remaining axes and dataset gaps.
   snapshot-range axis is a single pairing. Downloading another
   snapshot 2-4 weeks away would let us measure diff-wall vs
   snapshot-delta-size empirically.
-- [ ] **No real dataset crosses the antimeridian (brokkr#138).** Denmark
-  was byte-identical across four antimeridian fixes in the geocode
-  builder, so the real-data gate is blind to that defect class. Split on
-  2026-11-09, both halves now on pbfhogg: the dataset entry (Geofabrik
-  `australia-oceania/fiji` via `brokkr run --with pbfhogg pbfhogg-datasets -- download australia-oceania/fiji`, plus its
-  `brokkr.d/hosts` block) is our config. brokkr asked what queries an
-  index from the command line: `pbfhogg geocode-query INDEX POINTS` now
-  does (JSON lines, docs/cli/commands.md), and brokkr#138 was answered.
-  Real-data answers are judged by `pbfhogg-verify geocode` against an
-  osmium-derived model, but that model refuses data near the antimeridian,
-  so a Fiji dataset needs the model to unwrap longitude before it can
-  serve here.
+- [ ] **No real dataset crosses the antimeridian (bz pbfhogg#75).** The
+  geocode model is periodic in longitude and has no domain bound, and
+  `pbfhogg-verify geocode-seam` judges a fixed fixture across the seam and
+  past 85 degrees of latitude on every suite run. What real data would add
+  is breadth: a Fiji dataset (Geofabrik `australia-oceania/fiji` via
+  `brokkr run --with pbfhogg pbfhogg-datasets -- download australia-oceania/fiji`,
+  plus its `brokkr.d/hosts` block) judged by `geocode`, which needs Fiji
+  in the verifier's ELIGIBLE_DATASETS, the maintainer's call.
 
 ### Un-benched permutations (low priority)
 

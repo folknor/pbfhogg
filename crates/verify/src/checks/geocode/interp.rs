@@ -36,7 +36,8 @@
 
 use std::collections::HashMap;
 
-use super::{Address, cell, rad};
+use super::{Address, lon, path_cells, paths, rad, snap};
+use crate::tunables::GEOCODE_INTERP_MIN_TOTAL_LEN;
 
 /// How a way steps between its anchors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,11 +156,16 @@ impl Parent {
     }
 }
 
-/// The length of a segment in the contract's metric, radians.
-pub(super) fn segment_length(a: (i32, i32), b: (i32, i32)) -> f64 {
-    let dlat = rad(i64::from(b.0)) - rad(i64::from(a.0));
-    let dlon = (rad(i64::from(b.1)) - rad(i64::from(a.1))) * rad(i64::from(a.0)).cos();
+/// The length of a segment in the contract's metric, radians, longitude
+/// the shorter way round and scaled by the cosine of `a`'s latitude.
+pub(super) fn segment_length(a: (i32, i32), b: (i64, i64)) -> f64 {
+    let dlat = rad(b.0) - rad(i64::from(a.0));
+    let dlon = lon::wrap_rad(rad(b.1) - rad(i64::from(a.1))) * rad(i64::from(a.0)).cos();
     (dlat * dlat + dlon * dlon).sqrt()
+}
+
+fn widen(p: (i32, i32)) -> (i64, i64) {
+    (i64::from(p.0), i64::from(p.1))
 }
 
 /// What the ways resolve to: their sections, and how many were refused.
@@ -172,9 +178,11 @@ pub(super) struct Resolved {
 
 /// Resolve every way against the address points.
 pub(super) fn resolve(ways: &[RawWay], addresses: &[Address]) -> Resolved {
-    let mut at: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    // Keyed with the longitude folded: +180 and -180 are one meridian, so a
+    // way node and an address either side of that spelling meet.
+    let mut at: HashMap<(i32, i64), Vec<usize>> = HashMap::new();
     for (i, a) in addresses.iter().enumerate() {
-        at.entry((a.lat, a.lon)).or_default().push(i);
+        at.entry(key(a.lat, a.lon)).or_default().push(i);
     }
     let mut out = Resolved::default();
     for way in ways {
@@ -192,14 +200,23 @@ pub(super) fn resolve(ways: &[RawWay], addresses: &[Address]) -> Resolved {
     out
 }
 
+fn key(lat: i32, lon: i32) -> (i32, i64) {
+    (lat, lon::fold_e7(i64::from(lon)))
+}
+
 fn resolve_way(
     way: &RawWay,
     addresses: &[Address],
-    at: &HashMap<(i32, i32), Vec<usize>>,
+    at: &HashMap<(i32, i64), Vec<usize>>,
 ) -> Option<Vec<Section>> {
     let mode = way.mode?;
     let nodes: Vec<(i32, i32)> = way.nodes.iter().copied().collect::<Option<_>>()?;
-    let here = |node: (i32, i32)| at.get(&node).into_iter().flatten().map(|&i| &addresses[i]);
+    let here = |node: (i32, i32)| {
+        at.get(&key(node.0, node.1))
+            .into_iter()
+            .flatten()
+            .map(|&i| &addresses[i])
+    };
     let parent = match (&way.street, &way.place) {
         (Some(s), _) => Parent::Street(s.clone()),
         (None, Some(p)) => Parent::Place(p.clone()),
@@ -310,7 +327,7 @@ impl Section {
     fn new(parent: &Parent, mode: Mode, start: u32, end: u32, span: &[(i32, i32)]) -> Self {
         let mut along = vec![0.0];
         for pair in span.windows(2) {
-            along.push(along[along.len() - 1] + segment_length(pair[0], pair[1]));
+            along.push(along[along.len() - 1] + segment_length(pair[0], widen(pair[1])));
         }
         let (street, place) = match parent {
             Parent::Street(s) => (Some(s.clone()), None),
@@ -331,20 +348,20 @@ impl Section {
         self.along[self.along.len() - 1]
     }
 
-    /// Whether this section can answer (pbfhogg refuses a range of no length).
+    /// Whether this section can answer: pbfhogg leaves a range shorter than
+    /// a minimum total length unusable.
     pub(super) fn measurable(&self) -> bool {
-        self.total() > 0.0
+        self.total() >= GEOCODE_INTERP_MIN_TOTAL_LEN
     }
 
-    /// The answer of segment `index` at parameter `t` along it.
-    pub(super) fn answer(&self, index: usize, t: f64) -> InterpAnswer {
+    /// The answer of segment `index` at parameter `t` along its path `dlon`:
+    /// the position is measured to the snap as the reader reports it
+    /// (truncated and folded), from the segment's start, in the metric.
+    pub(super) fn answer(&self, index: usize, t: f64, dlon: i64) -> InterpAnswer {
         let (a, b) = (self.nodes[index], self.nodes[index + 1]);
-        let point = |p: i32, q: i32| f64::from(p) + t * (f64::from(q) - f64::from(p));
-        let (lat, lon) = (point(a.0, b.0), point(a.1, b.1));
-        let dlat = (lat - f64::from(a.0)) * 1e-7_f64.to_radians();
-        let dlon = (lon - f64::from(a.1)) * 1e-7_f64.to_radians() * rad(i64::from(a.0)).cos();
+        let snapped = snap(a, b.0, dlon, t);
         let total = self.total();
-        let f = (self.along[index] + (dlat * dlat + dlon * dlon).sqrt()) / total;
+        let f = (self.along[index] + segment_length(a, snapped)) / total;
         let reach = TRUNCATION_REACH_DEG.to_radians() / total + FRACTION_SLACK;
         let (x, y) = (
             self.mode.number_at(self.start, self.end, f - reach),
@@ -376,35 +393,30 @@ impl InterpAnswer {
 pub(super) struct InterpSegment {
     pub(super) section: u32,
     pub(super) index: u16,
+    /// The path's longitude extent, as a street segment's.
+    pub(super) dlon: i64,
 }
 
-/// The grid of every measurable section's segments, as the street model
-/// lists streets.
-pub(super) type Cells = HashMap<(i32, i32), Vec<u32>>;
-
-pub(super) fn grid(sections: &[Section]) -> Result<(Vec<InterpSegment>, Cells), String> {
+pub(super) fn grid(sections: &[Section]) -> Result<(Vec<InterpSegment>, super::Cells), String> {
     let mut segments = Vec::new();
-    let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+    let mut cells = super::Cells::new();
     for (s, section) in sections.iter().enumerate() {
         if !section.measurable() {
             continue;
         }
         for (i, pair) in section.nodes.windows(2).enumerate() {
             let (a, b) = (pair[0], pair[1]);
-            let n = u32::try_from(segments.len()).map_err(|_| "too many segments")?;
-            let (lo, hi) = (
-                cell(a.0.min(b.0), a.1.min(b.1)),
-                cell(a.0.max(b.0), a.1.max(b.1)),
-            );
-            for row in lo.0..=hi.0 {
-                for col in lo.1..=hi.1 {
-                    cells.entry((row, col)).or_default().push(n);
+            for dlon in paths(a, b) {
+                let n = u32::try_from(segments.len()).map_err(|_| "too many segments")?;
+                for key in path_cells(a, b.0, dlon) {
+                    cells.entry(key).or_default().push(n);
                 }
+                segments.push(InterpSegment {
+                    section: u32::try_from(s).map_err(|_| "too many sections")?,
+                    index: u16::try_from(i).map_err(|_| "interpolation way too long")?,
+                    dlon,
+                });
             }
-            segments.push(InterpSegment {
-                section: u32::try_from(s).map_err(|_| "too many sections")?,
-                index: u16::try_from(i).map_err(|_| "interpolation way too long")?,
-            });
         }
     }
     Ok((segments, cells))
@@ -509,7 +521,7 @@ mod tests {
         let s = &r.sections[0];
         let allowed = |t: f64| {
             (10..=20)
-                .filter(|&n| s.answer(0, t).allows(n))
+                .filter(|&n| s.answer(0, t, 0).allows(n))
                 .collect::<Vec<_>>()
         };
         assert_eq!(allowed(0.31), [13]);

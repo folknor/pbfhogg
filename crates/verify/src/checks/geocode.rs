@@ -29,8 +29,9 @@
 //! search radius: the fine radius answers everything within it and the
 //! coarse one is searched for a class with nothing there, so together they
 //! answer the nearest closer than either. The model finds candidates through
-//! a plain latitude/longitude grid that lists each segment under every cell
-//! its bounding box touches, with no S2 and no code of pbfhogg's, so a
+//! a plain latitude/longitude grid, its columns periodic, that lists each
+//! segment under every cell its framed bounding box touches, with no S2 and
+//! no code of pbfhogg's, so a
 //! record lost from the index's cells, a wrong coordinate or name, wrong
 //! pruning or a wrong fallback shows as a difference.
 //!
@@ -64,12 +65,7 @@
 //! object repeated in a decoding (the builder keeps the last occurrence in
 //! file order, osmium's sort orders repeats by version), an
 //! address or street way with a node osmium could not locate (the model
-//! would have to guess how the builder shortens it), any modelled
-//! coordinate within 10 degrees of the antimeridian or beyond 85 degrees of
-//! latitude (for a building address, any of its nodes as well as the mean), a
-//! building way spanning half a turn of longitude or more, and a street
-//! segment spanning half a turn of longitude or more
-//! (the model does not unwrap longitude; the reader takes the shorter way). libosmium cuts a string
+//! would have to guess how the builder shortens it). libosmium cuts a string
 //! at a NUL byte where pbfhogg answers it whole, so a tag value or a
 //! member role holding one
 //! is outside what this comparison can see; a FAIL naming such a value is
@@ -77,6 +73,15 @@
 //! across packed fields with an empty one last: libosmium keeps only the
 //! last segment, so the decoding shows a way pbfhogg reads with nodes as
 //! one with none, and a boundary listing it is withheld by the model only.
+//!
+//! Longitude is periodic, as the documented rules read it (`lon`): a
+//! difference is taken the shorter way round, every image of the query a
+//! turn apart that can be nearest is measured, each a candidate with its
+//! own snap, a segment of exactly half a turn is both half-world paths, a
+//! snap is folded with the antimeridian spelled +180, and a building is
+//! placed by the shorter-arc mean. No coordinate is outside the domain:
+//! `geocode-seam` judges the antimeridian and the high latitudes on a
+//! fixture, since no configured dataset reaches them.
 //!
 //! Queries are drawn from a fixed seed: uniform points over the extent of
 //! the modelled data, and witness points placed near modelled records,
@@ -89,6 +94,8 @@
 
 mod admin;
 mod interp;
+mod lon;
+pub(crate) mod seam;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -139,11 +146,28 @@ struct Address {
     postcode: Option<String>,
 }
 
+/// One path of a street segment: from `a`, `dlon` decimicrodegrees of
+/// longitude the shorter way round to `b`. A segment spanning exactly half a
+/// turn is both half-world paths, each its own candidate.
 #[derive(Debug, Clone, Copy)]
 struct Segment {
     name: u32,
     a: (i32, i32),
-    b: (i32, i32),
+    b_lat: i32,
+    dlon: i64,
+}
+
+/// Cell keys: a latitude row and a longitude column, columns periodic.
+type Cells = HashMap<(i64, i64), Vec<u32>>;
+
+/// The extent of the modelled coordinates in both longitude frames: raw, and
+/// with negative longitudes lifted by a turn. Queries are drawn over the
+/// narrower; that is a sampling choice, not a coverage claim.
+#[derive(Debug, Clone, Copy)]
+struct Extent {
+    lat: (i32, i32),
+    raw: (i64, i64),
+    lifted: (i64, i64),
 }
 
 #[derive(Default)]
@@ -151,14 +175,13 @@ struct Model {
     addresses: Vec<Address>,
     names: Vec<String>,
     segments: Vec<Segment>,
-    address_cells: HashMap<(i32, i32), Vec<u32>>,
-    segment_cells: HashMap<(i32, i32), Vec<u32>>,
-    /// `(min_lat, min_lon, max_lat, max_lon)` of every modelled coordinate.
-    extent: Option<(i32, i32, i32, i32)>,
+    address_cells: Cells,
+    segment_cells: Cells,
+    extent: Option<Extent>,
     interp_ways: Vec<interp::RawWay>,
     interp: interp::Resolved,
     interp_segments: Vec<interp::InterpSegment>,
-    interp_cells: HashMap<(i32, i32), Vec<u32>>,
+    interp_cells: Cells,
 }
 
 /// A street candidate's answer: its name and nearest point.
@@ -193,11 +216,53 @@ impl<T> Expect<T> {
     }
 }
 
-fn cell(lat: i32, lon: i32) -> (i32, i32) {
+/// Grid columns per turn of longitude.
+const GRID_COLUMNS: i64 = lon::TURN_E7 / GEOCODE_GRID_E7 as i64;
+
+fn cell(lat: i32, lon: i64) -> (i64, i64) {
+    let g = i64::from(GEOCODE_GRID_E7);
     (
-        lat.div_euclid(GEOCODE_GRID_E7),
-        lon.div_euclid(GEOCODE_GRID_E7),
+        i64::from(lat).div_euclid(g),
+        lon.div_euclid(g).rem_euclid(GRID_COLUMNS),
     )
+}
+
+/// Every cell a path from `a`, `dlon` the shorter way round, to latitude
+/// `b_lat` passes through: its framed bounding box, columns periodic.
+/// A path whose box covers more cells than this is listed under
+/// [`EVERYWHERE`] instead, so one long segment cannot fill the grid.
+const LONG_PATH_CELLS: i64 = 4096;
+
+/// The key every query's search reads: long paths.
+const EVERYWHERE: (i64, i64) = (i64::MIN, 0);
+
+pub(super) fn path_cells(a: (i32, i32), b_lat: i32, dlon: i64) -> Vec<(i64, i64)> {
+    let g = i64::from(GEOCODE_GRID_E7);
+    let (lon_a, lon_b) = (i64::from(a.1), i64::from(a.1) + dlon);
+    let rows = i64::from(a.0.min(b_lat)).div_euclid(g)..=i64::from(a.0.max(b_lat)).div_euclid(g);
+    let width =
+        (lon_a.max(lon_b).div_euclid(g) - lon_a.min(lon_b).div_euclid(g) + 1).min(GRID_COLUMNS);
+    if (rows.end() - rows.start() + 1) * width > LONG_PATH_CELLS {
+        return vec![EVERYWHERE];
+    }
+    let cols = lon::columns(
+        lon_a.min(lon_b).div_euclid(g),
+        lon_a.max(lon_b).div_euclid(g),
+        GRID_COLUMNS,
+    );
+    rows.flat_map(|r| cols.iter().map(move |&c| (r, c)))
+        .collect()
+}
+
+/// The paths of the segment `a`-`b` the reader measures: the shorter way
+/// round in longitude, both half-world paths at exactly half a turn.
+pub(super) fn paths(a: (i32, i32), b: (i32, i32)) -> Vec<i64> {
+    let d = lon::wrap_e7(i64::from(b.1) - i64::from(a.1));
+    if d == -lon::HALF_E7 {
+        vec![-lon::HALF_E7, lon::HALF_E7]
+    } else {
+        vec![d]
+    }
 }
 
 fn rad(e7: i64) -> f64 {
@@ -205,28 +270,24 @@ fn rad(e7: i64) -> f64 {
 }
 
 impl Model {
-    fn in_domain(lat: i32, lon: i32) -> Result<(), String> {
-        if lat.abs() > 850_000_000 || lon.abs() > 1_700_000_000 {
-            return Err(format!(
-                "coordinate {lat},{lon} (decimicrodegrees) is outside the modelled domain \
-                 (latitude within 85 degrees, longitude 10 degrees clear of the antimeridian)"
-            ));
-        }
-        Ok(())
-    }
-
-    fn widen(&mut self, lat: i32, lon: i32) -> Result<(), String> {
-        Self::in_domain(lat, lon)?;
-        let e = self.extent.get_or_insert((lat, lon, lat, lon));
-        *e = (e.0.min(lat), e.1.min(lon), e.2.max(lat), e.3.max(lon));
-        Ok(())
+    fn widen(&mut self, lat: i32, lon: i32) {
+        let raw = i64::from(lon);
+        let lifted = if raw < 0 { raw + lon::TURN_E7 } else { raw };
+        let e = self.extent.get_or_insert(Extent {
+            lat: (lat, lat),
+            raw: (raw, raw),
+            lifted: (lifted, lifted),
+        });
+        e.lat = (e.lat.0.min(lat), e.lat.1.max(lat));
+        e.raw = (e.raw.0.min(raw), e.raw.1.max(raw));
+        e.lifted = (e.lifted.0.min(lifted), e.lifted.1.max(lifted));
     }
 
     fn add_address(&mut self, address: Address) -> Result<(), String> {
-        self.widen(address.lat, address.lon)?;
+        self.widen(address.lat, address.lon);
         let index = u32::try_from(self.addresses.len()).map_err(|_| "too many addresses")?;
         self.address_cells
-            .entry(cell(address.lat, address.lon))
+            .entry(cell(address.lat, i64::from(address.lon)))
             .or_default()
             .push(index);
         self.addresses.push(address);
@@ -240,52 +301,58 @@ impl Model {
         let name_index = u32::try_from(self.names.len()).map_err(|_| "too many streets")?;
         self.names.push(name);
         for &(lat, lon) in coords {
-            self.widen(lat, lon)?;
+            self.widen(lat, lon);
         }
         for pair in coords.windows(2) {
             let (a, b) = (pair[0], pair[1]);
-            // The reader takes a segment the shorter way round in longitude;
-            // the model does not unwrap, so a segment spanning half a turn or
-            // more is outside its domain.
-            if (i64::from(b.1) - i64::from(a.1)).abs() >= 1_800_000_000 {
-                return Err(format!(
-                    "a street segment from {a:?} to {b:?} spans half a turn of longitude, \
-                     outside the modelled domain"
-                ));
-            }
-            let index = u32::try_from(self.segments.len()).map_err(|_| "too many segments")?;
-            let (lo, hi) = (
-                cell(a.0.min(b.0), a.1.min(b.1)),
-                cell(a.0.max(b.0), a.1.max(b.1)),
-            );
-            for row in lo.0..=hi.0 {
-                for col in lo.1..=hi.1 {
-                    self.segment_cells
-                        .entry((row, col))
-                        .or_default()
-                        .push(index);
+            for dlon in paths(a, b) {
+                let index = u32::try_from(self.segments.len()).map_err(|_| "too many segments")?;
+                for key in path_cells(a, b.0, dlon) {
+                    self.segment_cells.entry(key).or_default().push(index);
                 }
+                self.segments.push(Segment {
+                    name: name_index,
+                    a,
+                    b_lat: b.0,
+                    dlon,
+                });
             }
-            self.segments.push(Segment {
-                name: name_index,
-                a,
-                b,
-            });
         }
         Ok(())
     }
 
     /// The grid cells that hold every candidate nearer than the coarse
     /// radius to `(lat, lon)`, with one cell of margin.
-    fn cells_near(lat: f64, lon: f64) -> impl Iterator<Item = (i32, i32)> {
-        let reach_rad = GEOCODE_COARSE_RADIUS_M / EARTH_RADIUS_M;
+    fn cells_near(lat: f64, lon: f64) -> Vec<(i64, i64)> {
+        // The annulus where a candidate is unjudged reaches past the radius.
+        let reach_rad = (GEOCODE_COARSE_RADIUS_M + TOL) / EARTH_RADIUS_M;
         let dlat_deg = reach_rad.to_degrees();
-        let dlon_deg = dlat_deg / lat.to_radians().cos();
+        let cos = lat.to_radians().cos();
+        let g = f64::from(GEOCODE_GRID_E7);
         #[allow(clippy::cast_possible_truncation)]
-        let e7 = |deg: f64| (deg * 1e7).floor() as i32;
-        let lo = cell(e7(lat - dlat_deg), e7(lon - dlon_deg));
-        let hi = cell(e7(lat + dlat_deg), e7(lon + dlon_deg));
-        (lo.0 - 1..=hi.0 + 1).flat_map(move |row| (lo.1 - 1..=hi.1 + 1).map(move |col| (row, col)))
+        let index = |deg: f64| (deg * 1e7 / g).floor() as i64;
+        let rows = index(lat - dlat_deg) - 1..=index(lat + dlat_deg) + 1;
+        // The longitude window widens with the query's cosine and is capped
+        // at a turn, every column then visited once.
+        let dlon_deg = if cos > 0.0 {
+            dlat_deg / cos
+        } else {
+            f64::INFINITY
+        };
+        let cols = if dlon_deg >= 180.0 {
+            (0..GRID_COLUMNS).collect()
+        } else {
+            lon::columns(
+                index(lon - dlon_deg) - 1,
+                index(lon + dlon_deg) + 1,
+                GRID_COLUMNS,
+            )
+        };
+        let mut keys: Vec<(i64, i64)> = rows
+            .flat_map(|r| cols.iter().map(move |&c| (r, c)))
+            .collect();
+        keys.push(EVERYWHERE);
+        keys
     }
 
     fn expect_address(&self, lat: f64, lon: f64) -> Expect<Address> {
@@ -295,7 +362,7 @@ impl Model {
             for &i in self.address_cells.get(&key).into_iter().flatten() {
                 let a = &self.addresses[i as usize];
                 let dlat = rad(i64::from(a.lat)) - qlat;
-                let dlon = (rad(i64::from(a.lon)) - qlon) * cos;
+                let dlon = lon::wrap_rad(rad(i64::from(a.lon)) - qlon) * cos;
                 let d = (dlat * dlat + dlon * dlon).sqrt() * EARTH_RADIUS_M;
                 found.push((d, i as usize));
             }
@@ -313,18 +380,18 @@ impl Model {
                     continue;
                 }
                 let s = self.segments[i as usize];
-                let (t, distance_m) = nearest_on_segment(qlat, qlon, cos, s.a, s.b);
-                #[allow(clippy::cast_possible_truncation)]
-                let along =
-                    |a: i32, b: i32| (f64::from(a) + t * (f64::from(b) - f64::from(a))) as i64;
-                found.push((
-                    distance_m,
-                    StreetAnswer {
-                        name: self.names[s.name as usize].clone(),
-                        snap_lat: along(s.a.0, s.b.0),
-                        snap_lon: along(s.a.1, s.b.1),
-                    },
-                ));
+                // Every image of the query is a candidate with its own snap.
+                for (t, distance_m) in projections(qlat, qlon, cos, s.a, s.b_lat, s.dlon) {
+                    let (snap_lat, snap_lon) = snap(s.a, s.b_lat, s.dlon, t);
+                    found.push((
+                        distance_m,
+                        StreetAnswer {
+                            name: self.names[s.name as usize].clone(),
+                            snap_lat,
+                            snap_lon,
+                        },
+                    ));
+                }
             }
         }
         let indexed: Vec<(f64, usize)> = found.iter().enumerate().map(|(i, f)| (f.0, i)).collect();
@@ -353,8 +420,9 @@ impl Model {
                 let section = &self.interp.sections[s.section as usize];
                 let index = usize::from(s.index);
                 let (a, b) = (section.nodes[index], section.nodes[index + 1]);
-                let (t, distance_m) = nearest_on_segment(qlat, qlon, cos, a, b);
-                found.push((distance_m, section.answer(index, t)));
+                for (t, distance_m) in projections(qlat, qlon, cos, a, b.0, s.dlon) {
+                    found.push((distance_m, section.answer(index, t, s.dlon)));
+                }
             }
         }
         let indexed: Vec<(f64, usize)> = found.iter().enumerate().map(|(i, f)| (f.0, i)).collect();
@@ -362,22 +430,53 @@ impl Model {
     }
 }
 
-/// The nearest point of segment `a`-`b` to the query: its parameter and
-/// distance in meters, in the frame with the query at the origin, x the
-/// longitude scaled by the query's cosine and y the latitude, both radians.
-fn nearest_on_segment(qlat: f64, qlon: f64, cos: f64, a: (i32, i32), b: (i32, i32)) -> (f64, f64) {
-    let ax = (rad(i64::from(a.1)) - qlon) * cos;
-    let ay = rad(i64::from(a.0)) - qlat;
-    let dx = (rad(i64::from(b.1)) - rad(i64::from(a.1))) * cos;
-    let dy = rad(i64::from(b.0)) - rad(i64::from(a.0));
+/// The nearest point of one path (from `a`, `dlon` the shorter way round, to
+/// latitude `b_lat`) to each image of the query a turn apart that can be the
+/// nearest: its parameter and distance in meters. The frame has x the
+/// longitude scaled by the query's cosine and y the latitude, both radians;
+/// the query's longitude is periodic, so its image nearest `a` and the two a
+/// turn either side are all measured, and each is a candidate of its own.
+fn projections(
+    qlat: f64,
+    qlon: f64,
+    cos: f64,
+    a: (i32, i32),
+    b_lat: i32,
+    dlon: i64,
+) -> [(f64, f64); 3] {
+    let ax = rad(i64::from(a.1));
+    let near = ax + lon::wrap_rad(qlon - ax);
+    let dx = rad(dlon) * cos;
+    let dy = rad(i64::from(b_lat)) - rad(i64::from(a.0));
     let len_sq = dx * dx + dy * dy;
-    let t = if len_sq == 0.0 {
-        0.0
-    } else {
-        (-(ax * dx + ay * dy) / len_sq).clamp(0.0, 1.0)
-    };
-    let (px, py) = (ax + t * dx, ay + t * dy);
-    (t, (px * px + py * py).sqrt() * EARTH_RADIUS_M)
+    let ay = rad(i64::from(a.0)) - qlat;
+    [
+        near,
+        near + std::f64::consts::TAU,
+        near - std::f64::consts::TAU,
+    ]
+    .map(|px| {
+        let ax = (ax - px) * cos;
+        let t = if len_sq == 0.0 {
+            0.0
+        } else {
+            (-(ax * dx + ay * dy) / len_sq).clamp(0.0, 1.0)
+        };
+        let (x, y) = (ax + t * dx, ay + t * dy);
+        (t, (x * x + y * y).sqrt() * EARTH_RADIUS_M)
+    })
+}
+
+/// The point at parameter `t` along a path, as the reader reports it: the
+/// latitude truncated, the longitude truncated in the path's frame and folded
+/// into `(-180, 180]`.
+pub(super) fn snap(a: (i32, i32), b_lat: i32, dlon: i64, t: f64) -> (i64, i64) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let (lat, lon) = (
+        (f64::from(a.0) + t * f64::from(b_lat - a.0)) as i64,
+        (f64::from(a.1) + t * dlon as f64) as i64,
+    );
+    (lat, lon::fold_e7(lon))
 }
 
 /// The expectation of one class from every candidate's distance.
@@ -641,18 +740,7 @@ fn model_record(model: &mut Model, r: &Record<'_>) -> Result<(), String> {
                 && let Some(mode) = tag(&r.tags, "addr:interpolation")
             {
                 for &(lat, lon) in r.nodes.iter().flatten() {
-                    model.widen(lat, lon)?;
-                }
-                let located: Vec<(i32, i32)> = r.nodes.iter().flatten().copied().collect();
-                if located
-                    .windows(2)
-                    .any(|w| (i64::from(w[1].1) - i64::from(w[0].1)).abs() >= 1_800_000_000)
-                {
-                    return Err(format!(
-                        "{}: an interpolation segment spans half a turn of longitude, outside \
-                         the modelled domain",
-                        r.id
-                    ));
+                    model.widen(lat, lon);
                 }
                 model.interp_ways.push(interp::RawWay {
                     mode: interp::Mode::from_tag(mode),
@@ -680,33 +768,10 @@ fn model_record(model: &mut Model, r: &Record<'_>) -> Result<(), String> {
                         r.id
                     )
                 })?;
-            if is_building && !coords.is_empty() {
-                // The builder averages a footprint across the antimeridian in
-                // a lifted frame and gives none to one spanning half a turn;
-                // the model does neither, so it judges only footprints whose
-                // every node is in the domain and whose raw longitude span is
-                // under half a turn, where both take the raw mean.
-                for &(lat, lon) in &coords {
-                    Model::in_domain(lat, lon)?;
-                }
-                let (lo, hi) = coords.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
-                    (lo.min(i64::from(c.1)), hi.max(i64::from(c.1)))
-                });
-                if hi - lo >= 1_800_000_000 {
-                    return Err(format!(
-                        "{}: building way spans half a turn of longitude or more, outside \
-                         the compared domain",
-                        r.id
-                    ));
-                }
-                let count = i64::try_from(coords.len()).map_err(|_| "way too long")?;
-                let (sum_lat, sum_lon) = coords.iter().fold((0_i64, 0_i64), |s, c| {
-                    (s.0 + i64::from(c.0), s.1 + i64::from(c.1))
-                });
-                #[allow(clippy::cast_possible_truncation)]
+            if is_building && let Some((lat, lon)) = building_point(&coords)? {
                 model.add_address(Address {
-                    lat: (sum_lat / count) as i32,
-                    lon: (sum_lon / count) as i32,
+                    lat,
+                    lon,
                     house_number: house_number.unwrap_or_default().to_owned(),
                     street: street.clone(),
                     place: place.clone(),
@@ -723,11 +788,47 @@ fn model_record(model: &mut Model, r: &Record<'_>) -> Result<(), String> {
     }
 }
 
+/// A building's address point under the documented rule: the mean of every
+/// ref's coordinate (a repeated closing ref counted again), truncated toward
+/// zero, longitude averaged on the shorter arc. Raw longitudes serve when
+/// their span is under half a turn; otherwise negative ones are lifted a
+/// turn, and if that span is under half a turn the mean is folded back with
+/// the antimeridian spelled +180. A footprint with no such arc has no point.
+fn building_point(coords: &[(i32, i32)]) -> Result<Option<(i32, i32)>, String> {
+    let span = |lons: &mut dyn Iterator<Item = i64>| {
+        let (lo, hi) = lons.fold((i64::MAX, i64::MIN), |(lo, hi), l| (lo.min(l), hi.max(l)));
+        hi - lo
+    };
+    let lift = |lon: i32| {
+        let lon = i64::from(lon);
+        if lon < 0 { lon + lon::TURN_E7 } else { lon }
+    };
+    if coords.is_empty() {
+        return Ok(None);
+    }
+    let raw = span(&mut coords.iter().map(|c| i64::from(c.1))) < lon::HALF_E7;
+    if !raw && span(&mut coords.iter().map(|c| lift(c.1))) >= lon::HALF_E7 {
+        return Ok(None);
+    }
+    let count = i64::try_from(coords.len()).map_err(|_| "way too long")?;
+    let (sum_lat, sum_lon) = coords.iter().fold((0_i64, 0_i64), |s, c| {
+        let lon = if raw { i64::from(c.1) } else { lift(c.1) };
+        (s.0 + i64::from(c.0), s.1 + lon)
+    });
+    let lon = sum_lon / count;
+    let lon = if raw { lon } else { lon::fold_e7(lon) };
+    let point = (i32::try_from(sum_lat / count), i32::try_from(lon));
+    match point {
+        (Ok(lat), Ok(lon)) => Ok(Some((lat, lon))),
+        _ => Err("a building mean outside the coordinate range".to_owned()),
+    }
+}
+
 /// splitmix64: a fixed, documented sequence.
-struct Draw(u64);
+pub(super) struct Draw(u64);
 
 impl Draw {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -736,7 +837,7 @@ impl Draw {
     }
 
     /// Uniform in `[0, 1)`.
-    fn unit(&mut self) -> f64 {
+    pub(super) fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1_u64 << 53) as f64
     }
 }
@@ -779,35 +880,53 @@ const CLASSES: [&str; 3] = ["address", "street", "interpolation"];
 const CATEGORIES: [&str; 3] = ["within the fine radius", "between the radii", "beyond both"];
 
 /// A point `reach_m` meters from `(lat, lon)` (decimicrodegrees) at
-/// `bearing`.
-fn offset(lat: i32, lon: i32, reach_m: f64, bearing: f64) -> (f64, f64) {
-    let reach = reach_m / EARTH_RADIUS_M;
-    let lat = f64::from(lat) * 1e-7 + (reach * bearing.cos()).to_degrees();
-    let lon = f64::from(lon) * 1e-7 + (reach * bearing.sin()).to_degrees() / lat.to_radians().cos();
-    (lat, lon)
+/// `bearing`, on the sphere and folded, so it stays a legal query near the
+/// antimeridian and the poles.
+pub(super) fn offset(lat: i32, lon: i32, reach_m: f64, bearing: f64) -> (f64, f64) {
+    lon::destination(
+        f64::from(lat) * 1e-7,
+        f64::from(lon) * 1e-7,
+        reach_m / EARTH_RADIUS_M,
+        bearing,
+    )
 }
 
 /// The fixed query set: uniform points over the extent, then witnesses
 /// until every class the model holds has its quota in each category, then
-/// admin witnesses near boundary vertices.
+/// admin witnesses near boundary vertices, then same-level overlap
+/// witnesses, then `named` as given.
 ///
 /// Building every class's full expectation per attempt is deliberate and
-/// cheap: the whole draw measured under a tenth of a second on denmark
-/// (the `query draw` step), as did both admin bands' polygon scans (`admin
-/// judge`). The admin witnesses continue the same draw stream, so any change
+/// cheap beside the model build; the overlap search and its witness tests
+/// are most of the `query draw` step. The admin witnesses continue the same
+/// draw stream, so any change
 /// to where this loop stops changes the admin query set; a parallel or
 /// category-only draw has nothing to win and that hazard to carry.
-fn queries(model: &Model, admin: &admin::AdminModel) -> Result<Vec<Query>, Error> {
-    let (min_lat, min_lon, max_lat, max_lon) = model
+fn queries(
+    model: &Model,
+    admin: &admin::AdminModel,
+    named: &[(f64, f64)],
+) -> Result<(Vec<Query>, admin::OverlapAccount), Error> {
+    let extent = model
         .extent
         .ok_or_else(|| Error::tool("the input holds no address point and no street"))?;
+    // Over the narrower longitude frame, so data across the antimeridian is
+    // sampled across it rather than over the rest of the world.
+    let (min_lon, max_lon) = if extent.raw.1 - extent.raw.0 <= extent.lifted.1 - extent.lifted.0 {
+        extent.raw
+    } else {
+        extent.lifted
+    };
+    let (min_lat, max_lat) = extent.lat;
     let deg = |e7: i32| f64::from(e7) * 1e-7;
+    #[allow(clippy::cast_precision_loss)]
+    let deg64 = |e7: i64| e7 as f64 * 1e-7;
     let mut draw = Draw(GEOCODE_SEED);
     let mut out = Vec::new();
     for _ in 0..GEOCODE_UNIFORM_QUERIES {
         let lat = deg(min_lat) + draw.unit() * (deg(max_lat) - deg(min_lat));
-        let lon = deg(min_lon) + draw.unit() * (deg(max_lon) - deg(min_lon));
-        out.push(query(model, lat, lon));
+        let lon = deg64(min_lon) + draw.unit() * (deg64(max_lon) - deg64(min_lon));
+        out.push(query(model, lat, lon::fold_deg(lon)));
     }
     // A class the model holds nothing of has no witness to look for.
     let held = [true, true, !model.interp_segments.is_empty()];
@@ -875,17 +994,7 @@ fn queries(model: &Model, admin: &admin::AdminModel) -> Result<Vec<Query>, Error
     }
     // Admin witnesses: near outer and hole vertices, where containment,
     // holes and competing polygons are decided.
-    let vertices: Vec<(i32, i32)> = admin
-        .polygons
-        .iter()
-        .flat_map(|p| {
-            p.holes
-                .iter()
-                .flatten()
-                .chain(p.outer.iter().step_by((p.outer.len() / 64).max(1)))
-        })
-        .copied()
-        .collect();
+    let vertices = admin.witness_vertices();
     if !vertices.is_empty() {
         for _ in 0..GEOCODE_ADMIN_WITNESSES {
             #[allow(clippy::cast_possible_truncation)]
@@ -895,7 +1004,17 @@ fn queries(model: &Model, admin: &admin::AdminModel) -> Result<Vec<Query>, Error
             out.push(query(model, lat, lon));
         }
     }
-    Ok(out)
+    // Overlap witnesses, after every other draw so the queries before them
+    // do not move: points the model alone finds inside two areas of one
+    // level, one of them certified larger.
+    let (points, account) = admin.overlap_witnesses(&mut draw);
+    for (lat, lon) in points {
+        out.push(query(model, lat, lon));
+    }
+    for &(lat, lon) in named {
+        out.push(query(model, lat, lon));
+    }
+    Ok((out, account))
 }
 
 fn tally(filled: &mut [[usize; 3]; 3], q: &Query) {
@@ -1111,9 +1230,10 @@ fn judge_admin(
     answered: &[Value],
     label: &str,
     band_m: f64,
-) -> Result<(), Error> {
+) -> Result<Vec<admin::AdminExpect>, Error> {
     let mut tally = admin::AdminTally::default();
     let mut wrong = Vec::new();
+    let mut expects = Vec::with_capacity(queries.len());
     harness.timed("admin judge", || {
         for (q, answer) in queries.iter().zip(answered) {
             let expect = admin.expect(q.lat, q.lon, band_m);
@@ -1124,14 +1244,18 @@ fn judge_admin(
             if let Err(why) = result {
                 wrong.push(format!("query {}: {why}", q.text));
             }
+            expects.push(expect);
         }
     });
     harness.msg(&format!(
         "  admin {label}: {} containing answers judged ({} among several containing areas, \
+         {} of them with a competitor certified larger, {} with a certified unique least; \
          {} postal, {} with a country code), {} empty levels inside a polygon's box, {} \
          levels inside an owned hole, {} levels not judged, {} queries wrong",
         tally.containing,
         tally.several,
+        tally.ruled_out,
+        tally.unique,
         tally.postal,
         tally.country_code,
         tally.empty_boxed,
@@ -1154,7 +1278,7 @@ fn judge_admin(
         &format!("geocode admin answers {label} vs the osmium-derived model"),
         Verdict::from_pass(wrong.is_empty()),
     );
-    Ok(())
+    Ok(expects)
 }
 
 /// Build the index at the non-zero admin tolerance into `index` and at
@@ -1210,12 +1334,14 @@ fn report_unmodelled(harness: &mut Harness, admin: &admin::AdminModel) {
     // name the coarse ones: a run says which relation a gap comes from.
     for ((id, level, why), (_, b)) in admin.unmodelled_why.iter().zip(&admin.unmodelled) {
         if *level <= 4 {
+            #[allow(clippy::cast_precision_loss)]
+            let deg = |v: i64| v as f64 * 1e-7;
             harness.msg(&format!(
                 "    unmodelled level {level} {id} ({why:?}), box {:.4},{:.4} to {:.4},{:.4}",
-                f64::from(b.0) * 1e-7,
-                f64::from(b.1) * 1e-7,
-                f64::from(b.2) * 1e-7,
-                f64::from(b.3) * 1e-7,
+                deg(b.0),
+                deg(b.1),
+                deg(b.2),
+                deg(b.3),
             ));
         }
     }
@@ -1224,7 +1350,35 @@ fn report_unmodelled(harness: &mut Harness, admin: &admin::AdminModel) {
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("geocode")?;
     harness.msg("=== verify geocode (address, street, interpolation and admin answers) ===");
+    let judged = judge_input(harness, pbf, &outdir, direct_io, &[])?;
+    Ok(Some(format!(
+        "{} queries: every judged address, street and interpolation answer is the nearest \
+         documented candidate in the osmium decoding of the input, or none beyond the radii, \
+         and every judged admin level the least containing area of the modelled boundaries",
+        judged.queries.len()
+    )))
+}
 
+/// What one input's judgement leaves for a caller to hold to its own
+/// floors: the queries with the model's expectations, and each band's admin
+/// expectation per query, at tolerance 0 first.
+struct Judged {
+    queries: Vec<Query>,
+    admin: admin::AdminModel,
+    admin_expects: [Vec<admin::AdminExpect>; 2],
+}
+
+/// Build both indexes of `pbf`, model its decodings, draw the queries (with
+/// `named` last) and judge every class, recording one verdict per class and
+/// per admin build.
+fn judge_input(
+    harness: &mut Harness,
+    pbf: &Path,
+    outdir: &Path,
+    direct_io: bool,
+    named: &[(f64, f64)],
+) -> Result<Judged, Error> {
+    let outdir = outdir.to_path_buf();
     let index = outdir.join("index");
     let exact_index = outdir.join("index-tolerance-0");
     build_indexes(harness, pbf, &index, &exact_index, direct_io)?;
@@ -1269,7 +1423,13 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         admin.unmodelled.len(),
     ));
     report_unmodelled(harness, &admin);
-    let queries = harness.timed("query draw", || queries(&model, &admin))?;
+    let (queries, overlap) = harness.timed("query draw", || queries(&model, &admin, named))?;
+    harness.msg(&format!(
+        "  same-level overlap search: {} pairs of one level with meeting boxes, {} seed \
+         sites, {} witnesses kept inside two areas with one certified larger (the search \
+         finds what it finds; it does not claim every overlap)",
+        overlap.pairs, overlap.seeds, overlap.kept
+    ));
     let points = outdir.join("points.txt");
     {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&points)?);
@@ -1295,7 +1455,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         &outdir.join("pbfhogg-answers-tolerance-0.jsonl"),
         &queries,
     )?;
-    judge_admin(
+    let exact_expects = judge_admin(
         harness,
         &admin,
         &queries,
@@ -1303,20 +1463,19 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         "at --admin-tolerance 0",
         GEOCODE_ADMIN_EXACT_BAND_M,
     )?;
-    judge_admin(
+    let band_expects = judge_admin(
         harness,
         &admin,
         &queries,
         &answered,
         "outside the band of a non-zero --admin-tolerance",
-        GEOCODE_ADMIN_TOLERANCE_M * 1.01 + 1.0,
+        admin::TOLERANCE_BAND_M,
     )?;
-    Ok(Some(format!(
-        "{} queries: every judged address, street and interpolation answer is the nearest \
-         documented candidate in the osmium decoding of the input, or none beyond the radii, \
-         and every judged admin level the least containing area of the modelled boundaries",
-        queries.len()
-    )))
+    Ok(Judged {
+        queries,
+        admin,
+        admin_expects: [exact_expects, band_expects],
+    })
 }
 
 /// Whether an answer is this candidate: the same record, at the candidate's
@@ -1347,11 +1506,13 @@ impl Candidate for StreetAnswer {
     }
 
     /// The name exactly; the nearest point within two decimicrodegrees, the
-    /// truncation of a parameter two float paths compute a rounding apart.
+    /// truncation of a parameter two float paths compute a rounding apart,
+    /// longitude measured the shorter way round (a snap a unit either side
+    /// of the antimeridian is two spellings a unit apart).
     fn is(&self, other: &Self) -> bool {
         self.name == other.name
             && self.snap_lat.abs_diff(other.snap_lat) <= 2
-            && self.snap_lon.abs_diff(other.snap_lon) <= 2
+            && lon::wrap_e7(self.snap_lon - other.snap_lon).abs() <= 2
     }
 }
 
@@ -1471,12 +1632,23 @@ fn read_address(v: &Value) -> Result<(Address, f64), String> {
     ))
 }
 
+fn in_range(n: i64, lo: i64, hi: i64, key: &str) -> Result<i64, String> {
+    if (lo..=hi).contains(&n) {
+        Ok(n)
+    } else {
+        Err(format!("{key} {n} is outside {lo}..={hi}"))
+    }
+}
+
 fn read_street(v: &Value) -> Result<(StreetAnswer, f64), String> {
     Ok((
         StreetAnswer {
             name: string(v, "name")?,
-            snap_lat: integer(v, "snap_lat_e7")?,
-            snap_lon: integer(v, "snap_lon_e7")?,
+            snap_lat: integer(v, "snap_lat_e7")
+                .and_then(|n| in_range(n, -900_000_000, 900_000_000, "snap_lat_e7"))?,
+            // The documented spelling: the antimeridian is +180.
+            snap_lon: integer(v, "snap_lon_e7")
+                .and_then(|n| in_range(n, -lon::HALF_E7 + 1, lon::HALF_E7, "snap_lon_e7"))?,
         },
         distance(v)?,
     ))
@@ -1536,11 +1708,34 @@ mod tests {
         );
         let r = parse_record("w2 v1 Thighway=path,name=A Nn1x12.0y55.0,n2").unwrap();
         assert!(model_record(&mut m, &r).is_ok());
-        // Both ends are in the domain, but the reader takes the segment the
-        // short way round the antimeridian, which the model does not.
-        let r =
-            parse_record("w3 v1 Thighway=residential,name=A Nn1x-100.0y0.0,n2x100.0y0.0").unwrap();
-        crate::test_support::refused(model_record(&mut m, &r), "spans half a turn of longitude");
+    }
+
+    /// A segment is taken the shorter way round, and one of exactly half a
+    /// turn is both half-world paths; a query across the antimeridian finds
+    /// its candidates on the other side.
+    #[test]
+    fn segments_and_addresses_are_measured_the_shorter_way_round() {
+        let m = model(&[
+            "w3 v1 Thighway=residential,name=A Nn1x-100.0y0.0,n2x100.0y0.0",
+            "w4 v1 Thighway=residential,name=B Nn3x0.0y10.0,n4x180.0y10.0",
+            "n5 v1 Taddr:housenumber=5,addr:street=S x-180.0 y-17.0",
+        ]);
+        let dlons: Vec<i64> = m.segments.iter().map(|s| s.dlon).collect();
+        assert_eq!(dlons, [-1_600_000_000, -1_800_000_000, 1_800_000_000]);
+        let Expect::Some(true, tied) = m.expect_address(-17.0, 179.9999) else {
+            panic!("an address across the antimeridian is within the fine radius");
+        };
+        assert_eq!(tied[0].1.lon, -1_800_000_000);
+        let Expect::Some(true, tied) = m.expect_street(0.0, 179.99995) else {
+            panic!("a street across the antimeridian is within the fine radius");
+        };
+        assert_eq!(tied[0].1.name, "A");
+        // A building across the antimeridian is placed beside it.
+        assert_eq!(
+            building_point(&[(0, 1_799_999_000), (0, -1_799_999_000), (0, 1_799_999_000)]),
+            Ok(Some((0, 1_799_999_666)))
+        );
+        assert_eq!(building_point(&[(0, 0), (0, 1_800_000_000)]), Ok(None));
     }
 
     #[test]

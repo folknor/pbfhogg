@@ -78,7 +78,7 @@ order can choose between a boundary witness (refusal) and a strict one
 members. The hole-ownership witness rule (sorted witnesses, boundary
 abstains) would fix it the same way.
 
-Crossing rings flip it too, with no boundary witness at all (VER-133 spar):
+Crossing rings flip it too, with no boundary witness at all (found while building the geocode verifier's topology oracle):
 rectangles `[0,10] x [0,10]` and `[5,15] x [2,8]` drawn by open ways and
 joined by a bridge publish when each walk starts on an edge outside the
 other and are withheld when one starts on an edge inside it. Sorted

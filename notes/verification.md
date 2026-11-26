@@ -40,22 +40,12 @@ without a witness. Residue:
   replaced-before-the-call caller-pin cells are hand-rolled and run buffered only;
   their direct transports are unpinned.
 
-## VER-133 - Geocode antimeridian and same-level paths the real-data check does not reach
+## VER-162 - The reader's exact half-turn tie rule is not certified
 
-`pbfhogg-verify geocode` judges all four answer classes, and its admin model now assembles
-rings by an independent oracle of the builder's node-id rules. Two paths stay out of reach
-on the configured datasets:
-
-- The model refuses data beyond 170 degrees of longitude or 85 of latitude, and any member
-  edge spanning half a turn, as a verifier error. The check runs over every complete, located
-  boundary relation of the decoding, not only those near queries, so a region extract holding
-  one far-flung national boundary errors whole. Unwrapping longitude touches every class
-  (address, street, interpolation, building span, admin containment, bands, boxes, grid
-  cells); it can be built and tested on a fixture through `geocode --input`. Judging real data
-  across the seam (the Fiji entry in notes/todo.md, bz pbfhogg#75) additionally needs Fiji in
-  the maintainer-owned verify dataset list.
-- Same-level competition is judged only by chance: germany judged one query among several
-  containing areas (2026-11-26). A unit test pins the ranking judgement on nested rectangles;
-  witnesses aimed at real overlaps would need an overlap search over edge crossings and
-  interiors, not only vertices, since two areas can overlap with no vertex of either inside
-  the other.
+`pbfhogg-verify geocode` models a street or interpolation segment spanning exactly half a turn
+of longitude as both half-world paths, each a candidate with its own snap, and accepts either
+when their distances tie within the tolerance. The reader breaks an exact tie by the path running
+east from the lesser `(lon, lat)` endpoint (`segment_distance` in the geocode reader), and no
+check holds it to that rule: an answer taking the other path at a tie passes. Certifying it needs
+a query constructed on an exact tie (the `geocode-seam` fixture is the natural home) and a
+judgement of the path, not only of the distance.

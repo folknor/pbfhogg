@@ -1687,6 +1687,75 @@ impl RankedIdSet {
     }
 }
 
+/// A word-batching front end to [`IdSet::try_insert_atomic`] for one
+/// worker's run over IDs that mostly arrive in ascending order (one blob of
+/// a sorted file).
+///
+/// Consecutive IDs that fall in the same 64-bit word are OR-ed into a local
+/// mask, and the word is published with a single `fetch_or(Relaxed)` when
+/// the next ID leaves it, or when the batch is dropped. On a dense planet
+/// node blob that is one locked operation per word instead of one per node.
+/// Any visit order is correct - an ID outside the pending word just
+/// publishes it early - so order only decides how much is batched.
+///
+/// The batch publishes on drop, so the set is complete once every batch
+/// writing it has been dropped and the writers have joined; readers
+/// synchronise by that join exactly as with the unbatched setter.
+pub struct AtomicWordBatch<'a> {
+    set: &'a IdSet,
+    /// `id >> 6` of the pending word; meaningful only while `word` is set.
+    key: i64,
+    word: Option<&'a AtomicU64>,
+    mask: u64,
+}
+
+impl<'a> AtomicWordBatch<'a> {
+    pub fn new(set: &'a IdSet) -> Self {
+        Self {
+            set,
+            key: 0,
+            word: None,
+            mask: 0,
+        }
+    }
+
+    /// [`IdSet::try_insert_atomic`], batched: `true` when the ID is (or
+    /// will be, at the next publication) recorded, `false` - recording
+    /// nothing - for an ID no atomic setter can write, which the caller
+    /// spills.
+    #[inline]
+    pub fn insert(&mut self, id: i64) -> bool {
+        let key = id >> 6;
+        if self.word.is_some() && key == self.key {
+            // Same word as a covered non-negative ID, so this one is covered
+            // too and its bit index is its low six bits.
+            self.mask |= 1u64 << (id & 63);
+            return true;
+        }
+        self.publish();
+        let Some((words, off)) = self.set.dense_for_atomic(id) else {
+            return false;
+        };
+        self.word = Some(&words[(off >> 6) as usize]);
+        self.key = key;
+        self.mask = 1u64 << (off & 63);
+        true
+    }
+
+    #[inline]
+    fn publish(&mut self) {
+        if let Some(word) = self.word.take() {
+            word.fetch_or(self.mask, Relaxed);
+        }
+    }
+}
+
+impl Drop for AtomicWordBatch<'_> {
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1775,6 +1844,64 @@ mod tests {
     }
 
     // --- Atomic setters ------------------------------------------------
+
+    /// The word batch records exactly what the unbatched setter does, and
+    /// spills exactly the same IDs, over runs that stay in a word, cross
+    /// word and chunk boundaries, step backwards, start at zero and meet
+    /// negative and uncovered IDs; and two batches sharing a word from
+    /// different threads lose no bit.
+    #[test]
+    fn word_batch_matches_the_unbatched_setter() {
+        let chunk = 1i64 << ID_SHIFT;
+        let mut ids: Vec<i64> = (0..200).collect();
+        ids.extend([63, 64, 65, 5, 4, -1, -64, 0, 1]);
+        ids.extend((chunk - 70)..(chunk + 70));
+        // Ends on an ID seen nowhere before, so only the final publication
+        // on drop can record it.
+        ids.extend([3 * chunk + 9, 3 * chunk + 10, 2 * chunk, 7, 2 * chunk + 3]);
+        let mut batched = IdSet::new();
+        let mut plain = IdSet::new();
+        batched.pre_allocate(2 * chunk + 5);
+        plain.pre_allocate(2 * chunk + 5);
+        let mut spilled_batched = Vec::new();
+        let mut spilled_plain = Vec::new();
+        {
+            let mut batch = AtomicWordBatch::new(&batched);
+            for &id in &ids {
+                if !batch.insert(id) {
+                    spilled_batched.push(id);
+                }
+                if !plain.try_insert_atomic(id) {
+                    spilled_plain.push(id);
+                }
+            }
+        }
+        assert_eq!(spilled_batched, spilled_plain);
+        assert_eq!(
+            spilled_batched,
+            vec![-1, -64, 3 * chunk + 9, 3 * chunk + 10]
+        );
+        let members = |s: &IdSet| s.iter_canonical().collect::<Vec<_>>();
+        assert_eq!(members(&batched), members(&plain));
+
+        let shared = {
+            let mut s = IdSet::new();
+            s.pre_allocate(1_000);
+            s
+        };
+        std::thread::scope(|scope| {
+            for t in 0..8i64 {
+                let shared = &shared;
+                scope.spawn(move || {
+                    let mut batch = AtomicWordBatch::new(shared);
+                    for id in (t..1_000).step_by(8) {
+                        assert!(batch.insert(id));
+                    }
+                });
+            }
+        });
+        assert_eq!(shared.len(), 1_000);
+    }
 
     #[test]
     fn try_atomic_setters_report_uncovered_ids_for_spilling() {

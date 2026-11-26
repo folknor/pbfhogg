@@ -10,7 +10,7 @@ and R2d (relations) - patch only the ID/ref fields and copy everything
 else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
 construction. Pass 1 and stage 2d run work-stealing workers sized from
 the host (pass 1 capped); both record old IDs in one shared,
-pre-allocated `IdSet` per kind.
+pre-allocated `IdSet` per kind, one atomic OR per 64-ID word run.
 R2d: parallel with inline rank() dispatch (relation_map replaced by
 `relation_id_set.rank()`). All member-ref lookups via
 `node_id_set.rank()` + `way_id_set.rank()` inline - no flat temp
@@ -19,11 +19,46 @@ data phases (the header read and the schedule walk have their own).
 Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
 defaults to zlib:1.
 
-### Current baseline (planet, commit `c73f2a73` plus the host-sized stages, bygg, 2026-11-26)
+### Current baseline (planet, commit `b17276bc` plus word-batched ID sets, bygg, 2026-11-26)
 
-`id-remap` `--iterations 1`, cells `9c8055f4` and `de92105d`: 80 s and
-68 s. Pass 1 48.2 / 37.3 s, stage 2d 22.4 / 21.8 s, R1 2.4 s, R2D
-1.3 s; peak anon 3.6-3.7 GB. See "Host-sized rewrite stages" below.
+`id-remap` `--iterations 1`, cells `53b1ae16` and `d436f9a5`: 66.1 s and
+65.5 s. Pass 1 34.0 / 33.8 s, stage 2d 21.9 / 22.0 s, R1 2.4 s, R2D
+1.3 s; peak anon 3.6-3.7 GB. See "Word-batched ID set insertion" below.
+
+## History
+
+### Renumber
+
+#### Word-batched ID set insertion (planet, baseline `b17276bc`, bygg, 2026-11-26)
+
+Pass 1 and stage 2d recorded each old ID with its own
+`fetch_or(Relaxed)` on the shared set. They now go through
+`AtomicWordBatch` (`crates/lib/src/idset.rs`), which ORs IDs of the
+same 64-bit word into a local mask and publishes one `fetch_or` per run
+of IDs in a word within a blob. One matched suite after `brokkr fstrim`,
+order A B B A:
+
+| Cell | Arm | Wall | Pass 1 span | `pass1_reframe_ns` | `stage2d_reframe_ns` |
+|---|---|---:|---:|---:|---:|
+| `675bcf67` | baseline | 67.1 s | 35.4 s | 80.6 s | 362 s |
+| `53b1ae16` | batched | 66.1 s | 34.0 s | 45.0 s | 387 s |
+| `d436f9a5` | batched | 65.5 s | 33.8 s | 44.6 s | 389 s |
+| `6af731c3` | baseline | 72.1 s | 40.3 s | 78.8 s | 311 s |
+
+Verdict: kept. Pass 1 rewrite worker time fell 44 % in both pairs; the
+wall fell 1.0 s and 6.6 s, so the end-to-end size is not resolved beyond
+"a few percent, same sign twice". Stage 2d's reframe counter is
+unresolved (baseline spread 311-362 s; the way rewrite is dominated by
+per-ref lookups, and ways are sparser per word than nodes). Peak anon
+unchanged.
+
+Considered and refused in the same work: building the maps from
+worker-owned ID ranges with local pages and a checked join. The costs it
+targeted are gone or negligible at planet: way shards and their serial
+merge no longer exist, rank builds take 41-49 ms for nodes and 6 ms for
+ways, and the per-node atomic is now per word. What it would still add
+is plain stores in place of the remaining per-word atomics, not measured
+and not worth ownership of ID ranges that must follow observed IDs.
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
@@ -50,10 +85,6 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 | R1 (sequential wire-format relation ID scan) | **3.2 s** | - | 2% |
 | R2D (parallel wire-format relations, inline rank()) | **1.9 s** | - | 1% |
 | **TOTAL** | **194 s (3m14s)** | **3.3 GB** | - |
-
-## History
-
-### Renumber
 
 #### Host-sized rewrite stages (planet, baseline `c73f2a73`, bygg, 2026-11-26)
 

@@ -330,3 +330,29 @@ host is claimed for the set, for example as a per-host hardware list
 with each cell's own label deciding, rather than renaming it to today's
 host.
 
+## DOC-063 - The sparse coordinate store's field doc names a retired rank call
+
+Reported by: the spar accounting of the sparse ALTW rank item, from a scout
+lateral (2026-11-26); read from source.
+
+The `referenced` field doc on `SparseArrayIndex` in
+`crates/lib/src/commands/altw/sparse.rs` says `get` does
+"`rank_if_set(node_id) -> Some(rank)`". The signed set renamed that call:
+`get` uses `RankedIdSet::numeric_rank_if_set`, and the module header and
+`reference/pipeline.md` were already corrected to say so. Name the numeric
+rank, since the store's slot order is numeric (negatives first), not
+canonical.
+
+## DOC-064 - The wire rewriter's module doc hard-codes per-element costs
+
+Reported by: the spar accounting of the renumber lookup item, from a scout
+lateral (2026-11-26); read from source.
+
+The module doc of `crates/lib/src/commands/renumber/wire_rewrite.rs` says
+per-element cost "drops from ~113 ns ... to ~10-15 ns", with no commit,
+host or recorded cell behind either figure, and the rewrite stages have
+since changed width and lookup structure. Reword it to the mechanism (IDs
+rewritten in place, other fields copied as byte ranges, no full decode)
+without the drifting numbers, or cite a recorded cell in
+`reference/performance/renumber.md`.
+

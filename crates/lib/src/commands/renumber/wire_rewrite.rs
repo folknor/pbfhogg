@@ -40,7 +40,7 @@
 use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
 use crate::error::Error;
-use crate::idset::{IdSet, RankedIdSet};
+use crate::idset::{AtomicWordBatch, IdSet, RankedIdSet};
 
 /// Error text for a packed field this rewriter cannot splice.
 ///
@@ -499,7 +499,7 @@ struct NodeSink<'s> {
     base_new_id: i64,
     assigned: u64,
     span: Span,
-    id_set: &'s IdSet,
+    id_set: AtomicWordBatch<'s>,
     overflow: &'s mut Vec<i64>,
 }
 
@@ -508,7 +508,7 @@ impl NodeSink<'_> {
     #[inline]
     fn push(&mut self, old_id: i64) -> crate::Result<i64> {
         self.span.push("node", old_id)?;
-        if !self.id_set.try_insert_atomic(old_id) {
+        if !self.id_set.insert(old_id) {
             self.overflow.push(old_id);
         }
         let new_id = offset_id(self.base_new_id, self.assigned)?;
@@ -587,7 +587,8 @@ fn reframe_plain_node(
 /// everything else (string table, lat/lon, tags, metadata) verbatim at the
 /// byte level. Plain groups stay plain, so metadata presence survives.
 ///
-/// Records each old node ID in `id_set` through the atomic setter. An ID
+/// Records each old node ID in `id_set` through an [`AtomicWordBatch`]
+/// (one atomic OR per 64-ID word, published by the time this returns). An ID
 /// whose chunk `id_set` does not cover - the pre-allocation is bounded by the
 /// input's size, not by its indexdata's claims - is appended to `overflow`
 /// instead, for the caller to insert once the parallel pass has ended.
@@ -607,7 +608,7 @@ pub(super) fn reframe_dense_with_new_ids(
         base_new_id,
         assigned: 0,
         span: Span::default(),
-        id_set,
+        id_set: AtomicWordBatch::new(id_set),
         overflow,
     };
     let groups = for_each_group(decompressed, |group| {
@@ -667,7 +668,7 @@ pub(super) fn reframe_dense_with_new_ids(
             let delta = id_cursor.read_sint64().map_err(wire_err)?;
             old_id = old_id.wrapping_add(delta);
             span.push("node", old_id)?;
-            if !id_set.try_insert_atomic(old_id) {
+            if !id_set.insert(old_id) {
                 overflow.push(old_id);
             }
             group_count = inc(group_count)?;
@@ -728,7 +729,8 @@ pub(super) fn reframe_dense_with_new_ids(
 /// For each way: decode old way id, assign new sequential way id,
 /// resolve each ref's new node id through `nodes`, delta-encode the new
 /// refs, and copy keys/vals/info raw bytes verbatim. Each old way ID goes
-/// into `way_id_set` through `try_insert_atomic`; one the set has no
+/// into `way_id_set` through an [`AtomicWordBatch`] (one atomic OR per
+/// 64-ID word, published by the time this returns); one the set has no
 /// pre-allocated chunk for is appended to `overflow` instead.
 pub(super) fn reframe_ways_with_new_ids(
     decompressed: &[u8],
@@ -746,6 +748,7 @@ pub(super) fn reframe_ways_with_new_ids(
     let mut total: u64 = 0;
     let mut orphans: u64 = 0;
     let mut span = Span::default();
+    let mut way_ids = AtomicWordBatch::new(way_id_set);
     for_each_group(decompressed, |group| {
         s.group.clear();
         let mut gr_cursor = Cursor::new(group);
@@ -758,7 +761,7 @@ pub(super) fn reframe_ways_with_new_ids(
                         way_bytes,
                         new_way_id,
                         nodes,
-                        way_id_set,
+                        &mut way_ids,
                         overflow,
                         &mut span,
                         &mut s.packed,
@@ -798,7 +801,7 @@ fn reframe_way(
     way_bytes: &[u8],
     new_way_id: i64,
     nodes: &IdSpace<'_>,
-    way_id_set: &IdSet,
+    way_ids: &mut AtomicWordBatch<'_>,
     overflow: &mut Vec<i64>,
     span: &mut Span,
     refs_out: &mut Vec<u8>,
@@ -847,7 +850,7 @@ fn reframe_way(
 
     let (old_way_id, id_r) = id.ok_or_else(|| Error::invalid_data("reframe_ways: no id field"))?;
     span.push("way", old_way_id)?;
-    if !way_id_set.try_insert_atomic(old_way_id) {
+    if !way_ids.insert(old_way_id) {
         overflow.push(old_way_id);
     }
 

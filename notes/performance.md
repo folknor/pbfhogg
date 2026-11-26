@@ -1324,24 +1324,29 @@ proof before `--full` rereads the disordered kinds. Share the ID projection
 between the two consumers, keeping validated ID columns for any kind that
 needs duplicate replay.
 
-## PERF-049 - Renumber map construction does atomic per-node insertion
+## PERF-049 - Renumber ID sets materialise a 4 MiB bitmap per touched chunk
 
 Reported by: sort.
 
-Mechanism: every node does an atomic `fetch_or`; consecutive IDs hit the same
-word; ways go to workers building general `IdSet`s merged serially; rank
-construction scans bitmaps serially; the map preallocates node-ID-wide from a
-bounded maximum claim.
+Narrowed 2026-11-26: the per-node atomic is now one atomic per word run
+(`AtomicWordBatch`), pass 1 rewrite worker time -44 % on planet; worker-owned
+ranges and parallel rank building were refused (rank builds take
+milliseconds, the way-shard merge is gone); see
+reference/performance/renumber.md "Word-batched ID set insertion".
 
-Redesign: workers own contiguous schedule regions, accumulate whole words
-locally, return owned pages with local rank summaries and first and last IDs;
-joining moves pages, combines boundary fragments, checks strict order and
-prefix-sums; sparse pages for sparse high-ID input.
+Mechanism (residue): the node and way sets reserve up to the file-size bound
+(`RENUMBER_PREALLOC_IDS_PER_BYTE`), and a reserved chunk materialises its
+whole 4 MiB bit array on its first write. Sparse IDs under the bound can thus
+cost up to 8 bitmap bytes per input byte per set (plus one chunk of
+rounding), with both sets live in stage 2d; spill-path chunks and directory
+and rank storage come on top, and chunks at or above 2^43 are allocated
+eagerly. Planet is dense and unaffected.
 
-Risks: range ownership must follow observed IDs, not unverified claims; gain
-beside decompression and compression needs measurement.
+Redesign: sparse pages for the atomic path (an array-chunk form atomic
+writers can fill, or a per-chunk density decision), covering the eager
+high-ID path too.
 
-Kind: high conviction.
+Kind: medium conviction; matters only for sparse-ID inputs.
 
 ## PERF-050 - Renumber lookups are scalar and touch separate arrays
 

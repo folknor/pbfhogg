@@ -502,8 +502,11 @@ pub(crate) fn renumber_external_to<'a>(
         .iter()
         .fold(0_u64, |acc, t| acc.saturating_add(t.element_count));
 
-    // One shared IdSet, pre-allocated so workers can `try_insert_atomic`
-    // through `&self`. The whole schedule is scanned for the claimed max
+    // One shared IdSet, pre-allocated so workers can insert atomically
+    // through `&self` (word-batched per blob, `AtomicWordBatch`). A
+    // reservation materialises a whole 4 MiB bit array for the first ID
+    // written in its chunk, so sparse IDs under the bound still cost
+    // bitmap memory per touched chunk. The whole schedule is scanned for the claimed max
     // rather than trusting the last blob; the claim is then bounded by the
     // file size (see `RENUMBER_PREALLOC_IDS_PER_BYTE`).
     let mut node_id_set = crate::idset::IdSet::new();
@@ -564,7 +567,11 @@ pub(crate) fn renumber_external_to<'a>(
 
     // ---- Build rank index ----
     // Stage boundaries are checkpoints: the rank builds between the parallel
-    // stages have none of their own.
+    // stages have none of their own. The build is serial on purpose: on
+    // planet it takes tens of milliseconds for nodes and single digits for
+    // ways (the `renumber_ext_*_rank_ms` counters), so parallel rank
+    // construction or worker-owned map pages would buy nothing here; see
+    // reference/performance/renumber.md "Word-batched ID set insertion".
     host.invocation.check()?;
     let t_rank = Stopwatch::start();
     let node_id_set = node_id_set.into_ranked();

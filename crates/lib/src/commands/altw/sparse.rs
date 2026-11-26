@@ -1,7 +1,7 @@
 //! Rank-indexed flat node coordinate store.
 //!
 //! Pre-allocates a `referenced.total_count() * 8`-byte temp file and
-//! mmaps it `MmapMut`. Pass 1 workers write `(lat, lon)` at byte offset
+//! mmaps it `MmapMut`. Node-pass workers write `(lat, lon)` at byte offset
 //! `numeric_rank_if_set(node_id) << 3` via `AtomicU64::swap(Relaxed)`
 //! directly into the mmap; pass 2's `get(node_id)` is
 //! `numeric_rank_if_set(node_id)` plus
@@ -243,7 +243,11 @@ fn conflict_from_packed(node_id: i64, prev: u64, packed: u64) -> Error {
     }
 }
 
-/// Build the rank-indexed flat sparse array index from node blobs.
+/// Build the rank-indexed flat sparse array index from node blobs, as a pass
+/// of its own. Only the decode-all fallback (unindexed input under `--force`)
+/// runs it: the indexed path fills the same store inside its node output pass
+/// (`passthrough::write_output_passthrough`), so each node blob is
+/// decompressed once for both.
 ///
 /// Steps:
 ///   1. `referenced.into_ranked()` builds the rank index (~100 MB at
@@ -278,28 +282,9 @@ pub(super) fn build_node_index_sparse(
     referenced: IdSet,
     host: &crate::host::Entered<'_>,
 ) -> Result<SparseArrayIndex> {
-    let t_rank = crate::counters::Stopwatch::start();
-    let referenced = referenced.into_ranked();
-    host.invocation
-        .counter("altw_pass1_rank_index_ms", t_rank.elapsed_ms());
-    let total_bytes = referenced.total_count().saturating_mul(8);
-    host.invocation
-        .counter("altw_pass1_store_bytes", total_bytes);
-
-    // No referenced nodes (e.g. every way has zero refs): posix_fallocate and
-    // mmap both reject a zero length, so back the store with one unused slot.
-    // The borrowed slot slice stays at `total_bytes`, so no rank can address it.
-    let file = open_anonymous_sparse_file(scratch, total_bytes.max(8))?;
-
-    // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
-    let mut mmap = unsafe {
-        memmap2::MmapMut::map_mut(&file)
-            .map_err(|e| Error::from(e).context("failed to mmap sparse index values"))?
-    };
-
-    let capacity_bytes = usize::try_from(total_bytes)
-        .map_err(|_| Error::internal("sparse index total_bytes does not fit in usize"))?;
-    let writer = SharedSparseWriter::new(&mut mmap, capacity_bytes);
+    let mut store = StoreBuild::create(scratch, referenced, host)?;
+    let counters = Pass1Counters::new();
+    let sink = store.sink(&counters);
 
     // Every node blob is decoded here, so each one's claim is held to what
     // it holds: no foreign kind (the scanner reads only nodes, so a way or
@@ -316,26 +301,7 @@ pub(super) fn build_node_index_sparse(
             host,
         )?;
     let claims_ref = &claims;
-
-    // Per-blob rank-span accounting: on sorted inputs each blob's
-    // referenced nodes occupy one contiguous rank interval, so
-    // sum(span) / stored is the write-amplification a per-blob
-    // buffered-pwrite pass 1 would pay before it starts (the gate for a
-    // per-blob buffered-pwrite pass 1). Ratio near 1.0 = dense intervals;
-    // materially above 1.0 = hole-heavy, buffered rewrite disqualified. On
-    // sorted + indexed input whose node IDs are non-negative and whose way
-    // refs all resolve it reads exactly 1.000 by construction - ranks are
-    // assigned in ascending id order over disjoint blob id ranges. Referenced
-    // IDs the input lacks leave holes, and so do negative IDs: ranks are
-    // numeric (negatives first, descending by key) while a sorted file holds
-    // them canonically (`0, -1, -2, ...` then positives), so a blob holding
-    // `-2` and `1` spans every rank between. The counter only describes
-    // write locality; the store's correctness rests on the rank bijection.
-    let counters = Pass1Counters::new();
-
-    let referenced_ref = &referenced;
-    let writer_ref = &writer;
-    let c = &counters;
+    let sink = &sink;
     type Scratch = (Vec<crate::scan::node::NodeTuple>, Vec<(usize, usize)>);
     crate::scan::classify::parallel_scan_blobs_raw(
         &shared_input,
@@ -357,49 +323,145 @@ pub(super) fn build_node_index_sparse(
             tuples.clear();
             let kinds = crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
             let admitted = gate.admit(kinds)?;
-            let mut walk = crate::blob_meta::ClaimWalk::new(
-                claims_ref[position].as_ref(),
-                crate::blob_meta::Order::Free,
-            );
-            let mut blob_stored: u64 = 0;
-            let mut blob_min_rank: u64 = u64::MAX;
-            let mut blob_max_rank: u64 = 0;
-            for tup in tuples.iter() {
-                walk.observe(tup.id)?;
-                if let Some(rank) = referenced_ref.numeric_rank_if_set(tup.id) {
-                    writer_ref.insert(tup.id, rank, tup.lat, tup.lon)?;
-                    blob_stored += 1;
-                    if rank < blob_min_rank {
-                        blob_min_rank = rank;
-                    }
-                    if rank > blob_max_rank {
-                        blob_max_rank = rank;
-                    }
-                }
-            }
-            walk.finish()?;
-            c.tuples_scanned
-                .fetch_add(tuples.len() as u64, Ordering::Relaxed);
-            if blob_stored > 0 {
-                c.coords_stored.fetch_add(blob_stored, Ordering::Relaxed);
-                c.rank_span_slots
-                    .fetch_add(blob_max_rank - blob_min_rank + 1, Ordering::Relaxed);
-            }
+            sink.store_blob(tuples, claims_ref[position].as_ref())?;
             Ok((admitted, ()))
         },
         |_seq, ()| {},
         host,
     )?;
 
-    counters.emit_all(&host.invocation);
+    Ok(store.finish(&counters, host))
+}
 
-    advise_random_store(&mmap, &host.invocation);
+/// The sparse store while pass 1 fills it: the frozen referenced set, the
+/// mapped slots and their unlinked file. [`StoreBuild::sink`] lends the
+/// workers their shared writer; [`StoreBuild::finish`] ends that borrow and
+/// turns the store into the lookup index, so no lookup can run while a slot
+/// may still be written or refused.
+pub(super) struct StoreBuild {
+    referenced: RankedIdSet,
+    mmap: memmap2::MmapMut,
+    file: crate::scratch::ScratchFile,
+    capacity_bytes: usize,
+}
 
-    Ok(SparseArrayIndex {
-        referenced,
-        mmap,
-        _file: file,
-    })
+impl StoreBuild {
+    /// Rank the referenced set and allocate and map its `8 * count` store.
+    pub(super) fn create(
+        scratch: &crate::scratch::RunScratch,
+        referenced: IdSet,
+        host: &crate::host::Entered<'_>,
+    ) -> Result<Self> {
+        let t_rank = crate::counters::Stopwatch::start();
+        let referenced = referenced.into_ranked();
+        host.invocation
+            .counter("altw_pass1_rank_index_ms", t_rank.elapsed_ms());
+        let total_bytes = referenced.total_count().saturating_mul(8);
+        host.invocation
+            .counter("altw_pass1_store_bytes", total_bytes);
+
+        // No referenced nodes (e.g. every way has zero refs): posix_fallocate
+        // and mmap both reject a zero length, so back the store with one
+        // unused slot. The borrowed slot slice stays at `total_bytes`, so no
+        // rank can address it.
+        let file = open_anonymous_sparse_file(scratch, total_bytes.max(8))?;
+
+        // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
+        let mmap = unsafe {
+            memmap2::MmapMut::map_mut(&file)
+                .map_err(|e| Error::from(e).context("failed to mmap sparse index values"))?
+        };
+        let capacity_bytes = usize::try_from(total_bytes)
+            .map_err(|_| Error::internal("sparse index total_bytes does not fit in usize"))?;
+        Ok(Self {
+            referenced,
+            mmap,
+            file,
+            capacity_bytes,
+        })
+    }
+
+    /// The workers' shared writer, borrowing the store until it is dropped.
+    pub(super) fn sink<'a>(&'a mut self, counters: &'a Pass1Counters) -> StoreSink<'a> {
+        StoreSink {
+            referenced: &self.referenced,
+            writer: SharedSparseWriter::new(&mut self.mmap, self.capacity_bytes),
+            counters,
+        }
+    }
+
+    /// Every node blob has been stored and its workers joined: emit pass 1's
+    /// counters, advise random access and hand back the lookup index.
+    pub(super) fn finish(
+        self,
+        counters: &Pass1Counters,
+        host: &crate::host::Entered<'_>,
+    ) -> SparseArrayIndex {
+        counters.emit_all(&host.invocation);
+        advise_random_store(&self.mmap, &host.invocation);
+        SparseArrayIndex {
+            referenced: self.referenced,
+            mmap: self.mmap,
+            _file: self.file,
+        }
+    }
+}
+
+/// One pass-1 writer, shared by every worker: the frozen referenced set, the
+/// slot writer and the pass-1 counters.
+pub(super) struct StoreSink<'a> {
+    referenced: &'a RankedIdSet,
+    writer: SharedSparseWriter<'a>,
+    counters: &'a Pass1Counters,
+}
+
+impl StoreSink<'_> {
+    /// Store one node blob's tuples, holding the blob to its claim's exact
+    /// range and count. The caller has already admitted the blob's kinds:
+    /// no slot is written for a blob whose kinds contradict its claim.
+    ///
+    /// Per-blob rank-span accounting: on sorted inputs each blob's
+    /// referenced nodes occupy one contiguous rank interval, so
+    /// sum(span) / stored is the write-amplification a per-blob
+    /// buffered-pwrite pass 1 would pay before it starts. Ratio near 1.0 =
+    /// dense intervals; materially above 1.0 = hole-heavy. On sorted +
+    /// indexed input whose node IDs are non-negative and whose way refs all
+    /// resolve it reads exactly 1.000 by construction - ranks are assigned in
+    /// ascending id order over disjoint blob id ranges. Referenced IDs the
+    /// input lacks leave holes, and so do negative IDs: ranks are numeric
+    /// (negatives first, descending by key) while a sorted file holds them
+    /// canonically (`0, -1, -2, ...` then positives), so a blob holding `-2`
+    /// and `1` spans every rank between. The counter only describes write
+    /// locality; the store's correctness rests on the rank bijection.
+    pub(super) fn store_blob(
+        &self,
+        tuples: &[crate::scan::node::NodeTuple],
+        claim: Option<&crate::blob_meta::BlobIndex>,
+    ) -> crate::error::Result<()> {
+        let mut walk = crate::blob_meta::ClaimWalk::new(claim, crate::blob_meta::Order::Free);
+        let mut blob_stored: u64 = 0;
+        let mut blob_min_rank: u64 = u64::MAX;
+        let mut blob_max_rank: u64 = 0;
+        for tup in tuples {
+            walk.observe(tup.id)?;
+            if let Some(rank) = self.referenced.numeric_rank_if_set(tup.id) {
+                self.writer.insert(tup.id, rank, tup.lat, tup.lon)?;
+                blob_stored += 1;
+                blob_min_rank = blob_min_rank.min(rank);
+                blob_max_rank = blob_max_rank.max(rank);
+            }
+        }
+        walk.finish()?;
+        let c = self.counters;
+        c.tuples_scanned
+            .fetch_add(tuples.len() as u64, Ordering::Relaxed);
+        if blob_stored > 0 {
+            c.coords_stored.fetch_add(blob_stored, Ordering::Relaxed);
+            c.rank_span_slots
+                .fetch_add(blob_max_rank - blob_min_rank + 1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 crate::counters::counter_set! {
@@ -407,8 +469,8 @@ crate::counters::counter_set! {
     /// each blob's referenced nodes occupy one contiguous rank interval, so
     /// `rank_span_slots / coords_stored` is the write amplification a
     /// per-blob buffered-pwrite pass 1 would pay (see the accounting note
-    /// in `build_node_index_sparse`).
-    struct Pass1Counters {
+    /// on `StoreSink::store_blob`).
+    pub(super) struct Pass1Counters {
         tuples_scanned => "altw_pass1_tuples_scanned",
         coords_stored => "altw_pass1_coords_stored",
         rank_span_slots => "altw_pass1_rank_span_slots",

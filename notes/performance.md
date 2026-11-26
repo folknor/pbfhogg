@@ -787,31 +787,6 @@ needs occupancy-driven chunks with parallel insertion.
 
 Kind: high conviction.
 
-## PERF-026 - Sparse ALTW decodes node blobs twice and builds output after the index
-
-Reported by: altw-sparse.
-
-Mechanism: index construction decodes every node blob through
-`extract_node_tuples`; output decodes it again when untagged nodes are
-filtered, building `PrimitiveBlock`, converting metadata and rebuilding via
-`BlockBuilder`; relation dependencies are collected only after the index.
-
-Redesign: collect relation-member dependencies before node ingestion; decode
-each node blob once, feeding the join while selecting retained nodes; compress
-and submit node output immediately (on sorted input nodes precede ways, so node
-output takes its final position during collection); then process ways, then
-copy relations. Keep the source string table and raw tag indices; copy plain
-nodes as messages; filter dense columns (raw node builder as an intermediate).
-
-Payoff: removes a full node decompression pass on the default filtering path
-and overlaps output with index construction.
-
-Risks: dense metadata presence, delta reconstruction after deletion, tag
-delimiters, plain-node fields; arbitrary input order needs source-ordinal
-assembly or spooled fragments, which the sorted path should not inherit.
-
-Kind: high-conviction rewrite.
-
 ## PERF-027 - Sparse ALTW collects references even when an all-node store fits
 
 Reported by: altw-sparse.
@@ -2192,3 +2167,21 @@ with the 8 KiB OPL readers exists to set against it; the readers are now
 1 MiB.
 
 Kind: local.
+
+## PERF-085 - Renumber pass 1 cap rests on Germany; planet at the cap is worker-bound
+
+Reported by: the spar accounting of the renumber map construction item,
+from a scout lateral (2026-11-26).
+
+The `RENUMBER_PASS1_WORKERS_CAP = 12` doc says past about 12 workers pass 1
+waits on the writer, citing Germany (same wall at 12 and 28, with
+`ordered_pool_result_send_wait_ns` 14.3 s at 28). The planet cell at 12
+(`de92105d`, b17276bc's variant) shows the opposite shape:
+`ordered_pool_result_send_wait_ns` 0 and `pass1_consumer_recv_wait_ns`
+37.0 s of a 37.3 s span, so the writer was starved of results, with pread
+and decompress the dominant worker time. No planet cell with the shared
+set runs pass 1 above 12 (`ba0d1a22` ran 16 with way shards, total only).
+First step: matched planet `id-remap` cells at the cap and at host width,
+read on the pass 1 span; the cap may need to be judged per input size.
+
+Kind: medium conviction.

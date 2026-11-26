@@ -582,13 +582,10 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     }
     host.invocation.counter("altw_index_kind", 1);
 
-    host.invocation.marker("ALTW_PASS1_START");
-    let index =
-        build_node_index_sparse(input, options.write.direct_reads, scratch, referenced, host)?;
-    #[cfg(test)]
-    let index = NodeIndex::Sparse(Box::new(index));
-    host.invocation.marker("ALTW_PASS1_END");
-
+    // Relation members are collected before any node is read: the node pass
+    // writes retained nodes as it stores coordinates, and a relation member
+    // is retained whatever its tags. Nothing in the scan depends on the
+    // store.
     let relation_scan = if options.keep_untagged_nodes && !options.inject_prepass {
         (None, None)
     } else {
@@ -607,12 +604,12 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         );
         ids
     };
-    host.invocation.marker("ALTW_PASS2_START");
     let inject_metrics = inject_metrics::InjectMetrics::default();
     let stats = write_output_checked(
         input,
         output,
-        &index,
+        scratch,
+        referenced,
         options.keep_untagged_nodes,
         relation_scan.0.as_ref(),
         relation_scan.1.as_ref(),
@@ -624,7 +621,6 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         overrides,
         host,
     )?;
-    host.invocation.marker("ALTW_PASS2_END");
     emit_stats_counters(&stats, &host.invocation);
     if options.inject_prepass {
         let member_ways = relation_scan.1.as_ref().map_or(0, IdSet::len);
@@ -1432,7 +1428,8 @@ pub(crate) fn collect_relation_member_ids(
 fn write_output_checked(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
-    index: &NodeIndex,
+    scratch: &crate::scratch::RunScratch,
+    referenced: IdSet,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     relation_member_way_ids: Option<&IdSet>,
@@ -1459,7 +1456,7 @@ fn write_output_checked(
         write_output_passthrough(
             input,
             output,
-            index,
+            sparse::StoreBuild::create(scratch, referenced, host)?,
             keep_untagged_nodes,
             relation_member_node_ids,
             relation_member_way_ids,
@@ -1471,16 +1468,24 @@ fn write_output_checked(
             host,
         )
     } else {
-        write_output_decode_all(
+        host.invocation.marker("ALTW_PASS1_START");
+        let index = build_node_index_sparse(input, write.direct_reads, scratch, referenced, host)?;
+        #[cfg(test)]
+        let index = NodeIndex::Sparse(Box::new(index));
+        host.invocation.marker("ALTW_PASS1_END");
+        host.invocation.marker("ALTW_PASS2_START");
+        let stats = write_output_decode_all(
             input,
             output,
-            index,
+            &index,
             keep_untagged_nodes,
             relation_member_node_ids,
             write,
             overrides,
             host,
-        )
+        )?;
+        host.invocation.marker("ALTW_PASS2_END");
+        Ok(stats)
     }
 }
 
@@ -1525,7 +1530,7 @@ fn write_output_decode_all(
                 &block,
                 &mut bb,
                 &mut output,
-                index,
+                Some(index),
                 keep_untagged_nodes,
                 relation_member_node_ids,
                 &mut refs_buf,
@@ -1563,6 +1568,11 @@ use crate::owned::{dense_node_metadata, element_metadata};
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
 ///
+/// `node_index` is `None` in the indexed node pass, which rebuilds node
+/// blobs while the store is still being filled; its caller has refused any
+/// foreign kind first, so a way reaching the node-only rebuild is a broken
+/// invariant.
+///
 /// Way refs resolve via inline `SparseArrayIndex::get`. The earlier
 /// `resolve_batch_locations` pre-pass that converted random sparse mmap
 /// I/O to a sorted sequential scan was removed in favour of straight
@@ -1577,7 +1587,7 @@ fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    node_index: &NodeIndex,
+    node_index: Option<&NodeIndex>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     refs_buf: &mut Vec<i64>,
@@ -1638,6 +1648,11 @@ fn process_block(
                 }
             }
             Element::Way(w) => {
+                let Some(node_index) = node_index else {
+                    return Err(Error::internal(
+                        "a way reached the node-only rebuild past its blob's kind check",
+                    ));
+                };
                 ensure_way_capacity_local(bb, output)?;
                 refs_buf.clear();
                 refs_buf.extend(w.refs());

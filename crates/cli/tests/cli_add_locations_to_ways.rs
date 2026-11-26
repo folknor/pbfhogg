@@ -717,6 +717,85 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
     );
 }
 
+/// Sparse writes the node blobs before the first way blob as it stores them
+/// and the rest in the way pass: blobs `[1, 2]`, a relation, `[3, 4]`, a way,
+/// `[5, 6]`. The way's last node sits in the blob after it, so the store must
+/// be complete before any way is joined; output keeps input blob order, and a
+/// relation-member node is kept in either part, under both node policies.
+#[test]
+fn sparse_writes_node_blobs_on_both_sides_of_the_first_way_blob() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("split.osm.pbf");
+    let mut nodes: Vec<TestNode> = (1..=6).map(node_at).collect();
+    nodes[2].tags = vec![("name", "three")];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![
+            TestMember {
+                id: MemberId::Node(2),
+                role: "label",
+            },
+            TestMember {
+                id: MemberId::Node(5),
+                role: "label",
+            },
+        ],
+        tags: vec![("type", "site")],
+        meta: None,
+    }];
+    let refs = [1, 3, 6];
+    let blocks =
+        crate::common::encode_fixture_blocks(&nodes, &[way_over(10, &refs)], &relations, Some(2));
+    // Encoded as nodes [1, 2], [3, 4], [5, 6], the way, the relation.
+    let order = [&blocks[0], &blocks[4], &blocks[1], &blocks[3], &blocks[2]];
+    let blocks: Vec<Vec<u8>> = order.into_iter().cloned().collect();
+    crate::common::frame_fixture_blocks(
+        &input,
+        &blocks,
+        crate::common::FixtureFraming::INDEXED.unsorted(),
+    );
+    let expected_way = vec![(
+        10,
+        refs.iter()
+            .map(|&id| (node_at(id).lat, node_at(id).lon))
+            .collect::<Vec<_>>(),
+    )];
+    for (keep, expected_nodes) in [(false, vec![2, 3, 5]), (true, vec![1, 2, 3, 4, 5, 6])] {
+        let output = dir.path().join(format!("keep-{keep}.osm.pbf"));
+        let out = run_altw(&input, &output, keep, IndexBackend::Sparse, false);
+        assert!(out.status.success(), "{}", out.stderr_str());
+        assert_eq!(read_way_locations(&output), expected_way, "keep {keep}");
+        // Node IDs in output order: the prefix's before the way's blob, the
+        // late blob's after it.
+        assert_eq!(read_node_ids(&output), expected_nodes, "keep {keep}");
+        assert_eq!(
+            output_kind_sequence(&output),
+            vec!['n', 'r', 'n', 'w', 'n'],
+            "keep {keep}: blob kinds out of input order"
+        );
+    }
+}
+
+/// The element kind of each output data blob, in file order.
+fn output_kind_sequence(path: &Path) -> Vec<char> {
+    let reader = BlobReader::from_path(path).expect("open output");
+    let mut kinds = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode")
+            && let Some(element) = block.elements().next()
+        {
+            kinds.push(match element {
+                Element::DenseNode(_) | Element::Node(_) => 'n',
+                Element::Way(_) => 'w',
+                Element::Relation(_) => 'r',
+                _ => '?',
+            });
+        }
+    }
+    kinds
+}
+
 // ---------------------------------------------------------------------------
 // Sparse and external backends
 // ---------------------------------------------------------------------------

@@ -651,6 +651,14 @@
 
 ### Changed
 
+- **Sparse `add-locations-to-ways` decodes each node blob once, for indexed
+  input.** Node coordinates are stored and node output written in one
+  pass, and relation members are collected before it, so the relation
+  scan no longer re-reads blob headers after the node pass has evicted
+  them. North America on a 32-thread host: about 51 s to about 44 s;
+  Germany about 3 % faster. Output content is unchanged. Benchmark marker
+  `ALTW_PASS1` now spans node output too.
+
 - **Sparse `add-locations-to-ways` collects way references on every
   decode worker.** Its first pass recorded every way reference on one
   thread; workers now record them directly, for indexed input. Planet on a

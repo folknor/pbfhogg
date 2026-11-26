@@ -356,3 +356,32 @@ rewritten in place, other fields copied as byte ranges, no full decode)
 without the drifting numbers, or cite a recorded cell in
 `reference/performance/renumber.md`.
 
+## DOC-065 - Allocation-from-claims text names only renumber's node set
+
+Reported by: the spar accounting of the renumber map construction item,
+from a scout lateral (2026-11-26); read from source.
+
+Since renumber's stage 2d writes one shared pre-allocated way set, the way
+set is reserved from its own claimed `max_id` bounded by the file size, the
+same way as the node set (`crates/lib/src/commands/renumber/mod.rs`). Three
+durable texts still describe only the node set: `reference/indexdata-trust.md`
+"Allocation from claims" ("pre-allocates its node set"), ADR-0013 consequence
+2 ("bounds its initial node bitmap by the file size") and the
+`RENUMBER_PREALLOC_IDS_PER_BYTE` doc in `crates/lib/src/tunables.rs`. None is
+false, but the trust page is the list of claim-sized allocations, so it
+should name both sets.
+
+## DOC-066 - classify.md states an unmeasured verdict on sorted batch insertion
+
+Reported by: the spar accounting of the reference membership item, from a
+scout lateral (2026-11-26); read from source.
+
+`reference/performance/classify.md`, under "IdSetDense accumulation:
+Vec-push-then-drain wins", says a `set_sorted_batch()` "would amortize the
+chunk lookup but still loses to push on cold-line read-modify-write". No
+cell behind it is recorded; the measured cell is the per-ID direct `set()`
+(29x). Word-batched atomic insertion has since measured as a win in
+renumber pass 1 and sparse ALTW pass 0 (`reference/performance/renumber.md`,
+`reference/performance/add-locations-to-ways.md`). Mark the sentence as an
+unmeasured judgement scoped to the `&mut` classify hot loop, or drop it.
+

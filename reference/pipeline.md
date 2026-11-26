@@ -205,7 +205,8 @@ building a consumer.
 
 `crates/lib/src/scan/node.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
 
-Used internally by external join (stage 2) and ALTW sparse (pass 1).
+Used internally by external join (stage 2) and ALTW sparse (pass 1, both
+the indexed node pass and the unindexed store-only pass).
 Apply-changes uses its separate checked coordinate extractor in
 `crates/lib/src/commands/apply_changes/node_coords.rs`.
 
@@ -449,7 +450,16 @@ way-referenced nodes (pass 0: workers insert each admitted way blob's refs
 word-batched and atomically into a set reserved from the node blobs'
 claimed `max_id`, capped by the input size; refs outside the reservation,
 and every ref of an unindexed input, are unioned serially on the calling
-thread); pass 1 workers store packed `(lat, lon)` at byte
+thread). The relation-member scan runs next, before any node is read,
+because retention needs its member set. On indexed input pass 1 is the
+node pass of the output: one ordered pool over the output schedule's node
+blobs decompresses each once, stores its coordinates, and writes the node
+blobs before the first way blob (every node blob on sorted input) from the
+same bytes, rebuilt or, under `--keep-untagged-nodes`, copied raw; node
+blobs after the first way blob are stored only and rewritten by pass 2 in
+their place, so output keeps input blob order. Pass 2 starts only once
+every node task has succeeded, on the same writer. The unindexed `--force`
+fallback keeps a separate store-only pass 1. Pass 1 workers store packed `(lat, lon)` at byte
 offset `numeric_rank_if_set(node_id) << 3` via relaxed `AtomicU64::swap`
 (a duplicate ID whose coordinates disagree is refused)
 directly into a pre-allocated, `MmapMut`-mapped values file

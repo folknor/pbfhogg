@@ -40,11 +40,11 @@ No flag needed.
 breaks multipolygon boundaries, route relations, and any relation that references
 nodes directly. osmium's opt-in flag is widely considered a footgun. The cost of
 the extra relation-scanning pass is negligible (relation blobs are a small
-fraction of the file, filtered via `BlobFilter::only_relations()`).
+fraction of the file, selected by their indexdata kind).
 
-**Implementation:** A third pass scans relation blobs to collect node IDs
-referenced as members into an `IdSet` bitset. During the write pass,
-untagged nodes are kept if they appear in this set. Members are matched by
+**Implementation:** A pass over the relation blobs, run before any node is
+read, collects node IDs referenced as members into an `IdSet` bitset. When
+node blobs are written, untagged nodes are kept if they appear in this set. Members are matched by
 their signed ID, so a member `n-7` keeps node `-7` only; osmium's
 `--keep-member-nodes` folds each member onto its absolute value
 (`positive_ref()`), and its man page says the option does not work with

@@ -1,4 +1,14 @@
-//! Pass 2b: passthrough output path (indexdata present).
+//! The indexed output path (indexdata present): the node pass and the way
+//! pass, on one schedule and one writer.
+//!
+//! The node pass decompresses each node blob once, stores its referenced
+//! coordinates in the sparse store and, for node blobs before the first way
+//! blob (every node blob on sorted input), writes its output from the same
+//! bytes: rebuilt with untagged non-member nodes dropped, or copied raw under
+//! `--keep-untagged-nodes`. Node blobs after the first way blob (unsorted
+//! input) are stored only and rewritten by the way pass in their place, as
+//! before. The way pass below is the old pass 2 over the rest of the
+//! schedule, reading the store the node pass completed.
 //!
 //! Descriptor-first parallel pipeline lifted from
 //! `external/stage4.rs`:
@@ -104,7 +114,11 @@ crate::counters::counter_set! {
 /// Walk all blob headers and build the schedule. The OsmHeader blob (the
 /// walker refuses a second one) is used to build the output header bytes.
 ///
-/// This is the fourth header walk on the sparse path, and the marker pair
+/// On the indexed sparse path this is the third header walk (pass 0, the
+/// relation-member scan, this one; the node pass runs on this schedule, so
+/// the separate pass-1 walk is gone), and it runs before the node pass, right
+/// after the relation scan's walk. The marker keeps its old `PASS2` name so
+/// its recorded measurements stay comparable. The pair
 /// exists because its cost is invisible otherwise and swings enormously:
 /// a walk is ~50 us/blob cold and near free warm, decided entirely by
 /// whether the preceding phase left the headers in page cache. Measured
@@ -194,6 +208,9 @@ struct WorkerScratch {
     /// `Vec<(u32, u32)>` allocation is eliminated.
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
+    /// The node pass's coordinate tuples and dense-group scratch.
+    tuples: Vec<crate::scan::node::NodeTuple>,
+    group_starts: Vec<(usize, usize)>,
 }
 
 impl WorkerScratch {
@@ -210,6 +227,149 @@ impl WorkerScratch {
             output: Vec::new(),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
+            tuples: Vec::new(),
+            group_starts: Vec::new(),
+        }
+    }
+}
+
+/// What one node-pass task hands the consumer.
+enum NodeOut {
+    /// The blob's rebuilt blocks (untagged nodes filtered out).
+    Blocks(Vec<OwnedBlock>, Stats),
+    /// The blob's original frame, to be copied verbatim
+    /// (`--keep-untagged-nodes`).
+    Raw(Vec<u8>, Stats),
+    /// A node blob after the first way blob: stored only, written by the way
+    /// pass in its place.
+    IndexOnly,
+}
+
+/// How a node-pass task treats its blob's output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeTask {
+    Rebuild,
+    Raw,
+    IndexOnly,
+}
+
+/// One node blob of the node pass: decompressed once, its coordinates stored
+/// and, where it is in the output prefix, its output produced from the same
+/// bytes.
+///
+/// The order inside the blob is the old pass 1's and then the old pass 2's:
+/// the scanner's kinds are judged against the claim before any slot is
+/// written (a way or relation under a node claim would be met by no pass),
+/// the exact range and count are held to the claim while storing, and only
+/// then is the block built, kind-checked again and rebuilt.
+#[allow(clippy::too_many_arguments)]
+fn node_task(
+    desc: &BlobDescriptor,
+    task: NodeTask,
+    file: &std::fs::File,
+    sink: &super::sparse::StoreSink<'_>,
+    relation_member_node_ids: Option<&IdSet>,
+    scratch: &mut WorkerScratch,
+    counters: &Pass2Counters,
+    limits: &crate::commands::split::Limits,
+) -> crate::Result<NodeOut> {
+    let t_pread = crate::counters::Stopwatch::start();
+    // A raw copy reads the whole frame, which the writer takes as it is, and
+    // decodes its body slice; the others read the body alone.
+    let frame = if task == NodeTask::Raw {
+        let mut frame = vec![0_u8; desc.frame_size];
+        file.read_exact_at(&mut frame, desc.frame_offset)
+            .map_err(|e| crate::error::Error::from(e).context("node pass pread"))?;
+        Some(frame)
+    } else {
+        scratch
+            .read_buf
+            .read_exact_at(file, desc.data_offset, desc.data_size)
+            .map_err(|e| crate::error::Error::from(e).context("node pass pread"))?;
+        None
+    };
+    t_pread.record_ns(&counters.pread_ns);
+    counters
+        .bytes_read
+        .fetch_add(desc.data_size as u64, Relaxed);
+    let body = match &frame {
+        Some(frame) => {
+            let start = usize::try_from(desc.data_offset - desc.frame_offset)
+                .map_err(|_| crate::error::Error::internal("blob header length exceeds usize"))?;
+            &frame[start..start + desc.data_size]
+        }
+        None => scratch.read_buf.bytes(),
+    };
+
+    // A rebuilt blob decompresses into a pooled buffer the block takes over
+    // (its backing `Bytes` recycles it); the others into the worker's own.
+    let t_dc = crate::counters::Stopwatch::start();
+    let mut pooled = if task == NodeTask::Rebuild {
+        let mut buf = crate::blob::pool_get(Some(&scratch.pool), 0);
+        decompress_blob_raw(body, &mut buf)?;
+        Some(buf)
+    } else {
+        decompress_blob_raw(body, &mut scratch.decompress_buf)?;
+        None
+    };
+    t_dc.record_ns(&counters.decompress_ns);
+    let decompressed: &[u8] = pooled
+        .as_deref()
+        .unwrap_or(scratch.decompress_buf.as_slice());
+
+    scratch.tuples.clear();
+    let kinds = crate::scan::node::extract_node_tuples(
+        decompressed,
+        &mut scratch.tuples,
+        &mut scratch.group_starts,
+    )?;
+    kinds.refuse_under(desc.kind)?;
+    sink.store_blob(&scratch.tuples, desc.claim.as_ref())?;
+
+    match task {
+        NodeTask::IndexOnly => Ok(NodeOut::IndexOnly),
+        NodeTask::Raw => {
+            let frame = frame
+                .ok_or_else(|| crate::error::Error::internal("raw node task read no frame"))?;
+            // The claim was just held exact, so the claimed count is the
+            // blob's count.
+            let stats = Stats {
+                blobs_passthrough: 1,
+                nodes_read: desc.count,
+                nodes_written: desc.count,
+                ..Stats::default()
+            };
+            Ok(NodeOut::Raw(frame, stats))
+        }
+        NodeTask::Rebuild => {
+            let decompressed = pooled.take().ok_or_else(|| {
+                crate::error::Error::internal("rebuild task has no pooled buffer")
+            })?;
+            let t_nonway = crate::counters::Stopwatch::start();
+            scratch.output.clear();
+            let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                decompressed,
+                &scratch.pool,
+                &mut scratch.st_scratch,
+                &mut scratch.gr_scratch,
+            )?;
+            block.refuse_foreign_kind(desc.kind)?;
+            let mut block_stats = process_block(
+                &block,
+                &mut scratch.bb,
+                &mut scratch.output,
+                None,
+                false,
+                relation_member_node_ids,
+                &mut scratch.refs_buf,
+                &mut scratch.locations_buf,
+            )?;
+            flush_local(&mut scratch.bb, &mut scratch.output)?;
+            block_stats.blobs_decoded = 1;
+            t_nonway.record_ns(&counters.nonway_ns);
+            counters.nonway_blobs.fetch_add(1, Relaxed);
+            let (blocks, _) = super::fit_output(std::mem::take(&mut scratch.output), limits)?;
+            Ok(NodeOut::Blocks(blocks, block_stats))
         }
     }
 }
@@ -333,7 +493,7 @@ fn decode_one(
         &block,
         &mut scratch.bb,
         &mut scratch.output,
-        node_index,
+        Some(node_index),
         keep_untagged_nodes,
         relation_member_node_ids,
         &mut scratch.refs_buf,
@@ -353,7 +513,7 @@ fn decode_one(
 pub(super) fn write_output_passthrough(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
-    node_index: &NodeIndex,
+    mut store: super::sparse::StoreBuild,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     relation_member_way_ids: Option<&IdSet>,
@@ -399,12 +559,22 @@ pub(super) fn write_output_passthrough(
             .counter("altw_pass2_relation_blobs", relation_blobs);
     }
 
+    // The output prefix is every blob before the first one that is neither a
+    // node nor a relation blob: on sorted input, every node blob. Its node
+    // blobs are written by the node pass as it stores them; the way pass
+    // writes the rest. Judged from the schedule's claims, not from the
+    // header's sorted flag, which sparse carries without checking.
+    let split = schedule
+        .iter()
+        .position(|d| !matches!(d.kind, Some(ElementKind::Node | ElementKind::Relation)))
+        .unwrap_or(schedule.len());
+    let (prefix, suffix) = schedule.split_at(split);
+
     // Decode items go to the workers of the ordered pool, which runs over
     // them alone; passthrough items are copied by the consumer between them,
     // in schedule order, so input element ordering (nodes -> ways ->
     // relations) is preserved.
-    let decode_at =
-        crate::ordered_pool::DecodeSchedule::from_items(&schedule, |d| !d.is_passthrough);
+    let decode_at = crate::ordered_pool::DecodeSchedule::from_items(suffix, |d| !d.is_passthrough);
     host.invocation
         .counter("altw_pass2_decode_items", decode_at.decode_count());
     host.invocation.counter(
@@ -414,7 +584,7 @@ pub(super) fn write_output_passthrough(
     host.invocation
         .counter("altw_pass2_decode_threads", decode_threads);
     let decode_at = &decode_at;
-    let schedule = &schedule;
+    let schedule = suffix;
     let limits = &crate::commands::split::Limits::new(writer.compression());
 
     // Worker-side cumulative counters + the depth-gated WAIT span for
@@ -436,9 +606,41 @@ pub(super) fn write_output_passthrough(
     // The consumer's receive wait, in nanoseconds.
     let p2_recv_ns = std::sync::atomic::AtomicU64::new(0);
 
+    // The node pass. Its tasks are the prefix's node blobs, which it writes
+    // in schedule order with the prefix's relation blobs copied between
+    // them, and then every node blob after the prefix (unsorted input only),
+    // which it stores but does not write: the way pass writes those in their
+    // place. The store is complete only once every task has succeeded and
+    // the workers have joined, so no way is reframed before then: a way's
+    // node can sit in the last node blob, and a conflicting duplicate there
+    // refuses the run.
+    host.invocation.marker("ALTW_PASS1_START");
+    let prefix_at = crate::ordered_pool::DecodeSchedule::from_items(prefix, |d| {
+        d.kind == Some(ElementKind::Node)
+    });
+    let output_task = if keep_untagged_nodes {
+        NodeTask::Raw
+    } else {
+        NodeTask::Rebuild
+    };
+    let node_tasks: Vec<(&BlobDescriptor, NodeTask)> = (0..prefix_at.decode_count())
+        .map(|ordinal| (&prefix[prefix_at.position(ordinal)], output_task))
+        .chain(
+            suffix
+                .iter()
+                .filter(|d| d.kind == Some(ElementKind::Node))
+                .map(|d| (d, NodeTask::IndexOnly)),
+        )
+        .collect();
+    host.invocation.counter(
+        "altw_pass1_index_only_blobs",
+        node_tasks.len() - prefix_at.decode_count(),
+    );
     let mut consumer = Pass2Consumer {
-        interleaved: crate::ordered_pool::Interleaved::new(decode_at),
-        schedule,
+        interleaved: crate::ordered_pool::Interleaved::new(&prefix_at),
+        schedule: prefix,
+        output_tasks: prefix_at.decode_count(),
+        rested: false,
         file: &shared_file,
         writer: &mut writer,
         total_stats: Stats::default(),
@@ -449,6 +651,63 @@ pub(super) fn write_output_passthrough(
         blobs_dispatched: 0,
         cancel: &host.invocation,
     };
+    let pass1_counters = super::sparse::Pass1Counters::new();
+    {
+        let sink = store.sink(&pass1_counters);
+        let sink = &sink;
+        let node_tasks = &node_tasks;
+        let mut workers = vec![(); decode_threads];
+        crate::ordered_pool::run_ordered(
+            node_tasks.len(),
+            &mut workers,
+            crate::ordered_pool::PoolConfig {
+                window: crate::ordered_pool::default_window(decode_threads),
+                cancel: &host.invocation,
+                waits: crate::ordered_pool::Waits {
+                    recv: Some(crate::ordered_pool::Timer::Ns(&p2_recv_ns)),
+                    send: Some(crate::ordered_pool::Timer::Ns(&p2_counters.send_ns)),
+                    send_stall: Some(&p2_send_stall),
+                    ..crate::ordered_pool::Waits::default()
+                },
+            },
+            |_| WorkerScratch::new(&host.invocation),
+            |(), scratch: &mut WorkerScratch, ordinal| {
+                let (desc, task) = node_tasks[ordinal];
+                let result = node_task(
+                    desc,
+                    task,
+                    &shared_file,
+                    sink,
+                    relation_member_node_ids,
+                    scratch,
+                    p2_counters_ref,
+                    limits,
+                )
+                .map_err(|e| {
+                    e.locate(crate::error::Location::new(
+                        Some(source),
+                        Some(desc.blob_index),
+                        Some(crate::ByteOffset(desc.frame_offset)),
+                    ))
+                });
+                scratch.read_buf.release_outlier(&host.invocation);
+                crate::blob::release_decode_outlier(&mut scratch.decompress_buf, &host.invocation);
+                result
+            },
+            &mut consumer,
+        )?;
+    }
+    consumer.end_prefix()?;
+    let index = store.finish(&pass1_counters, host);
+    #[cfg(test)]
+    let index = super::NodeIndex::Sparse(Box::new(index));
+    let node_index = &index;
+    host.invocation.marker("ALTW_PASS1_END");
+
+    // The way pass: the rest of the schedule, on the same writer.
+    host.invocation.marker("ALTW_PASS2_START");
+    consumer.interleaved = crate::ordered_pool::Interleaved::new(decode_at);
+    consumer.schedule = schedule;
 
     // Cancellation is checked on the consumer, before each wait and on each
     // arrival; the early return is the write-error exit.
@@ -516,6 +775,7 @@ pub(super) fn write_output_passthrough(
     let p2_recv_ns = p2_recv_ns.into_inner();
 
     writer.flush()?;
+    host.invocation.marker("ALTW_PASS2_END");
 
     p2_counters.emit_all(&host.invocation);
     host.invocation
@@ -541,6 +801,11 @@ pub(super) fn write_output_passthrough(
 struct Pass2Consumer<'a> {
     interleaved: crate::ordered_pool::Interleaved<'a>,
     schedule: &'a [BlobDescriptor],
+    /// Node pass only: how many of its tasks have output positions in the
+    /// prefix (the store-only tasks follow them), and whether the prefix's
+    /// trailing passthrough frames have been written.
+    output_tasks: usize,
+    rested: bool,
     file: &'a std::fs::File,
     writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
     total_stats: Stats,
@@ -595,20 +860,21 @@ impl Pass2Consumer<'_> {
     }
 }
 
-impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Consumer<'_> {
-    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
-        for position in self.interleaved.before(ordinal) {
-            self.passthrough(position)?;
+impl Pass2Consumer<'_> {
+    /// Write the prefix's passthrough frames after its last node blob, once:
+    /// on reaching the first store-only task, or after the node pass.
+    fn end_prefix(&mut self) -> Result<()> {
+        if !self.rested {
+            self.rested = true;
+            for position in self.interleaved.rest() {
+                self.passthrough(position)?;
+            }
         }
         Ok(())
     }
 
-    fn consume(
-        &mut self,
-        _ordinal: usize,
-        (blocks, block_stats): (Vec<OwnedBlock>, Stats),
-    ) -> crate::Result<()> {
-        self.total_stats.merge(&block_stats)?;
+    fn write_blocks(&mut self, blocks: Vec<OwnedBlock>, block_stats: &Stats) -> Result<()> {
+        self.total_stats.merge(block_stats)?;
         let t_write = crate::counters::Stopwatch::start();
         for block in blocks {
             self.writer.write_primitive_block_owned(block)?;
@@ -623,5 +889,50 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Con
                 .counter("altw_pass2_blobs_dispatched", self.blobs_dispatched);
         }
         Ok(())
+    }
+}
+
+impl crate::ordered_pool::OrderedConsumer<NodeOut> for Pass2Consumer<'_> {
+    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+        if ordinal < self.output_tasks {
+            for position in self.interleaved.before(ordinal) {
+                self.passthrough(position)?;
+            }
+            Ok(())
+        } else {
+            self.end_prefix()
+        }
+    }
+
+    fn consume(&mut self, _ordinal: usize, out: NodeOut) -> crate::Result<()> {
+        match out {
+            NodeOut::Blocks(blocks, block_stats) => self.write_blocks(blocks, &block_stats),
+            NodeOut::Raw(frame, delta) => {
+                self.pt_bytes += frame.len() as u64;
+                self.pt_blobs += 1;
+                let t_write = crate::counters::Stopwatch::start();
+                self.writer.write_raw_owned(frame)?;
+                self.write_ns += t_write.elapsed_ns();
+                self.total_stats.merge(&delta)
+            }
+            NodeOut::IndexOnly => Ok(()),
+        }
+    }
+}
+
+impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Consumer<'_> {
+    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+        for position in self.interleaved.before(ordinal) {
+            self.passthrough(position)?;
+        }
+        Ok(())
+    }
+
+    fn consume(
+        &mut self,
+        _ordinal: usize,
+        (blocks, block_stats): (Vec<OwnedBlock>, Stats),
+    ) -> crate::Result<()> {
+        self.write_blocks(blocks, &block_stats)
     }
 }

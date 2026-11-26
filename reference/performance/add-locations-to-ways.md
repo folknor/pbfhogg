@@ -1,5 +1,37 @@
 # Add Locations To Ways
 
+### Sparse node blobs decoded once, relation scan before pass 1 (bygg, 2026-11-26, baseline `17304b00`)
+
+Pass 1 used to decode every node blob for the store, and pass 2 decoded it
+again to write it (rebuilt unless `--keep-untagged-nodes`); the
+relation-member scan ran between them. On indexed input pass 1 is now the
+node pass of the output: the relation scan runs first, then one ordered
+pool over the output schedule decompresses each node blob once, stores it
+and writes it; pass 2 runs over the rest of the schedule. One header walk
+(pass 1's own) is gone. `embed-locations --index-type sparse`,
+`--iterations 1`, alternating uncommitted variant and `--commit 17304b00`
+baseline, each baseline after a variant cell:
+
+| Dataset | Codec | Variant walls | Baseline walls |
+|---|---|---|---|
+| germany | zlib:6 | 9.9 (`e5a404d2`, first after the build, cold), 8.6 (`0ff60900`), 8.7 (`26788b2b`) s | 9.0 (`722ebd42`), 9.0 (`27dc692e`), 8.9 (`4a901022`) s |
+| germany | zstd:1 | 5.8 (`a22775af`), 6.3 (`127883e9`), 6.1 (`b91f7e71`) s | 6.4 (`58619fd3`), 6.4 (`9021b76d`), 6.4 (`326859ac`) s |
+| north-america | zlib:6 | 58.5 (`98645544`, first after germany, cold), 44.5 (`09fee7ef`), 42.7 (`29e4c095`) s | 51.1 (`57977a8b`), 51.3 (`8781f15f`), 52.9 (`d6609e6a`) s |
+
+Germany is writer-bound at zlib:6 (workers spend 72 to 77 core-seconds
+blocked sending in both arms; reframe and decompress CPU are unchanged),
+so the saved decode shows as about 3 % there and about 5 % at zstd:1.
+North-america gains about 16 % from the walk order more than the decode:
+the baseline's relation scan walked headers cold after pass 1 had evicted
+them (`ALTW_REL_MEMBER_SCAN` 3.5 s in `d6609e6a`), while the variant's
+walks run warm straight after pass 0 (0.24 s and 0.16 s in `29e4c095`).
+Phase split, `29e4c095` against `d6609e6a`: pass 0 5.0 s both; node pass
+11.1 s against pass 1 8.9 s plus pass 2's node share; pass 2 24.9 s
+against 34.6 s. The cold first cells are each the first after a different
+workload and are not compared. `ALTW_PASS1` now spans store and node output,
+so it is not comparable with pass-1 figures recorded before this. Verdict:
+kept.
+
 ### Sparse pass 0 inserts on the workers (bygg, 2026-11-26, baseline `ae651451`)
 
 Pass 0 used to union every way reference on the calling thread

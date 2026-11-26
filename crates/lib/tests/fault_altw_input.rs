@@ -218,9 +218,11 @@ const SPARSE: (Route, Shape) = (
     Route::Indexed(IndexType::Sparse),
     Shape {
         memory_available: Some(8 << 30),
-        opens: 5,
+        // The front read, pass 0, the relation scan and the output schedule,
+        // whose shared file the node and way passes both read.
+        opens: 4,
         racing: None,
-        transports: "DBBBB",
+        transports: "DBBB",
     },
 );
 
@@ -254,9 +256,9 @@ const AUTO_SPARSE: (Route, Shape) = (
     Route::Indexed(IndexType::Auto),
     Shape {
         memory_available: Some(8 << 30),
-        opens: 6,
+        opens: 5,
         racing: None,
-        transports: "DBBBBB",
+        transports: "DBBBB",
     },
 );
 
@@ -279,9 +281,9 @@ const AUTO_UNKNOWN_MEMORY: (Route, Shape) = (
     Route::Indexed(IndexType::Auto),
     Shape {
         memory_available: None,
-        opens: 5,
+        opens: 4,
         racing: None,
-        transports: "DBBBB",
+        transports: "DBBB",
     },
 );
 

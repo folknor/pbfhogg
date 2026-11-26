@@ -50,9 +50,9 @@ Tests go where they couple least.
   half on a host whose memlock limit refuses the pool (below); and the
   success half is a positive witness each cell states for the
   operation it claims, which a driver can check only once the cell
-  declares it, the same statement the cell makes today. What these
-  cells owe instead is that a skip inside a loop of backends or targets
-  ends that iteration only, never the later ones, and that every
+  declares it, the same statement the cell makes today. These
+  cells must announce a typed refusal through the skip helper. In a
+  loop of backends or targets, a skip ends only that iteration. Every
   successful iteration asserts the witness of the backend it ran.
   The getid full-scan unit cell exercises private dispatch with an injected
   threshold. It checks the selected arm, ordered input transports and
@@ -108,8 +108,9 @@ Tests go where they couple least.
   construct a direct type themselves (`DirectReader::open`,
   `direct_io::open_for_read`) need none: the unit test
   `opens_carry_o_direct_and_count_once` in `direct_io.rs` holds that
-  those opens carry `O_DIRECT`. Nor do cells whose direct leg is a
-  value only a `direct_io` open can produce and which the cell then
+  those opens carry `O_DIRECT`. The test announces a typed refusal of
+  the write open. Nor do cells whose direct leg is a value only a
+  `direct_io` open can produce and which the cell then
   consumes: a walker from `HeaderWalker::open_direct` (over
   `DirectPositional`), an `InputFile` with a direct alignment, or
   pass 2's dedupe sources, whose per-source transport list
@@ -128,8 +129,8 @@ Tests go where they couple least.
   input replacement records the transport of every verified open of
   its pinned target, in order (`InputReplacement::transports`, tagged
   by the pin constructor, `open` or `open_direct`). The
-  `fault_*_input` reference-and-matrix cells run through one driver,
-  `pinned_cell::check`,
+  `fault_*_input` reference-and-matrix cells and the apply-changes
+  splice-route base replacement cell run through `pinned_cell::check`,
   which owns the reference run, its exact list (buffered runs
   included), and the replacement matrix after it, judging every
   matrix run from that run's own report (a refused run's verified

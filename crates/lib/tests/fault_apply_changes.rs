@@ -1822,109 +1822,79 @@ mod apply_changes {
   </modify>
 </osmChange>"#;
 
-    /// A base renamed over mid-run: every later open of the base comes from
-    /// the caller's pin, so with a stable scratch reopen name
-    /// (`reopen_cell::Scenario`) the run reads the file it started on and writes what
-    /// an unreplaced run writes, and where opens go through the path the
-    /// run fails with `InputReplaced` and publishes nothing.
-    ///
-    /// On the splice route the base is opened four times after the pin: the
-    /// front read, the splice source, then the scanner's walker and the
-    /// worker pool's descriptor from their own threads. The replacement
-    /// fires right after the splice source, after the OSC parse and before
-    /// either producer opens, so both producer opens follow it and both of
-    /// their failure paths run in the forced mode. It does not replace the
-    /// base while blobs are in flight.
+    /// The splice route opens the front reader and splice source first.
+    /// The scanner's walker and worker pool's descriptor open concurrently
+    /// after that, so a path replacement after the splice open refuses both.
     #[test]
-    fn base_replaced_after_the_splice_open_is_never_read() {
-        use crate::reopen_cell;
+    fn base_replacement_on_the_splice_route() {
+        use crate::pinned_cell::{self, Cell, Judged};
 
-        let dir = crate::common::test_scratch();
+        let dir = common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
-        // Different IDs and blob layout: a run that read any of it would
-        // write different bytes, or fail.
-        write_multi_block_test_pbf(&base, &generate_nodes(40, 1), &[], &[], 5);
-        write_osc(&osc, REPLACEMENT_OSC);
-        let opts = MergeOptions {
-            write: WriteOptions {
-                // A splice-capable backend: the base's untouched blobs are
-                // copied from the splice source, the fourth derived open.
-                backend: pbfhogg::write::OutputBackend::Parallel,
-                ..WriteOptions::default()
-            },
-            parallelism: pbfhogg::Parallelism::from_jobs(2),
-            ..MergeOptions::default()
-        };
-        let run = |base: pbfhogg::read::input::InputSource<'_>,
-                   host: &pbfhogg::host::Host,
-                   output: &Path| {
-            merge(
-                base,
-                &osc,
-                common::out(output),
-                &opts,
-                &pbfhogg::HeaderOverrides::default(),
-                host,
-            )
-        };
-
-        let reference = dir.path().join("reference.osm.pbf");
-        run(
-            base.as_path().into(),
-            &crate::common::test_host(),
-            &reference,
-        )
-        .expect("unreplaced run");
-        let expected = std::fs::read(&reference).expect("read reference output");
-
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            let replacement = dir.path().join("replacement.osm.pbf");
-            write_multi_block_test_pbf(&replacement, &generate_nodes(60, 1), &[], &[], 7);
-            let host = crate::common::test_host();
-            scenario.run(&base, &host, |pin, scenario| {
-                host.invocation
-                    .faults()
-                    .arm_input_replacement(&base, &replacement, 2);
-                let output = dir.path().join(format!("output-{scenario:?}.osm.pbf"));
-                let before = common::snapshot_dir(dir.path());
-                let result = run(pin.into(), &host, &output);
-
-                let report = host
-                    .invocation
-                    .faults()
-                    .input_replacement()
-                    .expect("armed replacement");
-                assert!(report.fired, "the replacement must fire: {report:?}");
-                assert_eq!(report.attempts, 4, "{report:?}");
-                assert_eq!(report.attempts_after_fired, 2, "{report:?}");
-
-                if matches!(scenario, reopen_cell::Scenario::Pinned) {
-                    result.expect("a pinned run is unaffected by the replacement");
-                    assert_eq!(report.verified, 4, "{report:?}");
-                    assert_eq!(
-                        std::fs::read(&output).expect("read output"),
-                        expected,
-                        "the run must read only the base it pinned"
-                    );
-                    std::fs::remove_file(&output).expect("remove output");
-                } else {
-                    let err = result.err().expect("a path-reopened run must refuse");
-                    assert!(
-                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                        "{err:?}"
-                    );
-                    assert_eq!(report.refused, 2, "{report:?}");
-                    assert!(!output.exists(), "a refused run must publish nothing");
-                    // The replacement file was renamed over the base, so it is
-                    // the one path the run itself did not account for.
-                    let mut after = common::snapshot_dir(dir.path());
-                    after.insert(std::path::PathBuf::from("replacement.osm.pbf"));
-                    common::assert_scratch_unchanged(&before, &after);
-                }
-            });
-            // Restore the original base for the next mode.
+        let replacement = dir.path().join("replacement.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        let write_base = || {
             write_multi_block_test_pbf(&base, &generate_nodes(40, 1), &[], &[], 5);
+        };
+        write_osc(&osc, REPLACEMENT_OSC);
+
+        for &direct in pinned_cell::modes() {
+            write_base();
+            let opts = MergeOptions {
+                write: WriteOptions {
+                    backend: pbfhogg::write::OutputBackend::Parallel,
+                    direct_reads: direct,
+                    ..WriteOptions::default()
+                },
+                parallelism: pbfhogg::Parallelism::from_jobs(2),
+                ..MergeOptions::default()
+            };
+            let run = |base: pbfhogg::read::input::InputSource<'_>, host: &pbfhogg::host::Host| {
+                merge(
+                    base,
+                    &osc,
+                    common::out(&output),
+                    &opts,
+                    &pbfhogg::HeaderOverrides::default(),
+                    host,
+                )
+            };
+            let cell = Cell::new(
+                "apply-changes splice",
+                direct,
+                &base,
+                &replacement,
+                4,
+                "DDDD",
+            )
+            .racing(Some(2))
+            .scratch(dir.path());
+            pinned_cell::check(
+                &cell,
+                |host| run(base.as_path().into(), host),
+                |_| pinned_cell::take(&output),
+                |_, _| {
+                    write_base();
+                    // A larger ID range and different blob layout expose
+                    // reads of the replacement.
+                    write_multi_block_test_pbf(&replacement, &generate_nodes(60, 1), &[], &[], 7);
+                },
+                |(), step| run(step.pin.into(), step.host),
+                |expected, (), step, judged| match judged {
+                    Judged::Unaffected(_) => assert_eq!(
+                        &pinned_cell::take(&output),
+                        expected,
+                        "{}: the run must read only the base it pinned",
+                        step.what
+                    ),
+                    Judged::Refused => assert!(
+                        !output.exists(),
+                        "{}: a refused run must publish nothing",
+                        step.what
+                    ),
+                },
+            );
         }
     }
 

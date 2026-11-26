@@ -439,7 +439,9 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let flags = |file: &std::fs::File| {
             // Safety: F_GETFL on a descriptor the file owns.
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) }
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
+            flags
         };
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flags.bin");
@@ -447,7 +449,10 @@ mod tests {
         let call = host.invocation.call().unwrap();
         let written = match super::imp::create_for_write(&path, Some(&call)) {
             Ok((file, _)) => file,
-            Err(e) if crate::test_support::is_direct_io_refusal(&e) => return,
+            Err(e) if crate::test_support::is_direct_io_refusal(&e) => {
+                crate::test_support::skip(format!("direct write open: {e}"));
+                return;
+            }
             Err(e) => panic!("{e}"),
         };
         assert_ne!(flags(&written) & libc::O_DIRECT, 0, "write open");

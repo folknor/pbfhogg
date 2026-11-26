@@ -1054,33 +1054,23 @@ sort descriptors, scratch and the frozen set at their overlap for peak memory.
 
 Kind: capability with an unmeasured payoff (catch-up).
 
-## PERF-037 - merge-changes --simplify renders every change before choosing winners
+## PERF-037 - merge-changes --simplify holds a 64-byte descriptor per change
 
-Reported by: osc, merge.
+Reported by: osc, merge. Narrowed 2026-11-26.
 
-Mechanism: `render_batch` parses and formats every change to XML with a
-descriptor; `dedupe` builds and sorts another key vector and scans groups
-serially for version validation and winner choice; output is split about one
-chunk per worker per action, built and optionally compressed, and `all_chunks`
-retains everything before draining. Superseded changes are formatted and kept;
-winners are copied again.
+Residue: each change carries a 40-byte `Element` record (`usize` offsets) and,
+during dedupe, a 24-byte sort key: about 1.7 GB at the planet week's 26.3 M
+changes, beside the rendered XML. A packed descriptor (u32 offsets within the
+batch, the key derived instead of copied) would cut resident data with mostly
+unique changes. Unmeasured: the split of peak anon between descriptors and XML.
 
-Redesign: parse and validate into compact records holding what merge-changes
-re-emits (create versus modify, delete bodies and optional coordinates, lexical
-metadata passthrough); partition by object identity (ordered input epochs per
-partition, or radix partitioning descriptors), reducers retain the latest
-payload per object, per-input local compaction early; render only survivors;
-bounded render and compress chunks streamed to the destination.
+Declined, with reasons at the `simplify.rs` module doc and the cells in
+reference/performance/merge-changes.md: streaming chunks to the output in
+order (planet .osc.gz neutral), and rendering only survivors from compact
+reduced records (3.2 % of elements superseded on the one measured workload;
+bounded memory would need scratch, which --simplify refuses).
 
-Payoff: less resident data even with unique changes, less rendering with many
-superseded ones, no serial reduction tail.
-
-Risks: last-by-position, not highest-version; every claim checked in original
-order, including discarded payloads (`VersionFloor`); all elements still
-validated; input failures take precedence over version-regression failures; the
-apply-changes overlay would discard information merge-changes needs.
-
-Kind: high conviction; replace the pipeline.
+Kind: memory, unmeasured payoff.
 
 ## PERF-038 - Unsimplified OSC merge replays a lexical transcript
 
@@ -1607,11 +1597,11 @@ Every payoff below is unmeasured.
   wait, so a slow head unit can hold the run and worker cost is not ruled out.
 - Simplified OSC (`merge_changes/simplify.rs`) collects every chunk in
   `all_chunks` before the drain; for plain `.osc` that is a second XML copy of
-  every survivor (planet `95b543e1` peaked at 12.0 GB anon in emit against
-  9.2 GB in simplify, a `.osc.gz` cell, so the plain-XML copy is read from
-  the code, not measured). An ordered drain with bounded in-flight bytes
-  stops the retention; capping chunk size only bounds each worker's
-  temporary XML; draining per action alone does neither.
+  every survivor. An ordered windowed drain was measured on `.osc.gz` and is
+  wall- and peak-neutral there (reference/performance/merge-changes.md,
+  2026-11-26), so only the plain `.osc` case remains: a memory win there,
+  unmeasured (the bench has no plain-output option), is the sole reason
+  left to carry it.
 - Text diff `TextUnitSink` copies every full 1 MiB piece out of its buffer and
   the tail again; a chunking writer filling owned pieces would avoid it, but
   handing the buffer over whole retains oversized capacity that the overflow

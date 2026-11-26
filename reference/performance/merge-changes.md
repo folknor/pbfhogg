@@ -8,6 +8,28 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Simplify output streamed in order: declined (bygg, 2026-11-26, `5affed23` + change)
+
+The variant planned the chunks of all three action groups in output
+order (same boundaries, so identical bytes), ran them on the pool in a
+window of `min(lanes, workers)` admitted ahead of the next to write, and
+had the calling thread write each as soon as it and every earlier chunk
+was done, instead of collecting `all_chunks` before a serial drain.
+Planet 7-OSC (`--osc 4914..4920`) `--simplify yes`, `.osc.gz`, 32
+workers, `brokkr bench --iterations 1 merge-diffs`, after `brokkr
+fstrim`, baseline a `--commit HEAD` worktree, variant uncommitted,
+interleaved A B A B: baseline 4393 (`21095d0b`), 4498 ms (`846832fc`);
+variant 4403 (`017625db`), 4422 ms (`44a0ecdb`). Medians 4446 against
+4413 ms, -0.7 %, pair signs mixed: neutral. Split of `21095d0b` against
+`017625db`: parse 2602 vs 2660 ms, simplify 237 vs 245 ms, emit 1112 vs
+1146 ms, drain 319 vs 239 ms (the variant's drain is `finish` alone, its
+chunk writes ran inside emit); peak anon in emit 11.6 vs 12.0 GB, no
+reduction, since the rendered batches dominate the peak. Reverted. Plain
+`.osc` output, where the collected chunks are an uncompressed second
+copy, was not measured. Rendering only survivors was not attempted: 3.2
+% of elements are superseded on this workload (26,261,540 in, 25,417,990
+out) and dedupe as a whole is about 240 ms.
+
 ### XML lexical checks: references, separators, names, document grammar (bygg, 2026-11-24, `b13a2c8d` + change)
 
 The change adds a `<` lane to the start-tag SWAR word test, a

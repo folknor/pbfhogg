@@ -33,6 +33,27 @@
 //! superseded change's bytes stay in their batch until the run ends. The
 //! output bytes depend on the worker count (and through `-j 0` on the
 //! host's core count) while the changes and their order do not.
+//!
+//! # Considered and declined
+//!
+//! - **Streaming the chunks to the output in order** as they finish (all
+//!   three groups in one lane-capped window, the calling thread writing),
+//!   instead of collecting them before the drain. Measured neutral on
+//!   planet, a week of dailies, `.osc.gz`, 32 workers (2026-11-26, host
+//!   bygg, against 5affed23): 4393 and 4498 ms baseline, 4403 and 4422 ms
+//!   streamed, no lower peak, because the rendered batches dominate it;
+//!   `reference/performance/merge-changes.md` has the cells. Plain `.osc`
+//!   output, where the collected chunks are a second uncompressed copy,
+//!   was not measured.
+//! - **Rendering only survivors** from compact parsed records reduced per
+//!   object. On that workload 3.2 percent of elements were superseded and
+//!   rendering overlaps the per-input lexing; dedupe as a whole (key
+//!   build, sort, floor scan) took about 240 ms of 4.4 s. How much render
+//!   work the losers carry, and how much smaller a record holding what is
+//!   re-emitted would be than its XML, are not measured. Bounding memory
+//!   outright needs scratch, which `--simplify` refuses by contract. The
+//!   open memory lever is the per-change record and key, about 1.7 GB at
+//!   26 M changes.
 
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 use rayon::prelude::*;

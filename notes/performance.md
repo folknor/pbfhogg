@@ -1347,6 +1347,14 @@ Kind: high conviction.
 
 Reported by: sort.
 
+Narrowed 2026-11-26: the stage 2d wall was not bound by lookup cost but by
+its fixed 6 workers (pass 1 likewise at 4); both stages now run at host
+width with a shared way set, planet 126-131 s to 68-80 s
+(reference/performance/renumber.md, "Host-sized rewrite stages"). What
+remains is per-ref CPU, which matters again now that stage 2d keeps about
+28 cores busy; no cell yet attributes lookup time within
+`stage2d_reframe_ns` at this width, so the first step is that attribution.
+
 Mechanism: lookup reads a bitmap, separately allocated prefix arrays and
 popcounts up to seven words (`rank_if_set` already combines membership and
 directory); the way rewriter resolves each ref right after decoding it and

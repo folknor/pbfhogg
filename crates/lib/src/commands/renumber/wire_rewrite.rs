@@ -727,12 +727,15 @@ pub(super) fn reframe_dense_with_new_ids(
 ///
 /// For each way: decode old way id, assign new sequential way id,
 /// resolve each ref's new node id through `nodes`, delta-encode the new
-/// refs, and copy keys/vals/info raw bytes verbatim.
+/// refs, and copy keys/vals/info raw bytes verbatim. Each old way ID goes
+/// into `way_id_set` through `try_insert_atomic`; one the set has no
+/// pre-allocated chunk for is appended to `overflow` instead.
 pub(super) fn reframe_ways_with_new_ids(
     decompressed: &[u8],
     base_new_way_id: i64,
     nodes: &IdSpace<'_>,
-    way_id_set: &mut IdSet,
+    way_id_set: &IdSet,
+    overflow: &mut Vec<i64>,
     output: &mut Vec<u8>,
     s: &mut Scratch,
 ) -> crate::Result<Outcome> {
@@ -756,6 +759,7 @@ pub(super) fn reframe_ways_with_new_ids(
                         new_way_id,
                         nodes,
                         way_id_set,
+                        overflow,
                         &mut span,
                         &mut s.packed,
                         &mut s.element,
@@ -794,7 +798,8 @@ fn reframe_way(
     way_bytes: &[u8],
     new_way_id: i64,
     nodes: &IdSpace<'_>,
-    way_id_set: &mut IdSet,
+    way_id_set: &IdSet,
+    overflow: &mut Vec<i64>,
     span: &mut Span,
     refs_out: &mut Vec<u8>,
     out: &mut Vec<u8>,
@@ -842,7 +847,9 @@ fn reframe_way(
 
     let (old_way_id, id_r) = id.ok_or_else(|| Error::invalid_data("reframe_ways: no id field"))?;
     span.push("way", old_way_id)?;
-    way_id_set.insert(old_way_id);
+    if !way_id_set.try_insert_atomic(old_way_id) {
+        overflow.push(old_way_id);
+    }
 
     // Decode old ref deltas, resolve via rank, delta-encode new refs.
     refs_out.clear();
@@ -1379,13 +1386,14 @@ mod tests {
         let mut node_ids = IdSet::new();
         node_ids.insert(7);
         let node_ids = node_ids.into_ranked();
-        let mut way_ids = IdSet::new();
+        let way_ids = IdSet::new();
         let mut out = Vec::new();
         reframe_ways_with_new_ids(
             block,
             1_000,
             &IdSpace::new(&node_ids, 100),
-            &mut way_ids,
+            &way_ids,
+            &mut Vec::new(),
             &mut out,
             &mut Scratch::default(),
         )
@@ -2192,7 +2200,8 @@ mod tests {
             block,
             1_000,
             &IdSpace::new(&node_ids, 100),
-            &mut IdSet::new(),
+            &IdSet::new(),
+            &mut Vec::new(),
             out,
             &mut Scratch::default(),
         )

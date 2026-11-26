@@ -651,6 +651,13 @@
 
 ### Changed
 
+- **`renumber` sizes its node and way rewrite stages from the host.** They
+  ran a fixed 4 and 6 workers; they now use the host's cores (the node
+  stage capped at 12), and the way stage records way IDs in one shared
+  set instead of one per worker, so memory does not grow with the core
+  count. Planet on a 32-thread host: about 2m08s to about 1m14s, peak
+  memory about 0.4 GB higher.
+
 - **`cat`, `extract`, `multi-extract`, `tags-filter`, `getid`,
   `getparents` and snapshot `time-filter` cut an output block too large
   for one blob instead of refusing it.** A re-encoded block can pass the

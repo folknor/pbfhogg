@@ -12,7 +12,6 @@ use super::schedule::BlobTask;
 use super::wire_rewrite::{Scratch, reframe_dense_with_new_ids};
 use super::{BlobBuffers, Phase, StageCounters, blob_index, positional_bases};
 use crate::idset::IdSet;
-use crate::tunables::RENUMBER_PASS1_WORKERS;
 
 /// Per-worker state: I/O and rewrite buffers plus the IDs this worker could
 /// not record in the shared set.
@@ -45,10 +44,11 @@ pub(super) fn pass1_parallel_scan(
     source: &std::sync::Arc<std::path::Path>,
     node_id_set: &IdSet,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
+    width: usize,
 ) -> Result<Pass1Result> {
     let bases = positional_bases(start_node_id, schedule, "node")?;
     let counters = StageCounters::new();
-    let mut workers: Vec<Pass1Worker> = (0..RENUMBER_PASS1_WORKERS)
+    let mut workers: Vec<Pass1Worker> = (0..width)
         .map(|_| Pass1Worker {
             buffers: BlobBuffers::default(),
             scratch: Scratch::default(),

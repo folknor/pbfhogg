@@ -13,8 +13,8 @@
 //!   after the pass gives O(1) old-to-new lookup.
 //! - **Stage 2d**: parallel wire-format way splice rewriter. Resolves way
 //!   refs inline through the node set's rank during the splice - no
-//!   intermediate files. Per-worker `IdSet` shards for `way_id_set`, merged
-//!   after stage 2d.
+//!   intermediate files. Old way IDs go into one shared, pre-allocated
+//!   `way_id_set`, as pass 1 does for nodes.
 //! - **R1**: sequential relation scan to collect all relation IDs into
 //!   a third `IdSet` + rank index.
 //! - **R2d**: parallel wire-format splice rewriter for relations.
@@ -130,7 +130,7 @@ use schedule::{BlobTask, build_all_blob_schedules};
 use stage2::stage2d_parallel_way_assembly;
 use wire_rewrite::IdSpace;
 
-use crate::tunables::{RENUMBER_PREALLOC_IDS_PER_BYTE, RENUMBER_STAGE2D_WORKERS};
+use crate::tunables::{RENUMBER_PASS1_WORKERS_CAP, RENUMBER_PREALLOC_IDS_PER_BYTE};
 
 // ---------------------------------------------------------------------------
 // Shared instrumentation counters
@@ -518,6 +518,20 @@ pub(crate) fn renumber_external_to<'a>(
         }
     }
 
+    // Both rewrite stages are sized from the host: fixed at 4 and 6 they
+    // ran exactly that many threads busy (see the tunable).
+    let host_width = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    );
+    let pass1_width = host_width
+        .min(RENUMBER_PASS1_WORKERS_CAP)
+        .min(pass1_schedule.len())
+        .max(1);
+    let stage2d_width = host_width.min(way_schedule.len()).max(1);
+
     let pass1 = pass1_parallel_scan(
         &pass1_schedule,
         start_node_id,
@@ -525,6 +539,7 @@ pub(crate) fn renumber_external_to<'a>(
         &source,
         &node_id_set,
         &mut writer,
+        pass1_width,
     )?;
     if pass1.nodes_written != pass1_total_nodes {
         return Err(Error::internal(format!(
@@ -563,31 +578,47 @@ pub(crate) fn renumber_external_to<'a>(
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
     host.invocation.check()?;
     host.invocation.marker("RENUMBER_EXT_STAGE2D_START");
-    let mut way_id_sets: Vec<crate::idset::IdSet> = (0..RENUMBER_STAGE2D_WORKERS)
-        .map(|_| crate::idset::IdSet::new())
-        .collect();
+    // One shared way IdSet, pre-allocated like the node set above.
+    let mut way_id_set = crate::idset::IdSet::new();
+    if let Some(claimed_max) = way_schedule.iter().map(|t| t.max_id).max() {
+        let bound = crate::idset::IdSet::file_bounded_max_id(
+            claimed_max,
+            file_len,
+            RENUMBER_PREALLOC_IDS_PER_BYTE,
+        );
+        if bound >= 0 {
+            way_id_set.pre_allocate(bound);
+        }
+    }
     let stage2d = stage2d_parallel_way_assembly(
         &shared_file,
         &source,
         &mut writer,
-        &mut way_id_sets,
+        &way_id_set,
         &way_schedule,
         &nodes,
         start_way_id,
+        stage2d_width,
     )?;
+    host.invocation.check()?;
+    let mut way_overflow_ids: u64 = 0;
+    for ids in stage2d.overflow {
+        way_overflow_ids =
+            way_overflow_ids.saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+        for id in ids {
+            way_id_set.insert(id);
+        }
+    }
+    host.invocation
+        .counter("renumber_ext_way_overflow_ids", way_overflow_ids);
     host.invocation.marker("RENUMBER_EXT_STAGE2D_END");
 
     // ---- R1: collect relation IDs into IdSet ----
     host.invocation.marker("RENUMBER_EXT_R1_START");
-    let t_way_merge = Stopwatch::start();
-    let mut way_id_set = crate::idset::IdSet::new();
-    for other in way_id_sets {
-        way_id_set.merge(other);
-    }
-    host.invocation.check()?;
+    let t_way_rank = Stopwatch::start();
     let way_id_set = way_id_set.into_ranked();
     host.invocation
-        .counter("renumber_ext_way_merge_rank_ms", t_way_merge.elapsed_ms());
+        .counter("renumber_ext_way_rank_ms", t_way_rank.elapsed_ms());
     host.invocation
         .counter("renumber_ext_way_map_entries", way_id_set.total_count());
     set_matches_written("way", way_id_set.total_count(), stage2d.ways_written)?;

@@ -8,7 +8,9 @@ Wire-format splice rewriters
 for all three element types - pass 1 (dense and plain nodes), stage 2d (ways),
 and R2d (relations) - patch only the ID/ref fields and copy everything
 else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
-construction. Pass 1: 4 work-stealing workers. Stage 2d: 6 workers.
+construction. Pass 1 and stage 2d run work-stealing workers sized from
+the host (pass 1 capped); both record old IDs in one shared,
+pre-allocated `IdSet` per kind.
 R2d: parallel with inline rank() dispatch (relation_map replaced by
 `relation_id_set.rank()`). All member-ref lookups via
 `node_id_set.rank()` + `way_id_set.rank()` inline - no flat temp
@@ -16,6 +18,12 @@ files. Zero scratch disk usage. Single shared input fd across all
 data phases (the header read and the schedule walk have their own).
 Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
 defaults to zlib:1.
+
+### Current baseline (planet, commit `c73f2a73` plus the host-sized stages, bygg, 2026-11-26)
+
+`id-remap` `--iterations 1`, cells `9c8055f4` and `de92105d`: 80 s and
+68 s. Pass 1 48.2 / 37.3 s, stage 2d 22.4 / 21.8 s, R1 2.4 s, R2D
+1.3 s; peak anon 3.6-3.7 GB. See "Host-sized rewrite stages" below.
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
@@ -46,6 +54,38 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 ## History
 
 ### Renumber
+
+#### Host-sized rewrite stages (planet, baseline `c73f2a73`, bygg, 2026-11-26)
+
+Pass 1 and stage 2d were fixed at 4 and 6 workers, and their worker-time
+counters summed to exactly that many busy threads (`d24df488`: stage 2d
+reframe + decompress + pread 283 s over a 47.3 s span = 6.0; pass 1
+268.7 s over 67.2 s = 4.0): the stages were thread-starved on a
+32-thread host, not bound by per-ref lookup cost. Both are now sized from
+the host (width less two; pass 1 capped at 12 because past that it waits
+on the writer), and stage 2d records way IDs in one shared, pre-allocated
+`IdSet` through atomic inserts instead of one shard per worker merged in
+R1, so the set's storage does not grow with the width.
+
+Exploration, uncommitted, before the suite: Germany 7.8 s at HEAD
+(`3e60f5a1`); stage 2d at 16 workers alone 4.9 s (`8d42a9fd`, stage 2d
+3131 to 1349 ms); pass 1 at 12 as well 3.7 s (`30c7b862`, pass 1 2296 to
+1062 ms); 28 and 28 4.0 s (`c1cb88ff`, no better: pass 1
+`ordered_pool_result_send_wait_ns` 14.3 s, writer-bound). Planet with
+both at 16 and per-worker shards kept: 79.8 s (`ba0d1a22`), peak anon
+5.9 GB against 3.2 GB, the growth in stage 2d's shards, which is what the
+shared set removes.
+
+Matched suite after one `fstrim`, A B B A, baseline built with
+`--commit c73f2a73`, variant uncommitted on it: baseline 2m06s
+(`9766e8c7`) and 2m11s (`5985d34e`), variant 1m20s (`9c8055f4`) and
+1m08s (`de92105d`). Phase split, baseline against variant by pair:
+pass 1 68.7 / 48.2 s and 74.4 / 37.3 s, stage 2d 46.0 / 22.4 s and
+47.7 / 21.8 s, R1 2.45 / 2.39 s and 2.47 / 2.39 s. Peak anon 3.25 GB
+against 3.58 GB and 3.26 GB against 3.66 GB. Verdict: landed, about
+-40 % wall; Germany `pbfhogg-verify renumber` passes. Per-ref lookup
+CPU now matters more, since the stage runs about 28 cores busy instead
+of 6; that work is unmeasured at this width.
 
 #### Compressed-body trial, re-encoding cut and the zlib worst-case reserve (planet, baseline `62a911d7`, bygg, 2026-11-24)
 

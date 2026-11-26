@@ -2,8 +2,15 @@
 //!
 //! Single pass over way blobs on the shared ordered pool: resolves refs
 //! inline through the node `IdSpace` and splices new IDs into the wire
-//! format. Each worker records the way IDs it sees in its own `IdSet` shard;
-//! the caller merges the shards for relation member resolution.
+//! format. Old way IDs go into one shared, pre-allocated `IdSet` via
+//! `try_insert_atomic`, as pass 1 does for nodes; an ID outside the
+//! pre-allocation is collected per worker and returned for the caller to
+//! insert after the stage. The set's dense storage therefore does not grow
+//! with the worker count: per-worker shards each materialised a bit array
+//! for every chunk the work-stealing order sent them into, which at planet
+//! width cost a 4 MiB chunk per worker per way chunk. The price is the one
+//! pass 1 already pays: a reserved chunk any way touches becomes a 4 MiB bit
+//! array, where a shard could keep a sparsely covered chunk as an array.
 
 use super::super::Result;
 use super::pool::{Rewritten, run_rewrite_stage};
@@ -12,14 +19,14 @@ use super::wire_rewrite::{IdSpace, Scratch, reframe_ways_with_new_ids};
 use super::{BlobBuffers, Phase, StageCounters, blob_index, positional_bases};
 use crate::idset::IdSet;
 
-struct Stage2dWorker<'a> {
-    way_ids: &'a mut IdSet,
+struct Stage2dWorker {
     buffers: BlobBuffers,
     scratch: Scratch,
     reframe_buf: Vec<u8>,
+    overflow: Vec<i64>,
 }
 
-impl super::RewriteWorker for Stage2dWorker<'_> {
+impl super::RewriteWorker for Stage2dWorker {
     fn buffers(&mut self) -> &mut BlobBuffers {
         &mut self.buffers
     }
@@ -29,27 +36,31 @@ impl super::RewriteWorker for Stage2dWorker<'_> {
 pub(super) struct Stage2dResult {
     pub(super) ways_written: u64,
     pub(super) orphan_refs: u64,
+    /// Way IDs `way_id_set` had no pre-allocated chunk for. The caller must
+    /// `insert` them before building the rank index.
+    pub(super) overflow: Vec<Vec<i64>>,
 }
 
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage2d_parallel_way_assembly(
     shared_file: &crate::read::input::InputFile,
     source: &std::sync::Arc<std::path::Path>,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
-    way_id_sets: &mut [IdSet],
+    way_id_set: &IdSet,
     way_schedule: &[BlobTask],
     nodes: &IdSpace<'_>,
     start_way_id: i64,
+    width: usize,
 ) -> Result<Stage2dResult> {
     let bases = positional_bases(start_way_id, way_schedule, "way")?;
     let counters = StageCounters::new();
-    let mut workers: Vec<Stage2dWorker<'_>> = way_id_sets
-        .iter_mut()
-        .map(|way_ids| Stage2dWorker {
-            way_ids,
+    let mut workers: Vec<Stage2dWorker> = (0..width)
+        .map(|_| Stage2dWorker {
             buffers: BlobBuffers::default(),
             scratch: Scratch::default(),
             reframe_buf: Vec::new(),
+            overflow: Vec::new(),
         })
         .collect();
 
@@ -61,7 +72,7 @@ pub(super) fn stage2d_parallel_way_assembly(
         &mut workers,
         &counters,
         writer,
-        |w: &mut Stage2dWorker<'_>, idx| {
+        |w: &mut Stage2dWorker, idx| {
             let task = &way_schedule[idx];
             let base = bases[idx];
             (|| {
@@ -74,7 +85,8 @@ pub(super) fn stage2d_parallel_way_assembly(
                     &w.buffers.decompressed,
                     base,
                     nodes,
-                    &mut *w.way_ids,
+                    way_id_set,
+                    &mut w.overflow,
                     &mut w.reframe_buf,
                     &mut w.scratch,
                 )?;
@@ -112,5 +124,6 @@ pub(super) fn stage2d_parallel_way_assembly(
     Ok(Stage2dResult {
         ways_written: totals.written,
         orphan_refs: totals.orphans,
+        overflow: workers.into_iter().map(|w| w.overflow).collect(),
     })
 }

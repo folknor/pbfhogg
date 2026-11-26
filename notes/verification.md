@@ -20,12 +20,23 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-162 - The reader's exact half-turn tie rule is not certified
+## VER-163 - The apply-changes base replacement cell runs buffered and one arm only
 
-`pbfhogg-verify geocode` models a street or interpolation segment spanning exactly half a turn
-of longitude as both half-world paths, each a candidate with its own snap, and accepts either
-when their distances tie within the tolerance. The reader breaks an exact tie by the path running
-east from the lesser `(lon, lat)` endpoint (`segment_distance` in the geocode reader), and no
-check holds it to that rule: an answer taking the other path at a tie passes. Certifying it needs
-a query constructed on an exact tie (the `geocode-seam` fixture is the natural home) and a
-judgement of the path, not only of the distance.
+`fault_apply_changes.rs` `base_replaced_after_the_splice_open_is_never_read` is a hand-rolled
+pinned-input replacement cell outside `pinned_cell::check`: it arms the replacement after the
+splice-source open only, with `OutputBackend::Parallel` and buffered reads, and asserts no
+transport list. The file's `direct_reads_reach_every_base_open` cell pins the direct transports
+of an unreplaced run, so no cell holds apply-changes to its pin under a replacement on the direct
+read path, or at any open other than the one chosen. Every other pinned-input command now runs
+its whole matrix, both read modes and the caller-pin arm through the driver; apply-changes would
+need a driver cell whose run takes the base and the OSC, with the splice route's per-open list
+(front read, splice source, the scanner's walker, the worker pool's descriptor).
+
+## VER-164 - `opens_carry_o_direct_and_count_once` skips without announcing
+
+`direct_io.rs` `opens_carry_o_direct_and_count_once` returns on a typed direct-io refusal of its
+write open (`Err(e) if is_direct_io_refusal(&e) => return`) without calling `skip`, though
+`test_support::refused` leaves announcing the skip to its caller and every other predicate site
+announces. The gate still fails it through `fail_if_required`; outside the gate the test passes
+silently on a host that refuses O_DIRECT, and this is the test the construction exemption in
+`reference/testing.md` "Platform-dependent tests" rests on.

@@ -917,6 +917,13 @@
 
 ### Fixed
 
+- **`geocode-query` answers a street segment of exactly half a turn the
+  same whichever order its nodes run.** Both half-world paths are now
+  measured from the segment's lesser endpoint, with -180 ordered as +180,
+  so reversing the way or respelling an antimeridian endpoint no longer
+  changes which path a near-equidistant query snaps to; an exact tie takes
+  the path east of that endpoint. Rebuilding the index is not needed.
+
 - **`build-geocode-index` places a building across the antimeridian
   beside it.** Its node longitudes used to be averaged as plain numbers,
   so such a building's address landed near longitude 0, on the far side

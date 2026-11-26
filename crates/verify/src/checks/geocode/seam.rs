@@ -19,8 +19,11 @@
 use crate::error::Error;
 use crate::harness::Harness;
 
+use crate::harness::Verdict;
+use crate::tunables::GEOCODE_DISTANCE_TOLERANCE_M as TOL;
+
 use super::admin::{AdminExpect, AdminModel, Level};
-use super::{Expect, Query, judge_input};
+use super::{Expect, Query, StreetAnswer, judge, judge_input};
 
 /// The fixture. Coordinates are `x` longitude, `y` latitude.
 const FIXTURE: &str = "\
@@ -61,6 +64,12 @@ n74 v1 x179.985 y-17.019 T
 n75 v1 x-179.995 y-17.019 T
 n76 v1 x-179.995 y-16.99 T
 n77 v1 x179.985 y-16.99 T
+n80 v1 x0.0 y30.0 T
+n81 v1 x180.0 y40.0 T
+n82 v1 x0.0 y45.0 T
+n83 v1 x-180.0 y55.0 T
+n84 v1 x180.0 y72.0 T
+n85 v1 x0.0 y62.0 T
 w120 v1 Taddr:interpolation=even,addr:street=Range Nn21,n20,n24
 w121 v1 Tbuilding=yes,addr:housenumber=5,addr:street=SeamRoad Nn30,n31,n32,n33,n30
 w122 v1 Thighway=residential,name=SeamRoad Nn40,n41
@@ -70,6 +79,9 @@ w130 v1 T Nn60,n61,n62,n63,n60
 w131 v1 T Nn64,n65,n66,n67,n64
 w132 v1 T Nn70,n71,n72,n73,n70
 w133 v1 T Nn74,n75,n76,n77,n74
+w140 v1 Thighway=residential,name=HalfPlus Nn80,n81
+w141 v1 Thighway=residential,name=HalfMinus Nn82,n83
+w142 v1 Thighway=residential,name=HalfReversed Nn84,n85
 r1 v1 Tboundary=administrative,admin_level=2,name=SeamCountry,ISO3166-1:alpha2=FJ Mw130@outer,w131@inner
 r2 v1 Tboundary=administrative,admin_level=4,name=WestEdge Mw132@outer
 r3 v1 Tboundary=administrative,admin_level=4,name=BigFour Mw133@outer
@@ -195,6 +207,83 @@ const NAMED: [(&str, f64, f64, Rule); 11] = [
     ),
 ];
 
+/// The half-turn path queries: what each shows, where, the street, whether
+/// the two half-world paths tie there, and whether the answer's snap must
+/// lie east of the meridian (positive longitude).
+///
+/// Each street spans exactly half a turn from a node at longitude 0, the
+/// lesser endpoint by `(longitude, latitude)` with -180 ordered as +180, so
+/// the reader projects both paths from longitude 0. A query on that meridian
+/// is then an exact mirror of itself across it: both paths' squared
+/// distances are bit-equal in the reader, whichever order the way's nodes
+/// run and however the far end spells the antimeridian, and the rule that
+/// the path east of the lesser endpoint wins is the only thing deciding the
+/// snap. The model ties the two paths within its tolerance and cannot tell
+/// an exact tie from a near one in general, so the path is judged only here,
+/// where the tie is exact by construction. The control just west of the
+/// meridian is no tie: the west path is nearer by about a millimetre.
+const TIES: [(&str, f64, f64, &str, bool, bool); 4] = [
+    (
+        "an exact half-turn tie takes the path east of the lesser endpoint",
+        30.005,
+        0.0,
+        "HalfPlus",
+        true,
+        true,
+    ),
+    (
+        "the tie does not follow the far end's spelling of the antimeridian",
+        45.005,
+        0.0,
+        "HalfMinus",
+        true,
+        true,
+    ),
+    (
+        "the tie does not follow the order of the way's nodes",
+        62.005,
+        0.0,
+        "HalfReversed",
+        true,
+        true,
+    ),
+    (
+        "the strictly nearer half-world path wins over the tie preference",
+        30.005,
+        -0.000_000_1,
+        "HalfPlus",
+        false,
+        false,
+    ),
+];
+
+/// The model's candidates at a `TIES` query: two of `name` at one distance
+/// with snaps either side of the meridian at a tie, one west of it
+/// otherwise. Returns the candidate the answer must be.
+fn tie_candidate(
+    q: &Query,
+    name: &str,
+    tie: bool,
+    east: bool,
+) -> Result<(bool, (f64, StreetAnswer)), String> {
+    let Expect::Some(fine, tied) = &q.street else {
+        return Err(format!("street expected {:?}", q.street));
+    };
+    let ok = tied.iter().all(|(_, s)| s.name == name && s.snap_lon != 0)
+        && if tie {
+            tied.len() == 2
+                && (tied[0].0 - tied[1].0).abs() <= TOL
+                && (tied[0].1.snap_lon > 0) != (tied[1].1.snap_lon > 0)
+        } else {
+            tied.len() == 1
+        };
+    let pick = tied.iter().find(|(_, s)| (s.snap_lon > 0) == east);
+    match pick {
+        Some(c) if ok => Ok((*fine, c.clone())),
+        _ => Err(format!("street candidates {tied:?}")),
+    }
+}
+
 /// Level 4 unjudged at both bands because the `WestEdge` ring, which does
 /// not unwrap, has its edge on the antimeridian within each band.
 fn on_west_edge(q: &Query, admin: &AdminModel, bands: [&AdminExpect; 2]) -> Result<(), String> {
@@ -253,9 +342,13 @@ pub fn run(harness: &mut Harness, direct_io: bool) -> Result<Option<String>, Err
         "geocode-seam-fixture.1",
     )?;
     harness.run.watch(&fixture)?;
-    let points: Vec<(f64, f64)> = NAMED.iter().map(|n| (n.1, n.2)).collect();
+    let points: Vec<(f64, f64)> = NAMED
+        .iter()
+        .map(|n| (n.1, n.2))
+        .chain(TIES.iter().map(|t| (t.1, t.2)))
+        .collect();
     let judged = judge_input(harness, &fixture, &outdir, direct_io, &points)?;
-    let first = judged.queries.len() - NAMED.len();
+    let first = judged.queries.len() - points.len();
     for (k, (what, _, _, rule)) in NAMED.iter().enumerate() {
         let i = first + k;
         let bands = [&judged.admin_expects[0][i], &judged.admin_expects[1][i]];
@@ -267,10 +360,37 @@ pub fn run(harness: &mut Harness, direct_io: bool) -> Result<Option<String>, Err
         })?;
         harness.msg(&format!("  named {}: {what}", judged.queries[i].text));
     }
+    let mut wrong = Vec::new();
+    for (k, (what, _, _, name, tie, east)) in TIES.iter().enumerate() {
+        let i = first + NAMED.len() + k;
+        let q = &judged.queries[i];
+        let (fine, want) = tie_candidate(q, name, *tie, *east).map_err(|why| {
+            Error::tool(format!(
+                "named query {} ({what}): the model does not expect what the fixture shows: {why}",
+                q.text
+            ))
+        })?;
+        let street = judged.answered[i]
+            .get("street")
+            .ok_or_else(|| "the answer has no street key".to_owned());
+        if let Err(why) = street.and_then(|v| judge(&Expect::Some(fine, vec![want]), v)) {
+            wrong.push(format!("query {} ({what}): {why}", q.text));
+        }
+        harness.msg(&format!("  named {}: {what}", q.text));
+    }
+    for why in &wrong {
+        harness.msg(&format!("    {why}"));
+    }
+    harness.record(
+        "geocode half-turn street answers take the reader's path",
+        Verdict::from_pass(wrong.is_empty()),
+    );
     Ok(Some(format!(
         "{} queries over a fixture across the antimeridian and past 85 degrees of latitude, \
-         {} named seam cases expected as drawn and judged like the rest",
+         {} named seam cases expected as drawn and judged like the rest, {} half-turn \
+         path cases judged on the path",
         judged.queries.len(),
-        NAMED.len()
+        NAMED.len(),
+        TIES.len()
     )))
 }

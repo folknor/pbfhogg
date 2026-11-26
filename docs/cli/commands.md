@@ -2769,7 +2769,11 @@ built before that rule keeps the raw-frame area of such a ring, and one
 built before rings winding round a pole were refused keeps their
 raw-frame area too, until it is rebuilt. When the street segment spans
 exactly 180 degrees of longitude, the snap is the nearest point on either
-half-world path. A snap's longitude lies in (-180, 180]: a snap on the
+half-world path. Both paths are measured from the segment's lesser
+endpoint by (longitude, latitude), -180 ordered as +180, so the answer is
+the same whichever order the way's nodes run and whichever spelling an
+antimeridian endpoint carries; where the two computed distances are exactly
+equal, the path running east from that endpoint wins. A snap's longitude lies in (-180, 180]: a snap on the
 antimeridian is spelled +180, whichever spelling its way's nodes carry.
 
 ---

@@ -2538,12 +2538,23 @@ fn segment_endpoints_in_span(
 /// from `a` to `b` decides which way the segment runs, the projection is made
 /// on that path, and the snap is interpolated along the same delta. At an
 /// exact half turn both half-world paths are the segment (the builder covers
-/// both), so both are projected onto and the nearer wins; on an exact tie the
-/// path running east from the lesser endpoint wins, so the answer does not
-/// depend on the order of the way's nodes.
+/// both), so both are projected onto and the nearer wins. Both are projected
+/// from the lesser endpoint by `(longitude, latitude)`, -180 ordered as +180,
+/// so the arithmetic, and with it the answer, is the same whichever order the
+/// way's nodes run and whichever spelling an antimeridian endpoint carries;
+/// on an exact tie of the squared distances the path running east from that
+/// endpoint wins.
 fn segment_distance(ctx: &QueryContext, [a, b]: [NodeCoord; 2]) -> (i32, i32, f64) {
     const HALF_TURN_E7: i64 = geo::LON_FULL_TURN_E7 / 2;
     let dlon = geo::wrapped_longitude_delta_e7(i64::from(b.lon_e7) - i64::from(a.lon_e7));
+    let (a, b) = if dlon == -HALF_TURN_E7 {
+        // A half-turn pair has distinct folded longitudes, so latitude only
+        // completes the key; the far end's longitude is spent on `dlon`.
+        let key = |c: &NodeCoord| (geo::normalize_longitude_e7(i64::from(c.lon_e7)), c.lat_e7);
+        if key(&b) < key(&a) { (b, a) } else { (a, b) }
+    } else {
+        (a, b)
+    };
     let project = |dlon: i64| {
         let ax = geo::e7_to_rad(a.lon_e7);
         #[allow(clippy::cast_precision_loss)]
@@ -2561,11 +2572,10 @@ fn segment_distance(ctx: &QueryContext, [a, b]: [NodeCoord; 2]) -> (i32, i32, f6
     let (dlon, (t, dist_sq)) = if dlon == -HALF_TURN_E7 {
         let west = project(-HALF_TURN_E7);
         let east = project(HALF_TURN_E7);
-        let east_from_a = (a.lon_e7, a.lat_e7) < (b.lon_e7, b.lat_e7);
-        match east.1.total_cmp(&west.1) {
-            std::cmp::Ordering::Less => (HALF_TURN_E7, east),
-            std::cmp::Ordering::Equal if east_from_a => (HALF_TURN_E7, east),
-            _ => (-HALF_TURN_E7, west),
+        if east.1 <= west.1 {
+            (HALF_TURN_E7, east)
+        } else {
+            (-HALF_TURN_E7, west)
         }
     } else {
         (dlon, project(dlon))
@@ -2740,6 +2750,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A query on the lesser endpoint's meridian is equidistant from both
+    /// half-world paths; the path east of that endpoint wins, with the same
+    /// arithmetic whichever order the nodes run and however the far end
+    /// spells the antimeridian.
+    #[test]
+    fn half_turn_exact_tie_takes_the_path_east_of_the_lesser_endpoint() {
+        let zero = NodeCoord {
+            lat_e7: 300_000_000,
+            lon_e7: 0,
+        };
+        let far = |lon_e7| NodeCoord {
+            lat_e7: 400_000_000,
+            lon_e7,
+        };
+        let ctx = QueryContext::new(30.005, 0.0).expect("legal query");
+        let answers: Vec<_> = [
+            [zero, far(1_800_000_000)],
+            [far(1_800_000_000), zero],
+            [zero, far(-1_800_000_000)],
+            [far(-1_800_000_000), zero],
+        ]
+        .into_iter()
+        .map(|ends| segment_distance(&ctx, ends))
+        .collect();
+        assert!(answers[0].1 > 0, "snap {:?}", answers[0]);
+        for answer in &answers {
+            assert_eq!(answer.0, answers[0].0);
+            assert_eq!(answer.1, answers[0].1);
+            assert_eq!(answer.2.to_bits(), answers[0].2.to_bits());
+        }
+        // Just west of the meridian the west path is strictly nearer.
+        let ctx = QueryContext::new(30.005, -0.000_000_1).expect("legal query");
+        let (_, snap_lon, _) = segment_distance(&ctx, [zero, far(1_800_000_000)]);
+        assert!(snap_lon < 0, "snap {snap_lon}");
     }
 
     /// Equal-area candidates resolve to the lower polygon index whichever is

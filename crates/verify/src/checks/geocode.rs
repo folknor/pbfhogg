@@ -1364,6 +1364,8 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
 /// expectation per query, at tolerance 0 first.
 struct Judged {
     queries: Vec<Query>,
+    /// pbfhogg's answers at the non-zero admin tolerance, one per query.
+    answered: Vec<Value>,
     admin: admin::AdminModel,
     admin_expects: [Vec<admin::AdminExpect>; 2],
 }
@@ -1473,6 +1475,7 @@ fn judge_input(
     )?;
     Ok(Judged {
         queries,
+        answered,
         admin,
         admin_expects: [exact_expects, band_expects],
     })

@@ -28,10 +28,13 @@
 //!    masks by ID, propagated from child to parent on any bit gain, so a
 //!    parent already in region A still gains region B. Parent-added bits
 //!    never complete anything, and inclusion never travels down.
-//! 5. Smart only: one sweep of the way blobs puts the refs of every
-//!    occurrence of a way with a nonzero `extra_way` mask into
-//!    `relation_nodes` with that mask.
-//! 6. One write pass over the full blob schedule. A node goes to
+//! 5. Smart only: one sweep of the way blobs whose observed ID extent may
+//!    hold an extra way puts the refs of every occurrence of a way with a
+//!    nonzero `extra_way` mask into `relation_nodes` with that mask.
+//! 6. One write pass over the blobs whose span may hold an element some
+//!    region needs (`common::WriteSpan`: observed extents for way and
+//!    relation blobs and classified node blobs, the claimed ID range for a
+//!    node blob classify skipped, every unindexed blob). A node goes to
 //!    `spatial | way_nodes | relation_nodes`, a way to
 //!    `matched_way | extra_way`, a relation to its closed mask. Each mask
 //!    holds only what an earlier one does not (the single-region sets are
@@ -61,7 +64,8 @@ use crate::read::input::PinnedInput;
 use crate::scan::classify::ScheduledBlob;
 
 use super::common::{
-    BboxInt, BlobDesc, MatchableMember, Passthrough, matchable_members, spatial_blob_filter,
+    BboxInt, BlobDesc, Extent, MatchableMember, MayHold, Passthrough, WriteSlot, matchable_members,
+    select_by_extent, select_write_schedule, spatial_blob_filter, widen,
 };
 use super::membership::{
     BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of,
@@ -185,6 +189,10 @@ pub(super) fn try_extract_multi_dependent(
     // single-region engines' write pass runs over, so its decode validation
     // is theirs (no kind-claim refusal there).
     let mut write_schedule: Vec<BlobDesc> = Vec::new();
+    // Where each write entry's span comes from (`WriteSlot`): the write
+    // pass reads only blobs whose span may hold an element some region
+    // needs.
+    let mut write_slots: Vec<WriteSlot> = Vec::new();
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -192,6 +200,7 @@ pub(super) fn try_extract_multi_dependent(
         walker.observe_filter_index(meta.index.as_ref());
         let idx = meta.index.as_ref();
         let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Refuse)?;
+        let before = (way_schedule.len(), relation_schedule.len());
         write_schedule.push(BlobDesc {
             frame_offset: meta.frame_start,
             frame_size: meta.frame_size,
@@ -205,26 +214,30 @@ pub(super) fn try_extract_multi_dependent(
         // Kind and bbox are indexdata claims, believed without a decode
         // (reference/indexdata-trust.md), as in the single-region engines.
         if let Some(idx) = idx {
-            if !spatial_filter.wants_index(idx) {
-                continue;
-            }
-            match idx.kind {
-                ElementKind::Node => {
-                    // Classified only for the regions it is read for, as in
-                    // each single extract; one between regions is skipped.
-                    let admit = node_blob_regions(&bbox_ints, Some(idx));
-                    if admit
-                        .as_deref()
-                        .is_some_and(|mask| mask.iter().all(|&word| word == 0))
-                    {
-                        continue;
+            if spatial_filter.wants_index(idx) {
+                match idx.kind {
+                    ElementKind::Node => {
+                        // Classified only for the regions it is read for, as
+                        // in each single extract; one between regions is
+                        // skipped.
+                        let admit = node_blob_regions(&bbox_ints, Some(idx));
+                        if !admit
+                            .as_deref()
+                            .is_some_and(|mask| mask.iter().all(|&word| word == 0))
+                        {
+                            node_schedule.push(entry);
+                            node_admit.push(admit);
+                        }
                     }
-                    node_schedule.push(entry);
-                    node_admit.push(admit);
+                    ElementKind::Way => way_schedule.push(entry),
+                    ElementKind::Relation => relation_schedule.push(entry),
                 }
-                ElementKind::Way => way_schedule.push(entry),
-                ElementKind::Relation => relation_schedule.push(entry),
             }
+            write_slots.push(WriteSlot::of(
+                idx,
+                (before.0, way_schedule.len()),
+                (before.1, relation_schedule.len()),
+            )?);
         } else {
             // Non-indexed blob (force path): every phase sees it and acts
             // on its own kind only.
@@ -232,8 +245,12 @@ pub(super) fn try_extract_multi_dependent(
             node_admit.push(None);
             way_schedule.push(entry);
             relation_schedule.push(entry);
+            write_slots.push(WriteSlot::Unindexed);
         }
     }
+    // Observed extents, one per way and relation classify-schedule position.
+    let mut way_extents: Vec<Extent> = vec![None; way_schedule.len()];
+    let mut relation_extents: Vec<Extent> = vec![None; relation_schedule.len()];
     host.invocation.marker("MULTI_DEP_SCHEDULE_SCAN_END");
     let shared_file = walker.input();
     drop(walker);
@@ -390,10 +407,13 @@ pub(super) fn try_extract_multi_dependent(
                 )
             },
             |block, (ways, nodes, record, ref_mask, add)| {
+                // Every occurrence, matched or not (see the write pass).
+                let mut extent: Extent = None;
                 for element in block.elements_skip_metadata() {
                     let Element::Way(w) = &element else {
                         continue;
                     };
+                    widen(&mut extent, w.id());
                     record.fill(0);
                     for r in w.refs() {
                         if spatial.or_into(r, record) && record.as_slice() == all_regions.as_slice()
@@ -415,11 +435,14 @@ pub(super) fn try_extract_multi_dependent(
                         }
                     }
                 }
-                Ok((ways.finish(), nodes.finish()))
+                Ok((ways.finish(), nodes.finish(), extent))
             },
-            |_seq, (ways, nodes): (PageBatch, PageBatch)| {
+            |seq, (ways, nodes, extent): (PageBatch, PageBatch, Extent)| {
                 matched_way.install(ways);
                 way_nodes.install(nodes);
+                if let Some(slot) = way_extents.get_mut(seq) {
+                    *slot = extent;
+                }
             },
             host,
         )?;
@@ -460,10 +483,14 @@ pub(super) fn try_extract_multi_dependent(
                 let mut ids: Vec<i64> = Vec::new();
                 let mut masks: Vec<u64> = Vec::new();
                 let mut edges: Vec<(i64, i64)> = Vec::new();
+                // Every occurrence: the parent closure can include a
+                // relation no record matched directly.
+                let mut extent: Extent = None;
                 for element in block.elements_skip_metadata() {
                     let Element::Relation(r) = &element else {
                         continue;
                     };
+                    widen(&mut extent, r.id());
                     push_parent_edges(r, &mut edges);
                     direct.fill(0);
                     for member in matchable_members(r) {
@@ -504,15 +531,25 @@ pub(super) fn try_extract_multi_dependent(
                         }
                     }
                 }
-                Ok((ids, masks, edges, extra_ways.finish(), extra_nodes.finish()))
+                Ok((
+                    ids,
+                    masks,
+                    edges,
+                    extra_ways.finish(),
+                    extra_nodes.finish(),
+                    extent,
+                ))
             },
-            |_seq, (ids, masks, edges, ways, nodes): RelationBlob| {
+            |seq, (ids, masks, edges, ways, nodes, extent): RelationBlob| {
                 for (id, mask) in ids.iter().zip(masks.chunks_exact(mw)) {
                     relations.or_direct(*id, mask);
                 }
                 parent_edges.extend(edges);
                 extra_way.install(ways);
                 relation_nodes.install(nodes);
+                if let Some(slot) = relation_extents.get_mut(seq) {
+                    *slot = extent;
+                }
             },
             host,
         )?;
@@ -527,12 +564,16 @@ pub(super) fn try_extract_multi_dependent(
     // --- Smart: the nodes of extra ways, from every occurrence ---
     if smart {
         host.invocation.marker("MULTI_DEP_EXTRA_WAY_SWEEP_START");
+        // Only the way blobs whose observed extent may hold an extra way.
+        let sweep = select_by_extent(&way_schedule, &way_extents, &[&extra_way])?;
+        host.invocation
+            .counter("multi_extract_extra_way_blobs", sweep.len());
         let spatial = &spatial;
         let way_nodes = &way_nodes;
         let extra_way = &extra_way;
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
-            &way_schedule,
+            &sweep,
             None,
             || {
                 (
@@ -594,6 +635,19 @@ pub(super) fn try_extract_multi_dependent(
         strategy: name,
     };
     let mut stats: Vec<ExtractStats> = (0..n).map(|_| empty_stats(name)).collect();
+    let write_spans = write_slots
+        .iter()
+        .map(|slot| slot.span(&way_extents, &relation_extents))
+        .collect::<Result<Vec<_>>>()?;
+    let node_sets: [&dyn MayHold; 3] = [&spatial, &way_nodes, &relation_nodes];
+    let way_sets: [&dyn MayHold; 2] = [&matched_way, &extra_way];
+    let write_schedule = select_write_schedule(
+        &write_schedule,
+        &write_spans,
+        &node_sets,
+        &way_sets,
+        &[&relation_members],
+    )?;
     write_pass(
         input,
         &write_schedule,
@@ -645,8 +699,16 @@ pub(super) fn try_extract_multi_dependent(
 
 /// One relation blob's classify output: directly matched relation IDs,
 /// their masks (`mask_words` each, in ID order), the blob's parent edges,
-/// and smart's extra-way and relation-node pages.
-type RelationBlob = (Vec<i64>, Vec<u64>, Vec<(i64, i64)>, PageBatch, PageBatch);
+/// smart's extra-way and relation-node pages, and the blob's observed
+/// relation extent.
+type RelationBlob = (
+    Vec<i64>,
+    Vec<u64>,
+    Vec<(i64, i64)>,
+    PageBatch,
+    PageBatch,
+    Extent,
+);
 
 // ---------------------------------------------------------------------------
 // Relation masks and the parent closure

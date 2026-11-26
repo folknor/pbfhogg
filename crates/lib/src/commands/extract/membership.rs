@@ -616,6 +616,19 @@ impl Table {
         }
     }
 
+    /// Whether any page with index in `lo..=hi` is present.
+    fn any_page_in(&self, lo: u16, hi: u16) -> bool {
+        match self {
+            Self::Sparse(pages) => {
+                let at = pages.partition_point(|(i, _)| *i < lo);
+                pages.get(at).is_some_and(|(i, _)| *i <= hi)
+            }
+            Self::Full(slots) => slots[usize::from(lo)..=usize::from(hi)]
+                .iter()
+                .any(Option::is_some),
+        }
+    }
+
     fn pages_mut(&mut self) -> Box<dyn Iterator<Item = &mut Page> + '_> {
         match self {
             Self::Sparse(pages) => Box::new(pages.iter_mut().map(|(_, p)| p)),
@@ -687,6 +700,39 @@ impl Membership {
         self.or_into(id, out)
     }
 
+    /// Whether a present page lies in the page keys `lo..=hi`.
+    fn any_page_in_keys(&self, lo: u64, hi: u64) -> bool {
+        let page_mask = TABLE_PAGES as u64 - 1;
+        let (lo_chunk, hi_chunk) = (lo >> TABLE_SHIFT, hi >> TABLE_SHIFT);
+        let in_table = |chunk: u64, table: &Table| {
+            let first = if chunk == lo_chunk { lo & page_mask } else { 0 };
+            let last = if chunk == hi_chunk {
+                hi & page_mask
+            } else {
+                page_mask
+            };
+            table.any_page_in(first as u16, last as u16)
+        };
+        if lo_chunk < DIRECT_CHUNKS {
+            let end = hi_chunk.min(DIRECT_CHUNKS - 1);
+            for chunk in lo_chunk..=end {
+                match self.direct.get(chunk as usize) {
+                    None => break,
+                    Some(Some(table)) if in_table(chunk, table) => return true,
+                    Some(_) => {}
+                }
+            }
+        }
+        if hi_chunk >= DIRECT_CHUNKS {
+            let start = lo_chunk.max(DIRECT_CHUNKS);
+            return self
+                .overflow
+                .range(start..=hi_chunk)
+                .any(|(&chunk, table)| in_table(chunk, table));
+        }
+        false
+    }
+
     /// Merge one blob's pages into the membership.
     pub(super) fn install(&mut self, batch: PageBatch) {
         for (key, page) in batch.0 {
@@ -748,6 +794,27 @@ impl Membership {
                     *page = encode(&entries, mw, MEMBERSHIP_MERGE_BUDGET);
                 }
             }
+        }
+    }
+}
+
+/// Whether any region may hold an ID in the inclusive signed range, by page
+/// occupancy: a present page meeting the range answers yes even when its
+/// members lie outside it (a superset, which a dependency schedule may
+/// take). Pages are keyed by two's-complement bits, monotone within each
+/// sign, so a range straddling zero, whose first key lies above its last,
+/// wraps: it asks from its first key to the top and from the bottom to its
+/// last key.
+impl super::common::MayHold for Membership {
+    fn may_hold(&self, min_id: i64, max_id: i64) -> bool {
+        if min_id > max_id {
+            return false;
+        }
+        let (first, last) = (split(min_id).0, split(max_id).0);
+        if first <= last {
+            self.any_page_in_keys(first, last)
+        } else {
+            self.any_page_in_keys(first, u64::MAX >> PAGE_SHIFT) || self.any_page_in_keys(0, last)
         }
     }
 }
@@ -938,6 +1005,59 @@ mod tests {
                 let probes: Vec<i64> = (0..2_000).map(|_| rng.below(span + 10) as i64).collect();
                 check(regions, &blobs, &probes, false);
                 check(regions, &blobs, &probes, true);
+            }
+        }
+    }
+
+    /// `may_hold` answers yes for every range holding a member, and no
+    /// for every range whose pages (per sign half) hold none, across the
+    /// sparse and full table forms, the direct and overflow chunks, and
+    /// negative IDs.
+    #[test]
+    fn may_hold_is_exact_by_page_occupancy() {
+        use super::super::common::MayHold;
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut members: Vec<i64> = Vec::new();
+        // A dense chunk (full table), scattered pages, negatives, far IDs.
+        members.extend((0..3_000).map(|i| (i * 4096 * 2) as i64));
+        members.extend((0..200).map(|_| rng.below(1 << 40) as i64));
+        members.extend((0..200).map(|_| -(rng.below(1 << 30) as i64) - 1));
+        members.extend([i64::MIN, i64::MAX, -1, 0, 1 << 50]);
+        let mut membership = Membership::new(3);
+        let mut builder = BatchBuilder::new(3);
+        for &id in &members {
+            builder.push(id, (id.rem_euclid(3)) as usize);
+        }
+        membership.install(builder.finish());
+        membership.freeze();
+        let page = |id: i64| split(id).0;
+        let oracle = |lo: i64, hi: i64| {
+            members.iter().any(|&m| {
+                let half = |a: i64, b: i64| a <= b && (page(a)..=page(b)).contains(&page(m));
+                (m >= 0 && half(lo.max(0), hi)) || (m < 0 && half(lo, hi.min(-1)))
+            })
+        };
+        let mut probes: Vec<(i64, i64)> = vec![
+            (i64::MIN, i64::MAX),
+            (-5, 5),
+            (1, 4095),
+            (8193, 12_000),
+            (i64::MIN, i64::MIN),
+            (5, 4),
+        ];
+        for _ in 0..5_000 {
+            let a = rng.next() as i64 >> rng.below(63);
+            let b = a.saturating_add((rng.below(1 << 20)) as i64);
+            probes.push((a, b));
+        }
+        for &m in &members {
+            probes.push((m, m));
+        }
+        for (lo, hi) in probes {
+            let got = membership.may_hold(lo, hi);
+            assert_eq!(got, oracle(lo, hi), "range {lo}..={hi}");
+            if members.iter().any(|&m| lo <= m && m <= hi) {
+                assert!(got, "range {lo}..={hi} holds a member");
             }
         }
     }

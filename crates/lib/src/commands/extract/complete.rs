@@ -10,7 +10,7 @@ use super::common::{
     BboxInt, ExtractPass2IdSets, extract_block_pass2, pread_write_pass,
     pread_write_pass_with_schedule,
 };
-use super::smart::{CompleteRelationHandler, collect_pass1_generic};
+use super::smart::{CompleteRelationHandler, collect_pass1_generic, write_schedule_for};
 use super::{ExtractStats, Region};
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -69,10 +69,17 @@ pub(super) fn extract_complete_ways(
         host,
     )?;
 
-    // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
-    // holds immutable borrows of `result` and we need a brief mutable borrow
-    // here to mem::take the schedule.
-    let pass1_blob_schedule = std::mem::take(&mut result.pass3_blob_schedule);
+    let pass1_blob_schedule = match &result.schedules {
+        Some(schedules) => Some(write_schedule_for(
+            schedules,
+            &[&result.bbox_node_ids, &result.outside_way_node_ids],
+            &[&result.matched_way_ids],
+            &[&result.matched_relation_ids],
+            host,
+        )?),
+        None => None,
+    };
+    result.schedules = None;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &result.bbox_node_ids,
@@ -83,12 +90,12 @@ pub(super) fn extract_complete_ways(
 
     host.invocation.marker("COMPLETE_PASS2_SETUP_END");
     host.invocation.marker("COMPLETE_PASS2_WRITE_START");
-    // Reuse PASS1's pre-built blob schedule if available, falling back to
-    // build_blob_schedule for the unsorted-fallback path. Avoids the second
-    // post-PASS1 header scan and its cold-arena-page residency cascade.
-    if pass1_blob_schedule.is_empty() {
-        pread_write_pass(
+    // The pass 1 schedule, cut by span, on sorted input; the unsorted
+    // fallback builds a full one.
+    if let Some(pass1_blob_schedule) = pass1_blob_schedule {
+        pread_write_pass_with_schedule(
             input,
+            &pass1_blob_schedule,
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {
@@ -97,9 +104,8 @@ pub(super) fn extract_complete_ways(
             host,
         )?;
     } else {
-        pread_write_pass_with_schedule(
+        pread_write_pass(
             input,
-            &pass1_blob_schedule,
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {

@@ -1420,6 +1420,11 @@ fn close_relations(
     }
     drop(edges);
 
+    // Two relation reads, never a frontier traversal that rereads only the
+    // blobs each nesting level reaches: the relation reads take under
+    // 0.3 s at planet, a small share of the command, and the edge store
+    // already bounds them at two whatever the depth, so a per-level
+    // traversal was refused.
     if added {
         let reached = in_claimed_range(schedule, claims, &pulled.relation_ids, None)?;
         host.invocation

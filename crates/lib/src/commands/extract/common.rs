@@ -128,6 +128,160 @@ pub(super) struct BlobDesc {
     pub(super) passthrough: Passthrough,
 }
 
+// ---------------------------------------------------------------------------
+// Sparse dependency schedules
+// ---------------------------------------------------------------------------
+
+/// The signed ID extent of one blob's elements of its kind, `None` when it
+/// holds none.
+pub(super) type Extent = Option<(i64, i64)>;
+
+/// Widen `extent` to hold `id`.
+#[inline]
+pub(super) fn widen(extent: &mut Extent, id: i64) {
+    *extent = Some(match *extent {
+        None => (id, id),
+        Some((lo, hi)) => (lo.min(id), hi.max(id)),
+    });
+}
+
+/// An ID set a dependency schedule is cut against: whether any member may
+/// lie in the inclusive signed range. A superset answer is safe (the
+/// per-element test still decides); a false `false` drops a blob.
+pub(super) trait MayHold {
+    fn may_hold(&self, min_id: i64, max_id: i64) -> bool;
+}
+
+impl MayHold for IdSet {
+    fn may_hold(&self, min_id: i64, max_id: i64) -> bool {
+        self.any_in_numeric_range(min_id, max_id)
+    }
+}
+
+fn any_may_hold(sets: &[&dyn MayHold], extent: Extent) -> bool {
+    extent.is_some_and(|(lo, hi)| sets.iter().any(|s| s.may_hold(lo, hi)))
+}
+
+/// What decides whether a complete-ways or smart write-schedule blob is
+/// read. Way and relation extents are observed: the classify phases decode
+/// every way and relation blob and tally every occurrence's ID, so no claim
+/// is believed for them. A node blob's extent is its claimed
+/// `min_id`/`max_id`, believed as its bbox is
+/// (reference/indexdata-trust.md): node classify skips blobs by bbox, so it
+/// cannot observe every node blob, and tallying the ones it decodes was
+/// measured at planet (Berlin box, bygg) to add 2.4 s to a 12.7 s node
+/// classify, for a check that only refuses false claims.
+#[derive(Clone, Copy)]
+pub(super) enum WriteSpan {
+    Nodes(Extent),
+    Ways(Extent),
+    Relations(Extent),
+    /// An unindexed blob (the `--force` path) may hold any kind: always read.
+    Unindexed,
+}
+
+/// The entries of `schedule` (frame order kept) whose span may hold a
+/// member of its kind's sets. `spans` holds one span per entry. Dropping a
+/// blob drops only elements no set holds, so output and stats are those of
+/// the full schedule.
+pub(super) fn select_write_schedule(
+    schedule: &[BlobDesc],
+    spans: &[WriteSpan],
+    nodes: &[&dyn MayHold],
+    ways: &[&dyn MayHold],
+    relations: &[&dyn MayHold],
+) -> Result<Vec<BlobDesc>> {
+    if spans.len() != schedule.len() {
+        return Err(crate::error::Error::internal(
+            "extract: write spans do not match the write schedule entry for entry",
+        ));
+    }
+    Ok(schedule
+        .iter()
+        .zip(spans)
+        .filter(|(_, span)| match **span {
+            WriteSpan::Nodes(e) => any_may_hold(nodes, e),
+            WriteSpan::Ways(e) => any_may_hold(ways, e),
+            WriteSpan::Relations(e) => any_may_hold(relations, e),
+            WriteSpan::Unindexed => true,
+        })
+        .map(|(d, _)| *d)
+        .collect())
+}
+
+/// The entries of a classify `schedule` whose observed extent (one per
+/// entry) may hold a member of `sets`, in schedule order.
+pub(super) fn select_by_extent(
+    schedule: &[crate::scan::classify::ScheduledBlob],
+    extents: &[Extent],
+    sets: &[&dyn MayHold],
+) -> Result<Vec<crate::scan::classify::ScheduledBlob>> {
+    if extents.len() != schedule.len() {
+        return Err(crate::error::Error::internal(
+            "extract: observed extents do not match the classify schedule entry for entry",
+        ));
+    }
+    Ok(schedule
+        .iter()
+        .zip(extents)
+        .filter(|(_, e)| any_may_hold(sets, **e))
+        .map(|(d, _)| *d)
+        .collect())
+}
+
+/// Where a write-schedule blob's span comes from once the classify phases
+/// have run: a node blob's claim, or a way or relation blob's
+/// classify-schedule position.
+#[derive(Clone, Copy)]
+pub(super) enum WriteSlot {
+    Node((i64, i64)),
+    Way(usize),
+    Relation(usize),
+    Unindexed,
+}
+
+impl WriteSlot {
+    /// The slot a header walk records for an indexed OsmData blob, given
+    /// the way and relation classify schedules' lengths before and after
+    /// it handled the blob: both phases schedule every blob of their kind,
+    /// and a way or relation blob left unscheduled is an internal error, not
+    /// a slot pointing at a neighbour's extent.
+    pub(super) fn of(
+        idx: &crate::blob_meta::BlobIndex,
+        ways: (usize, usize),
+        relations: (usize, usize),
+    ) -> Result<Self> {
+        let pushed = |(before, after): (usize, usize)| {
+            (after == before + 1).then_some(before).ok_or_else(|| {
+                crate::error::Error::internal(
+                    "extract: an indexed way or relation blob was not classify-scheduled",
+                )
+            })
+        };
+        Ok(match idx.kind {
+            crate::ElementKind::Node => Self::Node((idx.min_id, idx.max_id)),
+            crate::ElementKind::Way => Self::Way(pushed(ways)?),
+            crate::ElementKind::Relation => Self::Relation(pushed(relations)?),
+        })
+    }
+
+    /// The span, from the way and relation classify phases' observed
+    /// extents.
+    pub(super) fn span(self, ways: &[Extent], relations: &[Extent]) -> Result<WriteSpan> {
+        let at = |v: &[Extent], i: usize| {
+            v.get(i).copied().ok_or_else(|| {
+                crate::error::Error::internal("extract: a write slot names no classify position")
+            })
+        };
+        Ok(match self {
+            Self::Node(claim) => WriteSpan::Nodes(Some(claim)),
+            Self::Way(i) => WriteSpan::Ways(at(ways, i)?),
+            Self::Relation(i) => WriteSpan::Relations(at(relations, i)?),
+            Self::Unindexed => WriteSpan::Unindexed,
+        })
+    }
+}
+
 /// Decide whether a passthrough candidate's decompressed payload is
 /// structurally eligible to be copied raw.
 ///

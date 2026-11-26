@@ -618,35 +618,36 @@ Kind: high potential for the stated workload.
 
 ## PERF-019 - Complete-ways and smart extract decode the same payloads repeatedly
 
-Reported by: spatial, framing.
+Reported by: spatial, framing. Narrowed 2026-11-26: smart's extra-way pass
+and the write pass (single region and `multi_dep.rs`) now read only blobs
+whose span may hold a needed ID (observed extents for ways and relations,
+claimed ranges for nodes); see reference/performance/extract.md.
 
-Mechanism: complete-ways classifies every kind then rereads everything for
-emission; smart adds another full way sweep for relation-selected ways'
-dependencies (`smart.rs` extra-way resolution scans the full schedule to get
-refs for `extra_way_ids`). Unsorted extraction `collect_pass1_generic` runs
-separate node, way and relation sweeps, each decompressing spatially admitted
-data. Extract's `BlobDesc` discards ID ranges so `IdSet::any_in_range` cannot
-prune.
+Residue: the node write. At a small region (planet, Berlin box) the write
+pass is still 37.6 s of 70 s and reads 48,487 of 50,816 blobs, because the
+node blobs (about 270,000 nodes each) nearly all hold a region node: IDs are
+chronological. Only 6,720 of the 32,826 node blobs may hold a way- or
+relation-completion node. Every other node blob is decoded a second time
+only to re-emit the in-region nodes node classify already found.
 
-Redesign (spatial): read relation topology early (member IDs, needed roles,
-type, parent edges, payload); after node classification read ways once
-(initial membership, outside-node dependencies, refs and payload for candidate
-completion ways and selected ways); resolve direct matches, parent closure and
-completion over retained records; emit nodes and retained payloads. Sweeps
-become: nodes twice, ways and relations once. Complete-ways and smart need a
-node revisit or retained node payload; smart does not need three traversals.
-Redesign (framing): decode once to produce node membership, compact way refs
-and relation edges, resolve dependencies over those, then reread only data
-needed for output. Retain ranges and selection summaries so sparse dependency
-sets give sparse emission schedules and empty sets no work.
+Candidate (sparred, not built): node classify, for a blob with in-region
+hits, also encodes and frames that blob's output (every occurrence whose ID
+is in the blob's local in-region set, in `block.elements()` order, through
+the existing node writer, metadata cleaning and block caps) and retains it;
+the write pass copies the retained frames at the blob's slot (the
+`Passthrough::Verified` interleave in `pread_execute`) when no completion
+node may lie in the blob's extent and the extent overlaps no other node
+blob's (otherwise duplicates elsewhere change the output), and rereads it
+otherwise. Required: gate speculation before the metadata walk and
+compression (per-blob hit limit plus a shared work and byte reservation,
+counting frames held by workers and queued results), since a large box would
+otherwise move encode work into classify and pay it again in the write;
+count frames encoded, admitted and reused; judge on node classify plus write
+wall, not write alone; keep unindexed input and multi-region on the current
+path until single-region pays. Isolation must be proved against every node
+extent, including spatially skipped blobs (claimed ranges there).
 
-Payoff: removes repeated decompression and parsing; strongest for small
-extracts.
-
-Risks: trading decompression for scratch traffic, less certain for near-world
-output; projection size; incomplete projections losing semantics.
-
-Kind: strong architectural opportunity; workload-specific rewrite.
+Kind: workload-specific rewrite; strongest for small extracts.
 
 ## PERF-020 - Polygon region membership walks segments per point
 

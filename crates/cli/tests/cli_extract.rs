@@ -907,6 +907,101 @@ fn complete_and_smart_include_parent_relations_recursively() {
     }
 }
 
+/// On sorted input, complete-ways and smart read after classification only
+/// the blobs whose ID extent may hold an element they write: smart's
+/// extra-way pass only way blobs that may hold a relation-pulled way, the
+/// write pass only blobs that may hold a selected node, way or relation.
+/// With one element per blob most blobs are skipped, and every output
+/// (elements, metadata, file order, summary) equals the unsorted fallback's,
+/// which reads every blob. Way 12 is repeated (history-shaped), relation
+/// 300 is included only as a parent, and a multipolygon pulls in way 11
+/// and its nodes from outside the box.
+#[test]
+fn dependency_passes_read_only_blobs_that_may_hold_a_needed_id() {
+    let dir = crate::common::test_scratch();
+    let mut nodes = test_nodes();
+    nodes.extend((1_000..1_020).map(|id| TestNode {
+        id,
+        lat: 400_000_000,
+        lon: 100_000_000,
+        tags: vec![],
+        meta: None,
+    }));
+    let mut ways = test_ways();
+    ways.push(TestWay {
+        id: 12,
+        refs: vec![3, 1_001],
+        tags: vec![("highway", "service")],
+        meta: None,
+    });
+    ways.sort_by_key(|w| w.id);
+    ways.extend((2_000..2_020).map(|id| TestWay {
+        id,
+        refs: vec![1_000, 1_002],
+        tags: vec![],
+        meta: None,
+    }));
+    let mut relations = test_relations();
+    relations.push(TestRelation {
+        id: 200,
+        members: vec![
+            TestMember {
+                id: MemberId::Node(3),
+                role: "",
+            },
+            TestMember {
+                id: MemberId::Way(11),
+                role: "outer",
+            },
+        ],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    });
+    relations.push(TestRelation {
+        id: 300,
+        members: vec![member_relation(200)],
+        tags: vec![("type", "site")],
+        meta: None,
+    });
+    relations.extend((3_000..3_020).map(|id| TestRelation {
+        id,
+        members: vec![TestMember {
+            id: MemberId::Node(1_003),
+            role: "",
+        }],
+        tags: vec![("type", "route")],
+        meta: None,
+    }));
+    let sorted = dir.path().join("sorted.osm.pbf");
+    let unsorted = dir.path().join("unsorted.osm.pbf");
+    crate::common::write_test_pbf_impl(&sorted, &nodes, &ways, &relations, true, Some(1));
+    crate::common::write_test_pbf_impl(&unsorted, &nodes, &ways, &relations, false, Some(1));
+    for (name, strategy) in [
+        ("complete", Strategy::CompleteWays),
+        ("smart", Strategy::Smart),
+    ] {
+        let a = dir.path().join(format!("{name}-sorted.osm.pbf"));
+        let b = dir.path().join(format!("{name}-unsorted.osm.pbf"));
+        let ra = run_extract(&sorted, &a, &RegionArg::Bbox(BBOX_STR), strategy);
+        let rb = run_extract(&unsorted, &b, &RegionArg::Bbox(BBOX_STR), strategy);
+        assert_eq!(read_in_file_order(&a), read_in_file_order(&b), "{name}");
+        assert_eq!(
+            extract_summary(&ra.stderr_str(), None),
+            extract_summary(&rb.stderr_str(), None),
+            "{name}"
+        );
+        let c = read_all_elements(&a);
+        assert_eq!(relation_ids(&c), vec![100, 200, 300], "{name}");
+        if matches!(strategy, Strategy::Smart) {
+            assert_eq!(way_ids(&c), vec![10, 11, 12, 12], "{name}");
+            assert_eq!(node_ids(&c), vec![1, 2, 3, 4, 1_001], "{name}");
+        } else {
+            assert_eq!(way_ids(&c), vec![10, 12, 12], "{name}");
+            assert_eq!(node_ids(&c), vec![1, 2, 3, 1_001], "{name}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spatial blob filter
 // ---------------------------------------------------------------------------

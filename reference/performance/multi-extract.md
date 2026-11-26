@@ -16,6 +16,16 @@ the 256 KiB per-output buffer, the shared region membership (they used one
 `IdSet` per region and kind) and the fused pass. 5 disjoint longitude strips
 per configured bench.
 
+### Dependency engine reads only blobs that may hold a needed ID (bygg, 2026-11-26, variant uncommitted against `4edb8193`)
+
+The smart extra-way sweep and the write pass cut by blob span as the
+single-region engines are (extract.md, "Complete-ways and smart read only
+blobs that may hold a needed ID"). Planet, default 5 strips of the dataset
+(Berlin) bbox, smart, `--iterations 1`: baseline 81.9 s (`9832ab8f`),
+variant 70.95 s (`7acfa7eb`), output bytes identical per region.
+`MULTI_DEP_EXTRA_WAY_SWEEP` 9.88 to 1.14 s, write 43.1 to 41.2 s; the
+classify phases within 2 %.
+
 ### Overlap components in the fused pass (bygg, 2026-11-26, against `61e55c62`)
 
 The whole-kind disjointness gate replaced by overlap component tasks (a

@@ -1755,7 +1755,12 @@ sorted-input schedules split blobs on their indexdata kind; both claims are
 believed. Through `--config` a node blob is read when its bbox meets any
 region, and its nodes are selected for, and written to, only the regions
 its bbox meets, so a node ID repeated in several blobs (history-shaped input)
-reaches each region from the blobs its single-region extract reads. A node blob copied raw is first decoded to prove every node lies in
+reaches each region from the blobs its single-region extract reads.
+Complete-ways and `--smart` on sorted input write from only the node blobs
+whose indexdata ID range may hold a selected node (that claim is believed
+too), and from only the way and relation blobs that the classification
+found to hold an ID in range of a selected way or relation; smart reads a
+relation-pulled way's nodes from only the way blobs that may hold it. A node blob copied raw is first decoded to prove every node lies in
 the region, but keeps its input `BlobHeader`. `--simple` on sorted input,
 single region or through `--config`, decodes each blob of a kind once when
 every blob of the kind carries indexdata, and then refuses a blob whose ID

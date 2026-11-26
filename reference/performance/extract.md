@@ -19,7 +19,7 @@ scanning the input file. The mechanism identified during the
 2026-04-10/11 investigation was a cold-arena-page residency cascade
 triggered by post-PASS1 header scans touching pages glibc had reserved
 but not populated; fixed by plumbing the PASS1 schedule forward into
-PASS2 and PASS3 via `Pass1Result::pass3_blob_schedule` and
+PASS2 and PASS3 (`Pass1Result::schedules`) and
 `pread_write_pass_with_schedule`.
 
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
@@ -36,6 +36,38 @@ history file's versions straddling a blob cut) are read as one component
 task; a kind the planner refuses (an unindexed blob, an overlap skipping a
 blob, more than 8 overlapping blobs in a run) classifies, then rereads and
 writes.
+
+### Complete-ways and smart read only blobs that may hold a needed ID (bygg, 2026-11-26, variant uncommitted against `4edb8193`)
+
+After classification, smart's extra-way pass reads only the way blobs whose
+observed ID extent may hold a relation-pulled way, and the write pass only
+blobs whose span may hold a selected element (observed extents for way and
+relation blobs, the claimed ID range for node blobs). Planet, dataset (Berlin)
+bbox, `--iterations 1` cells after one `brokkr fstrim`:
+
+| Cell | Wall | Pass 1 scan | Node classify | Pass 2 | Write |
+|---|---|---|---|---|---|
+| smart baseline `406b3160` | 81.47 s | 7.1 s | 12.6 s | 9.70 s | 39.36 s |
+| smart baseline `46085506` | 75.18 s | 0.5 s | 12.6 s | 9.79 s | 39.49 s |
+| smart variant `cde3a170` | 70.25 s | 6.8 s | 12.4 s | 0.72 s | 37.57 s |
+| complete baseline `e6860783` | 68.26 s | 4.5 s | 12.7 s | - | 38.32 s |
+| complete variant `acbf8d01` | 62.11 s | 0.1 s | 12.5 s | - | 36.55 s |
+
+Pass 2 read 1,221 of 17,529 way blobs; the write pass 48,487 of 50,816
+blobs. The pass 1 header walk swings 0.1 to 7.1 s on page-cache state in
+both arms, so read the phases: smart gains the 9 s of pass 2 and about 2 s
+of write, complete about 2 s of write. The node write is barely cut: the
+node blobs (32,826, about 270,000 nodes each) nearly all hold a Berlin node,
+since IDs are chronological; only 6,720 of them may hold a way- or
+relation-completion node (a probe counter, not landed). A first form that
+also tallied observed node extents in node classify (`17da5be4`,
+`bf61e35d`) put node classify at 15.2 s in both cells against 12.6 to
+12.7 s, so node blobs are cut on their claimed range instead.
+
+Germany, dataset (Berlin) bbox, smart: baseline 3.96 s (`e0261f9e`), variant
+4.01 s (`1223ec40`); pass 2 588 to 81 ms (8,696 to 1,144 way blobs), write
+62,461 to 57,566 blobs, 2.02 to 1.94 s. Multi-extract cells are in
+multi-extract.md.
 
 ### Overlap components in the fused kind pass (bygg, 2026-11-26, variant uncommitted against `61e55c62`)
 

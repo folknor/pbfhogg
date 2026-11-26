@@ -441,3 +441,16 @@ for a planet full-form block), which the consumer hashes; only counts and
 ID bounds are a summary. Reword the entry to say the worker serializes the
 block's canonical records and the consumer hashes them in file order.
 
+## DOC-071 - AGENTS.md says a configured getid_ids list qualifies the pairing key
+
+Reported by: the spar accounting of the getparents add-self item, from a
+scout lateral (2026-11-26); read from docs and scripts, not run.
+
+`AGENTS.md`, the brokkr.toml schema list, says of `getid_ids` /
+`getparents_ids` that "A configured list qualifies the result rows' pairing
+key." That comes from the typed runner (pbfhogg#27), which brokkr removed.
+The script benches `id-select` and `parent-select` read the lists from the
+resolved view and record them as `record.ids`, but the IDs are not a bound
+param, and nothing found says script result rows pair on them. Confirm what
+pairs script rows (asked in brokkr#225) and reword or drop the sentence.
+

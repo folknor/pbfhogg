@@ -13,8 +13,9 @@ use super::super::{
 use crate::idset::IdSet;
 
 use super::common::{
-    BboxInt, BlobDesc, Passthrough, pread_write_pass, pread_write_pass_with_schedule,
-    relation_has_matched_member, spatial_blob_filter,
+    BboxInt, BlobDesc, Extent, MayHold, Passthrough, WriteSlot, WriteSpan, pread_write_pass,
+    pread_write_pass_with_schedule, relation_has_matched_member, select_by_extent,
+    select_write_schedule, spatial_blob_filter, widen,
 };
 use super::{ExtractStats, Region};
 
@@ -34,20 +35,28 @@ pub(super) struct Pass1Result {
     /// planet for a Europe-sized box) alive from the way classify to the end.
     pub(super) outside_way_node_ids: IdSet,
     pub(super) matched_relation_ids: IdSet,
-    /// Unfiltered way blob schedule built during PASS1's manual scan, plumbed
-    /// out so smart PASS2 can reuse it instead of calling
-    /// `build_classify_schedule` again. Saves ~16% wall on Europe by avoiding
-    /// a second 19-second header scan. Empty for the unsorted-fallback path
-    /// (smart PASS2 falls back to `build_classify_schedule` in that case).
+    /// The schedules pass 1's header walk built, `None` on the unsorted
+    /// fallback (whose later passes build their own, unpruned).
+    pub(super) schedules: Option<Pass1Schedules>,
+}
+
+/// Schedules from pass 1's one header walk, reused by the later passes so
+/// none of them walks the headers again (post-pass-1 header walks cost
+/// about 16 % of Europe wall and a cold-arena-page residency cascade in
+/// anon RSS, commits `d4ea760`, `0b085b1`), with what the classify phases
+/// observed so the later passes read only the blobs that may hold an ID
+/// they need: for a small region that is a small share of the file, where
+/// they used to decode every way blob (smart's extra-way pass) and every
+/// OsmData blob (the write pass).
+pub(super) struct Pass1Schedules {
+    /// Every way blob, the way classify's schedule.
     pub(super) way_schedule: Vec<crate::scan::classify::ScheduledBlob>,
-    /// Full BlobDesc schedule for all OsmData blobs, built during PASS1's
-    /// manual scan and used by smart/complete PASS3 instead of calling
-    /// `build_blob_schedule` again. Eliminates a third post-PASS1 header scan
-    /// (~28 seconds on Europe). Empty for the unsorted-fallback path.
-    /// Post-PASS1 header scans trigger a cold-arena-page residency cascade
-    /// that doesn't show up in glibc's accounting but does show up in
-    /// anon RSS, so avoiding the rescan also helps peak memory at scale.
-    pub(super) pass3_blob_schedule: Vec<BlobDesc>,
+    /// The observed extent of each `way_schedule` entry's ways.
+    pub(super) way_extents: Vec<Extent>,
+    /// Every OsmData blob, in frame order.
+    pub(super) write_schedule: Vec<BlobDesc>,
+    /// One span per `write_schedule` entry.
+    pub(super) write_spans: Vec<WriteSpan>,
 }
 
 /// Strategy-specific relation handling for pass 1.
@@ -172,6 +181,16 @@ enum UnsortedPhase {
     Relations,
 }
 
+impl UnsortedPhase {
+    fn kind(self) -> crate::ElementKind {
+        match self {
+            Self::Nodes => crate::ElementKind::Node,
+            Self::Ways => crate::ElementKind::Way,
+            Self::Relations => crate::ElementKind::Relation,
+        }
+    }
+}
+
 /// Collect pass 1 ID sets with strategy-specific relation handling.
 ///
 /// On a sorted file, three parallel classify phases; on an unsorted one,
@@ -240,8 +259,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
                     continue;
                 }
+                // A blob claiming another kind holds nothing this sweep
+                // reads (its own sweep decodes it and refuses a false
+                // claim), as in the simple strategy's unsorted fallback.
                 if let Some(idx) = blob.index()
-                    && !filter.wants_index(&idx)
+                    && (idx.kind != phase.kind() || !filter.wants_index(&idx))
                 {
                     continue;
                 }
@@ -311,8 +333,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             matched_way_ids,
             outside_way_node_ids,
             matched_relation_ids,
-            way_schedule: Vec::new(),
-            pass3_blob_schedule: Vec::new(),
+            schedules: None,
         });
     }
 
@@ -333,18 +354,14 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     use crate::scan::classify::ScheduledBlob;
     let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
     let mut way_schedule: Vec<ScheduledBlob> = Vec::new();
+    // The spatial filter passes every way and relation blob, so
+    // `way_schedule` is every way blob: the schedule smart's extra-way pass
+    // cuts by observed extent.
     let mut relation_schedule: Vec<ScheduledBlob> = Vec::new();
-    // Unfiltered way schedule (no spatial filter): used by smart PASS2 to
-    // find ways referenced by relations regardless of spatial location.
-    // Returned via Pass1Result so smart PASS2 can skip its own
-    // build_classify_schedule call entirely, saving ~16% wall on Europe
-    // (one fewer 19-second header scan after PASS1's parallel work).
-    let mut full_way_schedule: Vec<ScheduledBlob> = Vec::new();
-    // Full BlobDesc schedule for all OsmData blobs, returned via Pass1Result
-    // for smart/complete PASS3 to reuse. Eliminates the third post-PASS1
-    // header scan (build_blob_schedule) and its associated cold-arena-page
-    // residency cascade.
-    let mut pass3_blob_schedule: Vec<BlobDesc> = Vec::new();
+    // Every OsmData blob, for the write pass, with where its span will
+    // come from.
+    let mut write_schedule: Vec<BlobDesc> = Vec::new();
+    let mut write_slots: Vec<WriteSlot> = Vec::new();
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -352,13 +369,12 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         walker.observe_filter_index(meta.index.as_ref());
         let idx = meta.index.as_ref();
         let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Refuse)?;
-        // Build pass3_blob_schedule unconditionally for all OsmData blobs.
-        // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
-        // no passthrough since smart/complete don't use the passthrough
-        // optimization).
+        // The write schedule takes every OsmData blob (no kind or spatial
+        // filter, no passthrough: smart and complete never copy raw).
         let bbox = idx.and_then(|i| i.bbox);
         let kind_for_blob = idx.map(|i| i.kind);
-        pass3_blob_schedule.push(BlobDesc {
+        let before = (way_schedule.len(), relation_schedule.len());
+        write_schedule.push(BlobDesc {
             frame_offset: meta.frame_start,
             frame_size: meta.frame_size,
             offset: meta.data_offset,
@@ -373,18 +389,18 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         // blob whose bbox understates its nodes is skipped by
         // `filter.wants_index` (reference/indexdata-trust.md).
         if let Some(idx) = idx {
-            // Build full_way_schedule unconditionally for way blobs.
-            if matches!(idx.kind, crate::ElementKind::Way) {
-                full_way_schedule.push(entry);
+            if filter.wants_index(idx) {
+                match idx.kind {
+                    crate::ElementKind::Node => node_schedule.push(entry),
+                    crate::ElementKind::Way => way_schedule.push(entry),
+                    crate::ElementKind::Relation => relation_schedule.push(entry),
+                }
             }
-            if !filter.wants_index(idx) {
-                continue;
-            }
-            match idx.kind {
-                crate::ElementKind::Node => node_schedule.push(entry),
-                crate::ElementKind::Way => way_schedule.push(entry),
-                crate::ElementKind::Relation => relation_schedule.push(entry),
-            }
+            write_slots.push(WriteSlot::of(
+                idx,
+                (before.0, way_schedule.len()),
+                (before.1, relation_schedule.len()),
+            )?);
         } else {
             // Non-indexed blob (force-flag path). Without indexdata we cannot
             // determine the blob's kind or bbox up front, so replicate into
@@ -397,7 +413,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             node_schedule.push(entry);
             way_schedule.push(entry);
             relation_schedule.push(entry);
-            full_way_schedule.push(entry);
+            write_slots.push(WriteSlot::Unindexed);
         }
     }
     host.invocation.marker("SMART_PASS1_SCHEDULE_SCAN_END");
@@ -409,9 +425,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     host.invocation
         .counter("smart_pass1_relation_blobs", relation_schedule.len());
     host.invocation
-        .counter("smart_pass1_full_way_blobs", full_way_schedule.len());
-    host.invocation
-        .counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len());
+        .counter("smart_pass1_pass3_blobs", write_schedule.len());
+    // Observed extents, one per way and relation classify-schedule position.
+    let mut way_extents: Vec<Extent> = vec![None; way_schedule.len()];
+    let mut relation_extents: Vec<Extent> = vec![None; relation_schedule.len()];
 
     let shared_file = walker.input();
     drop(walker);
@@ -462,26 +479,17 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 }
             } else {
                 for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn)
-                            if region.contains_node(
-                                exact_bbox,
-                                dn.decimicro_lat().ok(),
-                                dn.decimicro_lon().ok(),
-                            )? =>
-                        {
-                            ids.push(dn.id());
+                    let (id, lat, lon) = match &element {
+                        Element::DenseNode(dn) => {
+                            (dn.id(), dn.decimicro_lat().ok(), dn.decimicro_lon().ok())
                         }
-                        Element::Node(n)
-                            if region.contains_node(
-                                exact_bbox,
-                                n.decimicro_lat().ok(),
-                                n.decimicro_lon().ok(),
-                            )? =>
-                        {
-                            ids.push(n.id());
+                        Element::Node(n) => {
+                            (n.id(), n.decimicro_lat().ok(), n.decimicro_lon().ok())
                         }
-                        _ => {}
+                        _ => continue,
+                    };
+                    if region.contains_node(exact_bbox, lat, lon)? {
+                        ids.push(id);
                     }
                 }
             }
@@ -514,22 +522,31 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         |block, _s| {
             let mut way_ids = Vec::new();
             let mut node_ids = Vec::new();
+            // Every occurrence, matched or not: smart's extra-way pass and
+            // the write pass read this blob only if its extent may hold a
+            // way they need.
+            let mut extent: Extent = None;
             for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element
-                    && w.refs().any(|r| bbox_node_ids.get(r))
-                {
+                let Element::Way(w) = &element else {
+                    continue;
+                };
+                widen(&mut extent, w.id());
+                if w.refs().any(|r| bbox_node_ids.get(r)) {
                     way_ids.push(w.id());
                     node_ids.extend(w.refs().filter(|&r| !bbox_node_ids.get(r)));
                 }
             }
-            Ok((way_ids, node_ids))
+            Ok((way_ids, node_ids, extent))
         },
-        |_seq, (way_ids, node_ids)| {
+        |seq, (way_ids, node_ids, extent)| {
             for id in way_ids {
                 matched_way_ids.insert(id);
             }
             for id in node_ids {
                 outside_way_node_ids.insert(id);
+            }
+            if let Some(slot) = way_extents.get_mut(seq) {
+                *slot = extent;
             }
         },
         host,
@@ -566,10 +583,14 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             let mut extra_ways = Vec::new();
             let mut extra_nodes = Vec::new();
             let mut edges = Vec::new();
+            // Every occurrence: the parent closure can include a relation
+            // no record matched directly.
+            let mut extent: Extent = None;
             for element in block.elements_skip_metadata() {
                 let Element::Relation(r) = &element else {
                     continue;
                 };
+                widen(&mut extent, r.id());
                 push_parent_edges(r, &mut edges);
                 if relation_has_matched_member(r, known.bbox_node_ids, known.matched_way_ids) {
                     rel_ids.push(r.id());
@@ -578,14 +599,17 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
-            Ok((rel_ids, extra_ways, extra_nodes, edges))
+            Ok((rel_ids, extra_ways, extra_nodes, edges, extent))
         },
-        |_seq, (rel_ids, mut extra_ways, mut extra_nodes, edges)| {
+        |seq, (rel_ids, mut extra_ways, mut extra_nodes, edges, extent)| {
             for id in rel_ids {
                 matched_relation_ids.insert(id);
             }
             handler.merge_extras(&mut extra_ways, &mut extra_nodes);
             parent_edges.extend(edges);
+            if let Some(slot) = relation_extents.get_mut(seq) {
+                *slot = extent;
+            }
         },
         host,
     )?;
@@ -594,14 +618,43 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     add_parent_relations(&mut matched_relation_ids, parent_edges, host);
     host.invocation.marker("PASS1_RELATION_PARENTS_END");
 
+    let write_spans = write_slots
+        .iter()
+        .map(|slot| slot.span(&way_extents, &relation_extents))
+        .collect::<Result<Vec<_>>>()?;
     Ok(Pass1Result {
         bbox_node_ids,
         matched_way_ids,
         outside_way_node_ids,
         matched_relation_ids,
-        way_schedule: full_way_schedule,
-        pass3_blob_schedule,
+        schedules: Some(Pass1Schedules {
+            way_schedule,
+            way_extents,
+            write_schedule,
+            write_spans,
+        }),
     })
+}
+
+/// The write pass's schedule: the pass 1 write schedule cut to the blobs
+/// that may hold an element a set selects, counted for the sidecar.
+pub(super) fn write_schedule_for(
+    schedules: &Pass1Schedules,
+    nodes: &[&dyn MayHold],
+    ways: &[&dyn MayHold],
+    relations: &[&dyn MayHold],
+    host: &crate::host::Entered<'_>,
+) -> Result<Vec<BlobDesc>> {
+    let schedule = select_write_schedule(
+        &schedules.write_schedule,
+        &schedules.write_spans,
+        nodes,
+        ways,
+        relations,
+    )?;
+    host.invocation
+        .counter("extract_write_blobs", schedule.len());
+    Ok(schedule)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,28 +704,30 @@ pub(super) fn extract_smart(
     // --- Pass 2: Resolve extra way node deps (parallel pread) ---
     host.invocation.marker("SMART_PASS2_START");
     // For each way in extra_way_ids (none of them matched), collect the node
-    // refs pass 1 does not include into extra_node_ids.
-    // Reuses PASS1's full_way_schedule (built during the manual header scan
-    // in collect_pass1_generic) to avoid a second 19-second
-    // build_classify_schedule call after PASS1's parallel work. Saves ~16%
-    // wall on Europe extract-smart. Falls back to build_classify_schedule
-    // for the unsorted-fallback path where PASS1 doesn't build a schedule.
+    // refs pass 1 does not include into extra_node_ids. On sorted input the
+    // pass reads only the way blobs whose observed extent may hold an extra
+    // way (none when there are none); the unsorted fallback builds a full
+    // way schedule.
     {
         host.invocation.marker("SMART_PASS2_SCHEDULE_START");
-        let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
-        let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
-            crate::scan::classify::build_classify_schedule(
+        let (way_schedule, shared_file) = match &result.schedules {
+            Some(schedules) => (
+                select_by_extent(
+                    &schedules.way_schedule,
+                    &schedules.way_extents,
+                    &[&handler.extra_way_ids],
+                )?,
+                crate::read::input::InputFile::open(input)?,
+            ),
+            None => crate::scan::classify::build_classify_schedule(
                 input,
                 Some(crate::ElementKind::Way),
                 crate::scan::classify::KindClaims::Refuse,
                 host,
-            )?
-        } else {
-            (
-                pass1_way_schedule,
-                crate::read::input::InputFile::open(input)?,
-            )
+            )?,
         };
+        host.invocation
+            .counter("smart_pass2_way_blobs", way_schedule.len());
         host.invocation.marker("SMART_PASS2_SCHEDULE_END");
 
         let extra_way_ids_ref = &handler.extra_way_ids;
@@ -690,7 +745,8 @@ pub(super) fn extract_smart(
         // `extra_way_ids` this phase went from 10.1 s to 8.7 s at planet,
         // but the command moved by under 1 % (131.9 s against 131.5 s
         // median), noise for a 130 s run (reference/performance/inspect.md,
-        // "inspect --nodes reads through a projection").
+        // "inspect --nodes reads through a projection"); that measurement
+        // read every way blob, before the schedule was cut by extent.
         host.invocation.marker("SMART_PASS2_CLASSIFY_START");
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
@@ -746,10 +802,21 @@ pub(super) fn extract_smart(
         host,
     )?;
 
-    // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
-    // holds immutable borrows of `result` and we need a brief mutable borrow
-    // here to mem::take the schedule.
-    let pass1_blob_schedule = std::mem::take(&mut result.pass3_blob_schedule);
+    let pass1_blob_schedule = match &result.schedules {
+        Some(schedules) => Some(write_schedule_for(
+            schedules,
+            &[
+                &result.bbox_node_ids,
+                &result.outside_way_node_ids,
+                &extra_node_ids,
+            ],
+            &[&result.matched_way_ids, &handler.extra_way_ids],
+            &[&result.matched_relation_ids],
+            host,
+        )?),
+        None => None,
+    };
+    result.schedules = None;
 
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &result.bbox_node_ids,
@@ -762,12 +829,12 @@ pub(super) fn extract_smart(
 
     host.invocation.marker("SMART_PASS3_SETUP_END");
     host.invocation.marker("SMART_PASS3_WRITE_START");
-    // Reuse PASS1's pre-built blob schedule if available, falling back to
-    // build_blob_schedule for the unsorted-fallback path. Avoids the third
-    // post-PASS1 header scan and its cold-arena-page residency cascade.
-    if pass1_blob_schedule.is_empty() {
-        pread_write_pass(
+    // The pass 1 schedule, cut by span, on sorted input; the unsorted
+    // fallback builds a full one.
+    if let Some(pass1_blob_schedule) = pass1_blob_schedule {
+        pread_write_pass_with_schedule(
             input,
+            &pass1_blob_schedule,
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {
@@ -776,9 +843,8 @@ pub(super) fn extract_smart(
             host,
         )?;
     } else {
-        pread_write_pass_with_schedule(
+        pread_write_pass(
             input,
-            &pass1_blob_schedule,
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {

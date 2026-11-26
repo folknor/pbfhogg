@@ -364,6 +364,16 @@ Geographic extraction with three strategies:
 - Default (complete-ways) - two passes: pass 1 collects way-referenced node IDs and matched relations, then closes the relation set over parent relations (every relation's relation-type members are recorded as member-to-parent edges during the relation classify phase, sorted, and walked from the matched set); pass 2 emits all
 - `--smart` - three passes: also completes multipolygon/boundary relation members
 
+On sorted input the passes after classification read only the blobs that may
+hold an ID they need (`extract/common.rs` `WriteSpan`): the way and relation
+classify phases record each blob's observed ID extent, every occurrence
+included, so smart's extra-way pass reads only way blobs whose extent may hold
+an extra way, and the write pass only way and relation blobs whose extent may
+hold a selected one and node blobs whose claimed ID range may hold a selected
+node (every unindexed blob under `--force`). At a small region the node write
+still reads most node blobs: OSM IDs are chronological, so a city's nodes
+reach nearly every node blob.
+
 The membership rules each strategy implements are stated in
 `docs/cli/commands.md` "### extract". Bbox membership is integer: every edge is
 quantized once (`geo::BboxInt::inside_bbox`, decimal text by
@@ -380,7 +390,8 @@ classify and write passes for a kind the planner refuses (`extract/multi.rs`), o
 (`extract/multi_dep.rs`) that keeps per-region bit masks per kind in shared
 `Membership` tables (spatial nodes, matched ways, way-completion nodes,
 relations after the parent closure, smart's extra ways and their nodes) and
-writes every region in one pass over the full blob schedule. Unsorted input
+writes every region in one pass over the blobs that may hold an element some
+region needs, cut as the single-region write is. Unsorted input
 runs one extract per region. Node classification against N regions prunes candidates with a CSR grid
 (`RegionGrid`, `crates/lib/src/read/region_grid.rs`; 3600x1800 cells of 0.1 degree over
 the region bboxes) once `N >= 16` and the grid fits a 256 MiB coverage

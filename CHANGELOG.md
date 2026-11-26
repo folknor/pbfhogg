@@ -656,6 +656,18 @@
 
 ### Changed
 
+- **`extract` complete-ways and `--smart` read only the blobs that can
+  hold what they still need.** On sorted input, single region and through
+  `--config`, smart's relation-completion pass reads only the way blobs
+  that can hold a relation-pulled way, and the write pass skips blobs that
+  hold nothing selected (planet, Berlin box: smart about 75-81 s to 70 s,
+  its completion pass 9.7 s to 0.7 s; five-strip `--config` smart 82 s to
+  71 s). Way and relation blobs are judged by the IDs classification saw in
+  them; node blobs by their indexdata ID range, now believed like their
+  bbox, so a range that understates drops selected nodes (`check --index`
+  verifies ranges). On unsorted input the per-kind sweeps skip blobs whose
+  indexdata claims another kind, as `--simple` does. Output is unchanged.
+
 - **`getid --add-referenced` reads only the blobs that can hold what it
   needs.** The way read, the second relation read and the output pass
   select blobs by their indexdata ID range, as plain `getid` does, instead

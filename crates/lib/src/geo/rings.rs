@@ -83,6 +83,12 @@ pub enum RingRefusal {
 /// the member) and runs in that edge's source direction; rings are returned
 /// in the same order. The module documentation states which inputs are
 /// refused.
+///
+/// Performance: each call allocates its own node graph and owned rings. That
+/// per-relation allocation was weighed and left alone: the caller is the
+/// geocode builder's admin pass, not a throughput path (export does no ring
+/// assembly), and the old backtracking search whose worst cases did cost
+/// something is already gone. Revisit only if a profile shows this here.
 pub fn assemble_rings(members: &[RingMember<'_>]) -> Result<Vec<Ring>, RingRefusal> {
     let mut rings: Vec<KeyedRing> = Vec::new();
     let mut open = Vec::new();

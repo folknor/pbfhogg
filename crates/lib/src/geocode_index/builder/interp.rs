@@ -38,14 +38,15 @@
 //! dropped, without refusing the rest of the way. Both rules are
 //! [`InterpolationType`]'s, which the reader answers by too.
 //!
-//! A way is resolved whole or not at all: a refused way is kept as one
-//! record over all its nodes with both numbers at the zero sentinel (see
-//! CORRECTNESS.md), so it never answers a query - a borrowed, ambiguous or
-//! truncated number would be a silent wrong answer. So is a way with an
-//! unsupported `addr:interpolation` mode or with a node ref Pass 2 could not
-//! resolve, whose shortened node list could put an interior address where
-//! an end was. ADR-0024 records the end-node rule and the nearest-address
+//! A way is resolved whole or not at all. Refused ways emit no records:
+//! their endpoints cannot support a house-number answer. This includes
+//! ways with an unsupported mode and ways with a missing node ref, whose
+//! shortened path could put an interior address at one end. ADR-0024
+//! records the end-node rule and the nearest-address
 //! search it replaced; ADR-0026 the street inference and the sections.
+
+use std::io::Write;
+use std::path::Path;
 
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
@@ -54,6 +55,7 @@ use super::pass2::SlimInterpWay;
 use super::strings::{StringPool, read_string_from_pool};
 
 use super::super::format::*;
+use super::super::reader::segment_length_radians;
 
 /// A coordinate as an exact lookup key, longitude folded by
 /// [`crate::geo::normalize_longitude_e7`]: +180 and -180 degrees are one
@@ -151,8 +153,7 @@ fn parse_house_number(s: &str) -> Option<u32> {
 
 /// The interpolation records to write, and what happened to the source ways.
 pub(super) struct Resolution {
-    /// One record per section of a resolved way, one zero-sentinel record
-    /// per refused way, in source-way order.
+    /// Sections with an interior number, in source-way order.
     pub(super) records: Vec<SlimInterpWay>,
     /// Source ways resolved, including those whose every section was
     /// adjacent numbers and so emitted no record. Resolved means the street
@@ -203,7 +204,6 @@ pub(super) fn resolve_interpolation_ways_mmap(
         let Some(resolved) = outcome else {
             resolution.unresolved_ways += 1;
             super::sample_id(&mut resolution.unresolved_ids, way.way_id);
-            resolution.records.push(way);
             continue;
         };
         resolution.resolved_ways += 1;
@@ -223,6 +223,62 @@ pub(super) fn resolve_interpolation_ways_mmap(
         }
     }
     resolution
+}
+
+/// Write one prefix per segment, restarting the sum at every section.
+pub(super) fn write_sections(
+    output_dir: &Path,
+    sections: &[SlimInterpWay],
+    nodes: Table<'_, NodeCoord>,
+) -> super::Result<()> {
+    let mut ways_out = super::create_data_file(&output_dir.join(FILE_INTERP_WAYS))?;
+    let mut prefixes_out = super::create_data_file(&output_dir.join(FILE_INTERP_PREFIXES))?;
+    let mut prefix_offset = 0_u64;
+    for section in sections {
+        let Some(mode) = section.interpolation else {
+            return Err(crate::Error::internal(
+                "resolved interpolation section has no mode",
+            ));
+        };
+        if section.node_count < 2 {
+            return Err(crate::Error::internal(
+                "resolved interpolation section has fewer than two nodes",
+            ));
+        }
+        let span = nodes
+            .span_at(section.node_file_offset, u64::from(section.node_count))
+            .map_err(|_| {
+                crate::Error::internal("resolved interpolation section is outside its node file")
+            })?;
+        let mut section_nodes = span.iter();
+        let Some(mut prev) = section_nodes.next() else {
+            return Err(crate::Error::internal(
+                "resolved interpolation section has no nodes",
+            ));
+        };
+        let mut total_len = 0.0_f64;
+        for node in section_nodes {
+            prefixes_out.write_all(&InterpPrefix { length: total_len }.to_bytes())?;
+            total_len += segment_length_radians(&prev, &node);
+            prev = node;
+        }
+        let record = InterpWay {
+            node_offset: section.node_file_offset,
+            parent_offset: section.parent_offset,
+            start_number: section.start_number,
+            end_number: section.end_number,
+            node_count: section.node_count,
+            interpolation_type: mode.to_wire(),
+            parent_kind: section.parent_kind.to_wire(),
+            prefix_offset,
+            total_len,
+        };
+        ways_out.write_all(&record.to_bytes())?;
+        prefix_offset += u64::from(section.node_count - 1) * InterpPrefix::SIZE as u64;
+    }
+    prefixes_out.flush()?;
+    ways_out.flush()?;
+    Ok(())
 }
 
 /// A resolved way: its street and the sections that have numbers to infer.
@@ -576,7 +632,7 @@ mod tests {
         fx.address((A.0 + 1, A.1), "10", STREET);
         fx.address(B, "30", STREET);
         fx.way(&[A, B], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     #[test]
@@ -585,7 +641,7 @@ mod tests {
         fx.address(A, "10", "Corner Street");
         fx.address(B, "30", STREET);
         fx.way(&[A, B], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     #[test]
@@ -596,7 +652,7 @@ mod tests {
             fx.address(A, other, STREET);
             fx.address(B, "30", STREET);
             fx.way(&[A, B], Some(InterpolationType::Even));
-            assert_eq!(fx.resolve(), vec![(0, 0)], "10 beside {other}");
+            assert!(fx.resolve().is_empty(), "10 beside {other}");
         }
     }
 
@@ -617,7 +673,7 @@ mod tests {
             fx.address(A, bad, STREET);
             fx.address(B, "30", STREET);
             fx.way(&[A, B], Some(InterpolationType::All));
-            assert_eq!(fx.resolve(), vec![(0, 0)], "{bad:?}");
+            assert!(fx.resolve().is_empty(), "{bad:?}");
         }
     }
 
@@ -638,7 +694,7 @@ mod tests {
             fx.way(&[A, B], Some(interpolation));
             let got = fx.resolve();
             assert_eq!(
-                got[0] != (0, 0),
+                !got.is_empty(),
                 resolves,
                 "{interpolation:?} {start}..{end}: {got:?}"
             );
@@ -651,7 +707,7 @@ mod tests {
         fx.address(A, "10", STREET);
         fx.address(B, "30", STREET);
         fx.way(&[A, B], None);
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     /// An address stored at -180 degrees is at the same place as an end
@@ -728,7 +784,7 @@ mod tests {
         fx.address(B, "30", STREET);
         fx.way(&[A, B], Some(InterpolationType::Even));
         fx.place_way(&[A, B], Some(InterpolationType::Even), STREET);
-        assert_eq!(fx.resolve(), vec![(0, 0), (0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     /// An address with a street is numbered along its street, so its place
@@ -739,7 +795,7 @@ mod tests {
         fx.address_named(A, "10", "Main Road", PLACE);
         fx.address_named(B, "30", "", PLACE);
         fx.place_way(&[A, B], Some(InterpolationType::Even), PLACE);
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
 
         let mut fx = Fixture::new();
         fx.address_named(A, "10", "", PLACE);
@@ -753,7 +809,7 @@ mod tests {
         fx.address_named(A, "10", "North Road", PLACE);
         fx.address_named(B, "30", "South Road", PLACE);
         fx.bare_way(&[A, B], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     /// A shared street decides before places are looked at; two shared
@@ -774,7 +830,7 @@ mod tests {
             fx.address_named(key, number, "", "Other Place");
         }
         fx.bare_way(&[A, B], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     /// A numeric step: its anchors need no common grid, and a section with
@@ -806,7 +862,7 @@ mod tests {
         fx.address(A, "10", STREET);
         fx.address(B, "30", "Other Street");
         fx.bare_way(&[A, B], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
 
         let mut fx = Fixture::new();
         fx.address(A, "10", STREET);
@@ -814,7 +870,7 @@ mod tests {
         fx.address(B, "30", STREET);
         fx.address(B, "9b", "Other Street");
         fx.bare_way(&[A, B], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     /// 10 at the start, 20 in the middle, 40 at the end is two ranges, not
@@ -868,12 +924,7 @@ mod tests {
             fx.way(&[A, M, B], Some(InterpolationType::Even));
             let (resolution, _) = fx.run();
             assert_eq!(resolution.unresolved_ways, 1, "{first}/{second}");
-            let records: Vec<_> = resolution
-                .records
-                .iter()
-                .map(|r| (r.start_number, r.end_number, r.node_count))
-                .collect();
-            assert_eq!(records, vec![(0, 0, 3)], "{first}/{second}");
+            assert!(resolution.records.is_empty(), "{first}/{second}");
         }
     }
 
@@ -884,7 +935,7 @@ mod tests {
         let mut fx = Fixture::new();
         fx.address(A, "10", STREET);
         fx.way(&[A, M, B, A], Some(InterpolationType::Even));
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 
     #[test]
@@ -911,6 +962,6 @@ mod tests {
         fx.address(A, "10", STREET);
         fx.address(B, "30", STREET);
         fx.way_on(&[A, B], Some(InterpolationType::Even), STREET, false);
-        assert_eq!(fx.resolve(), vec![(0, 0)]);
+        assert!(fx.resolve().is_empty());
     }
 }

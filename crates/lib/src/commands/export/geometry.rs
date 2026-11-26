@@ -1,5 +1,6 @@
-use crate::Way;
+use crate::commands::extract::Bbox;
 use crate::coord_fmt::format_coord;
+use crate::{Way, WayNodeLocation};
 
 pub(super) const AREA_KEYS: &[&str] = &[
     "building", "landuse", "natural", "leisure", "amenity", "boundary", "waterway",
@@ -116,6 +117,7 @@ pub(super) struct Positions {
     first: Option<(f64, f64)>,
     last: Option<(f64, f64)>,
     scratch: String,
+    before_bbox_hit: Vec<WayNodeLocation>,
 }
 
 impl Positions {
@@ -158,21 +160,65 @@ impl Positions {
         self.push(lon, lat)
     }
 
-    /// Formats every position of `way`; `false` when one is invalid.
-    pub(super) fn fill_way(&mut self, way: &Way<'_>) -> bool {
+    fn push_location(&mut self, location: WayNodeLocation, lat: f64, lon: f64) -> bool {
+        self.push(
+            Ordinate {
+                nano: location.nano_lon_exact(),
+                deg: lon,
+            },
+            Ordinate {
+                nano: location.nano_lat_exact(),
+                deg: lat,
+            },
+        )
+    }
+
+    fn push_bbox_prefix(&mut self) -> bool {
+        let valid = (0..self.before_bbox_hit.len()).all(|index| {
+            let location = self.before_bbox_hit[index];
+            self.push_location(location, location.lat(), location.lon())
+        });
+        self.before_bbox_hit.clear();
+        valid
+    }
+
+    /// Collects coordinate text and reference endpoints in one source walk.
+    /// Save decoded positions until the first bbox hit so excluded ways
+    /// never need coordinate formatting.
+    pub(super) fn fill_way(&mut self, way: &Way<'_>, bbox: Option<&Bbox>) -> WayScan {
         self.clear();
-        way.node_locations().all(|location| {
-            self.push(
-                Ordinate {
-                    nano: location.nano_lon_exact(),
-                    deg: location.lon(),
-                },
-                Ordinate {
-                    nano: location.nano_lat_exact(),
-                    deg: location.lat(),
-                },
-            )
-        })
+        self.before_bbox_hit.clear();
+        let mut hits_bbox = bbox.is_none();
+        let mut first_ref = None;
+        let mut last_ref = None;
+        // Block validation guarantees that a way with locations has one
+        // per ref. Without locations there is no geometry to classify.
+        for (location, reference) in way.node_locations().zip(way.refs()) {
+            first_ref.get_or_insert(reference);
+            last_ref = Some(reference);
+            let lat = location.lat();
+            let lon = location.lon();
+            if !hits_bbox {
+                // Use the same quantized point test as nodes, on the input
+                // degrees before any GeoJSON coordinate formatting.
+                if !bbox.is_some_and(|bbox| bbox.contains(lat, lon)) {
+                    self.before_bbox_hit.push(location);
+                    continue;
+                }
+                hits_bbox = true;
+                if !self.push_bbox_prefix() {
+                    return WayScan::invalid();
+                }
+            }
+            if !self.push_location(location, lat, lon) {
+                return WayScan::invalid();
+            }
+        }
+        WayScan {
+            hits_bbox,
+            valid: true,
+            closed_refs: self.len() >= 4 && first_ref == last_ref,
+        }
     }
 
     #[cfg(test)]
@@ -226,6 +272,22 @@ impl Positions {
             prev = cur;
         }
         Some(twice_area)
+    }
+}
+
+pub(super) struct WayScan {
+    pub(super) hits_bbox: bool,
+    pub(super) valid: bool,
+    pub(super) closed_refs: bool,
+}
+
+impl WayScan {
+    fn invalid() -> Self {
+        Self {
+            hits_bbox: true,
+            valid: false,
+            closed_refs: false,
+        }
     }
 }
 
@@ -315,7 +377,7 @@ pub(super) fn write_way(out: &mut Vec<u8>, positions: &Positions, shape: WayShap
     }
 }
 
-fn is_area_tags<'a, T>(tags: T) -> bool
+pub(super) fn is_area_tags<'a, T>(tags: T) -> bool
 where
     T: Iterator<Item = (&'a str, &'a str)>,
 {
@@ -330,31 +392,6 @@ where
         area_key |= AREA_KEYS.contains(&key);
     }
     !area_no && (area_yes || area_key)
-}
-
-#[cfg(test)]
-fn is_area_parts<'a, T>(refs: &[i64], tags: T) -> bool
-where
-    T: Iterator<Item = (&'a str, &'a str)>,
-{
-    refs.len() >= 4 && refs.first() == refs.last() && is_area_tags(tags)
-}
-
-pub(super) fn is_area_way(way: &Way<'_>) -> bool {
-    let mut refs = way.refs();
-    let Some(first) = refs.next() else {
-        return false;
-    };
-    let mut count = 1_usize;
-    let mut last = first;
-    for reference in refs {
-        count += 1;
-        last = reference;
-    }
-    if count < 4 || first != last {
-        return false;
-    }
-    is_area_tags(way.tags())
 }
 
 /// An ordinate as a test states it in degrees, with the nanodegree value
@@ -576,20 +613,11 @@ mod tests {
 
     #[test]
     fn area_heuristic_truth_table() {
-        let closed = [1, 2, 3, 1];
-        assert!(is_area_parts(&closed, [("building", "yes")].into_iter()));
-        assert!(!is_area_parts(
-            &closed,
+        assert!(is_area_tags([("building", "yes")].into_iter()));
+        assert!(!is_area_tags(
             [("building", "yes"), ("area", "no")].into_iter()
         ));
-        assert!(is_area_parts(&closed, [("area", "yes")].into_iter()));
-        assert!(!is_area_parts(
-            &closed,
-            [("highway", "service")].into_iter()
-        ));
-        assert!(!is_area_parts(
-            &[1, 2, 3],
-            [("building", "yes")].into_iter()
-        ));
+        assert!(is_area_tags([("area", "yes")].into_iter()));
+        assert!(!is_area_tags([("highway", "service")].into_iter()));
     }
 }

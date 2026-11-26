@@ -13,8 +13,8 @@
 //! - One **writer-thread** runs the shared ordered-delivery loop
 //!   (`pipeline::deliver_in_order`) to hand items on in global-seq
 //!   order, computes each item's final byte offset by accumulating
-//!   lengths, and dispatches a `WriteOp` (Write { offset, bytes } |
-//!   CopyRange { out_offset, in_fd, src_offset, len }) to the pool.
+//!   lengths, and dispatches a `WriteOp` to write a buffer, write a
+//!   vectored group, or copy a range.
 //! - A **pool** of `POOL_SIZE` worker threads pops `WriteOp`s from
 //!   their per-worker bounded channel and runs `pwrite` / kernel-space
 //!   `copy_file_range` at the pre-computed offset. Writes complete in
@@ -62,6 +62,9 @@ use crate::write::pool_failure::FirstFailure;
 enum WriteOp {
     /// Plain `pwrite` at `offset`.
     Write { offset: u64, bytes: Vec<u8> },
+    /// `pwritev` a group of buffers starting at `offset`.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    WriteGroup { offset: u64, chunks: Vec<Vec<u8>> },
     /// Kernel-space `copy_file_range` from `(in_file, src_offset)` to
     /// `(out_fd, out_offset)` for `len` bytes.
     ///
@@ -315,6 +318,24 @@ impl OutputSink for PoolDispatch<'_> {
         self.send(WriteOp::Write { offset, bytes }, len)
     }
 
+    // Keep FileExt's scalar path on other targets, including 32-bit Linux
+    // where off_t can be too narrow for large PBF output offsets.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn write_chunks(
+        &mut self,
+        chunks: Vec<Vec<u8>>,
+        metrics: &super::metrics::WriterMetrics,
+    ) -> Result<()> {
+        if chunks.len() < 2 {
+            return super::pipeline::accept_chunks(self, chunks, metrics);
+        }
+        let len = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+        let offset = self.offset;
+        self.send(WriteOp::WriteGroup { offset, chunks }, len)?;
+        metrics.record_accepted(len);
+        Ok(())
+    }
+
     fn copy_range(
         &mut self,
         in_file: crate::read::input::InputFile,
@@ -403,6 +424,10 @@ fn worker_loop(
             WriteOp::Write { offset, bytes } => {
                 file.write_all_at(&bytes, offset).map_err(Error::from)
             }
+            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+            WriteOp::WriteGroup { offset, chunks } => {
+                write_group_at(file, offset, &chunks).map_err(Error::from)
+            }
             WriteOp::CopyRange {
                 out_offset,
                 in_file,
@@ -432,6 +457,42 @@ fn worker_loop(
             return;
         }
     }
+}
+
+/// Iovecs handed to one `pwritev`: Linux's `IOV_MAX`. A longer group is
+/// finished by the short-write resumption.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+const IOV_BATCH: usize = 1024;
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn write_group_at(file: &File, mut offset: u64, chunks: &[Vec<u8>]) -> std::io::Result<()> {
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    super::file_writer::write_group_all(chunks, |slices| {
+        // Passing fewer iovecs than offered is a short write, which
+        // write_group_all already resumes from.
+        let count = libc::c_int::try_from(slices.len().min(IOV_BATCH)).unwrap_or(libc::c_int::MAX);
+        let offset_error =
+            || io::Error::new(io::ErrorKind::InvalidInput, "write offset exceeds off_t");
+        #[cfg(not(target_env = "uclibc"))]
+        let at = libc::off_t::try_from(offset).map_err(|_| offset_error())?;
+        #[cfg(target_env = "uclibc")]
+        let at = libc::off64_t::try_from(offset).map_err(|_| offset_error())?;
+        // SAFETY: IoSlice has the ABI of iovec on Unix. The file and
+        // all count buffers stay live for the call, which only reads them.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "std has no positional vectored write; this is the one gathered pwritev"
+        )]
+        let n = unsafe { libc::pwritev(file.as_raw_fd(), slices.as_ptr().cast(), count, at) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n.unsigned_abs();
+        offset += n as u64;
+        Ok(n)
+    })
 }
 
 /// The pool's `Write` path, end to end, in every feature configuration.

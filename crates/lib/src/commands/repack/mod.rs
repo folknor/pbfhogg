@@ -223,7 +223,11 @@ pub(crate) fn repack_to(
     // The third result sizes IdSets in check callers; repack only needs the
     // schedules. Each per-kind phase re-encodes only its own kind, so an
     // unindexed blob (only under --force) sits in all three and is decoded
-    // once per phase.
+    // once per phase. A single decode pass would have to hold or spool
+    // later kinds' output while earlier kinds are still being coalesced:
+    // an unindexed blob can contain several kinds, and the sorted header
+    // alone cannot certify where one kind ends. A kind discovery pass
+    // avoids that storage but still inflates the routed blobs again.
     let (schedules, shared_file, _) = crate::scan::classify::build_classify_schedules_split(
         input,
         crate::scan::classify::KindClaims::Refuse,

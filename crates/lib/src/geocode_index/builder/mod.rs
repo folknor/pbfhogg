@@ -7,8 +7,6 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("the geocode index builder requires 64-bit pointers");
 
-use std::io::Write;
-
 use crate::ElementReader;
 use crate::coord_fmt::e7_to_deg;
 
@@ -171,8 +169,7 @@ pub struct BuildStats {
     pub addr_points: u64,
     pub street_ways: u64,
     /// Interpolation records in the index: one per section between the
-    /// address nodes of a resolved way, one per unresolved way. A resolved
-    /// way whose every section has no number to infer has none.
+    /// address nodes of a resolved way where an interior number exists.
     pub interp_ways: u64,
     pub admin_polygons: u64,
     /// Relations that produced no polygon because their boundary geometry was
@@ -814,7 +811,7 @@ fn build_from_schedules(
     // Staged interpolation ways are not a term, and the gate can therefore
     // run before resolution. An interpolation record takes its numbers only
     // from indexed address points on its own end nodes, so with no address
-    // points every way resolves to the zero sentinel and none can answer;
+    // points no way resolves and none can answer;
     // with address points the gate already passes on them. Counting staged
     // interpolation ways here once let an input whose only content was an
     // unresolvable `addr:interpolation` way publish an index that answers
@@ -874,27 +871,8 @@ fn build_from_schedules(
     host.invocation.marker("GEOCODE_PASS2_INTERP_RESOLVE_END");
     host.invocation.check()?;
 
-    // Write interp_ways.bin now (after resolution has set start/end numbers)
     host.invocation.marker("GEOCODE_PASS2_WRITE_START");
-    {
-        let mut iw_out = create_data_file(&output_dir.join(FILE_INTERP_WAYS))?;
-        for iw in &interp_ways {
-            let rec = InterpWay {
-                node_offset: iw.node_file_offset,
-                parent_offset: iw.parent_offset,
-                start_number: iw.start_number,
-                end_number: iw.end_number,
-                node_count: iw.node_count,
-                // An unsupported mode is never resolved, so its numbers are
-                // the zero sentinel and the reader never steps it; the
-                // record still needs a wire value `Reader::open` accepts.
-                interpolation_type: iw.interpolation.unwrap_or(InterpolationType::All).to_wire(),
-                parent_kind: iw.parent_kind.to_wire(),
-            };
-            iw_out.write_all(&rec.to_bytes())?;
-        }
-        iw_out.flush()?;
-    }
+    interp::write_sections(output_dir, &interp_ways, interp_nodes.table())?;
 
     // Write admin + strings data files
     let polygon_count = checked_count(admin_polygons.len(), "admin polygons")?;

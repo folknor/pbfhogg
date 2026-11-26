@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use super::super::Result;
+use super::keys::{InspectGetLookup, InspectGetNeed};
 use super::types::{
     BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState, TypeIdRange,
 };
@@ -68,21 +69,40 @@ pub fn inspect<'a>(
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
+    inspect_with_get(input, opts, None, host)
+}
+
+/// Inspect with the collectors required by an optional parsed get path.
+/// When a get path is supplied, use the returned report for that key only.
+#[doc(hidden)]
+pub fn inspect_with_get<'a>(
+    input: impl Into<InputSource<'a>>,
+    opts: &InspectOptions,
+    get: Option<InspectGetLookup>,
+    host: &crate::host::Host,
+) -> Result<InspectReport> {
+    let need = if opts.extended {
+        InspectGetNeed::Extended
+    } else {
+        get.map_or(InspectGetNeed::Scan, InspectGetLookup::need)
+    };
     let host = &host.enter()?;
     let input = input.into();
-    host.invocation.decided(|| inspect_inner(input, opts, host))
+    host.invocation
+        .decided(|| inspect_inner(input, opts, need, host))
 }
 
 fn inspect_inner(
     input: InputSource<'_>,
     opts: &InspectOptions,
+    need: InspectGetNeed,
     host: &crate::host::Entered<'_>,
 ) -> Result<InspectReport> {
     // A zero-byte or header-less file is the one missing-header error, not an
     // empty report: each scan below refuses it itself, from its own read.
     // Index-only fast path: skip decompression when all blobs have indexdata.
-    // --locations and --extended require per-element data, so they need full decode.
-    if !opts.show_locations && !opts.extended && !opts.distrust_metadata {
+    // Locations and payload-only get keys require a full decode.
+    if !opts.show_locations && !need.validates_timestamps() && !opts.distrust_metadata {
         // The walk below and the full decode it may fall back to are two
         // open file descriptions (the walk's `FADV_RANDOM` must not reach
         // the decode's sequential or direct reads), both derived from this
@@ -104,7 +124,7 @@ fn inspect_inner(
             opts.show_blocks,
             opts.show_id_ranges,
             opts.show_locations,
-            opts.extended,
+            need,
             opts.direct_io,
             host,
         );
@@ -115,7 +135,7 @@ fn inspect_inner(
         opts.show_blocks,
         opts.show_id_ranges,
         opts.show_locations,
-        opts.extended,
+        need,
         opts.direct_io,
         host,
     )
@@ -361,7 +381,7 @@ fn full_decode_scan(
     show_blocks: bool,
     show_id_ranges: bool,
     show_locations: bool,
-    extended: bool,
+    need: InspectGetNeed,
     direct_io: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<InspectReport> {
@@ -388,7 +408,7 @@ fn full_decode_scan(
     let mut indexed_blobs = 0u64;
     let mut total_data_blobs = 0u64;
     let mut accum = BlockAccum::new(show_blocks);
-    let mut state = ScanState::new(show_id_ranges, show_locations, extended);
+    let mut state = ScanState::for_need(show_id_ranges, show_locations, need);
 
     // Every data blob is decoded and summarized on the decode workers; the
     // summaries are folded here in file order, which is all the order-bound
@@ -397,7 +417,7 @@ fn full_decode_scan(
     let transform = SummarizeBlob {
         show_id_ranges,
         show_locations,
-        extended,
+        need,
     };
     reader.for_each_fused_blob(transform, |summary: BlobSummary| {
         total_data_blobs += 1;
@@ -432,25 +452,7 @@ fn full_decode_scan(
     // answer as the index-only walk and the first-data-blob probe.
     let is_indexed = indexed_blobs == total_data_blobs;
 
-    // objects_ordered: the decoded element stream strictly ascends by kind,
-    // then canonical ID. Kinds never stepping back plus each kind's IDs
-    // ascending canonically is exactly that, an equal ID within a kind
-    // included as a violation. The block layout (`ordering.standard`) is a
-    // different question: a block holding a node group then a way group is
-    // a mixed segment there and in order here.
-    if let Some(ref mut ext) = state.extended {
-        let ids_canonical = [&state.node_ids, &state.way_ids, &state.relation_ids]
-            .into_iter()
-            .flatten()
-            .all(TypeIdRange::canonical);
-        ext.objects_ordered = state.kind_order.is_ordered() && ids_canonical;
-        // `--extended` always decodes, so these ranges are the elements'
-        // own IDs, never an indexdata claim.
-        ext.has_negative_ids = [&state.node_ids, &state.way_ids, &state.relation_ids]
-            .into_iter()
-            .flatten()
-            .any(|r| r.has_data() && r.min_id < 0);
-    }
+    finish_id_stats(&mut state, need);
 
     Ok(InspectReport {
         file_name,
@@ -462,6 +464,34 @@ fn full_decode_scan(
         tagged_nodes: Some(state.tagged_node_count),
         state,
     })
+}
+
+fn finish_id_stats(state: &mut ScanState, need: InspectGetNeed) {
+    // objects_ordered: the decoded element stream strictly ascends by kind,
+    // then canonical ID. Kinds never stepping back plus each kind's IDs
+    // ascending canonically is exactly that, an equal ID within a kind
+    // included as a violation. The block layout (`ordering.standard`) is a
+    // different question: a block holding a node group then a way group is
+    // a mixed segment there and in order here.
+    if matches!(need, InspectGetNeed::Extended | InspectGetNeed::OrderedIds)
+        && let Some(ref mut ext) = state.extended
+    {
+        let ids_canonical = [&state.node_ids, &state.way_ids, &state.relation_ids]
+            .into_iter()
+            .flatten()
+            .all(TypeIdRange::canonical);
+        ext.objects_ordered = state.kind_order.is_ordered() && ids_canonical;
+    }
+    if need == InspectGetNeed::Extended
+        && let Some(ref mut ext) = state.extended
+    {
+        // `--extended` always decodes, so these ranges are the elements'
+        // own IDs, never an indexdata claim.
+        ext.has_negative_ids = [&state.node_ids, &state.way_ids, &state.relation_ids]
+            .into_iter()
+            .flatten()
+            .any(|r| r.has_data() && r.min_id < 0);
+    }
 }
 
 /// One data blob, scanned on its own on a decode worker: what the ordered
@@ -483,7 +513,7 @@ struct BlobSummary {
 struct SummarizeBlob {
     show_id_ranges: bool,
     show_locations: bool,
-    extended: bool,
+    need: InspectGetNeed,
 }
 
 impl crate::read::pipeline::DecodeTransform for SummarizeBlob {
@@ -511,7 +541,7 @@ impl crate::read::pipeline::DecodeTransform for SummarizeBlob {
                         buffer,
                         self.show_id_ranges,
                         self.show_locations,
-                        self.extended,
+                        self.need,
                     )?;
                     Ok((scan, raw_size))
                 })

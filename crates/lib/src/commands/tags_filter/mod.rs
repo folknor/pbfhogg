@@ -807,7 +807,7 @@ fn tags_filter_two_pass(
     // 4.6 s per walk on bygg), so each later walk cost a full cold read.
     // The walker is kept, unread, only so each filtered phase can still
     // report unindexed blobs through it; its file serves every pool.
-    let (walker, input_file, catalog) = {
+    let (walker, input_file, catalog, reservation) = {
         // Refuse a file without a readable header before pass 1. (The output
         // header, and its warning about undeclared enrichment, is built
         // before pass 2.)
@@ -847,6 +847,7 @@ fn tags_filter_two_pass(
         let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
         let mut catalog: Vec<CatalogEntry> = Vec::new();
         let mut blobs_skipped_by_tag: u64 = 0;
+        let mut node_max = None::<i64>;
         while let Some(meta) = walker.next_header()? {
             if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
                 continue;
@@ -855,6 +856,13 @@ fn tags_filter_two_pass(
                 &meta,
                 kind_claims(distrust_metadata),
             )?;
+            if let Some(index) = meta
+                .index
+                .as_ref()
+                .filter(|i| i.kind == crate::ElementKind::Node)
+            {
+                node_max = Some(node_max.map_or(index.max_id, |max| max.max(index.max_id)));
+            }
             catalog.push(CatalogEntry {
                 blob: entry,
                 kind: meta.index.as_ref().map(|i| i.kind),
@@ -896,11 +904,22 @@ fn tags_filter_two_pass(
         );
 
         let shared_file = walker.input();
+        let reservation = way_ref_reservation(&shared_file, node_max)?;
+        reserve_way_refs(&mut way_dep_node_ids, reservation);
+        let reserved = &way_dep_node_ids;
+        let mut spill = IdSet::new();
+        let mut consumer_busy_ns = 0_u64;
+        // The shared pool already measures blocking sends. Read its cumulative
+        // counter on either side of this phase to attribute pass 1 in a CLI
+        // invocation. Concurrent users of the same invocation share it.
+        let send_wait_before = classify_result_send_wait_ns(host);
 
         /// Per-blob classification result from a worker.
+        #[derive(Default)]
         struct ClassifyResult {
             matched_nodes: Vec<i64>,
-            matched_ways: Vec<(i64, Vec<i64>)>, // (way_id, refs)
+            matched_ways: Vec<i64>,
+            spilled_refs: Vec<i64>,
             matched_relations: Vec<i64>,
         }
 
@@ -908,13 +927,10 @@ fn tags_filter_two_pass(
             &shared_file,
             &schedule,
             jobs,
-            || (),
-            |block, _s| {
-                let mut result = ClassifyResult {
-                    matched_nodes: Vec::new(),
-                    matched_ways: Vec::new(),
-                    matched_relations: Vec::new(),
-                };
+            Vec::<i64>::new,
+            |block, refs| {
+                refs.clear();
+                let mut result = ClassifyResult::default();
                 let mut tags_buf: Vec<(&str, &str)> = Vec::new();
                 for element in block.elements_skip_metadata() {
                     match &element {
@@ -942,8 +958,8 @@ fn tags_filter_two_pass(
                             if element_matches(expressions, &tags_buf, crate::ElementKind::Way)
                                 != invert
                             {
-                                let refs: Vec<i64> = w.refs().collect();
-                                result.matched_ways.push((w.id(), refs));
+                                result.matched_ways.push(w.id());
+                                refs.extend(w.refs());
                             }
                         }
                         Element::Relation(r) => {
@@ -957,9 +973,11 @@ fn tags_filter_two_pass(
                         }
                     }
                 }
+                result.spilled_refs = publish_way_refs(reserved, reservation, refs);
                 Ok(result)
             },
             |_seq, cr| {
+                let watch = crate::counters::Stopwatch::start();
                 // Every set is signed: a negative ID is selected exactly,
                 // never folded onto its magnitude twin as osmium does.
                 matched_records[0] += cr.matched_nodes.len() as u64;
@@ -968,12 +986,12 @@ fn tags_filter_two_pass(
                 for id in cr.matched_nodes {
                     matched_node_ids.insert(id);
                 }
-                for (way_id, refs) in cr.matched_ways {
+                for way_id in cr.matched_ways {
                     direct_way_ids.insert(way_id);
                     has_included_way = true;
-                    for r in refs {
-                        way_dep_node_ids.insert(r);
-                    }
+                }
+                for id in cr.spilled_refs {
+                    spill.insert(id);
                 }
                 for id in cr.matched_relations {
                     direct_relation_ids.insert(id);
@@ -981,10 +999,21 @@ fn tags_filter_two_pass(
                         has_included_relation = true;
                     }
                 }
+                consumer_busy_ns = consumer_busy_ns.saturating_add(watch.elapsed_ns());
             },
             host,
         )?;
-        (walker, shared_file, catalog)
+        let watch = crate::counters::Stopwatch::start();
+        way_dep_node_ids.merge(spill);
+        host.invocation.counter(
+            "tagsfilter_pass1_consumer_busy_ns",
+            consumer_busy_ns.saturating_add(watch.elapsed_ns()),
+        );
+        host.invocation.counter(
+            "tagsfilter_pass1_result_send_wait_ns",
+            classify_result_send_wait_ns(host).saturating_sub(send_wait_before),
+        );
+        (walker, shared_file, catalog, reservation)
     };
     let mut walker = walker;
     // The file is wholly indexed or wholly unindexed (the walk refused a
@@ -1032,6 +1061,7 @@ fn tags_filter_two_pass(
             &kind_schedule(&catalog, crate::ElementKind::Way, distrust_metadata),
             &member_way_ids,
             &mut relation_dep_node_ids,
+            reservation,
             jobs,
             host,
         )?;
@@ -1457,6 +1487,56 @@ fn kind_schedule(
         .collect()
 }
 
+fn classify_result_send_wait_ns(host: &crate::host::Entered<'_>) -> u64 {
+    let mut wait = 0;
+    host.invocation.metrics().unordered.for_each(|name, value| {
+        if name == "classify_unordered_result_send_wait_ns" {
+            wait = value;
+        }
+    });
+    wait
+}
+
+fn way_ref_reservation(
+    file: &crate::read::input::InputFile,
+    node_max: Option<i64>,
+) -> Result<Option<i64>> {
+    let Some(max) = node_max.filter(|&max| max >= 0) else {
+        return Ok(None);
+    };
+    let file_len = file.file().metadata()?.len();
+    // Stay in the lazy direct directory, as in sparse ALTW.
+    let bound = IdSet::file_bounded_max_id(
+        max,
+        file_len,
+        crate::tunables::TAGS_FILTER_PREALLOC_IDS_PER_BYTE,
+    )
+    .min((1_i64 << 43) - 1);
+    Ok(Some(bound))
+}
+
+fn reserve_way_refs(set: &mut IdSet, reservation: Option<i64>) {
+    if let Some(max) = reservation {
+        set.pre_allocate(max);
+    }
+}
+
+/// Publish only after the validated blob has been classified. The worker
+/// keeps its ref buffer while the consumer receives only uncovered IDs.
+fn publish_way_refs(set: &IdSet, reservation: Option<i64>, refs: &mut Vec<i64>) -> Vec<i64> {
+    let Some(max) = reservation else {
+        return std::mem::take(refs);
+    };
+    let mut spill = Vec::new();
+    let mut batch = crate::idset::AtomicWordBatch::new(set);
+    for &id in refs.iter() {
+        if id < 0 || id > max || !batch.insert(id) {
+            spill.push(id);
+        }
+    }
+    spill
+}
+
 /// Scan all way blobs and add the node refs of the closure's member ways
 /// (direct matches collected theirs in pass 1).
 ///
@@ -1469,21 +1549,14 @@ fn collect_way_node_dependencies(
     schedule: &[crate::scan::classify::ScheduledBlob],
     member_way_ids: &IdSet,
     relation_dep_node_ids: &mut IdSet,
+    reservation: Option<i64>,
     jobs: Option<usize>,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
-    // Per-blob node-ref accumulation. Earlier this function used
-    // `parallel_classify_accumulate` with a per-worker `IdSet`; at
-    // planet's invert-match keep-rate (~99 % of ways included) each
-    // worker's bitmap grew to ~1.5 GB and the cumulative across ~30
-    // decode threads peaked at 24 GB anon - this per-worker bitmap shape made
-    // the memory peak scale with the number of decode workers.
-    // parallel_classify_phase emits per-blob `Vec<i64>` through a
-    // 32-slot bounded result channel. At DEFAULT_ELEMENT_CAP
-    // (crate::block_builder) ways per blob, with about 10 refs per way,
-    // the queued reference vectors occupy about 20 MB. Larger input
-    // blocks or more refs per way increase this estimate.
-    //
+    let mut reserved = IdSet::new();
+    reserve_way_refs(&mut reserved, reservation);
+    // A shared bitmap keeps memory independent of the worker count. The
+    // existing relation-node set also serves as the consumer's spill set.
     // Deliberately a block walk, not a projection. Reading each blob
     // through `read::project_ids::WaySpans` (with `only` the included set)
     // was built and measured at planet `w/highway=primary`: the walk after
@@ -1495,19 +1568,17 @@ fn collect_way_node_dependencies(
         shared_file,
         schedule,
         jobs,
-        || (),
-        |block, _state| {
-            let mut node_ids: Vec<i64> = Vec::new();
+        Vec::<i64>::new,
+        |block, node_ids| {
+            node_ids.clear();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
                     && member_way_ids.get(w.id())
                 {
-                    for r in w.refs() {
-                        node_ids.push(r);
-                    }
+                    node_ids.extend(w.refs());
                 }
             }
-            Ok(node_ids)
+            Ok(publish_way_refs(&reserved, reservation, node_ids))
         },
         |_seq, node_ids| {
             for id in node_ids {
@@ -1517,6 +1588,7 @@ fn collect_way_node_dependencies(
         host,
     )?;
 
+    relation_dep_node_ids.merge(reserved);
     Ok(())
 }
 
@@ -1994,6 +2066,44 @@ mod tests {
             elements.sort_unstable();
             assert_eq!(elements, expected, "{expression}, {mode}");
             assert_eq!(got, stats, "{expression}, {mode}: counters");
+        }
+    }
+
+    #[test]
+    fn way_refs_spill_past_the_claim_and_keep_their_sign() {
+        let mut set = IdSet::new();
+        reserve_way_refs(&mut set, Some(5));
+        let mut refs = vec![3, 5, 6, -3, i64::MAX, 3];
+        let uncovered = publish_way_refs(&set, Some(5), &mut refs);
+        assert_eq!(uncovered, [6, -3, i64::MAX]);
+        assert!(set.get(3));
+        assert!(set.get(5));
+        assert!(!set.get(6)); // A rounded-up atomic word can hold it.
+        assert!(!set.get(-3));
+
+        let mut spill = IdSet::new();
+        for id in uncovered {
+            spill.insert(id);
+        }
+        set.merge(spill);
+        assert_eq!(
+            set.iter_numeric_from(i64::MIN).collect::<Vec<_>>(),
+            [-3, 3, 5, 6, i64::MAX],
+        );
+    }
+
+    #[test]
+    fn indexed_atomic_way_dependencies_match_the_unindexed_path() {
+        let dir = crate::path_guard::tests::scratch();
+        let indexed = dir.path().join("indexed.pbf");
+        let unindexed = dir.path().join("unindexed.pbf");
+        write_partial_fixture(&indexed, [true; 3]);
+        write_partial_fixture(&unindexed, [false; 3]);
+        for expression in ["w/highway=primary", "r/type=route"] {
+            assert_eq!(
+                run_filter(&indexed, expression, "two-pass", true).unwrap(),
+                run_filter(&unindexed, expression, "two-pass", true).unwrap(),
+            );
         }
     }
 

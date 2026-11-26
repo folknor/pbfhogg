@@ -72,7 +72,7 @@ disallowed-methods = [
     { path = "libc::preadv2", reason = "the one cache-only read is read::header_walker's Positional::read_cached for File; range reads go through crate::write::copy_range::read_range, others through std FileExt" },
     { path = "libc::pwrite", reason = "positioned writes go through std FileExt::write_all_at" },
     { path = "libc::pwrite64", reason = "positioned writes go through std FileExt::write_all_at" },
-    { path = "libc::pwritev", reason = "positioned writes go through std FileExt::write_all_at" },
+    { path = "libc::pwritev", reason = "the one gathered positioned write is write::parallel_writer's write_group_at, std has no positional vectored write; others go through std FileExt::write_all_at" },
     { path = "libc::read", reason = "use std::fs::File's Read, which issues the same read(2)" },
     { path = "libc::write", reason = "use std::fs::File's Write, which issues the same write(2)" },
     # Page-cache advice has one owner, `crate::fadvise`, which handles the

@@ -5315,10 +5315,6 @@ fn run_inspect(
         InspectMode::Full => {}
     }
 
-    // The get-key table marks data and metadata paths as requiring extended stats.
-    let extended = extended
-        || get_lookup
-            .is_some_and(|lookup| lookup.need() == pbfhogg::inspect::InspectGetNeed::Extended);
     let show_blocks = blocks.is_some() || anomalies;
     let block_limit = if anomalies && blocks.is_none() {
         Some(0)
@@ -5338,7 +5334,7 @@ fn run_inspect(
         None
     };
     let input: pbfhogg::read::input::InputSource<'_> = pin.as_ref().map_or(path.into(), Into::into);
-    let mut report = pbfhogg::inspect::inspect(
+    let mut report = pbfhogg::inspect::inspect_with_get(
         input,
         &pbfhogg::inspect::InspectOptions {
             show_blocks,
@@ -5348,6 +5344,7 @@ fn run_inspect(
             distrust_metadata,
             direct_io,
         },
+        get_lookup,
         host,
     )?;
 

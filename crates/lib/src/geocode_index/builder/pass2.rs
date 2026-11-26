@@ -55,12 +55,8 @@ use super::super::format::*;
 /// with one record per section between its address nodes, whose node spans
 /// share the split node (see `interp.rs`).
 ///
-/// Interpolation endpoints must have positive house numbers. Endpoint matching
-/// rejects zero; serialized zero marks unresolved ways, so a real
-/// interpolation endpoint at house number 0 is unsupported (see
-/// CORRECTNESS.md). Fix shape if that is ever needed: persist a separate
-/// `resolved: bool` into [`crate::geocode_index::format::InterpWay`] and bump
-/// `FORMAT_VERSION`.
+/// Interpolation endpoints must have positive house numbers. Staged ways
+/// start with zero endpoints and emit sections only after resolution.
 pub(super) struct SlimInterpWay {
     pub(super) way_id: i64,
     pub(super) node_file_offset: u64,
@@ -101,6 +97,61 @@ pub(super) struct SlimInterpWay {
 struct NodeBlobOut {
     text: String,
     addr_points: Vec<FlatAddrPoint>,
+}
+
+#[derive(Clone, Copy)]
+enum AddressKey {
+    HouseNumber,
+    Street,
+    Place,
+    Postcode,
+}
+
+impl AddressKey {
+    fn classify(key: &str) -> Option<Self> {
+        match key {
+            "addr:housenumber" => Some(Self::HouseNumber),
+            "addr:street" => Some(Self::Street),
+            "addr:place" => Some(Self::Place),
+            "addr:postcode" => Some(Self::Postcode),
+            _ => None,
+        }
+    }
+}
+
+fn classify_address_keys(
+    block: &crate::PrimitiveBlock,
+    classes: &mut Vec<Option<AddressKey>>,
+) -> Result<()> {
+    classes.clear();
+    for sid in 0..block.string_table_len() {
+        let key = block
+            .string_table_entry(sid)
+            .ok_or_else(|| Error::internal("validated node string table entry is missing"))?;
+        classes.push(AddressKey::classify(key));
+    }
+    Ok(())
+}
+
+fn address_values<'a>(
+    block: &'a crate::PrimitiveBlock,
+    classes: &[Option<AddressKey>],
+    tags: impl Iterator<Item = (usize, usize)>,
+) -> Result<[Option<&'a str>; 4]> {
+    let mut values = [None; 4];
+    for (key, value) in tags {
+        let class = classes.get(key).ok_or_else(|| {
+            Error::internal("validated node tag key lies outside its string table")
+        })?;
+        let Some(class) = class else {
+            continue;
+        };
+        let value = block.string_table_entry(value).ok_or_else(|| {
+            Error::internal("validated node tag value lies outside its string table")
+        })?;
+        values[*class as usize] = Some(value);
+    }
+    Ok(values)
 }
 
 /// The names an address carries, as `(street, place)`: an empty value is
@@ -697,8 +748,12 @@ pub(super) fn run_pass2(
             node_schedule,
             None,
             std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS),
-            NodeBlobOut::default,
-            |block, state: &mut NodeBlobOut| -> Result<NodeBlobOut> {
+            || (Vec::new(), NodeBlobOut::default()),
+            |block, (address_keys, state)| -> Result<NodeBlobOut> {
+                // Dense validation in read/block.rs runs before this callback.
+                // Reusing it preserves the array and metadata refusals. The
+                // ALTW tuple scanner lacks tags and validates a different contract.
+                classify_address_keys(block, address_keys)?;
                 // Return the first node error in blob order to the pool,
                 // which adds the blob location.
                 for element in block.elements_skip_metadata() {
@@ -754,24 +809,11 @@ pub(super) fn run_pass2(
                                     )));
                                 }
                             }
-                            let mut hn: Option<&str> = None;
-                            let mut st: Option<&str> = None;
-                            let mut place: Option<&str> = None;
-                            let mut pc: Option<&str> = None;
-                            // Nearly every node tag is no `addr:` key, so one
-                            // prefix test rejects it before the key match.
-                            for (k, v) in node.tags() {
-                                let Some(key) = k.strip_prefix("addr:") else {
-                                    continue;
-                                };
-                                match key {
-                                    "housenumber" => hn = Some(v),
-                                    "street" => st = Some(v),
-                                    "place" => place = Some(v),
-                                    "postcode" => pc = Some(v),
-                                    _ => {}
-                                }
-                            }
+                            // Dense tag indices are signed on this API, and
+                            // block validation already checked their bounds.
+                            #[allow(clippy::cast_sign_loss)]
+                            let tags = node.raw_tags().map(|(k, v)| (k as usize, v as usize));
+                            let [hn, st, place, pc] = address_values(block, address_keys, tags)?;
                             let names = hn.and_then(|h| Some((h, address_names(st, place)?)));
                             if let Some((h, (st, place))) = names {
                                 let text = &mut state.text;

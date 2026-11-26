@@ -380,7 +380,7 @@ impl OwnedMetadata {
     /// The metadata as partial metadata, for a way or relation (which never
     /// carries dense metadata; a dense value converts field for field, each
     /// present when its column is).
-    fn as_partial(&self) -> PartialMetadata<'_> {
+    pub(crate) fn as_partial(&self) -> PartialMetadata<'_> {
         match self.as_borrowed() {
             Ok(DenseMetadata {
                 meta: m,

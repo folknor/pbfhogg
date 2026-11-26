@@ -321,12 +321,14 @@ a number that is not a positive decimal, equal or wrong-parity numbers,
 no single street or place, a missing node, an unsupported `addr:interpolation`
 mode).
 
-**Impact:** A 0 at either end means unresolved, so the way yields no
-interpolated number
-(`InterpolationType::answers` in `crates/lib/src/geocode_index/format.rs`, which
-the reader's `interpolation_total_length` and `number_at` both apply). House number 0 is therefore unsupported as
-an interpolation endpoint. "0" as a house number is rare but exists in
-some regions.
+**Impact:** A 0 at either end means unresolved. Since format version 10
+an unresolved way is counted in the build diagnostics
+(`geocode.pass2.interp_unresolved`) but written to no interpolation record
+or cell entry, so it can never answer; the reader still applies the same
+zero rule to any record it reads (`InterpolationType::answers` in
+`crates/lib/src/geocode_index/format.rs`). House number 0 is therefore
+unsupported as an interpolation endpoint. "0" as a house number is rare but
+exists in some regions.
 
 **Why not fix:** The clean fix is a `resolved: bool` field persisted into
 `InterpWay`, allowing zero-valued matches, and a `FORMAT_VERSION` bump.

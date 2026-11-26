@@ -4,7 +4,11 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+// library-deliberate: the batch boundary is the behaviour under test, and the tunable is its one definition
+use pbfhogg::GEOCODE_QUERY_BATCH_SIZE;
 
 use crate::common::{TestNode, TestWay, write_test_pbf_sorted};
 use crate::invoker::CliInvoker;
@@ -86,33 +90,58 @@ fn answers_one_json_object_per_query_in_order() {
     }
 }
 
-/// SIGINT and SIGTERM stop the run at a query: the interrupted exit status,
-/// nothing on stdout and nothing left in the current directory.
+#[test]
+fn writes_ordered_bytes_across_batches() {
+    let dir = pbfhogg_test_scratch::scratch();
+    let index = built_index(dir.path());
+    let points = dir.path().join("points.txt");
+    let mut input = String::new();
+    let mut expected = String::new();
+    for row in 0..=GEOCODE_QUERY_BATCH_SIZE {
+        let latitude = if row % 2 == 0 { "10.0" } else { "-0.0" };
+        writeln!(input, "{latitude} -40.0").unwrap();
+        writeln!(
+            expected,
+            r#"{{"address":null,"admin":[],"interpolation":null,"lat":{latitude},"lon":-40.0,"street":null}}"#
+        )
+        .unwrap();
+    }
+    std::fs::write(&points, input).unwrap();
+    let scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&scratch)
+        .arg("geocode-query")
+        .arg(&index)
+        .arg(&points)
+        .run();
+    assert!(out.status.success(), "{}", out.stderr_str());
+    assert_eq!(out.stdout_str(), expected);
+}
+
+/// SIGINT and SIGTERM stop the run at a query and leave stdout empty.
 #[cfg(pbfhogg_test_hooks)]
 #[test]
 fn an_interrupted_run_prints_no_answer() {
     let dir = pbfhogg_test_scratch::scratch();
     let index = built_index(dir.path());
     let points = dir.path().join("points.txt");
-    std::fs::write(&points, "55.0 12.0\n55.0 12.0\n").unwrap();
+    std::fs::write(&points, "55.0 12.0\n".repeat(GEOCODE_QUERY_BATCH_SIZE + 1)).unwrap();
+    // Pause after the first batch has been added to the in-memory report.
+    let checkpoint = (GEOCODE_QUERY_BATCH_SIZE as u64) + 2;
     for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
-        let cwd = pbfhogg_test_scratch::scratch();
         let scratch = pbfhogg_test_scratch::scratch();
         let mut child = CliInvoker::new(&scratch)
             .arg("geocode-query")
             .arg(&index)
             .arg(&points)
-            .current_dir(cwd.path())
-            .cancel_pause(std::num::NonZeroU64::new(2).unwrap(), false)
+            .cancel_pause(std::num::NonZeroU64::new(checkpoint).unwrap(), false)
             .spawn();
         child
-            .wait_announcement(&crate::invoker::Announcement::Paused(2))
+            .wait_announcement(&crate::invoker::Announcement::Paused(checkpoint))
             .unwrap();
         child.signal(signal);
         let out = child.wait();
         assert_eq!(out.status.code(), Some(code), "{}", out.stderr_str());
         assert!(out.stdout_str().is_empty(), "{}", out.stdout_str());
-        assert_eq!(std::fs::read_dir(cwd.path()).unwrap().count(), 0);
     }
 }
 

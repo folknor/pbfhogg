@@ -34,11 +34,17 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Bytes in one bit-array chunk (4 MiB).
 const CHUNK_BYTES: usize = 1 << 22;
 const WORDS_PER_CHUNK: usize = CHUNK_BYTES / std::mem::size_of::<u64>();
+const WORDS_PER_PAGE: usize =
+    crate::tunables::RENUMBER_ATOMIC_ID_PAGE_BYTES / std::mem::size_of::<u64>();
+const PAGES_PER_CHUNK: usize = WORDS_PER_CHUNK / WORDS_PER_PAGE;
+const _: () = assert!(WORDS_PER_PAGE.is_power_of_two() && WORDS_PER_PAGE <= WORDS_PER_CHUNK);
+
 /// Keys per chunk = bits per bit-array chunk = 2^25.
 const ID_SHIFT: u32 = 25;
 const OFFSET_MASK: u64 = (1 << ID_SHIFT) - 1;
@@ -122,7 +128,11 @@ fn neg_id(key: NonNegId) -> i64 {
 /// large comes from fresh zero pages and is resident only as far as it is
 /// written, rather than being touched end to end up front.
 fn new_dense() -> Box<[AtomicU64]> {
-    let words = Box::<[AtomicU64]>::new_zeroed_slice(WORDS_PER_CHUNK);
+    new_words(WORDS_PER_CHUNK)
+}
+
+fn new_words(len: usize) -> Box<[AtomicU64]> {
+    let words = Box::<[AtomicU64]>::new_zeroed_slice(len);
     // SAFETY: an all-zero bit pattern is a valid `AtomicU64` (value 0).
     unsafe { words.assume_init() }
 }
@@ -174,15 +184,140 @@ fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
 // Chunks
 // ---------------------------------------------------------------------------
 
+type Page = OnceLock<Box<[AtomicU64]>>;
+
+/// Both levels are published once. The directory is lazy even for chunks
+/// that have an eager overflow-map entry.
+#[derive(Default)]
+struct PagedChunk(OnceLock<Box<[Page]>>);
+
+impl PagedChunk {
+    fn page(&self, index: usize) -> Option<&[AtomicU64]> {
+        self.0.get()?.get(index)?.get().map(Box::as_ref)
+    }
+
+    fn page_for_atomic(&self, index: usize) -> &[AtomicU64] {
+        self.0.get_or_init(|| {
+            std::iter::repeat_with(Page::new)
+                .take(PAGES_PER_CHUNK)
+                .collect()
+        })[index]
+            .get_or_init(|| new_words(WORDS_PER_PAGE))
+    }
+
+    fn insert(&self, off: u32) -> bool {
+        let word = (off >> 6) as usize;
+        let words = self.page_for_atomic(word / WORDS_PER_PAGE);
+        let bit = 1u64 << (off & 63);
+        words[word % WORDS_PER_PAGE].fetch_or(bit, Relaxed) & bit == 0
+    }
+
+    fn pages(&self) -> impl Iterator<Item = (usize, &[AtomicU64])> {
+        self.0
+            .get()
+            .into_iter()
+            .flat_map(|pages| pages.iter().enumerate())
+            .filter_map(|(i, page)| Some((i, page.get()?.as_ref())))
+    }
+
+    fn clone_chunk(&self) -> Self {
+        let copy = Self::default();
+        copy.union(self);
+        copy
+    }
+
+    fn union(&self, src: &Self) {
+        for (i, page) in src.pages() {
+            self.union_page(i, page);
+        }
+    }
+
+    fn union_page(&self, i: usize, page: &[AtomicU64]) {
+        for (dst, src) in self.page_for_atomic(i).iter().zip(page) {
+            dst.fetch_or(src.load(Relaxed), Relaxed);
+        }
+    }
+
+    fn rank_blocks(&self) -> (Option<Vec<u32>>, u64) {
+        let mut pages = self.pages().peekable();
+        if pages.peek().is_none() {
+            return (None, 0);
+        }
+        let mut prefix = Vec::with_capacity(BLOCKS_PER_CHUNK);
+        let mut within = 0;
+        for (i, page) in pages {
+            prefix.resize(i * (WORDS_PER_PAGE / WORDS_PER_BLOCK), within);
+            append_rank_blocks(page, &mut prefix, &mut within);
+        }
+        prefix.resize(BLOCKS_PER_CHUNK, within);
+        (Some(prefix), u64::from(within))
+    }
+
+    fn footprint_bytes(&self, ranked: bool) -> usize {
+        let count = self.pages().count();
+        let directory = self
+            .0
+            .get()
+            .map_or(0, |pages| std::mem::size_of_val(&**pages));
+        let prefixes = if ranked && count != 0 {
+            BLOCKS_PER_CHUNK * std::mem::size_of::<u32>()
+        } else {
+            0
+        };
+        directory + count * crate::tunables::RENUMBER_ATOMIC_ID_PAGE_BYTES + prefixes
+    }
+}
+
+fn append_rank_blocks(words: &[AtomicU64], prefix: &mut Vec<u32>, within: &mut u32) {
+    for block in words.as_chunks::<WORDS_PER_BLOCK>().0 {
+        prefix.push(*within);
+        for word in block {
+            *within += word.load(Relaxed).count_ones();
+        }
+    }
+}
+
+#[inline]
+fn rank_in_words(words: &[AtomicU64], off: u32, target: u64) -> u64 {
+    let word = (off >> 6) as usize;
+    let start = word / WORDS_PER_BLOCK * WORDS_PER_BLOCK;
+    let mut rank = (target & ((1u64 << (off & 63)) - 1)).count_ones();
+    for previous in &words[start..word] {
+        rank += previous.load(Relaxed).count_ones();
+    }
+    u64::from(rank)
+}
+
+#[inline]
+fn block_rank(blocks: Option<&[u32]>, off: u32) -> u64 {
+    blocks.map_or(0, |prefix| {
+        u64::from(prefix[(off / BITS_PER_BLOCK) as usize])
+    })
+}
+
 /// One 2^25-key chunk.
 enum Chunk {
-    /// 4 MiB bit array; the only form the atomic setters can write.
+    /// Contiguous 4 MiB bit array.
     Dense(Box<[AtomicU64]>),
+    /// Bit array with pages allocated on first write.
+    Paged(PagedChunk),
     /// Sorted, deduplicated in-chunk offsets; at most `SPARSE_MAX` of them.
     Sparse(Vec<u32>),
 }
 
+fn atomic_chunk(paged: bool) -> Chunk {
+    if paged {
+        Chunk::Paged(PagedChunk::default())
+    } else {
+        Chunk::Dense(new_dense())
+    }
+}
+
 impl Chunk {
+    fn is_atomic(&self) -> bool {
+        !matches!(self, Chunk::Sparse(_))
+    }
+
     fn new_sparse() -> Self {
         Chunk::Sparse(Vec::new())
     }
@@ -193,6 +328,12 @@ impl Chunk {
             Chunk::Dense(words) => {
                 (words[(off >> 6) as usize].load(Relaxed) & (1u64 << (off & 63))) != 0
             }
+            Chunk::Paged(pages) => {
+                let word = (off >> 6) as usize;
+                pages.page(word / WORDS_PER_PAGE).is_some_and(|words| {
+                    words[word % WORDS_PER_PAGE].load(Relaxed) & (1u64 << (off & 63)) != 0
+                })
+            }
             Chunk::Sparse(offsets) => offsets.binary_search(&off).is_ok(),
         }
     }
@@ -202,6 +343,7 @@ impl Chunk {
     fn insert(&mut self, off: u32) -> bool {
         match self {
             Chunk::Dense(words) => dense_insert(words, off),
+            Chunk::Paged(pages) => pages.insert(off),
             Chunk::Sparse(offsets) => {
                 // Append fast path: ascending population (sorted input) never
                 // searches.
@@ -247,40 +389,69 @@ impl Chunk {
                     .map(|w| AtomicU64::new(w.load(Relaxed)))
                     .collect(),
             ),
+            Chunk::Paged(pages) => Chunk::Paged(pages.clone_chunk()),
             Chunk::Sparse(offsets) => Chunk::Sparse(offsets.clone()),
         }
     }
 
     /// Union `src` into `self`, borrowing `src`.
     fn union_ref(&mut self, src: &Chunk) {
-        // An array destination meeting a bit-array source becomes a bit
-        // array first; after this, an array destination implies an array
-        // source.
-        if matches!(src, Chunk::Dense(_)) {
-            self.promote();
-        }
-        match self {
-            Chunk::Dense(dst) => match src {
-                Chunk::Dense(s) => or_words(dst, s),
-                Chunk::Sparse(s) => {
-                    for &off in s {
-                        dense_insert(dst, off);
+        match (self, src) {
+            (Chunk::Dense(dst), Chunk::Dense(src)) => or_words(dst, src),
+            (Chunk::Dense(dst), Chunk::Paged(src)) => {
+                for (i, page) in src.pages() {
+                    let start = i * WORDS_PER_PAGE;
+                    or_words(&mut dst[start..start + WORDS_PER_PAGE], page);
+                }
+            }
+            (Chunk::Dense(dst), Chunk::Sparse(src)) => {
+                for &off in src {
+                    dense_insert(dst, off);
+                }
+            }
+            (Chunk::Paged(dst), Chunk::Dense(src)) => {
+                for (i, page) in src.as_chunks::<WORDS_PER_PAGE>().0.iter().enumerate() {
+                    if page.iter().any(|word| word.load(Relaxed) != 0) {
+                        dst.union_page(i, page);
                     }
                 }
-            },
-            Chunk::Sparse(dst) => match src {
-                Chunk::Sparse(s) => {
-                    let merged = union_sorted(dst, s);
-                    *self = if merged.len() > SPARSE_MAX {
-                        Chunk::Dense(dense_from_offsets(&merged))
-                    } else {
-                        Chunk::Sparse(merged)
-                    };
+            }
+            (Chunk::Paged(dst), Chunk::Paged(src)) => dst.union(src),
+            (Chunk::Paged(dst), Chunk::Sparse(src)) => {
+                for &off in src {
+                    dst.insert(off);
                 }
-                // Not reachable: a bit-array source promoted `self` above.
-                Chunk::Dense(_) => {}
-            },
+            }
+            (dst @ Chunk::Sparse(_), src) => dst.union_into_sparse(src),
         }
+    }
+
+    fn union_into_sparse(&mut self, src: &Chunk) {
+        let Chunk::Sparse(offsets) = self else {
+            unreachable!("union destination must be an offset array");
+        };
+        *self = match src {
+            Chunk::Dense(src) => {
+                let mut words = dense_from_offsets(offsets);
+                or_words(&mut words, src);
+                Chunk::Dense(words)
+            }
+            Chunk::Paged(src) => {
+                let pages = src.clone_chunk();
+                for &off in &*offsets {
+                    pages.insert(off);
+                }
+                Chunk::Paged(pages)
+            }
+            Chunk::Sparse(src) => {
+                let merged = union_sorted(offsets, src);
+                if merged.len() > SPARSE_MAX {
+                    Chunk::Dense(dense_from_offsets(&merged))
+                } else {
+                    Chunk::Sparse(merged)
+                }
+            }
+        };
     }
 
     /// Union `src` into `self`, consuming `src`. An array destination takes
@@ -305,25 +476,27 @@ impl Chunk {
                 .iter()
                 .map(|w| u64::from(w.load(Relaxed).count_ones()))
                 .sum(),
+            Chunk::Paged(pages) => pages
+                .pages()
+                .flat_map(|(_, words)| words)
+                .map(|w| u64::from(w.load(Relaxed).count_ones()))
+                .sum(),
             Chunk::Sparse(offsets) => offsets.len() as u64,
         }
     }
 
     /// Per-block prefix counts for a bit array (`None` for an array chunk,
-    /// whose rank is a binary search) and the chunk's member count.
+    /// whose rank is a binary search, or an empty paged chunk) and the
+    /// chunk's member count.
     fn rank_blocks(&self) -> (Option<Vec<u32>>, u64) {
         match self {
             Chunk::Dense(words) => {
                 let mut prefix = Vec::with_capacity(BLOCKS_PER_CHUNK);
                 let mut within: u32 = 0;
-                for block in words.as_chunks::<WORDS_PER_BLOCK>().0 {
-                    prefix.push(within);
-                    for w in block {
-                        within += w.load(Relaxed).count_ones();
-                    }
-                }
+                append_rank_blocks(words, &mut prefix, &mut within);
                 (Some(prefix), u64::from(within))
             }
+            Chunk::Paged(pages) => pages.rank_blocks(),
             Chunk::Sparse(offsets) => (None, offsets.len() as u64),
         }
     }
@@ -334,20 +507,28 @@ impl Chunk {
     fn rank_within(&self, off: u32, blocks: Option<&[u32]>) -> u64 {
         match self {
             Chunk::Dense(words) => {
-                let block_idx = (off / BITS_PER_BLOCK) as usize;
-                let mut r = blocks.map_or(0, |bp| u64::from(bp[block_idx]));
-                let target_word = (off >> 6) as usize;
-                for w in &words[block_idx * WORDS_PER_BLOCK..target_word] {
-                    r += u64::from(w.load(Relaxed).count_ones());
-                }
-                let bit = off & 63;
-                if bit > 0 {
-                    let mask = (1u64 << bit) - 1;
-                    r += u64::from((words[target_word].load(Relaxed) & mask).count_ones());
-                }
-                r
+                block_rank(blocks, off) + rank_in_words(words, off, load_rank_target(words, off))
+            }
+            Chunk::Paged(pages) => {
+                let (page, local) = split_page_offset(off);
+                block_rank(blocks, off)
+                    + pages.page(page).map_or(0, |words| {
+                        rank_in_words(words, local, load_rank_target(words, local))
+                    })
             }
             Chunk::Sparse(offsets) => offsets.partition_point(|&x| x < off) as u64,
+        }
+    }
+
+    #[inline]
+    fn rank_member(&self, off: u32, blocks: Option<&[u32]>) -> Option<u64> {
+        match self {
+            Chunk::Sparse(offsets) => offsets.binary_search(&off).ok().map(|i| i as u64),
+            Chunk::Dense(words) => member_rank_in_words(words, off, off, blocks),
+            Chunk::Paged(pages) => {
+                let (page, local) = split_page_offset(off);
+                member_rank_in_words(pages.page(page)?, local, off, blocks)
+            }
         }
     }
 
@@ -372,6 +553,7 @@ impl Chunk {
                 }
                 false
             }
+            Chunk::Paged(_) => self.offsets_from(lo).next().is_some_and(|off| off <= hi),
             Chunk::Sparse(offsets) => {
                 let i = offsets.partition_point(|&x| x < lo);
                 i < offsets.len() && offsets[i] <= hi
@@ -396,6 +578,7 @@ impl Chunk {
                     cur_base: (word as u32) * 64,
                 }
             }
+            Chunk::Paged(pages) => ChunkOffsets::Paged(PagedOffsets::new(pages, from)),
             Chunk::Sparse(offsets) => {
                 let i = offsets.partition_point(|&x| x < from);
                 ChunkOffsets::Sparse(offsets[i..].iter())
@@ -422,11 +605,104 @@ impl Chunk {
                     cur_base: (word as u32) * 64,
                 }
             }
+            Chunk::Paged(pages) => ChunkOffsetsRev::Paged(PagedOffsets::new(pages, to)),
             Chunk::Sparse(offsets) => {
                 let i = offsets.partition_point(|&x| x <= to);
                 ChunkOffsetsRev::Sparse(offsets[..i].iter().rev())
             }
         }
+    }
+}
+
+#[inline]
+fn split_page_offset(off: u32) -> (usize, u32) {
+    let page_bits = WORDS_PER_PAGE * 64;
+    (off as usize / page_bits, off % page_bits as u32)
+}
+
+#[inline]
+fn load_rank_target(words: &[AtomicU64], off: u32) -> u64 {
+    if off & 63 == 0 {
+        0
+    } else {
+        words[(off >> 6) as usize].load(Relaxed)
+    }
+}
+
+#[inline]
+fn member_rank_in_words(
+    words: &[AtomicU64],
+    local: u32,
+    off: u32,
+    blocks: Option<&[u32]>,
+) -> Option<u64> {
+    let target = words[(local >> 6) as usize].load(Relaxed);
+    (target & (1u64 << (local & 63)) != 0)
+        .then(|| block_rank(blocks, off) + rank_in_words(words, local, target))
+}
+
+/// The same word-at-a-time walk as a dense iterator, skipping absent pages.
+struct PagedOffsets<'a, const REVERSE: bool> {
+    pages: &'a PagedChunk,
+    word: usize,
+    remaining: u64,
+}
+
+impl<'a, const REVERSE: bool> PagedOffsets<'a, REVERSE> {
+    fn new(pages: &'a PagedChunk, off: u32) -> Self {
+        let word = (off >> 6) as usize;
+        let bit = off & 63;
+        let mask = if REVERSE {
+            u64::MAX >> (63 - bit)
+        } else {
+            u64::MAX << bit
+        };
+        let remaining = pages
+            .page(word / WORDS_PER_PAGE)
+            .map_or(0, |page| page[word % WORDS_PER_PAGE].load(Relaxed) & mask);
+        Self {
+            pages,
+            word,
+            remaining,
+        }
+    }
+
+    fn advance_word(&mut self) {
+        self.word = if REVERSE {
+            self.word.wrapping_sub(1)
+        } else {
+            self.word + 1
+        };
+        // loop-ends: each absent page advances to the next page boundary.
+        while self.word < WORDS_PER_CHUNK {
+            let page = self.word / WORDS_PER_PAGE;
+            if let Some(words) = self.pages.page(page) {
+                self.remaining = words[self.word % WORDS_PER_PAGE].load(Relaxed);
+                return;
+            }
+            self.word = if REVERSE {
+                (page * WORDS_PER_PAGE).wrapping_sub(1)
+            } else {
+                (page + 1) * WORDS_PER_PAGE
+            };
+        }
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        // loop-ends: advances by a word or page until a bit or the end.
+        while self.word < WORDS_PER_CHUNK {
+            if self.remaining != 0 {
+                let bit = if REVERSE {
+                    63 - self.remaining.leading_zeros()
+                } else {
+                    self.remaining.trailing_zeros()
+                };
+                self.remaining &= !(1u64 << bit);
+                return Some(self.word as u32 * 64 + bit);
+            }
+            self.advance_word();
+        }
+        None
     }
 }
 
@@ -449,6 +725,7 @@ enum ChunkOffsets<'a> {
         cur_base: u32,
     },
     Sparse(std::slice::Iter<'a, u32>),
+    Paged(PagedOffsets<'a, false>),
 }
 
 impl Iterator for ChunkOffsets<'_> {
@@ -478,6 +755,7 @@ impl Iterator for ChunkOffsets<'_> {
                 *next += 1;
             },
             ChunkOffsets::Sparse(it) => it.next().copied(),
+            ChunkOffsets::Paged(it) => it.next(),
         }
     }
 }
@@ -494,6 +772,7 @@ enum ChunkOffsetsRev<'a> {
         cur_base: u32,
     },
     Sparse(std::iter::Rev<std::slice::Iter<'a, u32>>),
+    Paged(PagedOffsets<'a, true>),
 }
 
 impl Iterator for ChunkOffsetsRev<'_> {
@@ -523,6 +802,7 @@ impl Iterator for ChunkOffsetsRev<'_> {
                 *cur_base = (*end as u32) * 64;
             },
             ChunkOffsetsRev::Sparse(it) => it.next().copied(),
+            ChunkOffsetsRev::Paged(it) => it.next(),
         }
     }
 }
@@ -534,6 +814,8 @@ struct RankIndex {
     /// entry (index `chunks.len()`) is the direct total.
     chunk_prefix: Vec<u64>,
     /// Per direct chunk: block prefixes for a bit array, `None` otherwise.
+    /// Membership-only reads use the bitmap without accessing this index,
+    /// so the prefixes stay separate from the words.
     block_prefix: Vec<Option<Vec<u32>>>,
     /// Overflow chunk ids, ascending.
     ov_keys: Vec<u64>,
@@ -562,13 +844,17 @@ enum Slot {
 /// found at `slot`): keys strictly below it.
 #[inline]
 fn rank_in_chunk(idx: &RankIndex, slot: Slot, cid: u64, chunk: &Chunk, off: u32) -> u64 {
+    let (prefix, blocks) = chunk_rank_index(idx, slot, cid);
+    prefix + chunk.rank_within(off, blocks)
+}
+
+#[inline]
+fn chunk_rank_index(idx: &RankIndex, slot: Slot, cid: u64) -> (u64, Option<&[u32]>) {
     match slot {
-        Slot::Direct(i) => {
-            idx.chunk_prefix[i] + chunk.rank_within(off, idx.block_prefix[i].as_deref())
-        }
+        Slot::Direct(i) => (idx.chunk_prefix[i], idx.block_prefix[i].as_deref()),
         Slot::Overflow => {
             let i = idx.ov_keys.partition_point(|&k| k < cid);
-            idx.ov_prefix[i] + chunk.rank_within(off, idx.ov_block[i].as_deref())
+            (idx.ov_prefix[i], idx.ov_block[i].as_deref())
         }
     }
 }
@@ -610,6 +896,7 @@ struct Bitmap {
     chunks: Vec<Cell>,
     /// Direct chunk ids below this are reserved for the atomic setters.
     reserved: usize,
+    paged_atomic: bool,
     /// Chunks with chunk id at or above `DIRECT_CHUNKS`, keyed by chunk id.
     /// Every key here is above every key in `chunks`.
     overflow: BTreeMap<u64, Chunk>,
@@ -666,6 +953,7 @@ impl Bitmap {
         Self {
             chunks: Vec::new(),
             reserved: 0,
+            paged_atomic: false,
             overflow: BTreeMap::new(),
         }
     }
@@ -719,7 +1007,8 @@ impl Bitmap {
                 self.chunks.resize_with(i + 1, Cell::vacant);
             }
             if i < self.reserved {
-                self.chunks[i].get_or_insert_with(|| Chunk::Dense(new_dense()))
+                let paged = self.paged_atomic;
+                self.chunks[i].get_or_insert_with(|| atomic_chunk(paged))
             } else {
                 self.chunks[i].get_or_insert_with(Chunk::new_sparse)
             }
@@ -750,8 +1039,9 @@ impl Bitmap {
         self.chunk_entry(cid).insert(off)
     }
 
-    /// Bit-array coverage for every key in `0..=max`: the direct chunks
-    /// reserved, the overflow chunks allocated; see [`IdSet::pre_allocate`].
+    /// Atomic coverage for every key in `0..=max`: reserve direct cells and
+    /// create overflow entries. Paged entries leave their directories and
+    /// pages vacant until the first write.
     fn pre_allocate(&mut self, max: NonNegId) {
         let (max_cid, _) = max.split();
         let direct_end = max_cid.min(DIRECT_CHUNKS - 1) as usize;
@@ -760,24 +1050,24 @@ impl Bitmap {
             match self.overflow.entry(cid) {
                 Entry::Occupied(mut e) => e.get_mut().promote(),
                 Entry::Vacant(e) => {
-                    e.insert(Chunk::Dense(new_dense()));
+                    e.insert(atomic_chunk(self.paged_atomic));
                 }
             }
         }
     }
 
-    /// The bit-array chunk an atomic setter may write for `key`, or `None`:
+    /// The chunk or page words writable for `key`, or `None`:
     /// no chunk and no reservation, or a chunk that only holds array
     /// contents (the atomic setters cannot grow or convert a chunk under
     /// `&self`). A reserved vacant cell is materialised here.
     #[inline]
-    fn dense_for_atomic(&self, key: NonNegId) -> Option<(&[AtomicU64], u32)> {
+    fn words_for_atomic(&self, key: NonNegId) -> Option<(&[AtomicU64], u32)> {
         let (cid, off) = key.split();
         let chunk = if cid < DIRECT_CHUNKS {
             let i = cid as usize;
             let cell = self.chunks.get(i)?;
             if i < self.reserved {
-                cell.0.get_or_init(|| Chunk::Dense(new_dense()))
+                cell.0.get_or_init(|| atomic_chunk(self.paged_atomic))
             } else {
                 cell.as_ref()?
             }
@@ -786,11 +1076,15 @@ impl Bitmap {
         };
         match chunk {
             Chunk::Dense(words) => Some((&words[..], off)),
+            Chunk::Paged(pages) => {
+                let (page, local) = split_page_offset(off);
+                Some((pages.page_for_atomic(page), local))
+            }
             Chunk::Sparse(_) => None,
         }
     }
 
-    /// Whether [`Self::dense_for_atomic`] would return a chunk for `key`,
+    /// Whether [`Self::words_for_atomic`] would return words for `key`,
     /// without materialising a reserved one.
     #[inline]
     fn covers_atomic(&self, key: NonNegId) -> bool {
@@ -804,25 +1098,25 @@ impl Bitmap {
         } else {
             self.overflow.get(&cid)
         };
-        matches!(chunk, Some(Chunk::Dense(_)))
+        chunk.is_some_and(Chunk::is_atomic)
     }
 
     /// The highest chunk id an atomic setter can write - reserved, or a
     /// bit array a plain insert promoted outside the reservation - for the
     /// atomic setters' panic message. It says nothing about holes below it.
     fn last_chunk(&self) -> Option<u64> {
-        let dense = |chunk: &Chunk| matches!(chunk, Chunk::Dense(_));
+        let atomic = Chunk::is_atomic;
         let overflow = self
             .overflow
             .iter()
             .rev()
-            .find(|(_, chunk)| dense(chunk))
+            .find(|(_, chunk)| atomic(chunk))
             .map(|(&cid, _)| cid);
         overflow.or_else(|| {
             let materialised = self
                 .chunks
                 .iter()
-                .rposition(|cell| cell.as_ref().is_some_and(dense));
+                .rposition(|cell| cell.as_ref().is_some_and(atomic));
             materialised
                 .max(self.reserved.checked_sub(1))
                 .map(|i| i as u64)
@@ -939,11 +1233,25 @@ impl Bitmap {
         use std::mem::size_of;
         let rank_entry = size_of::<u64>() + size_of::<Option<Vec<u32>>>();
         let per_chunk = CHUNK_BYTES + BLOCKS_PER_CHUNK * size_of::<u32>() + 128;
+        let chunk_bytes = self
+            .chunks
+            .iter()
+            .filter_map(Cell::as_ref)
+            .chain(self.overflow.values())
+            .map(|chunk| {
+                let pages = if matches!(chunk, Chunk::Paged(_)) {
+                    PAGES_PER_CHUNK * size_of::<Page>()
+                } else {
+                    0
+                };
+                (per_chunk + pages) as u64
+            })
+            .sum::<u64>();
         // The directory by its capacity (a reservation's vacant cells are
         // most of it), the rank vectors by its length.
         let directory = self.chunks.capacity() as u64 * size_of::<Cell>() as u64
             + (self.chunks.len() + 1) as u64 * rank_entry as u64;
-        directory + self.allocated_chunk_count() as u64 * per_chunk as u64
+        directory + chunk_bytes
     }
 
     /// The bytes this bitmap holds now, and with `ranked` also the rank index
@@ -971,6 +1279,7 @@ impl Bitmap {
                     };
                     (CHUNK_BYTES + prefixes) as u64
                 }
+                Chunk::Paged(pages) => pages.footprint_bytes(ranked) as u64,
                 Chunk::Sparse(offsets) => (offsets.capacity() * size_of::<u32>()) as u64,
             }
         };
@@ -1112,10 +1421,8 @@ impl Bitmap {
     fn rank_if_set(&self, idx: &RankIndex, key: NonNegId) -> Option<u64> {
         let (cid, off) = key.split();
         let (slot, chunk) = self.chunk(cid)?;
-        if !chunk.contains(off) {
-            return None;
-        }
-        Some(rank_in_chunk(idx, slot, cid, chunk, off))
+        let (prefix, blocks) = chunk_rank_index(idx, slot, cid);
+        chunk.rank_member(off, blocks).map(|rank| prefix + rank)
     }
 
     fn len(&self) -> u64 {
@@ -1153,10 +1460,11 @@ impl Bitmap {
 ///
 /// The exception is [`Self::pre_allocate`], which makes a whole
 /// non-negative ID range atomically writable on request: a bit array is
-/// allocated for each chunk of it an atomic setter writes, and a directory
-/// cell is held for the rest of the range below 2^43; its argument is the
-/// caller's responsibility (see its docs), and merging a pre-allocated set
-/// carries that coverage along.
+/// allocated for each chunk of it an atomic setter writes in the default
+/// set, and a directory cell is held for the rest of the range below 2^43.
+/// The paged set used by renumber allocates only touched bitmap pages.
+/// The caller sets the bound, and merging a pre-allocated set carries that
+/// coverage along.
 ///
 /// # Rank queries
 ///
@@ -1185,6 +1493,13 @@ impl IdSet {
         }
     }
 
+    /// Use lazy bitmap pages for renumber's non-negative atomic reservation.
+    pub(crate) const fn new_paged_atomic() -> Self {
+        let mut set = Self::new();
+        set.nonneg.paged_atomic = true;
+        set
+    }
+
     /// Returns `true` if any chunk has been allocated: by an insert, or by
     /// a `pre_allocate` above the direct directory. A reservation alone
     /// allocates no direct chunk. Membership is [`Self::is_empty`].
@@ -1193,7 +1508,7 @@ impl IdSet {
     }
 
     /// Returns the number of allocated chunks backing this set, in either
-    /// form (sorted array or 4 MiB bit array), over both families.
+    /// representation, over both families.
     pub fn allocated_chunk_count(&self) -> usize {
         self.nonneg.allocated_chunk_count() + self.neg.allocated_chunk_count()
     }
@@ -1245,10 +1560,11 @@ impl IdSet {
     ///
     /// Below 2^43 the range is reserved, not allocated: each 2^25-ID chunk
     /// costs a directory cell until an atomic setter first writes it, and
-    /// then its 4 MiB bit array. Above 2^43 it eagerly allocates 4 MiB per
-    /// chunk, so `max_id` still sizes memory there, and a caller deriving it
-    /// from untrusted input (indexdata) must bound it first with
-    /// [`IdSet::file_bounded_max_id`].
+    /// then its bitmap storage. Above 2^43 this creates overflow entries
+    /// eagerly, with a 4 MiB bit array each for a default set. Renumber's
+    /// paged sets allocate bitmap storage only for pages that receive writes.
+    /// A caller deriving the bound from untrusted indexdata must limit it
+    /// first with [`IdSet::file_bounded_max_id`].
     ///
     /// # Invariant for callers
     ///
@@ -1362,7 +1678,7 @@ impl IdSet {
     /// range keep using [`Self::insert_atomic`], whose panic catches a real
     /// caller bug.
     pub fn try_insert_atomic(&self, id: i64) -> bool {
-        let Some((words, off)) = self.dense_for_atomic(id) else {
+        let Some((words, off)) = self.words_for_atomic(id) else {
             return false;
         };
         words[(off >> 6) as usize].fetch_or(1u64 << (off & 63), Relaxed);
@@ -1375,27 +1691,27 @@ impl IdSet {
     /// the pre-allocated chunks - and the caller spills it. `Some(true)` /
     /// `Some(false)` carry the usual first-seen / already-seen answer.
     pub fn try_insert_atomic_if_new(&self, id: i64) -> Option<bool> {
-        let (words, off) = self.dense_for_atomic(id)?;
+        let (words, off) = self.words_for_atomic(id)?;
         let bit = 1u64 << (off & 63);
         let prev = words[(off >> 6) as usize].fetch_or(bit, Relaxed);
         Some((prev & bit) == 0)
     }
 
-    /// The bit-array chunk an atomic setter may write for `id`, or `None`
+    /// The chunk or page words writable for `id`, or `None`
     /// for a negative ID or an uncovered one. A negative ID is legal input,
     /// so landing here is an input property, not a corrupt-state signal -
     /// which is precisely why the `try_` callers get `None` rather than a
     /// panic.
     #[inline]
-    fn dense_for_atomic(&self, id: i64) -> Option<(&[AtomicU64], u32)> {
-        self.nonneg.dense_for_atomic(NonNegId::new(id)?)
+    fn words_for_atomic(&self, id: i64) -> Option<(&[AtomicU64], u32)> {
+        self.nonneg.words_for_atomic(NonNegId::new(id)?)
     }
 
-    /// Panicking chunk lookup for `insert_atomic` / `insert_atomic_if_new`,
+    /// Panicking word-slice lookup for `insert_atomic` / `insert_atomic_if_new`,
     /// with a message that says which of the failure modes this is.
     #[inline]
     fn chunk_for_atomic(&self, id: i64, fn_name: &'static str) -> (&[AtomicU64], u32) {
-        if let Some(found) = self.dense_for_atomic(id) {
+        if let Some(found) = self.words_for_atomic(id) {
             return found;
         }
         if id < 0 {
@@ -1723,6 +2039,9 @@ pub struct AtomicWordBatch<'a> {
     /// `id >> 6` of the pending word; meaningful only while `word` is set.
     key: i64,
     word: Option<&'a AtomicU64>,
+    /// First absolute word index of the cached page or dense chunk.
+    words_start: i64,
+    words: &'a [AtomicU64],
     mask: u64,
 }
 
@@ -1732,6 +2051,8 @@ impl<'a> AtomicWordBatch<'a> {
             set,
             key: 0,
             word: None,
+            words_start: 0,
+            words: &[],
             mask: 0,
         }
     }
@@ -1750,12 +2071,22 @@ impl<'a> AtomicWordBatch<'a> {
             return true;
         }
         self.publish();
-        let Some((words, off)) = self.set.dense_for_atomic(id) else {
-            return false;
+        // Check the full word distance before narrowing to a slice index.
+        let local = (key - self.words_start) as u64;
+        let word = if local < self.words.len() as u64 {
+            &self.words[local as usize]
+        } else {
+            let Some((words, off)) = self.set.words_for_atomic(id) else {
+                return false;
+            };
+            let local = (off >> 6) as usize;
+            self.words_start = key - local as i64;
+            self.words = words;
+            &words[local]
         };
-        self.word = Some(&words[(off >> 6) as usize]);
+        self.word = Some(word);
         self.key = key;
-        self.mask = 1u64 << (off & 63);
+        self.mask = 1u64 << (id & 63);
         true
     }
 
@@ -1834,7 +2165,7 @@ impl<'a> AtomicRepeatBatch<'a> {
         if !covered {
             return false;
         }
-        let Some((words, off)) = self.seen.dense_for_atomic(id) else {
+        let Some((words, off)) = self.seen.words_for_atomic(id) else {
             return false;
         };
         self.word = Some(&words[(off >> 6) as usize]);
@@ -1863,7 +2194,7 @@ impl<'a> AtomicRepeatBatch<'a> {
         // `insert` checked that `again` covers this word without
         // materialising it, and nothing can shrink a reservation under a
         // shared borrow, so the lookup succeeds.
-        let Some((words, off)) = self.again.dense_for_atomic(self.key << 6) else {
+        let Some((words, off)) = self.again.words_for_atomic(self.key << 6) else {
             panic!(
                 "AtomicRepeatBatch: the again set stopped covering word {}",
                 self.key
@@ -2118,6 +2449,86 @@ mod tests {
         s.insert(-1);
         s.insert(far);
         assert!(s.get(-1) && s.get(far));
+    }
+
+    #[test]
+    fn sparse_atomic_pages_bound_storage_and_preserve_rank() {
+        let mut set = IdSet::new_paged_atomic();
+        let chunk = 1_i64 << ID_SHIFT;
+        let page = WORDS_PER_PAGE as i64 * 64;
+        let high = (DIRECT_CHUNKS as i64) << ID_SHIFT;
+        set.pre_allocate(high + 2 * chunk);
+        assert_eq!(set.nonneg.overflow.len(), 3);
+        assert!(set.nonneg.overflow.values().all(|entry| {
+            matches!(entry, Chunk::Paged(pages) if pages.footprint_bytes(false) == 0)
+        }));
+
+        let ids = [
+            1,
+            63,
+            page - 1,
+            page,
+            4 * page + 9,
+            chunk + 7,
+            high + 3,
+            high + page,
+        ];
+        std::thread::scope(|scope| {
+            for order in [ids, std::array::from_fn(|i| ids[ids.len() - 1 - i])] {
+                let set = &set;
+                scope.spawn(move || {
+                    let mut batch = AtomicWordBatch::new(set);
+                    for id in order {
+                        assert!(batch.insert(id));
+                    }
+                    assert!(!batch.insert(-1));
+                    assert!(!batch.insert(high + 3 * chunk));
+                });
+            }
+        });
+        assert_eq!(set.len(), ids.len() as u64);
+        assert!(set.any_in_numeric_range(page, page));
+        assert!(!set.any_in_numeric_range(2 * page, 4 * page));
+        assert_eq!(set.iter_numeric_from(page).collect::<Vec<_>>(), ids[3..]);
+        assert_eq!(
+            set.nonneg
+                .iter_rev_to(NonNegId((high + page) as u64))
+                .map(|key| key.0 as i64)
+                .collect::<Vec<_>>(),
+            ids.into_iter().rev().collect::<Vec<_>>()
+        );
+
+        // Charge materialised bitmap pages, their directories and the rank
+        // blocks. Exclude the separately bounded direct directory.
+        let materialised: usize = set
+            .nonneg
+            .chunks
+            .iter()
+            .filter_map(Cell::as_ref)
+            .chain(set.nonneg.overflow.values())
+            .map(|entry| match entry {
+                Chunk::Paged(pages) => pages.footprint_bytes(true),
+                _ => panic!("the atomic reservation must be paged"),
+            })
+            .sum();
+        assert!(
+            materialised
+                <= 6 * crate::tunables::RENUMBER_ATOMIC_ID_PAGE_BYTES
+                    + 3 * (PAGES_PER_CHUNK * std::mem::size_of::<Page>()
+                        + BLOCKS_PER_CHUNK * std::mem::size_of::<u32>())
+        );
+        assert!(materialised < CHUNK_BYTES);
+
+        let ranked = set.into_ranked();
+        assert_eq!(ranked.total_count(), ids.len() as u64);
+        for (rank, id) in ids.into_iter().enumerate() {
+            assert_eq!(ranked.numeric_rank_if_set(id), Some(rank as u64));
+            assert_eq!(ranked.canonical_rank_if_set(id), Some(rank as u64));
+            assert_eq!(ranked.numeric_rank(id), rank as u64);
+        }
+        assert_eq!(ranked.numeric_rank_if_set(2 * page), None);
+        assert_eq!(ranked.numeric_rank(2 * page), 4);
+        assert_eq!(ranked.numeric_rank_if_set(high + 2 * chunk), None);
     }
 
     #[test]
@@ -2620,7 +3031,7 @@ mod tests {
 
         s.pre_allocate(3 << ID_SHIFT);
         assert!(!s.has_any(), "a reservation allocates no chunk");
-        assert!(s.nonneg.dense_for_atomic(NonNegId(5)).is_some());
+        assert!(s.nonneg.words_for_atomic(NonNegId(5)).is_some());
         assert!(s.has_any(), "an atomic setter's lookup materialises one");
         assert!(s.is_empty(), "but sets no member");
         assert_eq!(s.len(), 0);
@@ -2696,6 +3107,9 @@ mod tests {
             -1,
             -33_554_433,
         ];
+        // Chunk zero is a contiguous bitmap, while the other chunks keep
+        // their offset arrays. Exercise both branches of member rank.
+        s.pre_allocate(0);
         for &id in &ids {
             s.insert(id);
         }
@@ -2746,7 +3160,7 @@ mod tests {
     fn atomic_storage_is_u64_aligned_and_parallel_fill_survives_rank_build() {
         let mut s = IdSet::new();
         s.pre_allocate(10_000);
-        let Some((words, _)) = s.nonneg.dense_for_atomic(NonNegId(0)) else {
+        let Some((words, _)) = s.nonneg.words_for_atomic(NonNegId(0)) else {
             panic!("pre_allocate must cover the chunk with a bit array");
         };
         assert_eq!((words.as_ptr() as usize) % std::mem::align_of::<u64>(), 0);

@@ -34,9 +34,11 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// negative timestamp; version 9 makes the admin cell lists a binding cover
 /// (see [`AdminEntry`]): the reader consults only the query's own admin cell
 /// and accepts an interior-flagged entry without a point-in-polygon test,
-/// where version 8 and earlier only carried the flag as a hint. Readers
-/// deliberately reject other versions: existing indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 9;
+/// where version 8 and earlier only carried the flag as a hint; version 10
+/// stores interpolation section totals and segment prefixes and omits
+/// unresolved ways. Readers deliberately reject other versions: existing
+/// indexes must be rebuilt.
+pub const FORMAT_VERSION: u32 = 10;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -509,7 +511,7 @@ macro_rules! wire_field {
     )*};
 }
 
-wire_field!(u8, u16, u32, u64, i32, f32);
+wire_field!(u8, u16, u32, u64, i32, f32, f64);
 
 /// Define a record from its field list, which is its on-disk layout: fields
 /// are stored in the order listed, each at the width of its type, followed by
@@ -630,15 +632,14 @@ record! {
 
 record! {
     /// `interp_ways.bin`. One record per section of an interpolation way
-    /// between two of its address nodes (or one per unresolved way), so
-    /// the node spans of a way's sections share their split node and may
+    /// between two of its address nodes. The node spans share split nodes and may
     /// overlap in `interp_nodes.bin`.
     #[derive(Debug, Clone, Copy)]
     pub struct InterpWay {
         /// Byte offset into interp_nodes.bin (u64 for consistency).
         pub node_offset: u64,
         /// The street or place the section numbers along (see
-        /// `parent_kind`); 0 only on an unresolved record.
+        /// `parent_kind`).
         pub parent_offset: u32,
         pub start_number: u32,
         pub end_number: u32,
@@ -647,6 +648,19 @@ record! {
         pub interpolation_type: u8,
         /// Serialized ParentKind; checked when opening the index.
         pub parent_kind: u8,
+        /// Byte offset of this section's node_count - 1 segment prefixes.
+        pub prefix_offset: u64,
+        /// Total section length in radians.
+        pub total_len: f64,
+    }
+}
+
+record! {
+    /// `interp_prefixes.bin`. Length in radians from the section's start
+    /// to the start of one segment, accumulated in node order.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct InterpPrefix {
+        pub length: f64,
     }
 }
 
@@ -1153,6 +1167,7 @@ pub const FILE_STREET_NODES: &str = "street_nodes.bin";
 pub const FILE_ADDR_POINTS: &str = "addr_points.bin";
 pub const FILE_INTERP_WAYS: &str = "interp_ways.bin";
 pub const FILE_INTERP_NODES: &str = "interp_nodes.bin";
+pub const FILE_INTERP_PREFIXES: &str = "interp_prefixes.bin";
 pub const FILE_ADMIN_CELLS: &str = "admin_cells.bin";
 pub const FILE_ADMIN_ENTRIES: &str = "admin_entries.bin";
 pub const FILE_ADMIN_POLYGONS: &str = "admin_polygons.bin";
@@ -1778,6 +1793,16 @@ mod tests {
     }
 
     #[test]
+    fn version_nine_requires_rebuild() {
+        let mut bytes = valid_header_bytes();
+        bytes[4..8].copy_from_slice(&9u32.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(FormatError::UnsupportedVersion(9))
+        ));
+    }
+
+    #[test]
     fn version_two_requires_rebuild() {
         let mut bytes = valid_header_bytes();
         bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
@@ -1867,6 +1892,8 @@ mod tests {
             node_count: 5,
             interpolation_type: 1, // even
             parent_kind: 1,
+            prefix_offset: 16,
+            total_len: 0.25,
         };
         let bytes = iw.to_bytes();
         let parsed = InterpWay::from_bytes(&bytes);
@@ -1877,6 +1904,8 @@ mod tests {
         assert_eq!(parsed.node_count, 5);
         assert_eq!(parsed.interpolation_type, 1);
         assert_eq!(parsed.parent_kind, 1);
+        assert_eq!(parsed.prefix_offset, 16);
+        assert_eq!(parsed.total_len.to_bits(), 0.25f64.to_bits());
     }
 
     #[test]
@@ -2111,7 +2140,7 @@ mod tests {
         assert_eq!(AddrEntry::SIZE, 4);
         assert_eq!(StreetWay::SIZE, 14);
         assert_eq!(AddrPoint::SIZE, 24);
-        assert_eq!(InterpWay::SIZE, 24);
+        assert_eq!(InterpWay::SIZE, 40);
         assert_eq!(AdminCell::SIZE, 16);
         assert_eq!(AdminPolygon::SIZE, 26);
         assert_eq!(NodeCoord::SIZE, 8);
@@ -2142,6 +2171,8 @@ mod tests {
             node_count: 11,
             interpolation_type: 2,
             parent_kind: 1,
+            prefix_offset: 16,
+            total_len: 0.25,
         };
         let bytes = iw.to_bytes();
         assert_eq!(&bytes[0..8], &7u64.to_le_bytes());
@@ -2151,6 +2182,8 @@ mod tests {
         assert_eq!(&bytes[20..22], &11u16.to_le_bytes());
         assert_eq!(bytes[22], 2);
         assert_eq!(bytes[23], 1);
+        assert_eq!(&bytes[24..32], &16u64.to_le_bytes());
+        assert_eq!(&bytes[32..40], &0.25f64.to_le_bytes());
 
         let pt = AddrPoint {
             lat_e7: -1,

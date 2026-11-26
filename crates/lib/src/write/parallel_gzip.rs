@@ -34,13 +34,14 @@
 //! every seq still reaches the writer thread so flush barriers are answered.
 //! `finish` and `Drop` join every thread before they return.
 
+use std::cell::RefCell;
 use std::io::{self, Write};
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use flate2::write::GzEncoder;
+use flate2::{Compress, Compression, Crc, FlushCompress, Status};
 
 use crate::error::Error;
 use crate::reorder_buffer::ReorderBuffer;
@@ -59,8 +60,8 @@ use crate::write::pool_failure::FirstFailure;
 // writers. Moving this value alone would leave those paths with separate
 // owners and would imply a shared compression policy that the current tree
 // does not have.
-fn compression_level() -> flate2::Compression {
-    flate2::Compression::fast()
+fn compression_level() -> Compression {
+    Compression::fast()
 }
 
 /// One unit of work handed to the compressor pool.
@@ -686,21 +687,106 @@ fn guarded<T>(failure: &FirstFailure, who: &str, f: impl FnOnce() -> io::Result<
     }
 }
 
-/// Compress one chunk as a standalone gzip member. Also what the
-/// `diff --format osc` unit workers and its framing use, so every member of
-/// that output is deflated alike, with the same fixed header.
-///
-/// The `io::Result` return type is nominal: the inner writer is a
-/// `Vec<u8>` whose `Write` impl is infallible, and flate2 does not
-/// return `Err` for allocation failure (it panics/aborts). So the
-/// `?` at `write_all` and the `Err` arm of `finish()` are effectively
-/// unreachable today. Kept fallible as defensive coding in case the
-/// sink is ever swapped for a fallible writer; callers (particularly
-/// `worker_loop` above) must continue to handle `Err` as a real error.
+thread_local! {
+    // Indexed diff's workers and document sink share this entry point with
+    // the pool above. Each calling thread keeps its own deflate workspace.
+    static MEMBER_ENCODER: RefCell<MemberEncoder> =
+        RefCell::new(MemberEncoder::new(compression_level()));
+}
+
+/// Compress one chunk as a standalone gzip member.
 pub(crate) fn compress_one(raw: &[u8]) -> io::Result<Vec<u8>> {
-    let mut enc = GzEncoder::new(Vec::with_capacity(raw.len() / 2), compression_level());
-    enc.write_all(raw)?;
-    enc.finish()
+    MEMBER_ENCODER.with(|encoder| encoder.borrow_mut().encode(raw))
+}
+
+struct MemberEncoder {
+    deflate: Compress,
+    staging: Vec<u8>,
+    header: [u8; 10],
+}
+
+impl MemberEncoder {
+    fn new(level: Compression) -> Self {
+        let xfl = if level.level() >= Compression::best().level() {
+            2
+        } else if level.level() <= Compression::fast().level() {
+            4
+        } else {
+            0
+        };
+        Self {
+            deflate: Compress::new(level, false),
+            // Match GzEncoder's output window on every deflate call. The
+            // window can affect block boundaries, especially at level zero.
+            staging: Vec::with_capacity(32 * 1024),
+            // Default GzEncoder header: DEFLATE, no optional fields, zero
+            // mtime, level-dependent XFL, and unknown OS.
+            header: [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, xfl, 255],
+        }
+    }
+
+    fn encode(&mut self, raw: &[u8]) -> io::Result<Vec<u8>> {
+        self.deflate.reset();
+        // Delivery can hold owned members in queues and reorder buffers, and
+        // no caller returns its Vec. Reuse the staging buffer here without
+        // adding a return path or holding a buffer across a write.
+        let mut member = Vec::with_capacity(raw.len() / 2);
+        member.extend_from_slice(&self.header);
+        self.write_body(raw, &mut member)?;
+        self.finish_body(&mut member)?;
+
+        let mut crc = Crc::new();
+        crc.update(raw);
+        member.extend_from_slice(&crc.sum().to_le_bytes());
+        member.extend_from_slice(&crc.amount().to_le_bytes());
+        Ok(member)
+    }
+
+    fn write_body(&mut self, raw: &[u8], member: &mut Vec<u8>) -> io::Result<()> {
+        let mut consumed = 0;
+        while consumed < raw.len() {
+            let status = self.deflate_step(&raw[consumed..], FlushCompress::None, member)?;
+            let next = usize::try_from(self.deflate.total_in())
+                .map_err(|_| Error::internal("gzip member input count overflowed"))?;
+            if status == Status::StreamEnd {
+                return Err(Error::internal("gzip member ended before finish").into());
+            }
+            if next < consumed || next > raw.len() {
+                return Err(Error::internal("gzip member input count is out of range").into());
+            }
+            if next == consumed && self.staging.is_empty() {
+                return Err(Error::internal("gzip member deflate made no progress").into());
+            }
+            consumed = next;
+        }
+        Ok(())
+    }
+
+    fn finish_body(&mut self, member: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            if self.deflate_step(&[], FlushCompress::Finish, member)? == Status::StreamEnd {
+                return Ok(());
+            }
+            if self.staging.is_empty() {
+                return Err(Error::internal("gzip member finish made no progress").into());
+            }
+        }
+    }
+
+    fn deflate_step(
+        &mut self,
+        input: &[u8],
+        flush: FlushCompress,
+        member: &mut Vec<u8>,
+    ) -> io::Result<Status> {
+        self.staging.clear();
+        let status = self
+            .deflate
+            .compress_vec(input, &mut self.staging, flush)
+            .map_err(|error| Error::internal_with("gzip member deflate failed", error))?;
+        member.extend_from_slice(&self.staging);
+        Ok(status)
+    }
 }
 
 /// Writer: pull compressed chunks in arbitrary order, reorder by seq,
@@ -987,7 +1073,53 @@ mod fault_tests {
 mod tests {
     use super::*;
     use flate2::read::MultiGzDecoder;
+    use flate2::write::GzEncoder;
     use std::io::Read;
+
+    fn reference_member(raw: &[u8], level: Compression) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), level);
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn reused_encoder_matches_gz_encoder() {
+        let repetitive = b"<node id=\"1\"/>\n".repeat(16_384);
+        let mut seed = 1u32;
+        let varied: Vec<u8> = (0..65_536)
+            .flat_map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()
+            })
+            .collect();
+        let inputs: [&[u8]; 7] = [b"", b"x", &repetitive, b"", &varied, b"x", &repetitive];
+        for level in [
+            Compression::none(),
+            Compression::fast(),
+            Compression::default(),
+            Compression::best(),
+        ] {
+            let mut encoder = MemberEncoder::new(level);
+            let mut stream = Vec::new();
+            for (index, raw) in inputs.into_iter().enumerate() {
+                let member = encoder.encode(raw).unwrap();
+                assert_eq!(
+                    member,
+                    reference_member(raw, level),
+                    "level {}, member {index}",
+                    level.level()
+                );
+                stream.extend_from_slice(&member);
+            }
+            let mut decoded = Vec::new();
+            MultiGzDecoder::new(stream.as_slice())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, inputs.concat());
+        }
+    }
 
     /// Compress `bytes` via an owned-sink `ParallelGzipWriter`, return the
     /// gzip payload. The writer takes the sink by value (it must be
@@ -1054,11 +1186,14 @@ mod tests {
         // logical stream.
         let sink: Vec<u8> = Vec::new();
         let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Call::detached());
+        let mut expected = Vec::new();
         for i in 0..5u8 {
             let block = [i; 1024];
             gz.write_all(&block).unwrap();
+            expected.extend(reference_member(&block, compression_level()));
         }
         let compressed = gz.finish().unwrap();
+        assert_eq!(compressed, expected);
         let mut out = Vec::new();
         MultiGzDecoder::new(compressed.as_slice())
             .read_to_end(&mut out)

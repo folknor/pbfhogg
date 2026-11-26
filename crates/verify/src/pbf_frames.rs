@@ -6,9 +6,9 @@
 //! order from ([`framing`]), and `verify repack` and `verify degrade` read
 //! every blob's claim, pulled one blob at a time ([`Claims`]), to hold an
 //! output's block layout to a prediction. This walk
-//! reads each blob's `BlobHeader` (a few dozen bytes) and seeks past the
-//! payload without reading it, so its I/O is proportional to the blob count,
-//! never to the data. The one payload it reads is the leading `OSMHeader`'s,
+//! reads each blob's `BlobHeader` (a few dozen bytes) by positional read
+//! with random-access advice and skips its payload, so its I/O is
+//! proportional to the blob count, never to the data. The one payload it reads is the leading `OSMHeader`'s,
 //! for the header's required features; [`blob_ids`] reads one named data
 //! blob's elements on request, the bounded exception `verify degrade` takes
 //! for the few elements it locates, and [`index_truth`] reads every data
@@ -51,8 +51,13 @@
     reason = "shared verifier helpers consumed by the remaining family slices"
 )]
 
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::{Arc, mpsc};
+use std::thread;
 
 use crate::error::Error;
 
@@ -128,7 +133,8 @@ impl IndexSummary {
 /// Walk `path`'s framing; refuse anything pbfhogg would not read through its
 /// indexdata. Errors name the blob ordinal and offset.
 pub(crate) fn walk(path: &Path, origin: Origin) -> Result<IndexSummary, Error> {
-    let (mut file, len) = open(path, origin)?;
+    let (file, len) = open(path, origin)?;
+    let mut file = Positioned::random(file);
     walk_reader(&mut file, len).map_err(|why| {
         origin.refuse(format!(
             "{} is not a fully indexed PBF this check can select IDs from: {why}",
@@ -146,6 +152,49 @@ fn open(path: &Path, origin: Origin) -> Result<(std::fs::File, u64), Error> {
         .map_err(|e| origin.refuse(format!("cannot stat {}: {e}", path.display())))?
         .len();
     Ok((file, len))
+}
+
+/// A cursor for FrameWalk that requests exactly the bytes it consumes.
+struct Positioned {
+    file: Arc<File>,
+    offset: u64,
+}
+
+impl Positioned {
+    fn random(file: File) -> Self {
+        // SAFETY: the descriptor belongs to the live file. Advice is an
+        // optimization, so systems that reject it can still do the walk.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        Self::new(file)
+    }
+
+    fn new(file: File) -> Self {
+        Self {
+            file: Arc::new(file),
+            offset: 0,
+        }
+    }
+}
+
+impl Read for Positioned {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read_at(buf, self.offset)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Positioned {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let SeekFrom::Start(offset) = pos else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "frame walk needs an absolute offset",
+            ));
+        };
+        self.offset = offset;
+        Ok(offset)
+    }
 }
 
 fn walk_reader(r: &mut (impl Read + Seek), len: u64) -> Result<IndexSummary, String> {
@@ -181,7 +230,8 @@ pub(crate) enum Framing {
 /// its indexdata (as [`walk`] does) and a file mixing data blobs with and
 /// without indexdata, which pbfhogg classifies by its first blob alone.
 pub(crate) fn framing(path: &Path, origin: Origin) -> Result<Framing, Error> {
-    let (mut file, len) = open(path, origin)?;
+    let (file, len) = open(path, origin)?;
+    let mut file = Positioned::random(file);
     framing_reader(&mut file, len).map_err(|why| {
         origin.refuse(format!(
             "cannot read the framing of {}: {why}",
@@ -399,7 +449,7 @@ pub(crate) struct ClaimedBlob {
 pub(crate) struct Claims {
     path: std::path::PathBuf,
     origin: Origin,
-    file: std::io::BufReader<std::fs::File>,
+    file: Positioned,
     len: u64,
     offset: u64,
     ordinal: u64,
@@ -409,8 +459,16 @@ pub(crate) struct Claims {
 
 impl Claims {
     pub(crate) fn open(path: &Path, origin: Origin) -> Result<Self, Error> {
+        Self::open_with(path, origin, Positioned::random)
+    }
+
+    fn open_with(
+        path: &Path,
+        origin: Origin,
+        cursor: impl FnOnce(File) -> Positioned,
+    ) -> Result<Self, Error> {
         let (file, len) = open(path, origin)?;
-        let mut file = std::io::BufReader::new(file);
+        let mut file = cursor(file);
         let walk =
             FrameWalk::open(&mut file, len).map_err(|why| Self::error_at(path, origin, &why))?;
         let (offset, ordinal, required_features) =
@@ -604,14 +662,203 @@ impl IndexTruth {
 /// elements: every element of the claimed kind, the claimed count,
 /// and, for a nonempty blob, the claimed minimum and maximum ID exactly.
 pub(crate) fn index_truth(path: &Path, origin: Origin) -> Result<IndexTruth, Error> {
-    const SHOWN: usize = 10;
-    let mut truth = IndexTruth::default();
-    let mut claims = Claims::open(path, origin)?;
-    while let Some(blob) = claims.next_blob()? {
-        truth.blobs += 1;
-        let Some(claim) = blob.claim else { continue };
-        truth.blobs_with_indexdata += 1;
-        let ids = blob_ids(path, origin, blob.payload_offset, blob.datasize)?;
+    index_truth_with_claims(path, origin, |_| {})
+}
+
+pub(crate) fn index_truth_with_claims(
+    path: &Path,
+    origin: Origin,
+    mut each: impl FnMut(BlobClaim),
+) -> Result<IndexTruth, Error> {
+    let mut decoded = TruthWalk::open(path, origin)?;
+    while let Some((blob, ids)) = decoded.next(false)? {
+        if let Some(claim) = decoded.fold(blob, ids)? {
+            each(claim);
+        }
+    }
+    Ok(std::mem::take(&mut decoded.truth))
+}
+
+type Ids = Vec<(usize, i64)>;
+type Decoded = (ClaimedBlob, Result<Ids, Error>);
+
+/// A bounded pool with one in-flight blob per worker. Collect slots in
+/// dispatch order, including a framing error discovered after those slots.
+pub(crate) struct TruthWalk {
+    claims: Claims,
+    workers: Vec<DecodeWorker>,
+    pending: std::ops::Range<usize>,
+    terminal: Option<Result<(), Error>>,
+    truth: IndexTruth,
+}
+
+impl TruthWalk {
+    pub(crate) fn open(path: &Path, origin: Origin) -> Result<Self, Error> {
+        Ok(Self {
+            // This cursor also reads payloads, so leave kernel readahead on.
+            claims: Claims::open_with(path, origin, Positioned::new)?,
+            workers: Vec::new(),
+            pending: 0..0,
+            terminal: None,
+            truth: IndexTruth::default(),
+        })
+    }
+
+    fn fill(&mut self, all: bool) {
+        let mut sent = 0;
+        while sent < crate::tunables::FRAME_DECODE_WORKERS {
+            let blob = match self.claims.next_blob() {
+                Ok(Some(blob)) => blob,
+                end => {
+                    self.terminal = Some(end.map(|_| ()));
+                    break;
+                }
+            };
+            if let Err(error) = self.dispatch(sent, blob, all) {
+                self.terminal = Some(Err(error));
+                break;
+            }
+            sent += 1;
+        }
+        self.pending = 0..sent;
+    }
+
+    fn dispatch(&mut self, slot: usize, blob: ClaimedBlob, all: bool) -> Result<(), Error> {
+        if self.workers.len() == slot {
+            self.workers.push(DecodeWorker::start(&self.claims)?);
+        }
+        self.workers[slot].send((blob, all || blob.claim.is_some()))
+    }
+
+    pub(crate) fn next(&mut self, all: bool) -> Result<Option<Decoded>, Error> {
+        if self.pending.is_empty() && self.terminal.is_none() {
+            self.fill(all);
+        }
+        if let Some(slot) = self.pending.next() {
+            return self.workers[slot].recv().map(Some);
+        }
+        if let Some(Err(error)) = self.terminal.replace(Ok(())) {
+            return Err(error);
+        }
+        Ok(None)
+    }
+
+    /// Count unindexed blobs but leave their candidate-only decode errors
+    /// out of the truth verdict, which has always skipped their payloads.
+    pub(crate) fn observe(&mut self, blob: ClaimedBlob, ids: &[(usize, i64)]) {
+        self.truth.blobs += 1;
+        if let Some(claim) = blob.claim {
+            self.truth.blobs_with_indexdata += 1;
+            self.truth.check(blob.index, claim, ids);
+        }
+    }
+
+    fn fold(
+        &mut self,
+        blob: ClaimedBlob,
+        ids: Result<Ids, Error>,
+    ) -> Result<Option<BlobClaim>, Error> {
+        if blob.claim.is_some() {
+            self.observe(blob, &ids?);
+        } else {
+            self.observe(blob, &[]);
+        }
+        Ok(blob.claim)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<IndexTruth, Error> {
+        while let Some((blob, ids)) = self.next(false)? {
+            self.fold(blob, ids)?;
+        }
+        Ok(std::mem::take(&mut self.truth))
+    }
+}
+
+impl Drop for TruthWalk {
+    fn drop(&mut self) {
+        for worker in self.workers.drain(..) {
+            drop(worker.jobs);
+            // A worker that panicked has nothing left to report: the walk
+            // already failed on its closed result channel.
+            drop(worker.thread.join());
+        }
+    }
+}
+
+struct DecodeWorker {
+    jobs: mpsc::Sender<(ClaimedBlob, bool)>,
+    results: mpsc::Receiver<Decoded>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl DecodeWorker {
+    fn start(claims: &Claims) -> Result<Self, Error> {
+        let file = Arc::clone(&claims.file.file);
+        let path = claims.path.clone();
+        let origin = claims.origin;
+        let (jobs, work) = mpsc::channel::<(ClaimedBlob, bool)>();
+        let (done, results) = mpsc::channel();
+        let thread = thread::Builder::new().spawn(move || {
+            let mut reader = Positioned { file, offset: 0 };
+            let mut payload = Vec::new();
+            for (blob, read) in work {
+                let ids = if read {
+                    decode_ids(&mut reader, &mut payload, &path, origin, blob)
+                } else {
+                    Ok(Vec::new())
+                };
+                if done.send((blob, ids)).is_err() {
+                    break;
+                }
+            }
+        })?;
+        Ok(Self {
+            jobs,
+            results,
+            thread,
+        })
+    }
+
+    fn send(&self, job: (ClaimedBlob, bool)) -> Result<(), Error> {
+        self.jobs
+            .send(job)
+            .map_err(|_| Error::tool("frame decoder worker stopped"))
+    }
+
+    fn recv(&self) -> Result<Decoded, Error> {
+        self.results
+            .recv()
+            .map_err(|_| Error::tool("frame decoder worker stopped"))
+    }
+}
+
+fn decode_ids(
+    reader: &mut Positioned,
+    payload: &mut Vec<u8>,
+    path: &Path,
+    origin: Origin,
+    blob: ClaimedBlob,
+) -> Result<Ids, Error> {
+    let fail = |why: String| {
+        origin.refuse(format!(
+            "cannot read the data blob at byte {} of {}: {why}",
+            blob.payload_offset,
+            path.display()
+        ))
+    };
+    let size = usize::try_from(blob.datasize).map_err(|e| fail(e.to_string()))?;
+    payload.resize(size, 0);
+    reader.offset = blob.payload_offset;
+    reader
+        .read_exact(payload)
+        .map_err(|e| fail(e.to_string()))?;
+    let block = blob_content(payload).map_err(fail)?;
+    block_ids(&block).map_err(fail)
+}
+
+impl IndexTruth {
+    fn check(&mut self, index: u64, claim: BlobClaim, ids: &[(usize, i64)]) {
+        const SHOWN: usize = 10;
         let mut found = Vec::new();
         if let Some((kind, id)) = ids.iter().find(|(kind, _)| *kind != claim.kind) {
             found.push(format!(
@@ -644,13 +891,12 @@ pub(crate) fn index_truth(path: &Path, origin: Origin) -> Result<IndexTruth, Err
             }
         }
         for why in found {
-            truth.violations += 1;
-            if truth.shown.len() < SHOWN {
-                truth.shown.push(format!("data blob {}: {why}", blob.index));
+            self.violations += 1;
+            if self.shown.len() < SHOWN {
+                self.shown.push(format!("data blob {index}: {why}"));
             }
         }
     }
-    Ok(truth)
 }
 
 /// The `(kind, id)` of every element of a `PrimitiveBlock`.
@@ -1223,7 +1469,7 @@ impl Header {
 /// Read `path`'s leading `OSMHeader` (and the framing up to it).
 pub(crate) fn header(path: &Path, origin: Origin) -> Result<Header, Error> {
     let (file, len) = open(path, origin)?;
-    let mut file = std::io::BufReader::new(file);
+    let mut file = Positioned::random(file);
     let walk = FrameWalk::open(&mut file, len).map_err(|why| {
         origin.refuse(format!(
             "cannot read the header of {}: {why}",
@@ -1887,6 +2133,81 @@ mod tests {
             )
             .unwrap(),
             "data blob 1 holds 14 payload bytes in the first and 13 in the second",
+        );
+    }
+
+    #[test]
+    fn index_truth_folds_worker_results_in_frame_order() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let path = scratch.path().join("truth.osm.pbf");
+        let mut bytes = Vec::new();
+        frame("OSMHeader", &[], &header_payload(&[], false), &mut bytes);
+        let mut ways = Vec::new();
+        bytes_field(3, &element(10), &mut ways);
+        let raw = data_blob(&ways);
+        let block = super::blob_content(&raw).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&block).unwrap();
+        let mut compressed = Vec::new();
+        varint(2 << 3, &mut compressed);
+        varint(block.len() as u64, &mut compressed);
+        bytes_field(3, &encoder.finish().unwrap(), &mut compressed);
+        for count in 2..14 {
+            frame(
+                "OSMData",
+                &[&index(3, 1, 10, 10, count)],
+                if count % 2 == 0 { &raw } else { &compressed },
+                &mut bytes,
+            );
+        }
+        // A framed but undecodable, unindexed payload is counted only.
+        frame("OSMData", &[], &[8, 1], &mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut counts = Vec::new();
+        let truth = super::index_truth_with_claims(&path, super::Origin::Other, |claim| {
+            counts.push(claim.count);
+        })
+        .unwrap();
+        let mut walk = super::TruthWalk::open(&path, super::Origin::Other).unwrap();
+        let (blob, ids) = walk.next(true).unwrap().unwrap();
+        let ids = ids.unwrap();
+        assert_eq!(ids, [(1, 10)]);
+        walk.observe(blob, &ids);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(walk.finish().unwrap(), truth);
+
+        assert_eq!(counts, (2..14).collect::<Vec<_>>());
+        assert_eq!(
+            (truth.blobs, truth.blobs_with_indexdata, truth.violations),
+            (13, 12, 12)
+        );
+        assert_eq!(
+            truth.shown,
+            (0..10)
+                .map(|i| format!("data blob {i}: claims {} elements but holds 1", i + 2))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn index_truth_reports_a_bad_payload_before_a_later_bad_header() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let path = scratch.path().join("truth.osm.pbf");
+        let mut bytes = Vec::new();
+        frame("OSMHeader", &[], &header_payload(&[], false), &mut bytes);
+        let payload = [8, 1];
+        frame("OSMData", &[&index(3, 1, 10, 10, 1)], &payload, &mut bytes);
+        let offset = bytes.len() - payload.len();
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = super::index_truth(&path, super::Origin::Pbfhogg).unwrap_err();
+        assert!(matches!(error, super::Error::Failed(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("cannot read the data blob at byte {offset}"))
         );
     }
 

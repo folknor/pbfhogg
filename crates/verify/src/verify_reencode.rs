@@ -38,7 +38,7 @@
 //! never verified ([`Ran::TooLarge`]).
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::pbf_frames::{self, BlobClaim, ClaimedBlob, Claims, Framing, Origin};
@@ -71,13 +71,15 @@ pub(super) struct Input {
     pub locations: bool,
     /// Kinds grouped in order, known from osmium reading the input in
     /// kind and ID order (`objects_ordered`); an input with grouped kinds
-    /// but IDs out of order reads as not, which only builds a partition the
-    /// comparison did not need.
+    /// but IDs out of order reads as not. The OPL scan detects grouping
+    /// independently before deciding whether it needs to write a partition.
     pub standard: bool,
     /// Every data blob carries indexdata, and both the verifier's own blob
     /// decode and `check --index` found every claim true: its claims can
     /// feed a layout prediction.
     pub indexed: bool,
+    /// Validated claims bucketed by kind, in file order within each kind.
+    pub claims: [Vec<BlobClaim>; 3],
 }
 
 impl Input {
@@ -112,8 +114,11 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
         pbf_frames::framing(pbf, Origin::Other)?,
         Framing::Indexed { .. }
     );
+    let mut claims: [Vec<BlobClaim>; 3] = Default::default();
     if indexed {
-        let truth = pbf_frames::index_truth(pbf, Origin::Other)?;
+        let truth = pbf_frames::index_truth_with_claims(pbf, Origin::Other, |claim| {
+            claims[claim.kind].push(claim);
+        })?;
         if !truth.passed() {
             return Err(Error::Tool(format!(
                 "the verifier's blob decode finds {} claims of {} false ({}): its blob layout \
@@ -140,6 +145,7 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
         standard: info.ordered,
         info,
         indexed,
+        claims,
     };
     harness.msg(&format!(
         "  input: {}, {}indexed, kinds {}grouped in order, sort claim {}, LocationsOnWays {}",
@@ -242,7 +248,20 @@ pub(super) fn judge_index(
     label: &str,
     output: &Path,
 ) -> Result<(), Error> {
-    let truth = pbf_frames::index_truth(output, Origin::Pbfhogg)?;
+    judge_index_with(harness, outdir, label, output, None)
+}
+
+pub(super) fn judge_index_with(
+    harness: &mut Harness,
+    outdir: &Path,
+    label: &str,
+    output: &Path,
+    decoded: Option<FrameIds>,
+) -> Result<(), Error> {
+    let truth = match decoded {
+        Some(decoded) => decoded.finish()?,
+        None => pbf_frames::index_truth(output, Origin::Pbfhogg)?,
+    };
     let ok = truth.passed() && truth.blobs_with_indexdata == truth.blobs;
     for line in &truth.shown {
         harness.msg(&format!("  {label}: blob decode: {line}"));
@@ -354,7 +373,7 @@ pub(super) fn judge_header(
 // References
 // ---------------------------------------------------------------------------
 
-/// An expected record sequence: an OPL file the verifier wrote from
+/// An expected record sequence: an OPL file the verifier prepared from
 /// osmium's [`Policy::FULL`] decoding of the input.
 #[derive(Clone)]
 pub(super) struct Expected {
@@ -367,8 +386,15 @@ pub(super) struct Expected {
     pub basis: Option<opl_compare::Basis>,
 }
 
+/// Expected OPL files for the life of the run. A check can keep its usual
+/// artifact name by linking to the prepared file.
+#[derive(Default)]
+pub(crate) struct ReferenceStore {
+    entries: std::collections::HashMap<(PathBuf, bool), Expected>,
+}
+
 /// The expected sequences the arms compare an output's elements with, each
-/// built once per check from one osmium decoding of the input.
+/// built once per run for each input and coordinate policy.
 ///
 /// No reference is a PBF osmium writes: a fresh osmium PBF write can fail
 /// where pbfhogg succeeds (libosmium's writer packs records into blocks of
@@ -381,29 +407,20 @@ pub(super) struct Expected {
 pub(super) struct References<'a> {
     outdir: &'a Path,
     input: &'a Input,
-    kept: Option<Expected>,
-    stripped: Option<Expected>,
 }
 
 impl<'a> References<'a> {
     pub fn new(outdir: &'a Path, input: &'a Input) -> Self {
-        Self {
-            outdir,
-            input,
-            kept: None,
-            stripped: None,
-        }
+        Self { outdir, input }
     }
 
     /// The input's objects, each kind in input order and the kinds grouped
     /// nodes, ways, relations (a stable partition, the decoding itself on an
     /// input already grouped), every way-node coordinate written undefined
     /// (`n<id>xy`) when `strip`, as osmium decodes it otherwise.
-    pub fn get(&mut self, harness: &mut Harness, strip: bool) -> Result<Expected, Error> {
-        let slot = if strip { &self.stripped } else { &self.kept };
-        if let Some(expected) = slot {
-            return Ok(expected.clone());
-        }
+    pub fn get(&self, harness: &mut Harness, strip: bool) -> Result<Expected, Error> {
+        // Keep the original narration, which describes osmium's strict
+        // order probe. A grouped decoding can still have out-of-order IDs.
         let stem = if strip {
             "expected-stripped"
         } else {
@@ -423,22 +440,46 @@ impl<'a> References<'a> {
             }
         ));
         let path = self.outdir.join(format!("{stem}.opl"));
-        // Both strip variants read the run's one FULL decoding of the input.
+        let cache_key = (self.input.path.clone(), strip);
+        let expected = if let Some(cached) = harness.run.reencode_references.entries.get(&cache_key)
+        {
+            harness.run.revalidate()?;
+            std::fs::hard_link(&cached.path, &path)?;
+            Expected {
+                path,
+                ..cached.clone()
+            }
+        } else {
+            let expected = self.build(harness, path, strip)?;
+            harness
+                .run
+                .reencode_references
+                .entries
+                .insert(cache_key, expected.clone());
+            expected
+        };
+        harness.msg(&format!(
+            "  {} ways carry a defined coordinate in osmium's decoding",
+            expected.coordinate_ways
+        ));
+        Ok(expected)
+    }
+
+    fn build(&self, harness: &mut Harness, path: PathBuf, strip: bool) -> Result<Expected, Error> {
         let (written, key) = opl_compare::decoded(
             harness,
             (&self.input.path, Origin::Other),
             Policy::FULL,
             |h, opl| {
-                Ok((
-                    partition(opl, &path, strip)?,
-                    opl_compare::decoding_key(h, opl),
-                ))
+                let written = partition(opl, &path, strip)?;
+                if written.reused {
+                    // The decoding store can evict on release. The check
+                    // keeps a name for the same inode for the rest of the run.
+                    std::fs::hard_link(opl, &path)?;
+                }
+                Ok((written, opl_compare::decoding_key(h, opl)))
             },
         )?;
-        let coordinate_ways = written.coordinate_ways;
-        harness.msg(&format!(
-            "  {coordinate_ways} ways carry a defined coordinate in osmium's decoding"
-        ));
         // A decoding sealed under a summary key lets an output's stored
         // summary decide its comparison; one with no key never does.
         let basis = key.map(|key| opl_compare::Basis {
@@ -447,17 +488,11 @@ impl<'a> References<'a> {
             counts: written.counts,
             digest: written.digest,
         });
-        let expected = Expected {
+        Ok(Expected {
             path,
-            coordinate_ways,
+            coordinate_ways: written.coordinate_ways,
             basis,
-        };
-        if strip {
-            self.stripped = Some(expected.clone());
-        } else {
-            self.kept = Some(expected.clone());
-        }
-        Ok(expected)
+        })
     }
 }
 
@@ -465,11 +500,12 @@ impl<'a> References<'a> {
 struct Partitioned {
     /// Ways of the decoding with at least one defined coordinate.
     coordinate_ways: u64,
-    /// Objects written per kind.
+    /// Objects per kind in the resulting sequence.
     counts: [u64; 3],
-    /// XXH3-128 of every byte written, newlines included, spelled as a
+    /// XXH3-128 of the resulting sequence, newlines included, spelled as a
     /// decoding summary's digest is.
     digest: String,
+    reused: bool,
 }
 
 /// The expected file's writer, digesting every byte it is handed.
@@ -478,7 +514,7 @@ struct HashingWriter {
     hasher: xxhash_rust::xxh3::Xxh3,
 }
 
-impl std::io::Write for HashingWriter {
+impl Write for HashingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.file.write(buf)?;
         self.hasher.update(&buf[..n]);
@@ -490,59 +526,189 @@ impl std::io::Write for HashingWriter {
     }
 }
 
-/// Write `decoding`'s records to `out` kind by kind (one read per kind, each
-/// kind in file order), each way's coordinates stripped when `strip`;
-/// returns how many ways defined a coordinate, with the written file's
-/// counts and digest once it is flushed. A line that is not an object
-/// record, or a last line without its newline, is an error.
+/// One continuous byte range in the decoding or the projected-way spool.
+struct Part {
+    projected: bool,
+    start: u64,
+    end: u64,
+}
+
+/// A stable partition in one record scan. Unchanged byte ranges can be
+/// copied as-is if the sequence needs rewriting. Until EOF, a late kind
+/// regression or a projected way can still force a rewrite. Keep byte
+/// ranges instead of buffering the decoding or spooling the already grouped
+/// case. The rewrite copies those ranges without parsing them again.
 fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<Partitioned, Error> {
-    use std::io::Write;
-    let mut writer = std::io::BufWriter::new(HashingWriter {
+    let file = File::open(decoding)
+        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", decoding.display())))?;
+    let mut reader = BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file);
+    let mut plan = PartitionPlan::default();
+    let spool_path = out.with_extension("projected-ways");
+    let mut spool = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        plan.push(decoding, &line, strip, &spool_path, &mut spool)?;
+    }
+    let reused = plan.grouped && spool.is_none();
+    let digest = if reused {
+        format!("{:032x}", plan.original.digest128())
+    } else {
+        let digest = write_partition(out, reader.into_inner(), spool, &plan.parts)?;
+        if plan.projected_end != 0 {
+            std::fs::remove_file(spool_path)?;
+        }
+        digest
+    };
+    Ok(Partitioned {
+        coordinate_ways: plan.coordinate_ways,
+        counts: plan.counts,
+        digest,
+        reused,
+    })
+}
+
+struct PartitionPlan {
+    parts: [Vec<Part>; 3],
+    counts: [u64; 3],
+    original: xxhash_rust::xxh3::Xxh3,
+    coordinate_ways: u64,
+    source_end: u64,
+    projected_end: u64,
+    grouped: bool,
+    last_kind: usize,
+}
+
+impl Default for PartitionPlan {
+    fn default() -> Self {
+        Self {
+            parts: Default::default(),
+            counts: [0; 3],
+            original: xxhash_rust::xxh3::Xxh3::new(),
+            coordinate_ways: 0,
+            source_end: 0,
+            projected_end: 0,
+            grouped: true,
+            last_kind: 0,
+        }
+    }
+}
+
+impl PartitionPlan {
+    fn push(
+        &mut self,
+        decoding: &Path,
+        line: &[u8],
+        strip: bool,
+        spool_path: &Path,
+        spool: &mut Option<BufWriter<File>>,
+    ) -> Result<(), Error> {
+        let body = line.strip_suffix(b"\n").ok_or_else(|| {
+            Error::Failed(format!(
+                "{}: a last line without its newline (truncated?)",
+                decoding.display()
+            ))
+        })?;
+        let (kind, _) = opl_compare::parse_key(body)
+            .map_err(|why| Error::Failed(format!("{}: {why}", decoding.display())))?;
+        let source_start = self.source_end;
+        self.source_end += line.len() as u64;
+        self.counts[kind] += 1;
+        self.grouped &= self.last_kind <= kind;
+        self.last_kind = kind;
+        let mut part = Part {
+            projected: false,
+            start: source_start,
+            end: self.source_end,
+        };
+        if kind == 1 {
+            let (projected, defined) = strip_way_coordinates(body);
+            self.coordinate_ways += u64::from(defined > 0);
+            if strip && projected.as_slice() != body {
+                part = self.project_way(&projected, spool_path, spool)?;
+            }
+        }
+        if self.grouped && spool.is_none() {
+            self.original.update(line);
+        }
+        let parts = &mut self.parts[kind];
+        if let Some(last) = parts.last_mut()
+            && last.projected == part.projected
+            && last.end == part.start
+        {
+            last.end = part.end;
+        } else {
+            parts.push(part);
+        }
+        Ok(())
+    }
+
+    fn project_way(
+        &mut self,
+        line: &[u8],
+        spool_path: &Path,
+        spool: &mut Option<BufWriter<File>>,
+    ) -> Result<Part, Error> {
+        if spool.is_none() {
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(spool_path)?;
+            *spool = Some(BufWriter::new(file));
+        }
+        let writer = spool
+            .as_mut()
+            .ok_or_else(|| Error::tool("way projection lost its spool"))?;
+        writer.write_all(line)?;
+        writer.write_all(b"\n")?;
+        let start = self.projected_end;
+        self.projected_end += line.len() as u64 + 1;
+        Ok(Part {
+            projected: true,
+            start,
+            end: self.projected_end,
+        })
+    }
+}
+
+fn write_partition(
+    out: &Path,
+    mut source: File,
+    spool: Option<BufWriter<File>>,
+    parts: &[Vec<Part>; 3],
+) -> Result<String, Error> {
+    let mut projected = spool
+        .map(BufWriter::into_inner)
+        .transpose()
+        .map_err(|e| Error::Failed(format!("cannot write {}: {}", out.display(), e.error())))?;
+    let mut writer = BufWriter::new(HashingWriter {
         file: File::create(out)?,
         hasher: xxhash_rust::xxh3::Xxh3::new(),
     });
-    let mut counts = [0u64; 3];
-    let mut coordinate_ways = 0;
-    let mut line = Vec::new();
-    for kind in 0..KINDS.len() {
-        let file = File::open(decoding)
-            .map_err(|e| Error::Failed(format!("cannot open {}: {e}", decoding.display())))?;
-        let mut reader = BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file);
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            let Some(body) = line.strip_suffix(b"\n") else {
-                return Err(Error::Failed(format!(
-                    "{}: a last line without its newline (truncated?)",
-                    decoding.display()
-                )));
-            };
-            let (k, _) = opl_compare::parse_key(body)
-                .map_err(|why| Error::Failed(format!("{}: {why}", decoding.display())))?;
-            if k != kind {
-                continue;
-            }
-            counts[k] += 1;
-            if kind == 1 {
-                let (projected, defined) = strip_way_coordinates(body);
-                coordinate_ways += u64::from(defined > 0);
-                writer.write_all(if strip { &projected } else { body })?;
-            } else {
-                writer.write_all(body)?;
-            }
-            writer.write_all(b"\n")?;
+    for part in parts.iter().flatten() {
+        let reader = if part.projected {
+            projected
+                .as_mut()
+                .ok_or_else(|| Error::tool("way projection lost its spool"))?
+        } else {
+            &mut source
+        };
+        reader.seek(SeekFrom::Start(part.start))?;
+        let len = part.end - part.start;
+        if std::io::copy(&mut reader.take(len), &mut writer)? != len {
+            return Err(Error::tool(
+                "OPL partition source ended inside a record range",
+            ));
         }
     }
     let hashing = writer
         .into_inner()
         .map_err(|e| Error::Failed(format!("cannot write {}: {}", out.display(), e.error())))?;
-    Ok(Partitioned {
-        coordinate_ways,
-        counts,
-        digest: format!("{:032x}", hashing.hasher.digest128()),
-    })
+    Ok(format!("{:032x}", hashing.hasher.digest128()))
 }
 
 /// An OPL way line (osmium's writer with `locations_on_ways=true`) with every
@@ -612,7 +778,7 @@ pub(super) fn compare(
     stem: &str,
     expected: &Expected,
     output: &Path,
-    prediction: Prediction,
+    prediction: Prediction<'_>,
 ) -> Result<Compared, Error> {
     let listing = outdir.join(format!("{stem}.diff.opl"));
     let merged = opl_compare::compare_sequence_with_opl(
@@ -637,11 +803,11 @@ pub(super) fn compare(
                         Edit::Keep
                     }))
                 }),
-                Prediction::Survivors => {
+                Prediction::Survivors(decoded) => {
                     let Ok(mut survivors) = FrameIds::open(output) else {
                         return Ok(None);
                     };
-                    predict(&expected.path, whole, staged, |kind, id, _| {
+                    let candidate = predict(&expected.path, whole, staged, |kind, id, _| {
                         Ok(match survivors.peek() {
                             Ok(next) if next == Some((kind, id)) => {
                                 survivors.pending = None;
@@ -651,7 +817,9 @@ pub(super) fn compare(
                             // The candidate cannot be formed: the merge decides.
                             Err(_) => None,
                         })
-                    })
+                    });
+                    *decoded = Some(survivors);
+                    candidate
                 }
             }
         },
@@ -664,8 +832,7 @@ pub(super) fn compare(
 /// merge. Every prediction is only a candidate: the verdict is the
 /// equality of its counts and XXH3-128 with the summary of osmium's
 /// decoding of the output, and a miss decodes and merges.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Prediction {
+pub(super) enum Prediction<'a> {
     /// The expected file itself.
     Unchanged,
     /// The expected file with, per kind holding `Some(i)`, the kind's
@@ -675,7 +842,7 @@ pub(super) enum Prediction {
     /// The expected file less every record whose identity the output's
     /// blobs do not hold next, read by the verifier's own frame decoder:
     /// the candidate for a drop, whose selection is pbfhogg's.
-    Survivors,
+    Survivors(&'a mut Option<FrameIds>),
 }
 
 /// What [`predict`]'s walker does with one expected record.
@@ -703,7 +870,6 @@ fn predict(
     listing: &Path,
     mut decide: impl FnMut(usize, i64, u64) -> Result<Option<Edit>, Error>,
 ) -> Result<Option<opl_compare::Predicted>, Error> {
-    use std::io::Write;
     let mut reader =
         BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, File::open(expected)?);
     let mut out = std::io::BufWriter::new(File::create(listing)?);
@@ -776,9 +942,9 @@ fn predict(
 
 /// The identities an output's blobs hold, in file order, read by the
 /// verifier's frame decoder one blob at a time, with one held for a peek.
-struct FrameIds {
-    path: PathBuf,
-    claims: pbf_frames::Claims,
+pub(super) struct FrameIds {
+    walk: pbf_frames::TruthWalk,
+    truth_error: Option<Error>,
     blob: std::vec::IntoIter<(usize, i64)>,
     pending: Option<(usize, i64)>,
 }
@@ -786,32 +952,51 @@ struct FrameIds {
 impl FrameIds {
     fn open(path: &Path) -> Result<Self, Error> {
         Ok(Self {
-            path: path.to_path_buf(),
-            claims: pbf_frames::Claims::open(path, Origin::Pbfhogg)?,
+            walk: pbf_frames::TruthWalk::open(path, Origin::Pbfhogg)?,
+            truth_error: None,
             blob: Vec::new().into_iter(),
             pending: None,
         })
     }
 
     /// The next identity, left in place; `None` past the last blob.
-    fn peek(&mut self) -> Result<Option<(usize, i64)>, Error> {
+    fn peek(&mut self) -> Result<Option<(usize, i64)>, ()> {
         while self.pending.is_none() {
             if let Some(next) = self.blob.next() {
                 self.pending = Some(next);
                 break;
             }
-            let Some(blob) = self.claims.next_blob()? else {
-                return Ok(None);
+            let (blob, ids) = match self.walk.next(true) {
+                Ok(Some(decoded)) => decoded,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    self.truth_error = Some(error);
+                    return Err(());
+                }
             };
-            self.blob = pbf_frames::blob_ids(
-                &self.path,
-                Origin::Pbfhogg,
-                blob.payload_offset,
-                blob.datasize,
-            )?
-            .into_iter();
+            match ids {
+                Ok(ids) => {
+                    self.walk.observe(blob, &ids);
+                    self.blob = ids.into_iter();
+                }
+                Err(error) => {
+                    if blob.claim.is_some() {
+                        self.truth_error = Some(error);
+                    } else {
+                        self.walk.observe(blob, &[]);
+                    }
+                    return Err(());
+                }
+            }
         }
         Ok(self.pending)
+    }
+
+    fn finish(self) -> Result<pbf_frames::IndexTruth, Error> {
+        if let Some(error) = self.truth_error {
+            return Err(error);
+        }
+        self.walk.finish()
     }
 }
 
@@ -1118,30 +1303,6 @@ pub(super) fn split(cap: u64, count: u64, emit: &mut Emit<'_>) -> Result<(), Err
 /// `--unsort`: each kind packed continuously, full blocks then the rest.
 pub(super) fn continuous(cap: u64, total: u64, emit: &mut Emit<'_>) -> Result<(), Error> {
     split(cap, total, emit)
-}
-
-/// Feed `f` the claim of every blob of `kind` in `path`, in file order.
-/// Every blob must carry a claim.
-pub(super) fn each_claim(
-    path: &Path,
-    kind: usize,
-    mut f: impl FnMut(BlobClaim) -> Result<(), Error>,
-) -> Result<(), Error> {
-    // An input's claims, never a pbfhogg output's.
-    let mut claims = Claims::open(path, Origin::Other)?;
-    while let Some(blob) = claims.next_blob()? {
-        let claim = blob.claim.ok_or_else(|| {
-            Error::Failed(format!(
-                "data blob {} of {} carries no indexdata",
-                blob.index,
-                path.display()
-            ))
-        })?;
-        if claim.kind == kind {
-            f(claim)?;
-        }
-    }
-    Ok(())
 }
 
 /// An output's blobs compared, in order, with a predicted layout: the first
@@ -1497,6 +1658,24 @@ mod tests {
         crate::test_support::refused(
             partition(&decoding, &out, false),
             "d.opl: a last line without its newline",
+        );
+    }
+
+    #[test]
+    fn grouped_records_use_the_decoding_even_with_out_of_order_ids() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let (decoding, out) = (scratch.path().join("d.opl"), scratch.path().join("e.opl"));
+        let bytes = b"n2 v1\nn1 v1\nw3 v1 Nn2xy\nr1 v1 M\n";
+        std::fs::write(&decoding, bytes).unwrap();
+
+        let unchanged = partition(&decoding, &out, true).unwrap();
+        assert!(unchanged.reused);
+        assert!(!out.exists());
+        assert_eq!(unchanged.counts, [2, 1, 1]);
+        assert_eq!(unchanged.coordinate_ways, 0);
+        assert_eq!(
+            unchanged.digest,
+            format!("{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
         );
     }
 

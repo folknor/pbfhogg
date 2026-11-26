@@ -614,6 +614,69 @@ fn inspect_extended_metadata_counts_values() {
 }
 
 #[test]
+fn inspect_narrow_get_values_match_the_extended_report() {
+    use pbfhogg::inspect::{inspect, inspect_get_lookup, inspect_with_get};
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("get-values.osm.pbf");
+    crate::common::write_test_pbf(
+        &input,
+        &[TestNode {
+            id: -1,
+            lat: 123,
+            lon: -456,
+            tags: vec![("name", "test")],
+            meta: Some(crate::common::TestMeta {
+                timestamp: 1_700_000_000,
+                changeset: 5,
+                uid: 7,
+                user: "erin",
+                ..Default::default()
+            }),
+        }],
+        &[TestWay {
+            id: 2,
+            refs: vec![-1],
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+    );
+
+    let host = crate::common::test_host();
+    let opts = inspect_opts(false, false);
+    let mut extended_opts = inspect_opts(false, false);
+    extended_opts.extended = true;
+    let extended = inspect(&input, &extended_opts, &host).expect("extended report");
+
+    let compare = |key: &str| {
+        let get = inspect_get_lookup(key);
+        let narrow = inspect_with_get(&input, &opts, Some(get), &host).expect("get report");
+        assert_eq!(narrow.get_value(key), extended.get_value(key), "{key}");
+    };
+    for key in [
+        "indexed",
+        "blocks.total",
+        "elements.total",
+        "data.objects_ordered",
+        "data.has_negative_ids",
+        "data.timestamp.first",
+        "data.timestamp.last",
+        "data.bbox",
+        "data.count.nodes",
+        "data.count.ways",
+        "data.count.relations",
+    ] {
+        compare(key);
+    }
+    for scope in ["all_objects", "some_objects"] {
+        for field in ["version", "timestamp", "changeset", "uid", "user"] {
+            compare(&format!("metadata.{scope}.{field}"));
+        }
+    }
+}
+
+#[test]
 fn inspect_get_value() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("generated.osm.pbf");

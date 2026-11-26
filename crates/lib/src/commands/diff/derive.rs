@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::osc::merge_join::{
     BlockMergeAction, MergeSink, StreamingBlocks, element_id, stream_merge_phase,
 };
-use crate::osc::write::{OwnedMetadata, write_element_xml};
+use crate::osc::write::{ElementXmlScratch, OwnedMetadata, write_element_xml};
 use crate::read::input::{InputSource, PinnedInput};
 
 use super::units::UnitOut;
@@ -482,7 +482,7 @@ struct ChangeWriters<W: Write> {
     delete_count: u64,
     increment_version: bool,
     timestamp: Option<u64>,
-    coord_buf: String,
+    xml_scratch: ElementXmlScratch,
     /// Every element an action names passes through it, run elements
     /// included.
     repeats: RepeatGuard,
@@ -505,7 +505,7 @@ impl<W: Write> ChangeWriters<W> {
             delete_count: 0,
             increment_version,
             timestamp,
-            coord_buf: String::new(),
+            xml_scratch: ElementXmlScratch::default(),
             repeats: RepeatGuard::default(),
         }
     }
@@ -523,13 +523,13 @@ impl<W: Write> ChangeWriters<W> {
     }
 
     fn write_create(&mut self, elem: &crate::Element<'_>) -> Result<()> {
-        write_element_xml(&mut self.creates, elem, &mut self.coord_buf)?;
+        write_element_xml(self.creates.get_mut(), elem, &mut self.xml_scratch)?;
         self.create_count += 1;
         Ok(())
     }
 
     fn write_modify(&mut self, elem: &crate::Element<'_>) -> Result<()> {
-        write_element_xml(&mut self.modifies, elem, &mut self.coord_buf)?;
+        write_element_xml(self.modifies.get_mut(), elem, &mut self.xml_scratch)?;
         self.modify_count += 1;
         Ok(())
     }

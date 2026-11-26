@@ -144,3 +144,7 @@ pub(crate) const GEOCODE_OVERLAP_ATTEMPTS: usize = 6000;
 /// from one (pbfhogg's `INTERP_MIN_TOTAL_LEN`; the verifier links no
 /// pbfhogg code, so the value is restated here).
 pub(crate) const GEOCODE_INTERP_MIN_TOTAL_LEN: f64 = 1e-15;
+
+/// Independent frame decoders. One blob per worker bounds in-flight
+/// buffers while letting zlib work overlap positional reads.
+pub(crate) const FRAME_DECODE_WORKERS: usize = 4;

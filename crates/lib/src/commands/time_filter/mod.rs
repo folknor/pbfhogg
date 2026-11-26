@@ -36,11 +36,15 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::commands::split::Limits;
 use crate::owned::{dense_node_metadata, element_metadata};
+use crate::read::block::{BlockBuffer, ValidatedBlock};
 use crate::read::input::{InputSource, PinnedInput};
-use crate::scan::classify::{build_classify_schedule, parallel_classify_phase_ordered};
+use crate::scan::classify::{build_classify_schedule, parallel_project_phase_ordered};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter};
-use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
+use crate::{Element, ElementKind, ElementReader, PrimitiveBlock};
+
+mod project;
+use project::Records;
 
 /// Statistics from a `time-filter` snapshot operation.
 #[derive(Default)]
@@ -303,11 +307,7 @@ impl crate::read::pipeline::DecodeTransform for HistoryBlobs<'_> {
             return None;
         }
         let at = (blob.blob_index(), blob.offset());
-        Some(
-            decode
-                .block()
-                .and_then(|block| select_blob(&block, self.cutoff, self.limits, at)),
-        )
+        Some(decode.buffer(|buffer| select_blob(buffer, self.cutoff, self.limits, at)))
     }
 }
 
@@ -346,29 +346,19 @@ impl crate::commands::BlockSink for Fitted<'_> {
 /// block's flush comes back as a result too, since the stitcher writes it
 /// only when the candidate's ending is not chosen. The unconditional
 /// blocks' errors come first.
-fn encode_endings(
-    block: &PrimitiveBlock,
+fn encode_endings<'a>(
+    mut element_at: impl FnMut(usize) -> Result<Element<'a>>,
     winners: &[usize],
     candidate: Option<usize>,
     done: &mut Fitted<'_>,
     open: &mut Fitted<'_>,
 ) -> Result<(crate::Result<()>, Option<Ending>)> {
     let mut bb = BlockBuilder::new();
-    let mut wanted = winners.iter().copied().peekable();
     let mut bufs = EncodeBufs::default();
-    let mut elements = block.elements().enumerate();
-    let mut at_candidate = None;
-    for (pos, element) in elements.by_ref() {
-        if wanted.peek() == Some(&pos) {
-            wanted.next();
-            encode_kept(&element, &mut bb, done, &mut bufs)?;
-        } else if Some(pos) == candidate {
-            at_candidate = Some(element);
-            break;
-        } else if wanted.peek().is_none() && candidate.is_none() {
-            break;
-        }
+    for &position in winners {
+        encode_kept(&element_at(position)?, &mut bb, done, &mut bufs)?;
     }
+    let at_candidate = candidate.map(element_at).transpose()?;
     let fork = at_candidate.as_ref().map(|_| bb.clone());
     // Carried, not raised: the open block is written only when the
     // candidate does not take its place, and its flush runs the cut, which
@@ -386,15 +376,6 @@ fn encode_endings(
         .and_then(|()| flush_local(&mut fork, &mut alt))
         .map(|()| alt.blocks);
     Ok((opened, Some(ending)))
-}
-
-fn element_visible(element: &Element<'_>) -> bool {
-    match element {
-        Element::DenseNode(dn) => dense_visible(dn),
-        Element::Node(n) => node_visible(n),
-        Element::Way(w) => way_visible(w),
-        Element::Relation(r) => relation_visible(r),
-    }
 }
 
 /// One group's state during a blob's selection pass.
@@ -422,11 +403,12 @@ struct Selection {
 /// comment above.
 #[hotpath::measure]
 fn select_blob(
-    block: &PrimitiveBlock,
+    buffer: BlockBuffer<'_>,
     cutoff: i64,
     limits: &Limits,
     at: BlobAt,
 ) -> crate::Result<HistorySlice> {
+    let (records, validated) = project_records(buffer)?;
     let Selection {
         stats,
         winners,
@@ -434,7 +416,7 @@ fn select_blob(
         last,
         head_decided,
         closed_any,
-    } = select(block, cutoff)?;
+    } = select(&records, cutoff)?;
     let (Some(first), Some(last)) = (first, last) else {
         return Ok(HistorySlice {
             at,
@@ -458,7 +440,14 @@ fn select_blob(
         Some((pos, true)) => Some(pos),
         _ => None,
     };
-    let (opened, ending) = encode_endings(block, &winners, candidate, &mut done, &mut open)?;
+    let block = validated.into_block();
+    let (opened, ending) = encode_endings(
+        records.encoder(&block),
+        &winners,
+        candidate,
+        &mut done,
+        &mut open,
+    )?;
     let tail = match (last.winner, ending) {
         (None, _) => Tail::None,
         (Some((_, false)), _) => Tail::Deleted,
@@ -487,9 +476,21 @@ fn select_blob(
     })
 }
 
+// Projection data is provisional until full validation succeeds. Keep
+// selection refusals after that boundary and in element iteration order.
+fn project_records(buffer: BlockBuffer<'_>) -> Result<(Records, ValidatedBlock<'_>)> {
+    let (records, validated) = buffer.project(|fields, _| Records::new(fields.date_granularity))?;
+    if records.records.len() as u64 != validated.scan().element_count {
+        return Err(crate::Error::internal(
+            "time-filter: projected record count disagrees with validated block",
+        ));
+    }
+    Ok((records, validated))
+}
+
 /// The selection pass over one blob: identity, version, timestamp and
 /// visibility only.
-fn select(block: &PrimitiveBlock, cutoff: i64) -> crate::Result<Selection> {
+fn select(records: &Records, cutoff: i64) -> crate::Result<Selection> {
     let mut stats = TimeFilterStats::default();
     let mut winners: Vec<usize> = Vec::new();
     let mut first: Option<Edge> = None;
@@ -517,8 +518,13 @@ fn select(block: &PrimitiveBlock, cutoff: i64) -> crate::Result<Selection> {
         }
     };
 
-    for (pos, element) in block.elements().enumerate() {
-        let (kind, id, timestamp, version) = element_identity_and_timestamp(&element)?;
+    for (pos, record) in records.records.iter().enumerate() {
+        let (kind, id, version) = (record.kind, record.id, record.version);
+        let timestamp = require_timestamp(
+            record.timestamp(records.date_granularity),
+            kind.as_str(),
+            id,
+        )?;
         stats.versions_seen += 1;
         let key = order_key(kind, id);
         // The grouping believes the sorted header: an object whose versions
@@ -562,7 +568,7 @@ fn select(block: &PrimitiveBlock, cutoff: i64) -> crate::Result<Selection> {
         if timestamp <= cutoff {
             stats.versions_before_cutoff += 1;
             if let Some(g) = group.as_mut() {
-                g.winner = Some((pos, element_visible(&element)));
+                g.winner = Some((pos, record.visible));
             }
         }
     }
@@ -886,20 +892,28 @@ fn time_filter_snapshot(
     // as it fills, straight from the builder's buffer; the same worker shape
     // as cat --clean's. The ordered pool's window bounds the framed results
     // alive between decode and write.
-    parallel_classify_phase_ordered(
+    parallel_project_phase_ordered(
         &shared_file,
         &schedule,
         None,
         None,
         || crate::commands::WorkerBuilder::new(BlockBuilder::new()),
-        |block, worker| -> PhaseResult {
+        |buffer, worker| -> PhaseResult {
+            let (records, validated) = project_records(buffer)?;
+            let block = validated.into_block();
             let bb = worker.task()?;
             let mut output =
                 crate::commands::FramedBlocks::new(compression, &host.invocation.metrics().writer)
                     .cutting();
             let mut bounds: Bounds = None;
-            let block_stats =
-                filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, &mut bounds)?;
+            let block_stats = filter_block_snapshot(
+                &records,
+                &block,
+                cutoff_timestamp,
+                bb,
+                &mut output,
+                &mut bounds,
+            )?;
             flush_local(bb, &mut output)?;
             let framed = output.frames.into_iter().map(|(_, frame)| frame).collect();
             Ok((framed, block_stats, bounds))
@@ -968,6 +982,7 @@ fn snapshot_gate(
 
 #[hotpath::measure]
 fn filter_block_snapshot(
+    records: &Records,
     block: &PrimitiveBlock,
     cutoff_timestamp: i64,
     bb: &mut BlockBuilder,
@@ -977,17 +992,11 @@ fn filter_block_snapshot(
     let mut stats = TimeFilterStats::default();
     let mut bufs = EncodeBufs::default();
 
-    for element in block.elements() {
+    let mut element_at = records.encoder(block);
+    for (position, record) in records.records.iter().enumerate() {
         stats.versions_seen += 1;
-        // Every input element, before the gate drops any: the output keeps
-        // input order under the input's sorted claim, and keeps each
-        // occurrence of an object.
-        let (kind, id) = match &element {
-            Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
-            Element::Node(n) => (ElementKind::Node, n.id()),
-            Element::Way(w) => (ElementKind::Way, w.id()),
-            Element::Relation(r) => (ElementKind::Relation, r.id()),
-        };
+        // Check every input key before the gate can drop the record.
+        let (kind, id) = (record.kind, record.id);
         let key = order_key(kind, id);
         match bounds.as_mut() {
             None => *bounds = Some((key, key)),
@@ -1000,23 +1009,17 @@ fn filter_block_snapshot(
                 *last = key;
             }
         }
-        let (ts, visible) = match &element {
-            Element::DenseNode(dn) => (dense_timestamp(dn), dense_visible(dn)),
-            Element::Node(n) => (node_timestamp(n), node_visible(n)),
-            Element::Way(w) => (way_timestamp(w), way_visible(w)),
-            Element::Relation(r) => (relation_timestamp(r), relation_visible(r)),
-        };
         let Some(()) = snapshot_gate(
-            ts,
+            record.timestamp(records.date_granularity),
             (kind.as_str(), id),
-            visible,
+            record.visible,
             cutoff_timestamp,
             &mut stats,
         )?
         else {
             continue;
         };
-        encode_kept(&element, bb, output, &mut bufs)?;
+        encode_kept(&element_at(position)?, bb, output, &mut bufs)?;
         stats.elements_written += 1;
     }
     Ok(stats)
@@ -1095,58 +1098,6 @@ fn encode_kept<'a>(
         }
     }
     Ok(())
-}
-
-fn dense_visible(dn: &DenseNode<'_>) -> bool {
-    #[allow(clippy::redundant_closure_for_method_calls)]
-    dn.info().is_none_or(|i| i.visible())
-}
-
-fn node_visible(n: &Node<'_>) -> bool {
-    n.info().visible()
-}
-
-fn way_visible(w: &Way<'_>) -> bool {
-    w.info().visible()
-}
-
-fn relation_visible(r: &Relation<'_>) -> bool {
-    r.info().visible()
-}
-
-/// One element's identity for the history path: kind, ID, timestamp (which
-/// must be present) and version (`None` when it claims none: absent, or a
-/// sentinel below 1 such as dense `-1`).
-fn element_identity_and_timestamp(
-    element: &Element<'_>,
-) -> crate::Result<(ElementKind, i64, i64, Option<i32>)> {
-    let (kind, id, ts, version) = match element {
-        Element::DenseNode(dn) => (
-            ElementKind::Node,
-            dn.id(),
-            dense_timestamp(dn),
-            dn.info().and_then(crate::DenseNodeInfo::claimed_version),
-        ),
-        Element::Node(n) => (
-            ElementKind::Node,
-            n.id(),
-            node_timestamp(n),
-            n.info().claimed_version(),
-        ),
-        Element::Way(w) => (
-            ElementKind::Way,
-            w.id(),
-            way_timestamp(w),
-            w.info().claimed_version(),
-        ),
-        Element::Relation(r) => (
-            ElementKind::Relation,
-            r.id(),
-            relation_timestamp(r),
-            r.info().claimed_version(),
-        ),
-    };
-    Ok((kind, id, require_timestamp(ts, kind.as_str(), id)?, version))
 }
 
 /// An element's place in `Sort.Type_then_ID` order: its kind, then its ID in
@@ -1237,32 +1188,6 @@ fn version_violation(
 /// The claimed timestamp in whole seconds, rounded down.
 fn claim_seconds(claim: Option<crate::Result<i64>>) -> Option<crate::Result<i64>> {
     claim.map(|ms| ms.map(|ms| ms.div_euclid(1000)))
-}
-
-/// `None` means the element carries no timestamp at all.
-fn dense_timestamp(dn: &DenseNode<'_>) -> Option<crate::Result<i64>> {
-    // A timestamp column, when the group carries one, has a value for every
-    // node, so the column alone does not say this node has a timestamp.
-    // Absence is `info()` returning None (a metadata-stripped dense block),
-    // a DenseInfo without the timestamp column (libosmium writes any subset
-    // of columns), or a slot that claims no version and holds timestamp 0:
-    // the padding BlockBuilder and libosmium store for a node added without
-    // metadata among nodes that carry it. Each reads 0 and must not pass as
-    // the epoch; `claimed_milli_timestamp` is the slot rule every metadata
-    // output shares.
-    claim_seconds(dn.info()?.claimed_milli_timestamp())
-}
-
-fn node_timestamp(n: &Node<'_>) -> Option<crate::Result<i64>> {
-    claim_seconds(n.info().claimed_milli_timestamp())
-}
-
-fn way_timestamp(w: &Way<'_>) -> Option<crate::Result<i64>> {
-    claim_seconds(w.info().claimed_milli_timestamp())
-}
-
-fn relation_timestamp(r: &Relation<'_>) -> Option<crate::Result<i64>> {
-    claim_seconds(r.info().claimed_milli_timestamp())
 }
 
 /// Turn an absent timestamp into the error that names it, and an
@@ -1516,6 +1441,108 @@ mod tests {
         assert_eq!(err.blob_index(), Some(3));
         assert_eq!(err.byte_offset(), Some(crate::ByteOffset(77)));
         assert_eq!(err.source_path(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn projection_keeps_dense_claims_and_winner_positions_in_element_order() {
+        use crate::read::wire_fixtures::{
+            Group, block, deltas, dense, field_bytes, field_varint, packed, plain_node,
+        };
+
+        let mut info = Vec::new();
+        field_bytes(&mut info, 1, &packed([1, 2, 1]));
+        field_bytes(&mut info, 2, &deltas(&[-1, 500, 0]));
+        field_bytes(&mut info, 6, &packed([1, 0, 1]));
+        let mut nodes = dense(&[(2, 0, 0), (2, 1, 1), (3, 2, 2)], &[]);
+        field_bytes(&mut nodes, 5, &info);
+        let mut bytes = block(
+            &[""],
+            &[
+                Group {
+                    nodes: vec![plain_node(4, 0, 0, &[], Some([1, 0, 0, 0, 0]))],
+                    dense: Some(nodes),
+                    ..Group::default()
+                },
+                Group {
+                    nodes: vec![plain_node(5, 0, 0, &[], Some([1, 1000, 0, 0, 0]))],
+                    ..Group::default()
+                },
+                Group {
+                    nodes: vec![plain_node(6, 0, 0, &[], Some([1, 0, 0, 0, 0]))],
+                    ..Group::default()
+                },
+            ],
+        );
+        field_varint(&mut bytes, 18, 1);
+        let mut strings = Vec::new();
+        let mut groups = Vec::new();
+        let (projection, validated) = project_records(BlockBuffer::new(
+            bytes,
+            None,
+            &mut strings,
+            &mut groups,
+            None,
+        ))
+        .unwrap();
+
+        let at_epoch = select(&projection, 0).unwrap();
+        assert_eq!(at_epoch.winners, [2, 3]);
+        assert_eq!(at_epoch.stats.dropped_deleted, 1);
+        assert_eq!(at_epoch.last.unwrap().winner, Some((5, true)));
+
+        let before_epoch = select(&projection, -1).unwrap();
+        assert_eq!(before_epoch.winners, [0]);
+        let block = validated.into_block();
+        let mut element_at = projection.encoder(&block);
+        assert!(matches!(element_at(0).unwrap(), Element::DenseNode(n) if n.id() == 2));
+        assert!(matches!(element_at(2).unwrap(), Element::DenseNode(n) if n.id() == 3));
+        assert!(matches!(element_at(5).unwrap(), Element::Node(n) if n.id() == 6));
+    }
+
+    #[test]
+    fn selection_refusals_follow_validation_and_dense_first_order() {
+        use crate::read::wire_fixtures::{Group, block, dense, plain_node};
+
+        let bytes = block(
+            &["", "invalid"],
+            &[Group {
+                nodes: vec![plain_node(9, 0, 0, &[], None)],
+                dense: Some(dense(&[(7, 0, 0)], &[])),
+                ..Group::default()
+            }],
+        );
+        let mut invalid = bytes.clone();
+        let index = invalid
+            .windows(7)
+            .position(|part| part == b"invalid")
+            .unwrap();
+        invalid[index] = 0xff;
+
+        let mut strings = Vec::new();
+        let mut groups = Vec::new();
+        let limits = Limits::new(Compression::default());
+        let at = (None, None);
+        let err = crate::test_support::assert_err_kind!(
+            select_blob(
+                BlockBuffer::new(invalid, None, &mut strings, &mut groups, None),
+                0,
+                &limits,
+                at,
+            ),
+            crate::ErrorKind::StringtableUtf8 { index: 1, .. }
+        );
+        assert!(err.to_string().contains("UTF-8"));
+
+        let err = crate::test_support::assert_err_kind!(
+            select_blob(
+                BlockBuffer::new(bytes, None, &mut strings, &mut groups, None),
+                0,
+                &limits,
+                at,
+            ),
+            crate::ErrorKind::InvalidData { .. }
+        );
+        assert!(err.to_string().contains("node 7 carries no timestamp"));
     }
 
     /// Claims are judged in whole seconds rounded down: a negative

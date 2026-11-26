@@ -8,6 +8,7 @@
 //! entries for these nodes, so its size follows the referenced subset
 //! rather than every node in the file.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -35,31 +36,25 @@ fn record_referenced_node(
     }
 }
 
-/// Sort and deduplicate a worker's overflow list once it has doubled since
-/// the last compaction (`compacted_len`, updated here).
-fn compact_overflow_nodes(overflow: &mut Vec<i64>, compacted_len: &mut usize) {
-    if overflow.len() < OVERFLOW_COMPACT_MIN || overflow.len() < compacted_len.saturating_mul(2) {
+/// Publish a bounded batch and release its allocation. The ordered set
+/// deduplicates across workers without copying the accumulated IDs on each flush.
+fn fold_overflow_nodes(shared: &Mutex<BTreeSet<i64>>, batch: &mut Vec<i64>) {
+    if batch.is_empty() {
         return;
     }
-    overflow.sort_unstable();
-    overflow.dedup();
-    *compacted_len = overflow.len();
-}
-
-/// Insert the workers' overflow lists after the parallel scan, where `set`
-/// may grow the set under `&mut`.
-fn insert_overflow_nodes(referenced_nodes: &mut crate::idset::IdSet, lists: Vec<Vec<i64>>) {
-    for list in lists {
-        for node_id in list {
-            referenced_nodes.insert(node_id);
-        }
-    }
+    batch.sort_unstable();
+    batch.dedup();
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(std::mem::take(batch));
 }
 
 /// Record the accepted refs of one geocode-relevant way.
 fn record_way_refs(
     referenced: &crate::idset::IdSet,
     overflow_nodes: &mut Vec<i64>,
+    overflow: &Mutex<BTreeSet<i64>>,
     prealloc_max: i64,
     max_node_id: i64,
     refs: &[i64],
@@ -79,6 +74,9 @@ fn record_way_refs(
             continue;
         }
         record_referenced_node(referenced, overflow_nodes, prealloc_max, r);
+        if overflow_nodes.len() == OVERFLOW_COMPACT_MIN {
+            fold_overflow_nodes(overflow, overflow_nodes);
+        }
     }
 }
 
@@ -100,16 +98,6 @@ fn store_first_err(slot: &Mutex<Option<Error>>, e: Error) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.is_none() {
         *slot = Some(e);
-    }
-}
-
-/// Hand a finished worker's overflow list to the shared collection.
-fn push_overflow_list(lists: &Mutex<Vec<Vec<i64>>>, overflow_nodes: Vec<i64>) {
-    if !overflow_nodes.is_empty() {
-        lists
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(overflow_nodes);
     }
 }
 
@@ -275,9 +263,10 @@ struct ExtractWorker {
     overflow_nodes: Vec<i64>,
 }
 
-/// What the extraction of one blob reads but never writes.
+/// State shared by all way extraction workers.
 struct ExtractShared<'a> {
     referenced: &'a crate::idset::IdSet,
+    overflow: Mutex<BTreeSet<i64>>,
     needed_admin_ways: &'a crate::idset::IdSet,
     prealloc_max: i64,
     max_node_id: i64,
@@ -384,6 +373,7 @@ fn extract_blob_ways(
         record_way_refs(
             shared.referenced,
             &mut w.overflow_nodes,
+            &shared.overflow,
             shared.prealloc_max,
             shared.max_node_id,
             &w.refs_buf,
@@ -468,6 +458,7 @@ pub(super) fn run_pass1_5(
     {
         let shared = ExtractShared {
             referenced: &referenced_nodes,
+            overflow: Mutex::default(),
             needed_admin_ways,
             prealloc_max,
             max_node_id,
@@ -481,24 +472,16 @@ pub(super) fn run_pass1_5(
         // a hand-built claim-counter pool, deliberately not on
         // `crate::ordered_pool` or the classify pools. It has no consumer and
         // no order to keep, and every worker writes the one shared atomic
-        // `IdSet` and publishes its overflow list and tallies at its end. The
+        // `IdSet` and folds bounded overflow batches into a shared set. The
         // first recorded error (not the lowest blob) stops the others at
         // their next claim, and work in flight finishes; cancellation is
         // checked per claimed blob.
-        //
-        // No `*_wait_ns` stall counter: nothing here blocks on another
-        // thread. The claim is a `fetch_add`, the `IdSet` writes are atomic
-        // sets, each worker preads the shared file on its own, and the
-        // mutexes are the first-error slot (locked per blob, held for a load)
-        // and the end-of-worker hand-offs (once per worker).
         let next_idx = AtomicUsize::new(0);
         let next_ref = &next_idx;
         // First error observed across all workers. Workers drain until
         // the schedule is empty or the shared slot is populated.
         let first_err: Mutex<Option<Error>> = Mutex::new(None);
         let first_err_ref = &first_err;
-        let overflow_lists: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
-        let overflow_lists_ref = &overflow_lists;
 
         crate::threads::scope(&host.invocation, |scope| {
             for (worker, store_file) in store_files.into_iter().enumerate() {
@@ -521,7 +504,6 @@ pub(super) fn run_pass1_5(
                         segment: Vec::new(),
                         overflow_nodes: Vec::new(),
                     };
-                    let mut overflow_compacted_len = 0_usize;
 
                     loop {
                         // Exit early if another worker has reported an error.
@@ -575,10 +557,6 @@ pub(super) fn run_pass1_5(
                                 ));
                                 out_offset += len;
                             }
-                            compact_overflow_nodes(
-                                &mut w.overflow_nodes,
-                                &mut overflow_compacted_len,
-                            );
                             Ok(())
                         })();
                         read_buf.release_outlier(&host.invocation);
@@ -610,7 +588,7 @@ pub(super) fn run_pass1_5(
                             }
                         }
                     }
-                    push_overflow_list(overflow_lists_ref, w.overflow_nodes);
+                    fold_overflow_nodes(&shared_ref.overflow, &mut w.overflow_nodes);
                 });
                 // A refusal is recorded in the first-error slot, so the
                 // workers already born stop at their next claim instead of
@@ -636,12 +614,13 @@ pub(super) fn run_pass1_5(
             refs: shared.admin_refs.load(Ordering::Relaxed),
         };
 
-        insert_overflow_nodes(
-            &mut referenced_nodes,
-            overflow_lists
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        for node_id in shared
+            .overflow
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            referenced_nodes.insert(node_id);
+        }
     }
     host.invocation.marker("GEOCODE_PASS1_5_SCAN_END");
     let store = super::way_store::WayStore::open(
@@ -868,8 +847,8 @@ fn into_file_order(schedule: &mut [ScheduledBlob]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN, compact_overflow_nodes,
-        insert_overflow_nodes, record_referenced_node,
+        Mutex, NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN, fold_overflow_nodes,
+        record_referenced_node, record_way_refs,
     };
 
     /// Extract one uncompressed block, returning each record as
@@ -900,6 +879,7 @@ mod tests {
         };
         let shared = super::ExtractShared {
             referenced: &referenced,
+            overflow: Mutex::default(),
             needed_admin_ways: admin,
             prealloc_max: 1000,
             max_node_id: 1000,
@@ -926,7 +906,10 @@ mod tests {
                 crate::read::elements::WayRefIter::delta_decoded(way.refs).collect(),
             ));
         }
-        insert_overflow_nodes(&mut referenced, vec![w.overflow_nodes]);
+        fold_overflow_nodes(&shared.overflow, &mut w.overflow_nodes);
+        for id in shared.overflow.into_inner().expect("overflow") {
+            referenced.insert(id);
+        }
         (out, referenced)
     }
 
@@ -1039,7 +1022,11 @@ mod tests {
             record_referenced_node(&referenced, &mut overflow, 100, id);
         }
         assert_eq!(overflow, vec![-1, i64::MIN, -1]);
-        insert_overflow_nodes(&mut referenced, vec![overflow]);
+        let shared = Mutex::default();
+        fold_overflow_nodes(&shared, &mut overflow);
+        for id in shared.into_inner().expect("overflow") {
+            referenced.insert(id);
+        }
         for id in [-1, 5, i64::MIN] {
             assert!(referenced.get(id), "{id}");
         }
@@ -1069,7 +1056,11 @@ mod tests {
         record_referenced_node(&referenced, &mut overflow, 0, high_id);
         record_referenced_node(&referenced, &mut overflow, 0, high_id);
         assert_eq!(overflow, vec![high_id, high_id]);
-        insert_overflow_nodes(&mut referenced, vec![overflow]);
+        let shared = Mutex::default();
+        fold_overflow_nodes(&shared, &mut overflow);
+        for id in shared.into_inner().expect("overflow") {
+            referenced.insert(id);
+        }
 
         assert!(referenced.get(0));
         assert!(referenced.get(high_id));
@@ -1078,21 +1069,18 @@ mod tests {
     }
 
     #[test]
-    fn overflow_lists_compact_only_after_doubling() {
-        let mut compacted = 0;
-        let mut small = vec![3, 1, 3];
-        compact_overflow_nodes(&mut small, &mut compacted);
-        assert_eq!(
-            small,
-            vec![3, 1, 3],
-            "below the minimum, nothing is touched"
-        );
-
-        let mut list: Vec<i64> = std::iter::successors(Some(0_i64), |v| Some((v + 1) % 10))
-            .take(OVERFLOW_COMPACT_MIN)
-            .collect();
-        compact_overflow_nodes(&mut list, &mut compacted);
-        assert_eq!(list, (0..10).collect::<Vec<i64>>());
-        assert_eq!(compacted, 10);
+    fn overflow_batches_release_capacity_and_deduplicate_across_workers() {
+        let shared = Mutex::default();
+        let referenced = crate::idset::IdSet::new();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let refs = vec![-2; OVERFLOW_COMPACT_MIN];
+        record_way_refs(&referenced, &mut first, &shared, 0, 100, &refs);
+        assert_eq!(first.capacity(), 0);
+        record_way_refs(&referenced, &mut second, &shared, 0, 100, &[3, -2, -3, 101]);
+        fold_overflow_nodes(&shared, &mut second);
+        assert_eq!(second.capacity(), 0);
+        let ids: Vec<_> = shared.into_inner().expect("overflow").into_iter().collect();
+        assert_eq!(ids, vec![-3, -2, 3]);
     }
 }

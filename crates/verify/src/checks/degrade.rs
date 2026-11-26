@@ -116,8 +116,18 @@ impl Run<'_> {
         out: &Path,
         sorted: bool,
     ) -> Result<reencode::OutputBlobs, Error> {
+        self.common_with(label, out, sorted, None)
+    }
+
+    fn common_with(
+        &mut self,
+        label: &str,
+        out: &Path,
+        sorted: bool,
+        decoded: Option<reencode::FrameIds>,
+    ) -> Result<reencode::OutputBlobs, Error> {
         reencode::judge_header(self.harness, label, out, sorted, false)?;
-        reencode::judge_index(self.harness, &self.outdir, label, out)?;
+        reencode::judge_index_with(self.harness, &self.outdir, label, out, decoded)?;
         let blobs = reencode::output_blobs(out, DEFAULT_CAP)?;
         reencode::record_blobs(self.harness, label, &blobs);
         Ok(blobs)
@@ -129,7 +139,7 @@ impl Run<'_> {
         stem: &str,
         reference: &Expected,
         out: &Path,
-        prediction: Prediction,
+        prediction: Prediction<'_>,
     ) -> Result<Compared, Error> {
         reencode::compare(self.harness, &self.outdir, stem, reference, out, prediction)
     }
@@ -267,11 +277,11 @@ fn strip_locations(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error>
     run.common(label, &out, run.input.sorted_claim)?;
     if run.input.indexed {
         let mut layout = LayoutCheck::open(&out)?;
-        for kind in 0..3 {
+        for (kind, claims) in run.input.claims.iter().enumerate() {
             let mut emit = |n| layout.expect(kind, n);
-            reencode::each_claim(&run.input.path, kind, |claim| {
-                split(DEFAULT_CAP, claim.count, &mut emit)
-            })?;
+            for claim in claims {
+                split(DEFAULT_CAP, claim.count, &mut emit)?;
+            }
         }
         reencode::record_layout(run.harness, label, layout.finish()?);
     }
@@ -316,7 +326,8 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
         let label = format!("degrade --drop-ids {n}:{seed}{suffix}");
         // A warm run's candidate is the expected sequence less what the
         // output's blobs do not hold.
-        let compared = run.compare(stem, reference, out, Prediction::Survivors)?;
+        let mut decoded = None;
+        let compared = run.compare(stem, reference, out, Prediction::Survivors(&mut decoded))?;
         let (per_kind, ok) = judge_drop(run, &label, &compared, n, total)?;
         if ok {
             passed[index] = Some(compared.listing.clone());
@@ -324,9 +335,9 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
         for (most, removed) in removed_per_kind.iter_mut().zip(per_kind) {
             *most = (*most).max(removed);
         }
-        run.common(&label, out, run.input.sorted_claim)?;
+        run.common_with(&label, out, run.input.sorted_claim, decoded)?;
         if run.input.indexed {
-            let mismatch = predict_drop(&run.input.path, &compared.listing, out)?;
+            let mismatch = predict_drop(run.input, &compared.listing, out)?;
             reencode::record_layout(run.harness, &label, mismatch);
         }
         if index == 0 {
@@ -445,7 +456,7 @@ fn judge_repeat(
     if run.input.indexed
         && let Some(listing) = listing_a
     {
-        let mismatch = predict_drop(&run.input.path, listing, again)?;
+        let mismatch = predict_drop(run.input, listing, again)?;
         reencode::record_layout(run.harness, &label, mismatch);
     }
     run.gaps.push(format!(
@@ -534,13 +545,13 @@ fn judge_drop(
 /// its survivors: the removed IDs, from the listing, counted per input blob
 /// by its claimed range (the input in strict order, so ranges ascend and do
 /// not overlap).
-fn predict_drop(input: &Path, listing: &Path, output: &Path) -> Result<Option<String>, Error> {
+fn predict_drop(input: &Input, listing: &Path, output: &Path) -> Result<Option<String>, Error> {
     let mut layout = LayoutCheck::open(output)?;
     let mut removed = Listing::open(listing)?;
     let mut next = removed.next_group()?;
     for (kind, name) in KINDS.iter().enumerate() {
         let mut emit = |n| layout.expect(kind, n);
-        reencode::each_claim(input, kind, |claim| {
+        for claim in &input.claims[kind] {
             let mut gone = 0u64;
             while let Some(group) = &next {
                 if group.kind != kind || group.id > claim.max_id {
@@ -561,8 +572,8 @@ fn predict_drop(input: &Path, listing: &Path, output: &Path) -> Result<Option<St
                     claim.count
                 ))
             })?;
-            split(DEFAULT_CAP, survivors, &mut emit)
-        })?;
+            split(DEFAULT_CAP, survivors, &mut emit)?;
+        }
         if let Some(group) = next.as_ref().filter(|g| g.kind == kind) {
             return Err(Error::Failed(format!(
                 "removed {name}{} lies in no input blob's claimed range",

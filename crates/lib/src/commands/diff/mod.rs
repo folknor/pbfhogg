@@ -394,10 +394,8 @@ fn diff_block_pair<W: Write>(
     let (chunk_bytes, overflow_cap) = text_unit_limits(&host.invocation);
     let overflow = TextOverflow::new(overflow_cap);
     let make_sink = |_unit: usize| TextUnitSink {
-        sink: DiffSink::new(text.then(Vec::new), options),
-        chunk_bytes,
-        overflow: &overflow,
-        held: VecDeque::new(),
+        state: DiffState::new(options),
+        pieces: text.then(|| TextPieces::new(chunk_bytes, &overflow)),
     };
     let mut consumer = TextConsumer {
         output,
@@ -436,25 +434,25 @@ fn diff_block_pair<W: Write>(
 /// and the unindexed element stream - so a difference prints the same line
 /// (and, under `verbose`, the same details) at any shard count and whether
 /// or not the inputs carried indexdata.
-struct DiffSink<'a, O: Write> {
-    /// `None` for a count-only run.
-    output: Option<O>,
+struct DiffState<'a> {
     options: &'a DiffOptions,
     stats: DiffStats,
 }
 
-impl<'a, O: Write> DiffSink<'a, O> {
-    fn new(output: Option<O>, options: &'a DiffOptions) -> Self {
+impl<'a> DiffState<'a> {
+    fn new(options: &'a DiffOptions) -> Self {
         Self {
-            output,
             options,
             stats: DiffStats::default(),
         }
     }
-}
 
-impl<O: Write> MergeSink for DiffSink<'_, O> {
-    fn record(&mut self, kind: ElementKind, action: BlockMergeAction<'_>) -> Result<()> {
+    fn record(
+        &mut self,
+        output: Option<&mut impl Write>,
+        kind: ElementKind,
+        action: BlockMergeAction<'_>,
+    ) -> Result<()> {
         use crate::osc::merge_join::{element_id, element_version};
         let type_char = kind.type_char();
         match action {
@@ -466,7 +464,7 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
             // format each line.
             BlockMergeAction::BlobOldOnly(run) => {
                 self.stats.deleted += run.count;
-                if let Some(out) = self.output.as_mut() {
+                if let Some(out) = output {
                     for elem in run.elements() {
                         let ver = element_version(&elem);
                         write_compact_line(out, '-', type_char, element_id(&elem), ver)?;
@@ -475,7 +473,7 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
             }
             BlockMergeAction::BlobNewOnly(run) => {
                 self.stats.created += run.count;
-                if let Some(out) = self.output.as_mut() {
+                if let Some(out) = output {
                     for elem in run.elements() {
                         let ver = element_version(&elem);
                         write_compact_line(out, '+', type_char, element_id(&elem), ver)?;
@@ -484,14 +482,14 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
             }
             BlockMergeAction::ElementEqual(e) => {
                 if !self.options.suppress_common
-                    && let Some(out) = self.output.as_mut()
+                    && let Some(out) = output
                 {
                     write_compact_line(out, ' ', type_char, element_id(e), element_version(e))?;
                 }
                 self.stats.common += 1;
             }
             BlockMergeAction::ElementModified { old, new } => {
-                if let Some(out) = self.output.as_mut() {
+                if let Some(out) = output {
                     let old_ver = element_version(old);
                     let new_ver = element_version(new);
                     write_modified_line(out, type_char, element_id(old), old_ver, new_ver)?;
@@ -507,13 +505,13 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
                 self.stats.modified += 1;
             }
             BlockMergeAction::ElementOldOnly(o) => {
-                if let Some(out) = self.output.as_mut() {
+                if let Some(out) = output {
                     write_compact_line(out, '-', type_char, element_id(o), element_version(o))?;
                 }
                 self.stats.deleted += 1;
             }
             BlockMergeAction::ElementNewOnly(n) => {
-                if let Some(out) = self.output.as_mut() {
+                if let Some(out) = output {
                     write_compact_line(out, '+', type_char, element_id(n), element_version(n))?;
                 }
                 self.stats.created += 1;
@@ -521,9 +519,20 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
         }
         Ok(())
     }
+}
+
+struct DiffSink<'a, O> {
+    output: Option<O>,
+    state: DiffState<'a>,
+}
+
+impl<O: Write> MergeSink for DiffSink<'_, O> {
+    fn record(&mut self, kind: ElementKind, action: BlockMergeAction<'_>) -> Result<()> {
+        self.state.record(self.output.as_mut(), kind, action)
+    }
 
     fn equality(&self) -> crate::content::Equality {
-        crate::content::Equality::Relation(self.options.relation())
+        crate::content::Equality::Relation(self.state.options.relation())
     }
 }
 
@@ -585,21 +594,34 @@ impl Drop for HeldChunk<'_> {
     }
 }
 
-/// A text diff unit's worker side: the shared sink formatting each action
-/// into a worker-local buffer (`None` counting only), handed over in pieces
-/// of the chunk size. When the unit's channel is full a piece is held in
+/// A text diff unit's worker side formats directly into owned chunks
+/// (`None` counting only). When the unit's channel is full a piece is held in
 /// memory against the run's [`TextOverflow`] allowance instead of blocking,
 /// so a unit the consumer is not reading yet keeps formatting; once the
 /// allowance is spent it blocks as before. Held pieces go out strictly in
 /// order, ahead of any newer piece.
 struct TextUnitSink<'a> {
-    sink: DiffSink<'a, Vec<u8>>,
+    state: DiffState<'a>,
+    pieces: Option<TextPieces<'a>>,
+}
+
+struct TextPieces<'a> {
+    pending: Vec<u8>,
     chunk_bytes: usize,
     overflow: &'a TextOverflow,
     held: VecDeque<HeldChunk<'a>>,
 }
 
-impl TextUnitSink<'_> {
+impl<'a> TextPieces<'a> {
+    fn new(chunk_bytes: usize, overflow: &'a TextOverflow) -> Self {
+        Self {
+            pending: Vec::new(),
+            chunk_bytes,
+            overflow,
+            held: VecDeque::new(),
+        }
+    }
+
     /// Send held pieces, oldest first, while the channel has room.
     fn drain_held(&mut self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<()> {
         // loop-ends: sends one held piece per pass and stops at the first
@@ -653,63 +675,73 @@ impl TextUnitSink<'_> {
     }
 }
 
+/// Format directly into the allocation the channel will own. Fill and
+/// hand off a piece even when a single action spans several pieces.
+struct TextChunkWriter<'w, 'a> {
+    pieces: &'w mut TextPieces<'a>,
+    out: &'w mut dyn units::UnitOut<Vec<u8>>,
+}
+
+impl Write for TextChunkWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let pieces = &mut self.pieces;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if pieces.pending.capacity() == 0 {
+            // Reserve a full piece once so growth cannot recopy its prefix.
+            pieces.pending = Vec::with_capacity(pieces.chunk_bytes);
+        }
+        let written = bytes.len().min(pieces.chunk_bytes - pieces.pending.len());
+        pieces.pending.extend_from_slice(&bytes[..written]);
+        if pieces.pending.len() == pieces.chunk_bytes {
+            let piece = std::mem::take(&mut pieces.pending);
+            pieces.emit(piece, self.out).map_err(std::io::Error::from)?;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl units::UnitSink for TextUnitSink<'_> {
     type Item = Vec<u8>;
     type Stats = DiffStats;
 
     fn equality(&self) -> crate::content::Equality {
-        crate::content::Equality::Relation(self.sink.options.relation())
+        crate::content::Equality::Relation(self.state.options.relation())
     }
 
-    /// An action is formatted whole into the local buffer, then every full
-    /// chunk-size piece is copied out into its own allocation and handed
-    /// over; the remainder waits for the next action, and the unit's tail
-    /// is copied out the same way. So a queued or held piece owns about one
-    /// chunk of allocation however large one action's text grew (verbose
-    /// details, a single-sided blob run); only the worker-local buffer
-    /// keeps an action's size.
     fn record_into(
         &mut self,
         kind: ElementKind,
         action: BlockMergeAction<'_>,
         out: &mut dyn units::UnitOut<Vec<u8>>,
     ) -> Result<()> {
-        // Opportunistic: frees held pieces as the channel drains, and fails
-        // fast once the run is abandoned.
-        if !self.held.is_empty() {
-            self.drain_held(out)?;
-        }
-        self.sink.record(kind, action)?;
-        let chunk_bytes = self.chunk_bytes;
-        let Some(buf) = self.sink.output.as_mut() else {
-            return Ok(());
+        let mut writer = if let Some(pieces) = self.pieces.as_mut() {
+            // Free held pieces as the channel drains and detect abandonment.
+            if !pieces.held.is_empty() {
+                pieces.drain_held(out)?;
+            }
+            Some(TextChunkWriter { pieces, out })
+        } else {
+            None
         };
-        if buf.len() < chunk_bytes {
-            return Ok(());
-        }
-        let mut buf = std::mem::take(buf);
-        let mut taken = 0;
-        while buf.len() - taken >= chunk_bytes {
-            let piece = buf[taken..taken + chunk_bytes].to_vec();
-            taken += chunk_bytes;
-            self.emit(piece, out)?;
-        }
-        buf.drain(..taken);
-        // One huge action leaves its allocation behind; keep the local
-        // buffer near a chunk between actions.
-        buf.shrink_to(2 * chunk_bytes);
-        self.sink.output = Some(buf);
-        Ok(())
+        self.state.record(writer.as_mut(), kind, action)
     }
 
-    fn finish_into(mut self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<DiffStats> {
-        self.flush_held(out)?;
-        // The tail goes out in its own allocation too: the local buffer may
-        // still carry an earlier action's capacity.
-        if let Some(buf) = self.sink.output.take().filter(|buf| !buf.is_empty()) {
-            out.send(buf[..].to_vec())?;
+    fn finish_into(self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<DiffStats> {
+        if let Some(mut pieces) = self.pieces {
+            pieces.flush_held(out)?;
+            if !pieces.pending.is_empty() {
+                // The consumer retains the allocation, so trim the unused
+                // capacity of the last piece before handing it over.
+                out.send(pieces.pending.into_boxed_slice().into_vec())?;
+            }
         }
-        Ok(self.sink.stats)
+        Ok(self.state.stats)
     }
 }
 
@@ -839,7 +871,10 @@ fn diff_element_stream<W: Write>(
         StreamingBlocks::new_sequential(old, direct_io, std::sync::Arc::clone(&pool), host)?;
     let mut new_src = StreamingBlocks::new_sequential(new, direct_io, pool, host)?;
 
-    let mut sink = DiffSink::new(output, options);
+    let mut sink = DiffSink {
+        output,
+        state: DiffState::new(options),
+    };
 
     let phases = [
         (
@@ -871,7 +906,7 @@ fn diff_element_stream<W: Write>(
         }
     }
 
-    Ok(sink.stats)
+    Ok(sink.state.stats)
 }
 
 /// Advance both cursors past a kind the type filter excludes, wherever it
@@ -1318,15 +1353,6 @@ mod text_unit_sink_tests {
         }
     }
 
-    fn sink<'a>(options: &'a DiffOptions, overflow: &'a TextOverflow) -> TextUnitSink<'a> {
-        TextUnitSink {
-            sink: DiffSink::new(Some(Vec::new()), options),
-            chunk_bytes: 4,
-            overflow,
-            held: VecDeque::new(),
-        }
-    }
-
     fn piece(byte: u8) -> Vec<u8> {
         vec![byte; 4]
     }
@@ -1335,8 +1361,8 @@ mod text_unit_sink_tests {
     /// first, ahead of the piece that finds the channel open again.
     #[test]
     fn held_pieces_go_out_in_order_and_release_their_charge() {
-        let (options, overflow) = (options(), TextOverflow::new(1 << 20));
-        let mut s = sink(&options, &overflow);
+        let overflow = TextOverflow::new(1 << 20);
+        let mut s = TextPieces::new(4, &overflow);
         let mut ch = Channel::default();
         for b in 0..3 {
             s.emit(piece(b), &mut ch).unwrap();
@@ -1358,8 +1384,8 @@ mod text_unit_sink_tests {
     /// the new one, and nothing stays charged.
     #[test]
     fn a_spent_allowance_blocks_after_the_held_pieces() {
-        let (options, overflow) = (options(), TextOverflow::new(6));
-        let mut s = sink(&options, &overflow);
+        let overflow = TextOverflow::new(6);
+        let mut s = TextPieces::new(4, &overflow);
         let mut ch = Channel::default();
         s.emit(piece(0), &mut ch).unwrap();
         assert_eq!(overflow.used.load(Ordering::Relaxed), 4);
@@ -1372,40 +1398,54 @@ mod text_unit_sink_tests {
     /// every charge back.
     #[test]
     fn failures_release_every_charge() {
-        let (options, overflow) = (options(), TextOverflow::new(8));
-        let mut s = sink(&options, &overflow);
+        let overflow = TextOverflow::new(8);
+        let mut s = TextPieces::new(4, &overflow);
         let mut ch = Channel::default();
         s.emit(piece(0), &mut ch).unwrap();
         s.emit(piece(1), &mut ch).unwrap();
         ch.fail_send = true;
+        let mut writer = TextChunkWriter {
+            pieces: &mut s,
+            out: &mut ch,
+        };
         crate::test_support::assert_err_kind!(
-            s.emit(piece(2), &mut ch),
+            writer.write_all(&piece(2)).map_err(crate::Error::from),
             crate::ErrorKind::Internal { msg, .. } if msg == "test: consumer gone",
         );
         drop(s);
         assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
 
-        let mut s = sink(&options, &overflow);
+        let mut s = TextPieces::new(4, &overflow);
         let mut ch = Channel::default();
         s.emit(piece(0), &mut ch).unwrap();
         drop(s);
         assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
     }
 
-    /// The unit's tail leaves in its own allocation, not the local buffer
-    /// an earlier large action grew, and after the held pieces.
     #[test]
-    fn the_tail_is_sent_last_in_a_fresh_allocation() {
-        let (options, overflow) = (options(), TextOverflow::new(1 << 20));
-        let mut s = sink(&options, &overflow);
+    fn writes_span_chunks_and_the_tail_follows_held_pieces() {
+        let (options, overflow) = (options(), TextOverflow::new(8));
         let mut ch = Channel::default();
-        s.emit(piece(0), &mut ch).unwrap();
-        let mut tail = Vec::with_capacity(1 << 20);
-        tail.extend_from_slice(b"ab");
-        s.sink.output = Some(tail);
-        units::UnitSink::finish_into(s, &mut ch).unwrap();
-        assert_eq!(ch.sent, vec![piece(0), b"ab".to_vec()]);
-        assert!(ch.sent[1].capacity() < 1 << 10, "{}", ch.sent[1].capacity());
+        let mut pieces = TextPieces::new(4, &overflow);
+        let mut writer = TextChunkWriter {
+            pieces: &mut pieces,
+            out: &mut ch,
+        };
+        writer.write_all(b"a").unwrap();
+        let first = writer.pieces.pending.as_ptr();
+        writer.write_all(b"bcdefghij").unwrap();
+        assert_eq!(pieces.held[0].chunk.as_ptr(), first);
+        assert_eq!(overflow.used.load(Ordering::Relaxed), 8);
+        let sink = TextUnitSink {
+            state: DiffState::new(&options),
+            pieces: Some(pieces),
+        };
+        units::UnitSink::finish_into(sink, &mut ch).unwrap();
+        assert_eq!(
+            ch.sent,
+            [b"abcd".to_vec(), b"efgh".to_vec(), b"ij".to_vec()]
+        );
+        assert_eq!(ch.sent[2].capacity(), 2);
         assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
     }
 }

@@ -30,6 +30,7 @@ fn write_index(dir: &Path) {
         format::FILE_STREET_NODES,
         format::FILE_INTERP_WAYS,
         format::FILE_INTERP_NODES,
+        format::FILE_INTERP_PREFIXES,
         format::FILE_ADMIN_CELLS,
         format::FILE_ADMIN_ENTRIES,
         format::FILE_ADMIN_POLYGONS,
@@ -55,9 +56,11 @@ fn write_offset_records(dir: &Path) {
         parent_offset: 4,
         start_number: 10,
         end_number: 20,
-        node_count: 1,
+        node_count: 2,
         interpolation_type: 0,
         parent_kind: 0,
+        prefix_offset: 0,
+        total_len: 0.0,
     };
     let polygon = format::AdminPolygon {
         area: 1.0,
@@ -79,13 +82,13 @@ fn write_offset_records(dir: &Path) {
     ] {
         std::fs::write(dir.join(file), bytes).expect("offset-bearing record");
     }
-    for file in [
-        format::FILE_STREET_NODES,
-        format::FILE_INTERP_NODES,
-        format::FILE_ADMIN_VERTICES,
-    ] {
+    for file in [format::FILE_STREET_NODES, format::FILE_ADMIN_VERTICES] {
         std::fs::write(dir.join(file), [0u8; 8]).expect("one coordinate");
     }
+    std::fs::write(dir.join(format::FILE_INTERP_NODES), [0u8; 16])
+        .expect("two interpolation coordinates");
+    std::fs::write(dir.join(format::FILE_INTERP_PREFIXES), 0.0f64.to_le_bytes())
+        .expect("one segment prefix");
     std::fs::write(dir.join(format::FILE_ADMIN_ENTRIES), 0u16.to_le_bytes())
         .expect("empty admin list");
 }
@@ -253,10 +256,11 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
         ("admin_cells.bin", 8..16, "admin entry"),
         ("street_ways.bin", 0..8, "street way node"),
         ("interp_ways.bin", 0..8, "interpolation way node"),
+        ("interp_ways.bin", 24..32, "interpolation segment prefix"),
         ("admin_polygons.bin", 4..12, "admin polygon vertex"),
     ];
-    for (file, range, expected) in cases {
-        let index_dir = dir.path().join(format!("case-{file}"));
+    for (case, (file, range, expected)) in cases.iter().enumerate() {
+        let index_dir = dir.path().join(format!("case-{case}"));
         write_index(&index_dir);
         let path = index_dir.join(file);
         let mut bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));

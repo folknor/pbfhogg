@@ -1,4 +1,8 @@
+use std::collections::hash_map::Entry;
 use std::io::Write;
+use std::ops::Range;
+
+use rustc_hash::FxHashMap;
 
 /// Export prints the crate's one reading of element metadata.
 pub(super) use crate::read::claims::MetaClaims;
@@ -31,14 +35,55 @@ pub(super) fn reserve(buf: &[u8], incoming: usize, cap: usize) -> Result<(), Sto
 }
 
 fn push_json_string(buf: &mut Vec<u8>, value: &str, cap: usize) -> Result<(), Stop> {
-    // serde_json escapes a byte as at most six (`\u001f`), plus the quotes.
-    reserve(buf, value.len().saturating_mul(6).saturating_add(2), cap)?;
+    reserve(buf, json_string_bound(value), cap)?;
+    encode_json_string(buf, value)
+}
+
+fn json_string_bound(value: &str) -> usize {
+    // serde_json escapes a byte as at most six (\u001f), plus the quotes.
+    value.len().saturating_mul(6).saturating_add(2)
+}
+
+fn encode_json_string(buf: &mut Vec<u8>, value: &str) -> Result<(), Stop> {
     // Use serde_json's data encoding for every destination, including a
     // terminal. Literal Unicode display controls are permitted in JSON;
     // display escaping belongs to the consumer, not the property value.
     serde_json::to_writer(&mut *buf, value)
         .map_err(|error| crate::Error::internal_with("failed to encode a JSON string", error))?;
     Ok(())
+}
+
+/// The escaped string-table entries used by one block. The validated table
+/// returns stable slices into the block buffer. Hash their address and length
+/// so a cache hit never has to read the source string. The address is only a
+/// key, and the cache follows the same block if formatting moves to the
+/// consumer. Duplicate keys are still detected by string content.
+#[derive(Default)]
+pub(super) struct EscapedStrings {
+    bytes: Vec<u8>,
+    entries: FxHashMap<(usize, usize), Range<usize>>,
+}
+
+impl EscapedStrings {
+    fn push(&mut self, out: &mut Vec<u8>, value: &str, cap: usize) -> Result<(), Stop> {
+        // Keep the same cap decision on cache hits, including when the
+        // worker hands the block to the consumer for a retry.
+        reserve(out, json_string_bound(value), cap)?;
+        let key = (value.as_ptr().addr(), value.len());
+        let range = match self.entries.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let start = self.bytes.len();
+                encode_json_string(&mut self.bytes, value)?;
+                entry.insert(start..self.bytes.len())
+            }
+        };
+        let bytes = self.bytes.get(range.clone()).ok_or_else(|| {
+            crate::Error::internal("export escaped string cache range is out of bounds")
+        })?;
+        out.extend_from_slice(bytes);
+        Ok(())
+    }
 }
 
 fn push_name(buf: &mut Vec<u8>, first: &mut bool, name: &str, cap: usize) -> Result<(), Stop> {
@@ -104,6 +149,7 @@ impl<'a> SeenKeys<'a> {
 pub(super) fn write_properties<'a, T>(
     buf: &mut Vec<u8>,
     seen: &mut SeenKeys<'a>,
+    escaped: &mut EscapedStrings,
     id: i64,
     object_type: &str,
     tags: T,
@@ -157,7 +203,7 @@ where
         }
         if let Some(user) = &meta.user {
             push_name(buf, &mut first, "@user", cap)?;
-            push_json_string(buf, user.as_ref().map_err(crate::Error::clone)?, cap)?;
+            escaped.push(buf, user.as_ref().map_err(crate::Error::clone)?, cap)?;
         }
         if let Some(value) = meta.visible {
             push_name(buf, &mut first, "@visible", cap)?;
@@ -176,8 +222,10 @@ where
         {
             continue;
         }
-        push_name(buf, &mut first, key, cap)?;
-        push_json_string(buf, value, cap)?;
+        buf.push(b',');
+        escaped.push(buf, key, cap)?;
+        buf.push(b':');
+        escaped.push(buf, value, cap)?;
     }
     buf.push(b'}');
     Ok(())
@@ -187,6 +235,33 @@ where
 mod tests {
     use super::*;
     use crate::commands::export::{ExportFormat, ExportTypes};
+
+    #[test]
+    fn cached_strings_are_lazy_and_share_their_escaped_bytes() {
+        let mut builder = crate::block_builder::BlockBuilder::new();
+        let value = "a\n\"\\";
+        builder.add_node(1, 0, 0, [(value, value), ("unused", "tag")], None);
+        let bytes = builder.take().expect("take").expect("block").to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes).expect("decode");
+        let Some(crate::Element::DenseNode(node)) = block.elements().next() else {
+            panic!("expected a dense node");
+        };
+        let (key, value) = node.tags().next().expect("tag");
+
+        let mut escaped = EscapedStrings::default();
+        let mut out = Vec::new();
+        assert!(matches!(
+            escaped.push(&mut out, key, 1),
+            Err(Stop::Overflow)
+        ));
+        assert!(escaped.entries.is_empty());
+        escaped.push(&mut out, key, usize::MAX).expect("key");
+        escaped.push(&mut out, value, usize::MAX).expect("value");
+        let want = serde_json::to_vec(value).expect("JSON");
+        assert_eq!(escaped.entries.len(), 1);
+        assert_eq!(escaped.bytes, want);
+        assert_eq!(out, [want.as_slice(), want.as_slice()].concat());
+    }
 
     #[test]
     fn escapes_whitelists_and_suppresses_collisions() {
@@ -210,6 +285,7 @@ mod tests {
         write_properties(
             &mut buf,
             &mut seen,
+            &mut EscapedStrings::default(),
             7,
             "node",
             tags.into_iter(),
@@ -247,6 +323,7 @@ mod tests {
         write_properties(
             &mut buf,
             &mut seen,
+            &mut EscapedStrings::default(),
             1,
             "node",
             tags.into_iter(),
@@ -278,6 +355,7 @@ mod tests {
         let result = write_properties(
             &mut buf,
             &mut seen,
+            &mut EscapedStrings::default(),
             1,
             "node",
             [("name", long.as_str())].into_iter(),

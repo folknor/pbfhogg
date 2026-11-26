@@ -226,6 +226,14 @@ pub(crate) fn getparents_with_arm(
 /// blob whose range understates its IDs is skipped with the queried element
 /// in it, as `getid` skips one. A blob that is read still has its kind claim
 /// refused at decode.
+///
+/// Reading every way blob for a node query, and every relation blob for any
+/// query, is structural: a parent is found through its refs and members,
+/// which no indexdata claim describes. Only a reverse index from referenced
+/// IDs to blobs, bound to the exact file, would narrow it, and that pays
+/// only for repeated queries against one file. On the full-scan arm the wall
+/// is the sequential read of every byte (europe 34 GB in about 10.5 s,
+/// unchanged by this selection), so nothing short of skipping bytes moves it.
 struct Selection<'q> {
     ids: &'q ElementIds,
     add_self: bool,

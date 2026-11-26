@@ -478,10 +478,32 @@ pub const INVENTORY: &[Entry] = &[
     ),
     e(
         "crates/lib/src/commands/inspect/scan.rs",
-        "full_decode_scan",
+        "finish_id_stats",
         "|r| r.has_data() && r.min_id < 0",
         1,
         REPORT,
+    ),
+    e(
+        "crates/lib/src/commands/inspect/project.rs",
+        "InspectProjection::observe_negative_id",
+        "ext.has_negative_ids |= id < 0",
+        1,
+        REPORT,
+    ),
+    e(
+        "crates/lib/src/commands/inspect/project.rs",
+        "InspectProjection::dense_negative_ids",
+        "id < 0",
+        1,
+        REPORT,
+    ),
+    // Reservation coverage.
+    e(
+        "crates/lib/src/commands/tags_filter/mod.rs",
+        "publish_way_refs",
+        "if id < 0 || id > max || !batch.insert(id)",
+        1,
+        "the atomic reservation covers 0..=max; a negative ref or one above max goes to the signed spill set, so both signs reach the same membership",
     ),
     // Renumber's direction.
     e(

@@ -8,8 +8,50 @@ pub enum InspectGetNeed {
     Header,
     /// The value requires the ordinary inspect scan.
     Scan,
+    /// Use the ordinary scan for counts or index coverage.
+    Basic,
+    /// Decode and count elements from the payload.
+    PayloadCounts,
+    /// Decode element IDs and kind ordering.
+    OrderedIds,
+    /// Decode element IDs to check for negative IDs.
+    NegativeIds,
+    /// Decode timestamp claims and track their range.
+    Timestamps,
+    /// Count objects with a timestamp.
+    TimestampCoverage,
+    /// Decode node coordinate bounds.
+    Bounds,
+    /// Count objects with a version.
+    Versions,
+    /// Count objects with a changeset.
+    Changesets,
+    /// Count objects with a UID.
+    Uids,
+    /// Count objects with a user name.
+    Users,
     /// The value requires the extended inspect scan.
     Extended,
+}
+
+impl InspectGetNeed {
+    // Every former extended key still validates timestamp scaling, even
+    // when the requested field never uses the scaled value.
+    pub(super) const fn validates_timestamps(self) -> bool {
+        !matches!(self, Self::Header | Self::Scan | Self::Basic)
+    }
+
+    pub(super) const fn collects_metadata(self) -> bool {
+        matches!(
+            self,
+            Self::Extended
+                | Self::TimestampCoverage
+                | Self::Versions
+                | Self::Changesets
+                | Self::Uids
+                | Self::Users
+        )
+    }
 }
 
 /// The value represented by a recognized `inspect --get` path.
@@ -131,121 +173,123 @@ const INSPECT_GET_KEYS: &[(&str, InspectGetKeyKind, InspectGetNeed)] = &[
         InspectGetKeyKind::HeaderReplicationTimestamp,
         InspectGetNeed::Header,
     ),
-    ("indexed", InspectGetKeyKind::Indexed, InspectGetNeed::Scan),
+    // These keys share the header walk and its validating fallback. An
+    // early answer from a prefix could miss a later malformed frame.
+    ("indexed", InspectGetKeyKind::Indexed, InspectGetNeed::Basic),
     (
         "blocks.total",
         InspectGetKeyKind::BlocksTotal,
-        InspectGetNeed::Scan,
+        InspectGetNeed::Basic,
     ),
     (
         "elements.nodes",
         InspectGetKeyKind::ElementsNodes,
-        InspectGetNeed::Scan,
+        InspectGetNeed::Basic,
     ),
     (
         "elements.ways",
         InspectGetKeyKind::ElementsWays,
-        InspectGetNeed::Scan,
+        InspectGetNeed::Basic,
     ),
     (
         "elements.relations",
         InspectGetKeyKind::ElementsRelations,
-        InspectGetNeed::Scan,
+        InspectGetNeed::Basic,
     ),
     (
         "elements.total",
         InspectGetKeyKind::ElementsTotal,
-        InspectGetNeed::Scan,
+        InspectGetNeed::Basic,
     ),
     (
         "data.objects_ordered",
         InspectGetKeyKind::DataObjectsOrdered,
-        InspectGetNeed::Extended,
+        InspectGetNeed::OrderedIds,
     ),
     (
         "data.has_negative_ids",
         InspectGetKeyKind::DataHasNegativeIds,
-        InspectGetNeed::Extended,
+        InspectGetNeed::NegativeIds,
     ),
     (
         "data.timestamp.first",
         InspectGetKeyKind::DataTimestampFirst,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Timestamps,
     ),
     (
         "data.timestamp.last",
         InspectGetKeyKind::DataTimestampLast,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Timestamps,
     ),
     (
         "data.bbox",
         InspectGetKeyKind::DataBbox,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Bounds,
     ),
     (
         "data.count.nodes",
         InspectGetKeyKind::DataCountNodes,
-        InspectGetNeed::Extended,
+        InspectGetNeed::PayloadCounts,
     ),
     (
         "data.count.ways",
         InspectGetKeyKind::DataCountWays,
-        InspectGetNeed::Extended,
+        InspectGetNeed::PayloadCounts,
     ),
     (
         "data.count.relations",
         InspectGetKeyKind::DataCountRelations,
-        InspectGetNeed::Extended,
+        InspectGetNeed::PayloadCounts,
     ),
     (
         "metadata.all_objects.version",
         InspectGetKeyKind::MetadataAllObjectsVersion,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Versions,
     ),
     (
         "metadata.all_objects.timestamp",
         InspectGetKeyKind::MetadataAllObjectsTimestamp,
-        InspectGetNeed::Extended,
+        InspectGetNeed::TimestampCoverage,
     ),
     (
         "metadata.all_objects.changeset",
         InspectGetKeyKind::MetadataAllObjectsChangeset,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Changesets,
     ),
     (
         "metadata.all_objects.uid",
         InspectGetKeyKind::MetadataAllObjectsUid,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Uids,
     ),
     (
         "metadata.all_objects.user",
         InspectGetKeyKind::MetadataAllObjectsUser,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Users,
     ),
     (
         "metadata.some_objects.version",
         InspectGetKeyKind::MetadataSomeObjectsVersion,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Versions,
     ),
     (
         "metadata.some_objects.timestamp",
         InspectGetKeyKind::MetadataSomeObjectsTimestamp,
-        InspectGetNeed::Extended,
+        InspectGetNeed::TimestampCoverage,
     ),
     (
         "metadata.some_objects.changeset",
         InspectGetKeyKind::MetadataSomeObjectsChangeset,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Changesets,
     ),
     (
         "metadata.some_objects.uid",
         InspectGetKeyKind::MetadataSomeObjectsUid,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Uids,
     ),
     (
         "metadata.some_objects.user",
         InspectGetKeyKind::MetadataSomeObjectsUser,
-        InspectGetNeed::Extended,
+        InspectGetNeed::Users,
     ),
 ];
 

@@ -87,25 +87,21 @@ crate::counters::counter_set! {
         /// old name was retired, not redefined, so a name-keyed comparison
         /// against stored runs finds no counterpart instead of a false one.
         pub handoff_ns => "writer_handoff_ns",
-        /// `pwrite` / `copy_file_range` execution time summed across the
-        /// `pwrite` pool's threads, including dropping the written buffer,
+        /// `pwrite`, `pwritev` and `copy_file_range` execution time summed
+        /// across the pool's threads, including dropping written buffers,
         /// failed operations too. Thread-time: up to the pool size times wall.
         /// Zero on every other backend, which has no pool.
         pub pool_write_ns => "writer_pool_write_ns",
         pub flush_ns => "writer_flush_ns",
         pub bytes_framed => "writer_bytes_framed",
         /// Bytes covered by successful handoff operations, header frame
-        /// included, counted per constituent operation (each chunk of a
-        /// `RawChunks`, each of a synchronous frame's three writes, a whole
-        /// `CopyRange` on success). "Handed to the backend", not "on disk":
-        /// the buffered backend counts bytes copied into its `BufWriter`,
-        /// io_uring bytes copied into a registered buffer the kernel writes
-        /// later, and the `pwrite` pool bytes queued to a worker - so the pool
-        /// counting at dispatch is the same boundary as the others, not an
-        /// earlier one. Bytes partially accepted inside a failing operation
-        /// are not counted, and on a failed run accepted bytes may never reach
-        /// the file. On success, for fresh regular-file outputs, it equals the
-        /// sum of the output files' sizes (alignment padding never counts).
+        /// included. An operation can be one buffer, a vectored group,
+        /// or a whole `CopyRange`. Handoff includes copying into a
+        /// `BufWriter` or an io_uring registered buffer, a buffered
+        /// vectored write, or queueing an operation to a pwrite worker.
+        /// Bytes partially accepted inside a failing operation are not counted.
+        /// On success, for fresh regular-file outputs, this equals the sum of
+        /// the output files' sizes (alignment padding never counts).
         pub bytes_written => "writer_bytes_written",
 
         /// The `payload_*` pairs count what callers submitted, on synchronous
@@ -140,9 +136,9 @@ crate::counters::counter_set! {
         pub copy_range_fallback_bytes => "writer_copy_range_fallback_bytes",
 
         /// `buffered_write_*` and `direct_write_*` count successful
-        /// `FileWriter::write` calls and the logical bytes they accepted - not
-        /// syscalls, not physical bytes (`CopyRange`, internal buffer flushes
-        /// and `O_DIRECT` padding bypass them). The synchronous writers over a
+        /// `FileWriter` scalar and vectored writes and the logical bytes
+        /// they accepted - not syscalls or physical bytes. `CopyRange`, internal
+        /// buffer flushes and `O_DIRECT` padding bypass them. Synchronous writers over a
         /// plain `BufWriter<File>` or an arbitrary `Write` never go through
         /// `FileWriter`, so zero here does not mean no buffered output.
         pub buffered_write_calls => "writer_buffered_write_calls",

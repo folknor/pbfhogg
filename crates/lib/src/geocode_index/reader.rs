@@ -15,8 +15,8 @@ use s2::latlng::LatLng;
 
 use super::format::{
     self, ADMIN_LEVEL_SLOTS, AddrEntry, AddrPoint, AdminCell, AdminEntry, AdminPolygon, GeoCell,
-    HEADER_SIZE, Header, InterpWay, InterpolationType, NodeCoord, ParentKind, Record, Records,
-    RunError, SegmentRef, StreetWay, Table,
+    HEADER_SIZE, Header, InterpPrefix, InterpWay, InterpolationType, NodeCoord, ParentKind, Record,
+    Records, RunError, SegmentRef, StreetWay, Table,
 };
 use crate::geo;
 use crate::tunables::{
@@ -441,6 +441,7 @@ pub struct Reader {
     addr_points: Records<AddrPoint>,
     interp_ways: Records<InterpWay>,
     interp_nodes: Records<NodeCoord>,
+    interp_prefixes: Records<InterpPrefix>,
     admin_cells: Records<AdminCell>,
     admin_entries: Lists<AdminEntry>,
     admin_polygons: Records<AdminPolygon>,
@@ -674,6 +675,7 @@ impl Reader {
             addr_points: dir.records(format::FILE_ADDR_POINTS)?,
             interp_ways: dir.records(format::FILE_INTERP_WAYS)?,
             interp_nodes: dir.records(format::FILE_INTERP_NODES)?,
+            interp_prefixes: dir.records(format::FILE_INTERP_PREFIXES)?,
             admin_cells: dir.records(format::FILE_ADMIN_CELLS)?,
             admin_entries: dir.lists(format::FILE_ADMIN_ENTRIES)?,
             admin_polygons: dir.records(format::FILE_ADMIN_POLYGONS)?,
@@ -840,6 +842,7 @@ impl Reader {
     ///
     /// - `StreetWay.node_offset` + `node_count` into `street_nodes.bin`
     /// - `InterpWay.node_offset` + `node_count` into `interp_nodes.bin`
+    /// - `InterpWay.prefix_offset` + `node_count - 1` into `interp_prefixes.bin`
     /// - `AdminPolygon.vertex_offset` + `vertex_count` into
     ///   `admin_vertices.bin`
     ///
@@ -857,6 +860,41 @@ impl Reader {
     /// offset decodes, not that it is the start of an entry the builder
     /// wrote; an offset pointing at another valid entry is undetectable
     /// either way.
+    /// One interpolation record's checks, for [`Self::validate_way_geometry`].
+    fn validate_interp_way(&self, way: &InterpWay) -> Result<()> {
+        InterpolationType::try_from(way.interpolation_type)
+            .map_err(crate::Error::invalid_data_from)?;
+        ParentKind::try_from(way.parent_kind).map_err(crate::Error::invalid_data_from)?;
+        validate_span(
+            &self.interp_nodes,
+            way.node_offset,
+            u64::from(way.node_count),
+            "interpolation way node",
+        )?;
+        validate_span(
+            &self.interp_prefixes,
+            way.prefix_offset,
+            u64::from(way.node_count.saturating_sub(1)),
+            "interpolation segment prefix",
+        )?;
+        if !way.total_len.is_finite() || way.total_len < 0.0 {
+            return Err(corrupt(
+                "invalid geocode index: invalid interpolation total length",
+            ));
+        }
+        validate_string_offset(way.parent_offset, &self.strings, "interpolation way parent")?;
+        // Builder-produced sections always name what they number along.
+        let resolved = way.start_number != 0 && way.end_number != 0;
+        if resolved && self.pool_name(way.parent_offset).is_none() {
+            return Err(corrupt(
+                "invalid geocode index: a resolved interpolation record names no street or \
+                 place"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_way_geometry(&self) -> Result<()> {
         for (index, way) in self.street_ways.table().iter().enumerate() {
             (|| -> Result<()> {
@@ -871,34 +909,8 @@ impl Reader {
             .map_err(|e| in_record(e, format::FILE_STREET_WAYS, index))?;
         }
         for (index, way) in self.interp_ways.table().iter().enumerate() {
-            (|| -> Result<()> {
-                InterpolationType::try_from(way.interpolation_type)
-                    .map_err(crate::Error::invalid_data_from)?;
-                ParentKind::try_from(way.parent_kind).map_err(crate::Error::invalid_data_from)?;
-                validate_span(
-                    &self.interp_nodes,
-                    way.node_offset,
-                    u64::from(way.node_count),
-                    "interpolation way node",
-                )?;
-                validate_string_offset(
-                    way.parent_offset,
-                    &self.strings,
-                    "interpolation way parent",
-                )?;
-                // A resolved record names what it numbers along; only the
-                // zero-sentinel record of a refused way may name nothing.
-                let resolved = way.start_number != 0 && way.end_number != 0;
-                if resolved && self.pool_name(way.parent_offset).is_none() {
-                    return Err(corrupt(
-                        "invalid geocode index: a resolved interpolation record names no \
-                         street or place"
-                            .to_owned(),
-                    ));
-                }
-                Ok(())
-            })()
-            .map_err(|e| in_record(e, format::FILE_INTERP_WAYS, index))?;
+            self.validate_interp_way(&way)
+                .map_err(|e| in_record(e, format::FILE_INTERP_WAYS, index))?;
         }
         for (index, poly) in self.admin_polygons.table().iter().enumerate() {
             (|| -> Result<()> {
@@ -1187,27 +1199,14 @@ impl Reader {
 
     /// Return the total length for a way that has a usable house-number range.
     ///
-    /// Keep this calculation candidate-driven. Building a table at open time
-    /// would walk every interpolation node even when a reader serves only a
-    /// small area. The ranked query retains the winning length, avoiding the
-    /// second walk when it computes that result. Search sinks use this check
-    /// before recording a hit so an unusable fine segment cannot suppress a
-    /// usable coarse fallback. The unranked candidate API still checks each
-    /// returned hit and avoids an eager all-ways cache at reader open.
-    ///
-    /// A range is usable when its mode [answers](InterpolationType::answers)
-    /// it, the same rule the builder writes sections by: the zero sentinel
-    /// of a refused way, a wrong-parity range or one with no number between
-    /// its anchors never answers. Checking here, where the sinks admit a
-    /// hit, keeps such a record from shadowing the coarse fallback as well
-    /// as from answering.
+    /// Search sinks check range and length before admitting a hit so an
+    /// unusable fine segment cannot suppress a usable coarse fallback.
     fn interpolation_total_length(&self, iw: InterpWay) -> Option<f64> {
         let mode = InterpolationType::try_from(iw.interpolation_type).ok()?;
         if !mode.answers(iw.start_number, iw.end_number) {
             return None;
         }
-        let total_len = self.way_length_radians(&iw);
-        (total_len >= crate::tunables::INTERP_MIN_TOTAL_LEN).then_some(total_len)
+        (iw.total_len >= crate::tunables::INTERP_MIN_TOTAL_LEN).then_some(iw.total_len)
     }
 
     fn interpolated_number_at_length(
@@ -1227,7 +1226,8 @@ impl Reader {
         if total_len < crate::tunables::INTERP_MIN_TOTAL_LEN {
             return None;
         }
-        let acc_len = self.accumulated_length_radians(&iw, segment_index, snap_lat_e7, snap_lon_e7);
+        let acc_len =
+            self.accumulated_length_radians(&iw, segment_index, snap_lat_e7, snap_lon_e7)?;
         // number_at refuses a range its mode does not answer, the zero
         // sentinel included, and a non-finite fraction.
         InterpolationType::try_from(iw.interpolation_type)
@@ -1492,9 +1492,6 @@ impl SearchSink<'_> for BestTracker {
     ) {
         let key = segment_key(segment, dist_sq);
         if key.beats(self.interp.as_ref().map(|best| &best.3)) {
-            // Only candidates that can improve the current result need a full
-            // way-length scan. Retain the winner's length to avoid scanning it
-            // again while assembling the final house number.
             let Some(total_len) = reader.interpolation_total_length(way) else {
                 return;
             };
@@ -2422,55 +2419,30 @@ impl Reader {
         })
     }
 
-    /// The interpolation way's nodes. Open validated the span; a way whose
-    /// span does not fit reads as having no nodes.
-    #[inline]
-    fn interp_way_nodes(&self, iw: &InterpWay) -> Table<'_, NodeCoord> {
-        self.interp_nodes
-            .span(iw.node_offset, u64::from(iw.node_count))
-            .unwrap_or_default()
-    }
-
-    fn way_length_radians(&self, iw: &InterpWay) -> f64 {
-        let mut nodes = self.interp_way_nodes(iw).iter();
-        let Some(mut prev) = nodes.next() else {
-            return 0.0;
-        };
-        let mut total = 0.0;
-        for node in nodes {
-            total += segment_length_radians(&prev, &node);
-            prev = node;
-        }
-        total
-    }
-
-    /// Length along the way from its first node to the snap point on
-    /// segment `seg_idx`. The caller has checked `seg_idx + 1 < node_count`.
+    /// Length along the section from its first node to the snap point.
     fn accumulated_length_radians(
         &self,
         iw: &InterpWay,
         seg_idx: u16,
         snap_lat: i32,
         snap_lon: i32,
-    ) -> f64 {
-        let mut nodes = self
-            .interp_way_nodes(iw)
-            .iter()
-            .take(usize::from(seg_idx) + 1);
-        let Some(mut prev) = nodes.next() else {
-            return 0.0;
-        };
-        let mut acc = 0.0;
-        for node in nodes {
-            acc += segment_length_radians(&prev, &node);
-            prev = node;
-        }
-        // Partial segment from the segment's start node to the snap point
+    ) -> Option<f64> {
+        let index = usize::from(seg_idx);
+        let start = self
+            .interp_nodes
+            .span(iw.node_offset, u64::from(iw.node_count))
+            .ok()?
+            .get(index)?;
+        let prefix = self
+            .interp_prefixes
+            .span(iw.prefix_offset, u64::from(iw.node_count.saturating_sub(1)))
+            .ok()?
+            .get(index)?;
         let snap = NodeCoord {
             lat_e7: snap_lat,
             lon_e7: snap_lon,
         };
-        acc + segment_length_radians(&prev, &snap)
+        Some(prefix.length + segment_length_radians(&start, &snap))
     }
 }
 
@@ -2602,7 +2574,7 @@ fn interpolate_coord(a: &NodeCoord, b: &NodeCoord, dlon: i64, t: f64) -> (i32, i
     (snap_lat as i32, snap_lon as i32)
 }
 
-fn segment_length_radians(a: &NodeCoord, b: &NodeCoord) -> f64 {
+pub(super) fn segment_length_radians(a: &NodeCoord, b: &NodeCoord) -> f64 {
     geo::approx_distance_sq(
         geo::e7_to_rad(a.lat_e7),
         geo::e7_to_rad(a.lon_e7),
@@ -3127,6 +3099,7 @@ mod tests {
             addr_points: Records::map(&empty).expect("empty addr_points"),
             interp_ways: Records::map(&empty).expect("empty interp_ways"),
             interp_nodes: Records::map(&empty).expect("empty interp_nodes"),
+            interp_prefixes: Records::map(&empty).expect("empty interp_prefixes"),
             admin_cells: Records::map(&empty).expect("empty admin_cells"),
             admin_entries: Lists::map(&empty).expect("empty admin_entries"),
             admin_polygons: Records::map(&empty).expect("empty admin_polygons"),

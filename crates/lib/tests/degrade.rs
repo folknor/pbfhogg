@@ -230,6 +230,60 @@ fn an_empty_reencode_needs_indexdata_unless_forced() {
     assert_eq!(forced.result.expect("forced").elements_written, 13);
 }
 
+#[test]
+fn forced_drop_ids_matches_indexed_output_with_signed_and_repeated_ids() {
+    let dir = crate::common::test_scratch();
+    let indexed = dir.path().join("indexed.osm.pbf");
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    let header = HeaderBuilder::new().build().expect("fixture");
+    for (path, indexed) in [(&indexed, true), (&unindexed, false)] {
+        let mut writer = PbfWriter::new(
+            std::fs::File::create(path).expect("fixture"),
+            Compression::None,
+        );
+        writer.write_header(&header).expect("fixture");
+        let write_block = |builder: &mut BlockBuilder, writer: &mut PbfWriter<_>| {
+            let block = builder.take().expect("fixture").expect("fixture");
+            if indexed {
+                writer.write_primitive_block(block).expect("fixture");
+            } else {
+                writer
+                    .write_primitive_block_no_indexdata(block)
+                    .expect("fixture");
+            }
+        };
+        let mut builder = BlockBuilder::new();
+        for id in [-7, 1] {
+            builder.add_node(id, 0, 0, [("n", "v")], None);
+        }
+        write_block(&mut builder, &mut writer);
+        builder.add_way(-7, [("w", "v")], &[-7], None);
+        write_block(&mut builder, &mut writer);
+        for id in [-7, 2] {
+            builder.add_way(id, [("w", "v")], &[-7], None);
+        }
+        write_block(&mut builder, &mut writer);
+        writer.flush().expect("fixture");
+    }
+
+    let flags = reencode(Reencode {
+        drop_ids: Some(pbfhogg::degrade::DropSpec { n: 3, seed: 42 }),
+        ..Reencode::default()
+    });
+    let expected = dir.path().join("expected.osm.pbf");
+    let actual = dir.path().join("actual.osm.pbf");
+    for (input, output, force) in [(&indexed, &expected, false), (&unindexed, &actual, true)] {
+        let stats = run(input, output, flags, force).result.expect("fixture");
+        assert_eq!(stats.dropped, 4);
+        assert_eq!(stats.elements_written, 1);
+        assert_eq!(elements(output).0, [(0, -7)]);
+    }
+    assert_eq!(
+        std::fs::read(expected).expect("fixture"),
+        std::fs::read(actual).expect("fixture")
+    );
+}
+
 /// Neither unsort shape exists at a block cap of 1: one element per blob
 /// leaves no room for an intra-blob inversion, and single-element blobs of
 /// distinct IDs never overlap. Both modes refuse before writing anything.

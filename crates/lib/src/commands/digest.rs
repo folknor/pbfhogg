@@ -105,8 +105,10 @@ use crate::blob::{Blob, BlobType};
 use crate::blob_meta::BlobIndex;
 use crate::content::{Prepass, Relation, write_full_record, write_header_record, write_record};
 use crate::error::{Error, Location};
+use crate::read::block::GroupProjection;
 use crate::read::input::InputSource;
-use crate::read::pipeline::DecodeTransform;
+use crate::read::pipeline::{DecodeTransform, Decoder};
+use crate::read::wire::{PackedSint32Iter, WireDenseInfo, WireDenseNodes};
 use crate::tunables::DIGEST_RECORD_BUFFERS_KEPT;
 use crate::{ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
 
@@ -348,11 +350,7 @@ impl DecodeTransform for DigestTransform {
     type Out = BlockSummary;
     const PARSE_INDEXDATA: bool = true;
 
-    fn apply(
-        &self,
-        blob: &Blob,
-        decode: crate::read::pipeline::Decoder<'_>,
-    ) -> Option<crate::Result<BlockSummary>> {
+    fn apply(&self, blob: &Blob, decode: Decoder<'_>) -> Option<crate::Result<BlockSummary>> {
         match blob.get_type() {
             BlobType::OsmData => {}
             // The reader refuses a misplaced header before it gets here;
@@ -376,14 +374,120 @@ impl DecodeTransform for DigestTransform {
                 way_members: declared.then(|| blob.way_members_checked()),
             },
         };
-        Some(decode.block().and_then(|block| {
-            Ok(BlockSummary {
-                index: blob.index(),
-                blob: blob.blob_index(),
-                offset: blob.offset(),
-                content: summarize_block(block, records, &self.buffers)?,
-            })
+        Some(self.summarize(decode, records).map(|content| BlockSummary {
+            index: blob.index(),
+            blob: blob.blob_index(),
+            offset: blob.offset(),
+            content,
         }))
+    }
+}
+
+impl DigestTransform {
+    fn summarize(
+        &self,
+        decode: Decoder<'_>,
+        records: Records<'_>,
+    ) -> crate::Result<Option<BlockContent>> {
+        if matches!(records, Records::Content(_)) {
+            return decode.buffer(|buffer| {
+                let (users, block) = buffer.project(|_, _| DenseUsers::default())?;
+                summarize_block(&block.into_block(), records, &self.buffers, Some(&users))
+            });
+        }
+        summarize_block(&decode.block()?, records, &self.buffers, None)
+    }
+}
+
+/// Keep the packed user column and the group boundaries from block validation.
+/// Copy only this column so building the block can move or grow its byte buffer.
+#[derive(Default)]
+struct DenseUsers {
+    groups: Vec<(usize, usize)>,
+    packed: Vec<u8>,
+}
+
+impl GroupProjection for DenseUsers {
+    fn dense(&mut self, _: &WireDenseNodes<'_>, ids: usize, info: Option<&WireDenseInfo<'_>>) {
+        if ids != 0 {
+            if let Some(info) = info {
+                self.packed.extend_from_slice(info.user_sid_data);
+            }
+            self.groups.push((ids, self.packed.len()));
+        }
+    }
+}
+
+struct DenseUserCursor<'a> {
+    groups: std::slice::Iter<'a, (usize, usize)>,
+    packed: &'a [u8],
+    end: usize,
+    remaining: usize,
+    deltas: Option<PackedSint32Iter<'a>>,
+    sid: i32,
+}
+
+impl<'a> DenseUserCursor<'a> {
+    fn new(users: &'a DenseUsers) -> Self {
+        Self {
+            groups: users.groups.iter(),
+            packed: &users.packed,
+            end: 0,
+            remaining: 0,
+            deltas: None,
+            sid: 0,
+        }
+    }
+
+    fn start_group(&mut self) -> crate::Result<()> {
+        let Some(&(count, end)) = self.groups.next() else {
+            return Err(Error::internal(
+                "digest dense user cursor ran out of groups",
+            ));
+        };
+        let packed = self
+            .packed
+            .get(self.end..end)
+            .ok_or_else(|| Error::internal("digest dense user column has an invalid range"))?;
+        self.end = end;
+        self.remaining = count;
+        self.deltas = (!packed.is_empty()).then(|| PackedSint32Iter::new(packed));
+        self.sid = 0;
+        Ok(())
+    }
+
+    fn check_next(&mut self, table_len: usize) -> crate::Result<()> {
+        if self.remaining == 0 {
+            self.start_group()?;
+        }
+        self.remaining -= 1;
+        let Some(deltas) = &mut self.deltas else {
+            return Ok(());
+        };
+        let delta = deltas
+            .next()
+            .ok_or_else(|| Error::internal("digest dense user column ended early"))?;
+        if self.remaining == 0 && deltas.next().is_some() {
+            return Err(Error::internal("digest dense user column has extra deltas"));
+        }
+        self.sid = self.sid.wrapping_add(delta);
+        let index = usize::try_from(self.sid).map_err(|_| {
+            crate::error::new_wire_error("dense node info has negative user string index")
+        })?;
+        // Block validation already checked UTF-8 for every table entry.
+        if index >= table_len {
+            return Err(crate::error::new_stringtable_index_out_of_bounds(index));
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> crate::Result<()> {
+        if self.remaining != 0 || !self.groups.as_slice().is_empty() {
+            return Err(Error::internal(
+                "digest dense user cursor has unvisited nodes",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -496,15 +600,14 @@ fn block_kind(block: &PrimitiveBlock) -> crate::Result<Option<ElementKind>> {
 }
 
 /// Validate one block internally (domain rules 2 and 4) and serialize it.
-/// Runs on the decode workers. Takes the block by value because the fused
-/// pipeline hands ownership to its transform.
-#[allow(clippy::needless_pass_by_value)]
+/// Runs on the decode workers.
 fn summarize_block(
-    block: PrimitiveBlock,
+    block: &PrimitiveBlock,
     records: Records<'_>,
     buffers: &RecordBuffers,
+    users: Option<&DenseUsers>,
 ) -> crate::Result<Option<BlockContent>> {
-    let classified = block_kind(&block)?;
+    let classified = block_kind(block)?;
     // The full form's per-block inputs. A way block in a file declaring
     // pbfhogg.WayMembers-v1 needs its field-5 payload (domain rule 5).
     let (relation, full) = match records {
@@ -520,8 +623,15 @@ fn summarize_block(
             (Relation::Content, Some((prepass, payload)))
         }
     };
+    let mut users = users.map(DenseUserCursor::new);
+    let table_len = block.string_table_len();
+    let elements = if users.is_some() {
+        block.elements_skip_metadata()
+    } else {
+        block.elements()
+    };
     let mut content: Option<BlockContent> = None;
-    for element in block.elements() {
+    for element in elements {
         let kind = element_kind(&element);
         if classified != Some(kind) {
             return Err(Error::invalid_data(format!(
@@ -532,7 +642,8 @@ fn summarize_block(
             )));
         }
         let id = crate::osc::merge_join::element_id(&element);
-        check_user(&element).map_err(|e| e.context(format!("{} {id}", kind.as_str())))?;
+        check_record_user(&element, users.as_mut(), table_len)
+            .map_err(|e| e.context(format!("{} {id}", kind.as_str())))?;
         let c = content.get_or_insert_with(|| BlockContent {
             kind,
             first_id: id,
@@ -552,6 +663,9 @@ fn summarize_block(
             )));
         }
         let written = match full {
+            // The way already carries its parsed message, and write_record
+            // streams its refs once. A separate way writer would duplicate
+            // record encoding without removing a message or ref re-parse.
             None => write_record(&element, id, relation, &mut c.records),
             Some((prepass, payload)) => {
                 let member = match payload {
@@ -567,10 +681,24 @@ fn summarize_block(
         c.max_id = c.max_id.max(id);
         c.count += 1;
     }
+    if let Some(users) = users {
+        users.finish()?;
+    }
     if let Some((_, Some(payload))) = full {
         check_way_member_tail(payload, content.as_ref().map_or(0, |c| c.count))?;
     }
     Ok(content)
+}
+
+fn check_record_user(
+    element: &Element<'_>,
+    users: Option<&mut DenseUserCursor<'_>>,
+    table_len: usize,
+) -> crate::Result<()> {
+    match (element, users) {
+        (Element::DenseNode(_), Some(users)) => users.check_next(table_len),
+        _ => check_user(element),
+    }
 }
 
 /// Resolve the element's metadata user name, if it has one (domain rule 4).
@@ -771,7 +899,101 @@ fn kind_byte(kind: ElementKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_way_member_tail, way_member_bit};
+    use super::{
+        DenseUsers, Prepass, PrimitiveBlock, RecordBuffers, Records, Relation,
+        check_way_member_tail, summarize_block, way_member_bit,
+    };
+    use crate::read::block::BlockBuffer;
+
+    fn field(number: u8, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![
+            (number << 3) | 2,
+            u8::try_from(body.len()).expect("fixture"),
+        ];
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn dense_group(ids: &[u8], lats: &[u8], users: &[u8]) -> Vec<u8> {
+        let mut info = field(1, &vec![1; ids.len()]);
+        info.extend(field(5, users));
+        let mut dense = field(1, ids);
+        dense.extend(field(5, &info));
+        dense.extend(field(8, lats));
+        dense.extend(field(9, &vec![0; ids.len()]));
+        field(2, &field(2, &dense))
+    }
+
+    fn block_and_users(groups: &[Vec<u8>]) -> (PrimitiveBlock, DenseUsers) {
+        let mut table = field(1, b"");
+        table.extend(field(1, b"user"));
+        let mut bytes = field(1, &table);
+        for group in groups {
+            bytes.extend_from_slice(group);
+        }
+        let mut strings = Vec::new();
+        let mut offsets = Vec::new();
+        let (users, block) = BlockBuffer::new(bytes, None, &mut strings, &mut offsets, None)
+            .project(|_, _| DenseUsers::default())
+            .expect("fixture");
+        (block.into_block(), users)
+    }
+
+    #[test]
+    fn content_dense_user_cursor_preserves_record_bytes_across_groups() {
+        let (block, users) = block_and_users(&[
+            dense_group(&[2, 2], &[0, 0], &[2, 1]), // IDs 1, 2; SIDs 1, 0
+            field(2, &field(1, &[8, 6, 64, 0, 72, 0])), // Plain node ID 3
+            dense_group(&[], &[], &[]),
+            dense_group(&[8], &[0], &[]),   // ID 4, no user column
+            dense_group(&[10], &[0], &[2]), // ID 5, SID 1
+            dense_group(&[12], &[0], &[2]), // ID 6, SID restarts at 1
+        ]);
+        let buffers = RecordBuffers::default();
+        for relation in [Relation::Content, Relation::ContentLocations] {
+            let baseline = summarize_block(&block, Records::Content(relation), &buffers, None)
+                .expect("fixture")
+                .expect("fixture");
+            let projected =
+                summarize_block(&block, Records::Content(relation), &buffers, Some(&users))
+                    .expect("fixture")
+                    .expect("fixture");
+            assert_eq!(projected.count, 6);
+            assert_eq!(projected.records, baseline.records);
+        }
+    }
+
+    #[test]
+    fn dense_user_error_precedes_id_order_and_record_errors() {
+        // Both IDs are 1. The second latitude is i64::MAX before scaling,
+        // so serializing that node would also fail.
+        let lats = [0, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1];
+        let buffers = RecordBuffers::default();
+        for (delta, message) in [
+            (1, "negative user string index"),
+            (4, "stringtable index out of bounds"),
+            (2, "IDs must strictly ascend"),
+        ] {
+            let (block, users) = block_and_users(&[dense_group(&[2, 0], &lats, &[0, delta])]);
+            for (records, users) in [
+                (Records::Content(Relation::Content), None),
+                (Records::Content(Relation::Content), Some(&users)),
+                (Records::Content(Relation::ContentLocations), Some(&users)),
+                (
+                    Records::Full {
+                        prepass: Prepass::default(),
+                        way_members: None,
+                    },
+                    None,
+                ),
+            ] {
+                let error = summarize_block(&block, records, &buffers, users)
+                    .err()
+                    .expect("second node must fail");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
+    }
 
     /// Bits are LSB-first in block order; the payload must count exactly
     /// the block's ways and leave its padding clear.

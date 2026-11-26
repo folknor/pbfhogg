@@ -488,8 +488,10 @@ counts and digest in the same walk): for `--unsort-intra` each firing
 kind's first two records swapped, for `--unsort` its records `cap` and
 `cap + 1` swapped, and for a drop the expected sequence less every record
 whose identity the output's blobs, read by the verifier's own frame
-decoder, do not hold next. The walk writes, to a staged file renamed into
-place only after a match, the listing the merge would write for that
+decoder, do not hold next. The indexdata check resumes that decoder and
+uses the observations already made by the candidate. The walk writes, to
+a staged file renamed into place only after a match, the listing the merge
+would write for that
 stream (`-` for a removed record; `-a` then `+a` for a swapped `a < q`),
 and its counts. The frame decoder only picks a drop's candidate; the
 verdict is still the equality with osmium's stored summary, so a wrong
@@ -931,14 +933,14 @@ lengths (`opl_compare::compare_sequence`). No unmatched or differing
 record means the two sequences are identical element by element, whatever
 their order, a shifted tag boundary (`a=bc` against `ab=c`) included; only
 reference-side records means the output is a subsequence of the reference.
-A moved or removed object is listed with its line. The reference side is an
-OPL file the verifier writes from osmium's decoding of the input under the
-same policy (`opl_compare::compare_sequence_with_opl`): the decoding's
-records kind by kind, each kind in file order (a stable partition, the
-decoding itself when osmium reads the input in kind and ID order), with every
-way-node coordinate rewritten undefined (`n<id>xy`) where the command must
-drop them. No reference is a PBF osmium writes: libosmium's writer chooses
-its own blocks and can exceed the 32 MiB limit on input pbfhogg re-encodes,
+A moved or removed object is listed with its line. The reference side uses
+osmium's decoding of the input under the same policy
+(`opl_compare::compare_sequence_with_opl`). One scan prepares a stable
+partition by kind and projects way-node coordinates to undefined
+(`n<id>xy`) where the command must drop them. Grouped decodings that need
+no projection are used directly. Checks with the same input and coordinate
+policy share the result for the life of the run. Libosmium's PBF writer
+chooses its own blocks and can exceed the 32 MiB limit on input pbfhogg re-encodes,
 and its plain writer drops `visible` without a history header. Whether the
 input's ways carry coordinates is counted from that decoding, never read
 from the header: libosmium decodes lat/lon arrays whether or not
@@ -946,12 +948,12 @@ from the header: libosmium decodes lat/lon arrays whether or not
 each output's indexdata must be on every blob and true: kind, count and
 exact ID range by the verifier's own decode of every blob
 (`pbf_frames::index_truth`, raw or zlib; any other compression is an error),
-bounding box and tag index by `pbfhogg check --index`; then the header-only
-claims walk (`pbf_frames::Claims`,
-pulling input and output blobs side by side in constant memory) holds the
-output's blobs, in order, to the documented rule run over the input's
-claims, which on an indexed input must pass both indexdata checks too (else
-an error: they feed the prediction). Every output must also claim
+and bounding box and tag index by `pbfhogg check --index`. The frame decoder
+reads payloads through one open file, using a small worker pool and folding
+results in file order. The predictions reuse the input claims collected by
+the verifier's indexdata check and walk each output's blob headers in order.
+An indexed input must pass both indexdata checks before its claims can feed
+a prediction. Every output must also claim
 `Sort.Type_then_ID` and `LocationsOnWays` as its command documents, hold no
 blob over the cap or empty, and keep kinds in order. Both arms read the input
 with `osmium fileinfo -e` and refuse a header requiring

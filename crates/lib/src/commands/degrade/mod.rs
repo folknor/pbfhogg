@@ -99,6 +99,7 @@ use crate::blob::BlobKind;
 /// Compatibility alias for [`crate::block_builder::DEFAULT_ELEMENT_CAP`].
 pub use crate::block_builder::DEFAULT_ELEMENT_CAP as DEFAULT_BLOCK_CAP;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::element_kind::ElementKindSet;
 use crate::error::Error;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -108,6 +109,8 @@ use crate::owned::{
 };
 use crate::read::frame::Frames;
 use crate::read::input::InputSource;
+use crate::read::project_ids::{IdScratch, KindIds};
+use crate::scan::classify::{KindSchedules, parallel_project_phase};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, strip_blob_header_fields};
 use crate::{Element, ElementReader};
@@ -1140,14 +1143,11 @@ fn degrade_decode_path(
         .header()
         .clone();
 
-    // Each per-kind phase re-encodes only its own kind, so an unindexed blob
-    // (only under --force) sits in all three and is decoded once per phase.
     let (schedules, shared_file, _max_ids) = crate::scan::classify::build_classify_schedules_split(
         input,
         crate::scan::classify::KindClaims::Refuse,
         host,
     )?;
-    let (node_schedule, way_schedule, rel_schedule) = schedules.into_replicated();
     // Use the input size as a preallocation budget for the caller-supplied
     // cap. Compressed input can expand to more elements than bytes; the
     // vectors grow as needed without changing the requested block cap.
@@ -1159,20 +1159,18 @@ fn degrade_decode_path(
     let mut drop_occurrences: u64 = 0;
     let drop_sets = if let Some(spec) = reencode.drop_ids {
         host.invocation.marker("DEGRADE_DROP_SELECT_START");
-        let (sets, occurrences) = select_drop_sets(
-            &shared_file,
-            &node_schedule,
-            &way_schedule,
-            &rel_schedule,
-            spec,
-            host,
-        )?;
+        let (sets, occurrences) = select_drop_sets(&shared_file, &schedules, spec, host)?;
         host.invocation.marker("DEGRADE_DROP_SELECT_END");
         drop_occurrences = occurrences;
         Some(sets)
     } else {
         None
     };
+
+    // Keep the per-kind rewrite schedules to preserve output order and blob
+    // boundaries. Forcing unindexed input still repeats inflation in the
+    // rewrite because a single pass would need to buffer or spool later kinds.
+    let (node_schedule, way_schedule, rel_schedule) = schedules.into_replicated();
 
     // Every way is re-encoded without inline coordinates or prepass fields;
     // under --strip-locations that is the request, not a loss to warn about.
@@ -1274,10 +1272,10 @@ fn degrade_decode_path(
             .counter("degrade_unsort_fired_relations", i64::from(unsort_fired[2]));
     }
 
-    // Both passes walk the same schedules and recognise the same element
-    // variants, so every occurrence the selection counted was either written
-    // or removed; the difference is the measured removal count, which
-    // exceeds N when a selected ID occurs more than once.
+    // Both passes recognize the same element variants, so every occurrence
+    // the selection counted was either written or removed. The difference
+    // is the measured removal count, which exceeds N when a selected ID
+    // occurs more than once.
     let dropped = if drop_sets.is_some() {
         drop_occurrences
             .checked_sub(elements_written)
@@ -1298,25 +1296,27 @@ fn degrade_decode_path(
 
 fn select_drop_sets(
     shared_file: &crate::read::input::InputFile,
-    node_schedule: &[crate::scan::classify::ScheduledBlob],
-    way_schedule: &[crate::scan::classify::ScheduledBlob],
-    relation_schedule: &[crate::scan::classify::ScheduledBlob],
+    schedules: &KindSchedules,
     spec: DropSpec,
     host: &crate::host::Entered<'_>,
 ) -> Result<(DropSets, u64)> {
     let mut total = 0_u64;
     let mut heap = BTreeSet::new();
-    for (kind, schedule) in [
-        (ElementKind::Node, node_schedule),
-        (ElementKind::Way, way_schedule),
-        (ElementKind::Relation, relation_schedule),
-    ] {
-        crate::scan::classify::parallel_classify_phase(
+    let phases = match schedules {
+        KindSchedules::Indexed {
+            nodes,
+            ways,
+            relations,
+        } => [Some(nodes), Some(ways), Some(relations)],
+        KindSchedules::Unindexed(blobs) => [Some(blobs), None, None],
+    };
+    for schedule in phases.into_iter().flatten() {
+        parallel_project_phase(
             shared_file,
             schedule,
             None,
-            || (),
-            |block, _| Ok(select_block_keys(block, kind, spec)),
+            IdScratch::default,
+            |_, buffer, scratch| select_block_keys(buffer, scratch, spec),
             |_seq, block_drop| {
                 total += block_drop.matched;
                 for key in block_drop.smallest {
@@ -1343,23 +1343,22 @@ fn select_drop_sets(
 }
 
 fn select_block_keys(
-    block: &crate::PrimitiveBlock,
-    kind: ElementKind,
+    buffer: crate::read::block::BlockBuffer<'_>,
+    scratch: &mut IdScratch,
     spec: DropSpec,
-) -> BlockDrop {
-    // Cross the reproducibility boundary once: everything downstream (the
-    // hash input and the DropKey ordering) uses this byte, not the enum.
-    let kind_byte = hash_kind(kind);
+) -> Result<BlockDrop> {
+    let mut kinds = ElementKindSet::default();
+    for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
+        kinds.add(kind);
+    }
+    // The projection validates any indexdata kind claim before exposing IDs.
+    let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::new(kinds, &mut *scratch))?;
     let mut matched = 0_u64;
     let mut heap = BTreeSet::new();
-    for element in block.elements() {
-        let id = match (&element, kind) {
-            (Element::DenseNode(node), ElementKind::Node) => node.id(),
-            (Element::Node(node), ElementKind::Node) => node.id(),
-            (Element::Way(way), ElementKind::Way) => way.id(),
-            (Element::Relation(relation), ElementKind::Relation) => relation.id(),
-            _ => continue,
-        };
+    // Across all kinds we still need only N candidates from this block:
+    // any omitted key already has N distinct keys ahead of it here.
+    scratch.each(accepted.bytes(), |kind, id| {
+        let kind_byte = hash_kind(kind);
         matched += 1;
         keep_smallest(
             &mut heap,
@@ -1370,11 +1369,12 @@ fn select_block_keys(
                 id,
             },
         );
-    }
-    BlockDrop {
+        Ok(())
+    })?;
+    Ok(BlockDrop {
         matched,
         smallest: heap.into_iter().collect(),
-    }
+    })
 }
 
 struct PhaseStats {
@@ -1976,6 +1976,39 @@ mod tests {
             expected.sort();
             expected.truncate(usize::try_from(n).unwrap_or(usize::MAX));
             assert_eq!(select(all.clone(), n), expected);
+        }
+    }
+
+    #[test]
+    fn projected_drop_candidates_match_full_element_walk() {
+        use crate::read::block::BlockBuffer;
+        use crate::read::project_ids::IdScratch;
+        use crate::{Element, PrimitiveBlock};
+
+        let mut scratch = IdScratch::default();
+        let (mut strings, mut groups) = (Vec::new(), Vec::new());
+        for (name, bytes) in crate::read::wire_fixtures::projection_fixtures() {
+            let block = PrimitiveBlock::from_vec(bytes.clone()).expect("fixture");
+            let spec = super::DropSpec { n: 3, seed: 42 };
+            let mut expected = Vec::new();
+            for element in block.elements() {
+                let (kind, id) = match element {
+                    Element::DenseNode(node) => (ElementKind::Node, node.id()),
+                    Element::Node(node) => (ElementKind::Node, node.id()),
+                    Element::Way(way) => (ElementKind::Way, way.id()),
+                    Element::Relation(relation) => (ElementKind::Relation, relation.id()),
+                };
+                let kind = hash_kind(kind);
+                expected.push(DropKey {
+                    hash: drop_hash(kind, id, spec.seed),
+                    kind,
+                    id,
+                });
+            }
+            let buffer = BlockBuffer::new(bytes, None, &mut strings, &mut groups, None);
+            let result = super::select_block_keys(buffer, &mut scratch, spec).expect("fixture");
+            assert_eq!(result.matched, expected.len() as u64, "{name}");
+            assert_eq!(result.smallest, oracle(&expected, 3), "{name}");
         }
     }
 

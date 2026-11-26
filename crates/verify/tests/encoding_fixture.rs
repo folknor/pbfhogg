@@ -67,6 +67,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     judge_degrade_pair(&mut h, exe, &dir, &input, &low);
     judge_locations_faults(&mut h, exe, &dir, &input, &low, &undeclared);
     judge_undeclared_repack(&mut h, exe, &dir, &undeclared);
+    judge_shared_reference(&mut h, exe, &dir, &undeclared);
     // Only the exact refusal with no published output is accepted.
     for (fault, accepted) in [
         ("refused", true),
@@ -188,6 +189,35 @@ fn judge_degrade_pair(h: &mut harness::Harness, exe: &Path, dir: &Path, input: &
         harness::CheckStatus::Passed,
         "{locations:?}"
     );
+}
+
+/// Both checks strip the undeclared coordinates, sharing one projection
+/// while retaining their own artifact names.
+fn judge_shared_reference(h: &mut harness::Harness, exe: &Path, dir: &Path, input: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::write(dir.join("fault"), "").unwrap();
+    h.run = run::Run::create(dir, exe, true).unwrap();
+    h.run.watch(input).unwrap();
+    for (name, check) in [
+        ("repack", checks::repack::run as checks::ReadCheck),
+        ("degrade", checks::degrade::run),
+    ] {
+        let judged = super::judge(h, name, |h| check(h, input, true));
+        assert_eq!(judged.status, harness::CheckStatus::Passed, "{judged:?}");
+    }
+    let inode = |check| {
+        std::fs::metadata(
+            h.run
+                .dir
+                .join("checks")
+                .join(check)
+                .join("expected-stripped.opl"),
+        )
+        .unwrap()
+        .ino()
+    };
+    assert_eq!(inode("repack"), inode("degrade"));
 }
 
 /// Hold one encoding fault to the comparisons it must fail on every arm

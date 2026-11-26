@@ -738,16 +738,6 @@ invalid-geometry policy.
 
 Kind: architectural direction.
 
-## PERF-024 - Export scope differs from what the hunt brief assumed
-
-Reported by: spatial.
-
-The spatial hunter found that this checkout's export writes GeoJSON and GeoJSON
-sequences for nodes and ways only, requires LocationsOnWays, ignores
-relations, and has no GeoParquet writer; ring assembly serves the geocode
-builder, not export. Filed because the brief named GeoParquet and relation
-geometry as export hot paths; there was nothing there to assess.
-
 ## PERF-025 - Reference membership is inserted by one consumer
 
 Reported by: indexdata, altw-sparse, tags, check.
@@ -1316,25 +1306,6 @@ Kind: hypothesis, unsized. The path is CPU-bound on bygg's planet `history2`
 (about 27 cores), but the hotpath cell does not split selection from
 encoding inside `select_blob`; validation stays either way.
 
-## PERF-052 - getparents reads every way and relation blob for any query
-
-Reported by: copy.
-
-Residue. Claimed-range selection landed for `getid --add-referenced` and for
-`getparents --add-self` (node blobs, and way blobs when only ways are
-queried; `Selection` in `getparents/mod.rs`, cells in
-`reference/performance/getparents.md`). What remains is structural: a parent
-is found through its refs and members, which no indexdata claim describes,
-so a node query still reads every way blob and any query every relation
-blob. A reverse index from referenced IDs to blobs would transform repeated
-small getparents queries, conditional on reuse and on binding to the exact
-file (the persisted-directory question of PERF-004). On the full scan arm
-(high-blob-count encodings) the wall is the sequential stream of every byte
-whatever is decoded (europe 34 GB in about 10.5 s, unchanged by the
-selection), so only a read that skips bytes would move it.
-
-Kind: low conviction (conditional on repeated queries against one file).
-
 ## PERF-053 - Geocode admin lookup reconstructs polygons per query
 
 Reported by: geocode.
@@ -1547,17 +1518,6 @@ Every payoff below is unmeasured.
 - The serial diff planner reads both payload streams on one thread; the
   denmark common-output record already shows planner and head delays, with no
   evidence it limits planet today.
-
-## PERF-062 - Ring assembly allocates a graph per relation
-
-Reported by: spatial.
-
-Mechanism: `geo::assemble_rings` (node-ID biconnected blocks, `geo/rings.rs`)
-builds a node graph and owned rings for every relation. The old backtracking
-search over coordinate copies is gone, and its pathological worst cases with
-it; what remains is per-relation allocation.
-
-Payoff: small; not a current export throughput item.
 
 ## PERF-063 - Geocode Pass 1.5 overflow lists are unbounded per worker
 

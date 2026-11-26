@@ -1277,10 +1277,9 @@ pub(crate) const GEOCODE_INPUT_HASH_CHUNK_BYTES: usize = 8 << 20;
 /// worker count - the per-worker accumulation shape this pass was moved off.
 pub(crate) const NODE_PREALLOC_IDS_PER_BYTE: u64 = 64;
 
-/// A worker's overflow list is sorted and deduplicated whenever it has
-/// doubled since its last compaction and holds at least this many IDs, so
-/// refs repeated across blobs cannot grow it far past its distinct count.
-pub(crate) const OVERFLOW_COMPACT_MIN: usize = 1 << 20;
+/// Number of spilled refs a geocode worker sorts before publishing a batch.
+/// A small batch bounds duplicate storage while amortizing the shared lock.
+pub(crate) const OVERFLOW_COMPACT_MIN: usize = 4096;
 
 /// Maximum number of distinct sample IDs kept for a build diagnostic.
 pub(crate) const DIAGNOSTIC_ID_SAMPLE_LIMIT: usize = 16;
@@ -1560,3 +1559,30 @@ pub const TEST_CHILD_POLL: std::time::Duration = std::time::Duration::from_milli
 pub const TEST_CHILD_CAPTURE_EDGE: usize = 1024 * 1024;
 /// Bounded stack buffer for test child pipe reads.
 pub const TEST_CHILD_CAPTURE_CHUNK: usize = 8192;
+
+// --- Vectored output groups ---
+
+/// Amortize writer pipeline handoffs while bounding pending rewritten bytes
+/// in the drain. An oversized frame is submitted alone.
+pub(crate) const APPLY_CHANGES_REWRITE_GROUP_BYTES: usize = 2 * 1024 * 1024;
+
+/// Bound iovec setup and stay within the POSIX minimum IOV_MAX.
+pub(crate) const WRITE_GROUP_MAX_CHUNKS: usize = 16;
+
+// --- CLI reverse geocoding ---
+
+/// Keep enough independent queries to distribute across the executor while
+/// bounding the number of rows serialized independently per batch.
+pub const GEOCODE_QUERY_BATCH_SIZE: usize = 256;
+
+// --- Renumber atomic ID collection ---
+
+/// Limit the cost of an isolated ID while keeping one page lookup useful
+/// across many consecutive word runs in the renumber decoder.
+pub(crate) const RENUMBER_ATOMIC_ID_PAGE_BYTES: usize = 64 * 1024;
+
+// --- Tags-filter way dependencies ---
+
+/// Cap the claim-sized atomic node bitmap at one bit per ID and roughly
+/// one byte per input byte. Refs beyond the cap use the signed spill set.
+pub(crate) const TAGS_FILTER_PREALLOC_IDS_PER_BYTE: u64 = 8;

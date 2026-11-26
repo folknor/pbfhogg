@@ -294,6 +294,9 @@ pub mod process;
 pub mod test_hooks;
 
 #[doc(hidden)]
+pub use tunables::GEOCODE_QUERY_BATCH_SIZE;
+
+#[doc(hidden)]
 pub use tunables::{
     TEST_CHILD_BUDGET, TEST_CHILD_CAPTURE_CHUNK, TEST_CHILD_CAPTURE_EDGE, TEST_CHILD_CLEANUP,
     TEST_CHILD_POLL, TEST_CHILD_TIMEOUT, TEST_FD_ADMISSION_BOUND, TEST_HANG_BOUND,

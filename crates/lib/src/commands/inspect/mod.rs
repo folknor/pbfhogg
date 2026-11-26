@@ -14,6 +14,6 @@ mod types;
 
 pub use format::format_replication_timestamp;
 pub use keys::{InspectGetKeyKind, InspectGetLookup, InspectGetNeed, inspect_get_lookup};
-pub use scan::{InspectHeader, InspectOptions, inspect, inspect_header};
+pub use scan::{InspectHeader, InspectOptions, inspect, inspect_header, inspect_with_get};
 pub use show_element::show_element_to;
 pub use types::InspectReport;

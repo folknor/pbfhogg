@@ -66,6 +66,8 @@ pub(crate) struct Run {
     /// The run's retained OPL decodings, in `RUN/decodings/`: owned by the
     /// run, so no other run ever reads them.
     pub(crate) decodings: crate::opl_compare::Decodings,
+    /// Expected OPL projections shared by the re-encoding checks.
+    pub(crate) reencode_references: crate::verify_reencode::ReferenceStore,
     keep: bool,
 }
 
@@ -90,6 +92,7 @@ impl Run {
             inputs: Vec::new(),
             digests: std::collections::HashMap::new(),
             decodings: crate::opl_compare::Decodings::default(),
+            reencode_references: crate::verify_reencode::ReferenceStore::default(),
             keep,
         })
     }

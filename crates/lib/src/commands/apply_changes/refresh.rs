@@ -308,7 +308,7 @@ fn scale(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
 
 #[cold]
 #[inline(never)]
-fn refs_err() -> crate::error::Error {
+pub(super) fn refs_err() -> crate::error::Error {
     new_wire_error("way refs array holds a truncated or overlong varint")
 }
 
@@ -331,6 +331,8 @@ pub(super) struct WayEval {
     pub(super) deleted_refs: u64,
     /// The way carries coordinate arrays.
     pub(super) has_coords: bool,
+    /// Positions validated by the refs scan.
+    pub(super) ref_count: usize,
 }
 
 /// Evaluate one surviving base way from its raw packed `refs`, `lat` and
@@ -367,6 +369,7 @@ pub(super) fn evaluate_way(
         }
         index += 1;
     }
+    eval.ref_count = index;
     if !eval.has_coords {
         return Ok(eval);
     }
@@ -410,29 +413,27 @@ pub(super) fn evaluate_way(
 /// the OSC upserts taking the OSC's coordinate. Returns how many positions
 /// changed value, which equals [`evaluate_way`]'s `stale_refs`.
 ///
+/// Hit positions are strictly increasing, as produced by [`evaluate_way`].
 /// The way must carry coordinate arrays; one without them is written as it
 /// is by the caller.
 pub(super) fn refreshed_locations(
-    refs_data: &[u8],
+    ref_count: usize,
     lat_data: &[u8],
     lon_data: &[u8],
     framing: CoordFraming,
-    probe: &StaleProbe,
+    hits: &[(usize, (i32, i32))],
     out_lats: &mut Vec<u8>,
     out_lons: &mut Vec<u8>,
 ) -> Result<u64> {
     out_lats.clear();
     out_lons.clear();
-    let mut refs = Cursor::new(refs_data);
     let mut lats = Cursor::new(lat_data);
     let mut lons = Cursor::new(lon_data);
-    let (mut current, mut raw_lat, mut raw_lon) = (0i64, 0i64, 0i64);
+    let (mut raw_lat, mut raw_lon) = (0i64, 0i64);
     let (mut last_lat, mut last_lon) = (0i64, 0i64);
     let mut changed = 0u64;
-    while !refs.is_empty() {
-        current = current.wrapping_add(zigzag_decode_64(
-            refs.read_varint().map_err(|_| refs_err())?,
-        ));
+    let mut remaining_hits = hits;
+    for position in 0..ref_count {
         raw_lat = raw_lat.wrapping_add(zigzag_decode_64(
             lats.read_varint().map_err(|_| coords_err())?,
         ));
@@ -440,12 +441,13 @@ pub(super) fn refreshed_locations(
             lons.read_varint().map_err(|_| coords_err())?,
         ));
         let inline = framing.decimicro(raw_lat, raw_lon)?;
-        let (lat, lon) = match probe.get(current) {
-            Some(ProbeEntry::Upserted(lat, lon)) => {
-                if (lat, lon) != inline {
+        let (lat, lon) = match remaining_hits.split_first() {
+            Some((&(hit_position, coord), rest)) if hit_position == position => {
+                remaining_hits = rest;
+                if coord != inline {
                     changed += 1;
                 }
-                (lat, lon)
+                coord
             }
             _ => inline,
         };
@@ -457,6 +459,11 @@ pub(super) fn refreshed_locations(
     }
     if !lats.is_empty() || !lons.is_empty() {
         return Err(coords_err());
+    }
+    if !remaining_hits.is_empty() {
+        return Err(crate::Error::internal(
+            "way refresh hits are unordered or out of range",
+        ));
     }
     Ok(changed)
 }
@@ -838,23 +845,16 @@ mod tests {
         let lats = packed(&[10, 20, 10]);
         let lons = packed(&[11, 21, 11]);
         let p = probe(&[(5, ProbeEntry::Upserted(-7, 8)), (6, ProbeEntry::Deleted)]);
-        let eval = evaluate_way(
-            &refs,
-            &lats,
-            &lons,
-            CoordFraming::DEFAULT,
-            &p,
-            &mut Vec::new(),
-        )
-        .unwrap();
+        let mut hits = Vec::new();
+        let eval = evaluate_way(&refs, &lats, &lons, CoordFraming::DEFAULT, &p, &mut hits).unwrap();
         assert_eq!((eval.stale_refs, eval.deleted_refs), (2, 1));
         let (mut out_lats, mut out_lons) = (Vec::new(), Vec::new());
         let changed = refreshed_locations(
-            &refs,
+            eval.ref_count,
             &lats,
             &lons,
             CoordFraming::DEFAULT,
-            &p,
+            &hits,
             &mut out_lats,
             &mut out_lons,
         )
@@ -877,18 +877,19 @@ mod tests {
         let lats = packed(&[3, 4]);
         let lons = packed(&[1, 2]);
         let p = probe(&[(1, ProbeEntry::Upserted(35, 10))]);
-        let eval = evaluate_way(&refs, &lats, &lons, framing, &p, &mut Vec::new()).unwrap();
+        let mut hits = Vec::new();
+        let eval = evaluate_way(&refs, &lats, &lons, framing, &p, &mut hits).unwrap();
         assert_eq!(
             eval.stale_refs, 0,
             "equal once scaled, though the raw bytes differ"
         );
         let (mut out_lats, mut out_lons) = (Vec::new(), Vec::new());
         let changed = refreshed_locations(
-            &refs,
+            eval.ref_count,
             &lats,
             &lons,
             framing,
-            &p,
+            &hits,
             &mut out_lats,
             &mut out_lons,
         )
@@ -900,6 +901,48 @@ mod tests {
             "normalized to the default framing"
         );
         assert_eq!(out_lons, packed(&[10, 20]));
+    }
+
+    #[test]
+    fn refresh_without_probe_rescales_all_positions() {
+        let framing = CoordFraming {
+            granularity: 1000,
+            lat_offset: 500,
+            lon_offset: 0,
+        };
+        let lats = packed(&[3, 4]);
+        let lons = packed(&[1, 2]);
+        let (mut out_lats, mut out_lons) = (Vec::new(), Vec::new());
+        assert_eq!(
+            refreshed_locations(2, &lats, &lons, framing, &[], &mut out_lats, &mut out_lons)
+                .unwrap(),
+            0
+        );
+        assert_eq!(out_lats, packed(&[35, 45]));
+        assert_eq!(out_lons, packed(&[10, 20]));
+    }
+
+    #[test]
+    fn refresh_checks_base_coordinates_even_at_replaced_positions() {
+        let mut lats = Vec::new();
+        let mut lons = Vec::new();
+        let hits = [(0, (3, 4))];
+        let invalid_lats = [packed(&[i64::from(i32::MAX) + 1]), vec![0x80]];
+        for invalid in &invalid_lats {
+            assert!(
+                // any-error-deliberate: the claim is that a base coordinate is still validated at a replaced position; out-of-range and truncated varints refuse through different kinds
+                refreshed_locations(
+                    1,
+                    invalid,
+                    &packed(&[2]),
+                    CoordFraming::DEFAULT,
+                    &hits,
+                    &mut lats,
+                    &mut lons,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

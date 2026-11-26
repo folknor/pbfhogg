@@ -51,8 +51,9 @@ use protohoggr::{
 };
 
 use super::encode::{
-    KeySet, collect_checked_keys, encode_relation, encode_relation_raw_bytes, encode_way,
-    encode_way_raw_bytes, encode_way_raw_bytes_with_locations, encode_way_with_locations,
+    KeySet, collect_checked_keys, encode_relation, encode_relation_prefix,
+    encode_relation_raw_bytes, encode_way, encode_way_raw_bytes,
+    encode_way_raw_bytes_with_locations, encode_way_with_locations,
 };
 use super::string_table::StringTable;
 
@@ -493,8 +494,8 @@ pub struct BlockBuilder {
     elem_scratch: Vec<u8>,
     packed_scratch: Vec<u8>, // per-field packed content (refs in location path, DenseInfo)
     packed_vals_scratch: Vec<u8>, // tag values packed encoding (dual-buffer single-pass)
-    packed_lat_scratch: Vec<u8>, // way location lat encoding (single-pass)
-    packed_lon_scratch: Vec<u8>, // way location lon encoding (single-pass)
+    packed_lat_scratch: Vec<u8>, // way latitudes or streamed relation member IDs
+    packed_lon_scratch: Vec<u8>, // way longitudes or streamed relation member types
     info_scratch: Vec<u8>,   // Info sub-message body
 
     // The block encode buffer. `take` and `lend_encoded` lend it and keep it
@@ -582,10 +583,8 @@ impl BlockBuilder {
     pub fn with_element_cap_prealloc(cap: std::num::NonZeroUsize, prealloc_bound: usize) -> Self {
         let cap = cap.get();
         let prealloc = cap.min(prealloc_bound.max(1));
-        // dense_keys_vals carries 2*N entries on average for tagless nodes
-        // (one key/val pair plus a 0 delimiter is more typical, but the
-        // historical pre-alloc is 2*cap; preserved here). saturating_mul
-        // guards against pathological caps near usize::MAX.
+        // Preserve the historical reservation for mixed tag runs.
+        // saturating_mul guards against pathological caps near usize::MAX.
         let kv_cap = prealloc.saturating_mul(2);
         BlockBuilder {
             string_table: StringTable::new(),
@@ -889,7 +888,6 @@ impl BlockBuilder {
         self.add_node_columns(id, decimicro_lat, decimicro_lon, tags, meta, columns);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
     fn add_node_columns<'t>(
         &mut self,
         id: i64,
@@ -910,6 +908,7 @@ impl BlockBuilder {
             DenseColumns::default()
         });
 
+        let preceding = self.dense_ids.len();
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
 
@@ -928,10 +927,10 @@ impl BlockBuilder {
         for (key, val) in tags {
             let key_idx = self.string_table.add(key);
             self.tag_key_indices.insert(key_idx);
-            self.dense_keys_vals.push(key_idx as i32);
-            self.dense_keys_vals.push(self.string_table.add(val) as i32);
+            let val_idx = self.string_table.add(val);
+            self.push_dense_tag(preceding, key_idx, val_idx);
         }
-        self.dense_keys_vals.push(0);
+        self.finish_dense_tags();
 
         // Metadata: `begin_dense_node` keeps every dense run homogeneous in
         // metadata presence, so a node without metadata never needs
@@ -1003,7 +1002,6 @@ impl BlockBuilder {
     }
 
     /// Add a node routed `NodeRoute::Partial` to the optional dense run.
-    #[allow(clippy::cast_possible_wrap)]
     fn add_optional_node<'t>(
         &mut self,
         id: i64,
@@ -1028,12 +1026,11 @@ impl BlockBuilder {
             let key_idx = self.string_table.add(key);
             let val_idx = self.string_table.add(val);
             self.tag_key_indices.insert(key_idx);
-            self.dense_keys_vals.push(key_idx as i32);
-            self.dense_keys_vals.push(val_idx as i32);
+            self.push_dense_tag(self.dense_ids.len(), key_idx, val_idx);
             protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_idx));
             protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_idx));
         }
-        self.dense_keys_vals.push(0);
+        self.finish_dense_tags();
         let raw = RawPartialMetadata {
             version: meta.version,
             timestamp: meta.timestamp,
@@ -1044,6 +1041,24 @@ impl BlockBuilder {
             visible: meta.visible,
         };
         self.push_optional_node(id, decimicro_lat, decimicro_lon, &raw);
+    }
+
+    /// A dense group can omit its tag column until its first tag. At that
+    /// point the earlier tagless slots need one delimiter each.
+    #[inline]
+    fn push_dense_tag(&mut self, preceding: usize, key: u32, value: u32) {
+        if self.dense_keys_vals.is_empty() {
+            self.dense_keys_vals.resize(preceding, 0);
+        }
+        self.dense_keys_vals.push(key.cast_signed());
+        self.dense_keys_vals.push(value.cast_signed());
+    }
+
+    #[inline]
+    fn finish_dense_tags(&mut self) {
+        if !self.dense_keys_vals.is_empty() {
+            self.dense_keys_vals.push(0);
+        }
     }
 
     /// Start or continue an optional run with `columns`. A mandatory run, or
@@ -1473,6 +1488,89 @@ impl BlockBuilder {
         self.count += 1;
     }
 
+    /// Encode members from a source block into reusable packed columns.
+    /// Tags and the user are interned ahead of roles, as in the slice encoder.
+    pub(crate) fn add_relation_partial_iter<'t, 'm>(
+        &mut self,
+        id: i64,
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+        members: impl IntoIterator<Item = Result<MemberData<'m>>>,
+        metadata: Option<&PartialMetadata<'_>>,
+    ) -> Result<()> {
+        if !self.can_add_relation() {
+            return Err(self.raw_refusal(BlockType::Relations, id));
+        }
+        encode_relation_prefix(
+            &mut self.string_table,
+            &mut self.elem_scratch,
+            &mut self.packed_scratch,
+            &mut self.packed_vals_scratch,
+            &mut self.info_scratch,
+            &mut self.tag_key_indices,
+            id,
+            tags,
+            metadata,
+        );
+        if let Err(err) = self.pack_relation_members(id, members) {
+            self.poison(err.to_string());
+            return Err(err);
+        }
+        for (field, data) in [
+            (8, &self.packed_scratch),
+            (9, &self.packed_lat_scratch),
+            (10, &self.packed_lon_scratch),
+        ] {
+            encode_bytes_field(&mut self.elem_scratch, field, data);
+        }
+        protohoggr::encode_bytes_field_always(&mut self.group_buf, 4, &self.elem_scratch);
+        self.block_type = Some(BlockType::Relations);
+        self.track_id(id);
+        self.count += 1;
+        Ok(())
+    }
+
+    fn pack_relation_members<'m>(
+        &mut self,
+        id: i64,
+        members: impl IntoIterator<Item = Result<MemberData<'m>>>,
+    ) -> Result<()> {
+        use protohoggr::{encode_varint, zigzag_encode_64};
+
+        self.packed_scratch.clear();
+        self.packed_lat_scratch.clear();
+        self.packed_lon_scratch.clear();
+        let mut last_id = 0;
+        let mut unknown = None;
+        for member in members {
+            let member = member?;
+            let kind = member.id.member_type();
+            if let MemberType::Unknown(raw) = kind {
+                unknown.get_or_insert(raw);
+                continue;
+            }
+            let role = self.string_table.add(member.role).cast_signed();
+            encode_varint(&mut self.packed_scratch, i64::from(role).cast_unsigned());
+            let member_id = member.id.id();
+            // PBF member deltas wrap at the signed boundary.
+            encode_varint(
+                &mut self.packed_lat_scratch,
+                zigzag_encode_64(member_id.wrapping_sub(last_id)),
+            );
+            last_id = member_id;
+            encode_varint(
+                &mut self.packed_lon_scratch,
+                u64::from(member_type_value(kind).cast_unsigned()),
+            );
+        }
+        if let Some(raw) = unknown {
+            return Err(crate::error::Error::invalid_data(format!(
+                "relation {id}: member type {raw} has no Relation.MemberType enum \
+                 value; encoding it would rewrite the member as a node",
+            )));
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Raw string indices, copied from a pre-seeded source block (apply-changes)
     // -----------------------------------------------------------------------
@@ -1845,6 +1943,7 @@ impl BlockBuilder {
         self.block_type = Some(BlockType::DenseNodes);
         self.begin_dense_node(metadata.map_or_else(DenseColumns::default, |m| m.columns));
 
+        let preceding = self.dense_ids.len();
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
         self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
@@ -1872,10 +1971,9 @@ impl BlockBuilder {
             self.tag_key_indices.insert(key_sid);
             // Both are below a table length, which a block's byte limit
             // keeps far below `i32::MAX`.
-            self.dense_keys_vals.push(key_sid.cast_signed());
-            self.dense_keys_vals.push(val_sid.cast_signed());
+            self.push_dense_tag(preceding, key_sid, val_sid);
         }
-        self.dense_keys_vals.push(0); // delimiter
+        self.finish_dense_tags();
 
         if let Some(meta) = metadata {
             self.add_dense_metadata_raw(meta);
@@ -2128,12 +2226,11 @@ impl BlockBuilder {
             self.tag_key_indices.insert(key_sid);
             // Below a table length, which a block's byte limit keeps far
             // below `i32::MAX`.
-            self.dense_keys_vals.push(key_sid.cast_signed());
-            self.dense_keys_vals.push(val_sid.cast_signed());
+            self.push_dense_tag(self.dense_ids.len(), key_sid, val_sid);
             protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_sid));
             protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_sid));
         }
-        self.dense_keys_vals.push(0);
+        self.finish_dense_tags();
         self.push_optional_node(id, decimicro_lat, decimicro_lon, meta);
     }
 
@@ -2712,13 +2809,16 @@ impl BlockBuilder {
             9,
             &self.dense_lons,
         );
-        // DenseNodes field 10: keys_vals (packed int32)
-        encode_packed_int32(
-            &mut self.group_buf,
-            &mut self.elem_scratch,
-            10,
-            &self.dense_keys_vals,
-        );
+        // DenseNodes field 10: keys_vals (packed int32). The same encoding
+        // supplies the optional run's size comparison, including wrappers.
+        if !self.dense_keys_vals.is_empty() {
+            encode_packed_int32(
+                &mut self.group_buf,
+                &mut self.elem_scratch,
+                10,
+                &self.dense_keys_vals,
+            );
+        }
 
         // Write PrimitiveBlock field 2 (PrimitiveGroup) holding PrimitiveGroup
         // field 2 (DenseNodes, the body in group_buf). Both lengths follow
@@ -3096,6 +3196,114 @@ mod tests {
     };
     use crate::{MemberId, MemberType, PrimitiveBlock};
     use protohoggr::encode_bytes_field;
+
+    #[test]
+    fn dense_tag_column_round_trips() -> crate::Result<()> {
+        use crate::read::wire::{Cursor, WireGroup};
+
+        type Tags = [Option<(&'static str, &'static str)>; 3];
+        let tag = ("key", "value");
+        let cases: [(Tags, &[u8]); 4] = [
+            ([None, None, None], &[]),
+            ([None, None, Some(tag)], &[0, 0, 1, 2, 0]),
+            ([Some(tag), None, None], &[1, 2, 0, 0, 0]),
+            ([Some(tag), None, Some(tag)], &[1, 2, 0, 0, 1, 2, 0]),
+        ];
+        let mut bb = BlockBuilder::new();
+        for (tags, expected_column) in cases {
+            for (id, tag) in (1..).zip(tags) {
+                bb.add_node(id, 0, 0, tag, None);
+            }
+            let bytes = bb.take()?.expect("block").to_vec();
+            let mut block_wire = Cursor::new(&bytes);
+            assert_eq!(block_wire.read_tag()?.map(|(field, _)| field), Some(1));
+            block_wire.read_len_delimited()?;
+            assert_eq!(block_wire.read_tag()?.map(|(field, _)| field), Some(2));
+            let group = WireGroup::new(block_wire.read_len_delimited()?);
+            let mut dense = Cursor::new(group.dense()?.expect("dense group"));
+            let mut column = None;
+            while let Some((field, wire_type)) = dense.read_tag()? {
+                if field == 10 {
+                    assert!(column.is_none());
+                    column = Some(dense.read_len_delimited()?);
+                } else {
+                    dense.skip_field(wire_type)?;
+                }
+            }
+            assert_eq!(
+                column,
+                (!expected_column.is_empty()).then_some(expected_column)
+            );
+
+            let block = PrimitiveBlock::from_vec(bytes)?;
+            let group = block.groups().next().expect("group");
+            let decoded: Vec<_> = group
+                .dense_nodes()
+                .map(|node| (node.id(), node.tags().collect::<Vec<_>>()))
+                .collect();
+            let expected: Vec<_> = (1..)
+                .zip(tags.map(|tag| tag.into_iter().collect::<Vec<_>>()))
+                .collect();
+            assert_eq!(decoded, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_dense_tag_column_breaks_optional_run_size_tie() -> crate::Result<()> {
+        let meta = PartialMetadata {
+            version: Some(1),
+            visible: Some(true),
+            ..PartialMetadata::default()
+        };
+        let mut bb = BlockBuilder::new();
+        for id in 1..=2 {
+            bb.add_node_partial(id, 0, 0, [], Some(&meta));
+        }
+        // With a two-byte tag column and its prefix the forms tie at 30
+        // bytes. Omitting the column makes the dense group the smaller one.
+        let block = PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
+        assert_eq!(node_ids(&block), [(1, true), (2, true)]);
+        Ok(())
+    }
+
+    #[cfg(feature = "commands")]
+    #[test]
+    fn streamed_relation_members_match_slice_encoding() -> crate::Result<()> {
+        let members = [
+            MemberData {
+                id: MemberId::Node(i64::MAX),
+                role: "role",
+            },
+            MemberData {
+                id: MemberId::Way(i64::MIN),
+                role: "",
+            },
+            MemberData {
+                id: MemberId::Relation(-1),
+                role: "role",
+            },
+        ];
+        let meta = PartialMetadata {
+            version: Some(1),
+            user: Some("user"),
+            ..PartialMetadata::default()
+        };
+        let tags = [("key", "value")];
+        let mut streamed = BlockBuilder::new();
+        let mut sliced = BlockBuilder::new();
+        for (id, members) in [(1, members.as_slice()), (2, &[]), (3, members.as_slice())] {
+            streamed.add_relation_partial_iter(
+                id,
+                tags,
+                members.iter().copied().map(Ok),
+                Some(&meta),
+            )?;
+            sliced.add_relation_partial(id, tags, members, Some(&meta));
+        }
+        assert_eq!(streamed.take()?, sliced.take()?);
+        Ok(())
+    }
 
     #[test]
     fn partial_metadata_preserves_absence_zero_and_node_order() -> crate::Result<()> {

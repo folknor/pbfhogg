@@ -495,7 +495,9 @@ pub(super) fn write_base_way_local_with_locations<O: BlockSink + ?Sized>(
     } = &mut **scratch;
     let has_coords = !(way.lat_data().is_empty() && way.lon_data().is_empty());
     let mut reencode = has_coords && !framing.is_default();
-    if !probe.is_empty() {
+    let eval = if probe.is_empty() {
+        None
+    } else {
         let eval = evaluate_way(
             way.refs_data(),
             way.lat_data(),
@@ -506,7 +508,8 @@ pub(super) fn write_base_way_local_with_locations<O: BlockSink + ?Sized>(
         )?;
         tally.deleted_refs += eval.deleted_refs;
         reencode |= eval.stale_refs > 0;
-    }
+        Some(eval)
+    };
     let info = output_info(
         crate::ElementKind::Way,
         way.id(),
@@ -515,12 +518,20 @@ pub(super) fn write_base_way_local_with_locations<O: BlockSink + ?Sized>(
         info,
     )?;
     if reencode {
+        let (ref_count, hits) = match eval {
+            Some(eval) => (eval.ref_count, hits.as_slice()),
+            None => (
+                crate::read::block::packed_varint_count(way.refs_data())
+                    .map_err(|_| super::refresh::refs_err())?,
+                &[][..],
+            ),
+        };
         let changed = refreshed_locations(
-            way.refs_data(),
+            ref_count,
             way.lat_data(),
             way.lon_data(),
             *framing,
-            probe,
+            hits,
             lats,
             lons,
         )?;

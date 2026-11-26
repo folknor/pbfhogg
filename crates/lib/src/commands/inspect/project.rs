@@ -9,7 +9,7 @@
 //! one validated element, decoded with the readers' own decoders and
 //! arithmetic (wrapping delta sums, `offset + granularity * raw` wrapping,
 //! the packed iterators' narrowing), so it is the value the element walk
-//! gives. One check goes beyond block construction: under `--extended` each
+//! gives. Extended reports and their get keys do one additional check: each
 //! reconstructed timestamp is scaled by `date_granularity` exactly
 //! (`read::claims::scale_milli_timestamp`), and a scaling that overflows
 //! refuses the blob after its validation succeeds, as every other output
@@ -28,6 +28,11 @@ use crate::read::wire::{
 };
 use crate::{ElementKind, Result};
 
+use super::keys::InspectGetNeed;
+use super::keys::InspectGetNeed::{
+    Bounds, Changesets, Extended, Header, NegativeIds, OrderedIds, Scan, TimestampCoverage,
+    Timestamps, Uids, Users, Versions,
+};
 use super::types::{BlockKind, ScanState, TypeIdRange, UserNames, classify_block, count_metadata};
 
 /// Scan one decompressed data block into a fresh [`ScanState`] with the
@@ -42,16 +47,15 @@ pub(super) fn scan_block_buffer(
     buffer: BlockBuffer<'_>,
     show_id_ranges: bool,
     show_locations: bool,
-    extended: bool,
+    need: InspectGetNeed,
 ) -> Result<(ScanState, BlockKind, u64)> {
     let (mut projection, accepted) = buffer.project(|fields, st| {
-        let state = ScanState::new(show_id_ranges, show_locations, extended);
-        let users = state
-            .extended
-            .is_some()
+        let state = ScanState::for_need(show_id_ranges, show_locations, need);
+        let users = matches!(need, Extended | Users)
             .then(|| UserNames::from_lengths(st.iter().map(|&(_, len)| len as usize)));
         InspectProjection {
             state,
+            need,
             fields: *fields,
             st_len: st.len(),
             users,
@@ -76,9 +80,10 @@ pub(super) fn scan_block_buffer(
 
 struct InspectProjection {
     state: ScanState,
+    need: InspectGetNeed,
     fields: BlockFields,
     st_len: usize,
-    /// Built only for `--extended`, which counts user names.
+    /// Built only when the requested statistic counts user names.
     users: Option<UserNames>,
     /// The current group's dense and plain node IDs, joined dense first.
     dense_ids: TypeIdRange,
@@ -115,15 +120,14 @@ impl InspectProjection {
 
     /// One plain element's metadata census, as `Info` reads it.
     fn census_info(&mut self, info: Option<&WireInfo>) {
-        let (Some(ext), Some(users)) = (self.state.extended.as_mut(), self.users.as_ref()) else {
+        let Some(ext) = self.state.extended.as_mut() else {
             return;
         };
-        ext.metadata.total += 1;
-        let date_granularity = i64::from(self.fields.date_granularity);
+        ext.metadata.total += u64::from(self.need.collects_metadata());
         let Some(i) = info else {
-            count_metadata(ext, 0, 0, 0, 0, false);
             return;
         };
+        let date_granularity = i64::from(self.fields.date_granularity);
         let millis = match i
             .timestamp
             .map(|ts| scale_milli_timestamp(ts, date_granularity))
@@ -135,14 +139,28 @@ impl InspectProjection {
                 0
             }
         };
-        count_metadata(
-            ext,
-            i.version.unwrap_or(0),
-            millis,
-            i.changeset.unwrap_or(0),
-            i.uid.unwrap_or(0),
-            i.user_sid.is_some_and(|sid| users.names(sid)),
-        );
+        let named_user = || {
+            self.users
+                .as_ref()
+                .is_some_and(|users| i.user_sid.is_some_and(|sid| users.names(sid)))
+        };
+        match self.need {
+            Extended => count_metadata(
+                ext,
+                i.version.unwrap_or(0),
+                millis,
+                i.changeset.unwrap_or(0),
+                i.uid.unwrap_or(0),
+                named_user(),
+            ),
+            Timestamps => ext.record_timestamp(millis),
+            TimestampCoverage => ext.metadata.has_timestamp += u64::from(millis != 0),
+            Versions => ext.metadata.has_version += u64::from(i.version.unwrap_or(0) >= 1),
+            Changesets => ext.metadata.has_changeset += u64::from(i.changeset.unwrap_or(0) > 0),
+            Uids => ext.metadata.has_uid += u64::from(i.uid.unwrap_or(0) > 0),
+            Users => ext.metadata.has_user += u64::from(named_user()),
+            _ => {}
+        }
     }
 
     /// The dense nodes' tagged count: a node is tagged when the first pair
@@ -173,29 +191,44 @@ impl InspectProjection {
     }
 
     fn dense_census(&mut self, info: &WireDenseInfo<'_>, ids: usize) {
-        let (Some(ext), Some(users)) = (self.state.extended.as_mut(), self.users.as_ref()) else {
+        self.dense_timestamp_claims(info, ids);
+        let Some(ext) = self.state.extended.as_mut() else {
             return;
         };
         let m = &mut ext.metadata;
-        m.has_version += PackedInt32Iter::new(info.version_data)
-            .take(ids)
-            .filter(|&v| v >= 1)
-            .count() as u64;
-        let mut changeset: i64 = 0;
-        for delta in PackedSint64Iter::new(info.changeset_data).take(ids) {
-            changeset = changeset.wrapping_add(delta);
-            m.has_changeset += u64::from(changeset > 0);
+        if matches!(self.need, Extended | Versions) {
+            m.has_version += PackedInt32Iter::new(info.version_data)
+                .take(ids)
+                .filter(|&v| v >= 1)
+                .count() as u64;
         }
-        let mut uid: i32 = 0;
-        for delta in PackedSint32Iter::new(info.uid_data).take(ids) {
-            uid = uid.wrapping_add(delta);
-            m.has_uid += u64::from(uid > 0);
+        if matches!(self.need, Extended | Changesets) {
+            let mut changeset: i64 = 0;
+            for delta in PackedSint64Iter::new(info.changeset_data).take(ids) {
+                changeset = changeset.wrapping_add(delta);
+                m.has_changeset += u64::from(changeset > 0);
+            }
         }
-        let mut sid: i32 = 0;
-        for delta in PackedSint32Iter::new(info.user_sid_data).take(ids) {
-            sid = sid.wrapping_add(delta);
-            m.has_user += u64::from(users.names(sid));
+        if matches!(self.need, Extended | Uids) {
+            let mut uid: i32 = 0;
+            for delta in PackedSint32Iter::new(info.uid_data).take(ids) {
+                uid = uid.wrapping_add(delta);
+                m.has_uid += u64::from(uid > 0);
+            }
         }
+        if let Some(users) = &self.users {
+            let mut sid: i32 = 0;
+            for delta in PackedSint32Iter::new(info.user_sid_data).take(ids) {
+                sid = sid.wrapping_add(delta);
+                m.has_user += u64::from(users.names(sid));
+            }
+        }
+    }
+
+    fn dense_timestamp_claims(&mut self, info: &WireDenseInfo<'_>, ids: usize) {
+        let Some(ext) = self.state.extended.as_mut() else {
+            return;
+        };
         let date_granularity = i64::from(self.fields.date_granularity);
         let mut timestamp: i64 = 0;
         // The delta sum wraps, as every reader reconstructs it (the writer
@@ -209,7 +242,61 @@ impl InspectProjection {
                 }
                 continue;
             };
-            ext.record_timestamp(millis);
+            match self.need {
+                Extended | Timestamps => ext.record_timestamp(millis),
+                TimestampCoverage => ext.metadata.has_timestamp += u64::from(millis != 0),
+                _ => {}
+            }
+        }
+    }
+
+    fn dense_bounds(&mut self, dense: &WireDenseNodes<'_>, ids: usize) {
+        // Each coordinate is scaled before its extremum: raw extrema do not
+        // survive wrapping or a negative granularity.
+        let (lat_offset, lon_offset) = (self.fields.lat_offset, self.fields.lon_offset);
+        let mut lat_range = (i64::MAX, i64::MIN);
+        let mut raw: i64 = 0;
+        for delta in PackedSint64Iter::new(dense.lat_data).take(ids) {
+            raw = raw.wrapping_add(delta);
+            let nano = self.nano(lat_offset, raw);
+            lat_range = (lat_range.0.min(nano), lat_range.1.max(nano));
+        }
+        let mut lon_range = (i64::MAX, i64::MIN);
+        raw = 0;
+        for delta in PackedSint64Iter::new(dense.lon_data).take(ids) {
+            raw = raw.wrapping_add(delta);
+            let nano = self.nano(lon_offset, raw);
+            lon_range = (lon_range.0.min(nano), lon_range.1.max(nano));
+        }
+        if ids > 0
+            && let Some(ext) = self.state.extended.as_mut()
+        {
+            let bb = &mut ext.data_bbox;
+            bb.min_lat = bb.min_lat.min(lat_range.0);
+            bb.max_lat = bb.max_lat.max(lat_range.1);
+            bb.min_lon = bb.min_lon.min(lon_range.0);
+            bb.max_lon = bb.max_lon.max(lon_range.1);
+        }
+    }
+
+    fn observe_negative_id(&mut self, id: i64) {
+        if self.need == NegativeIds
+            && let Some(ext) = self.state.extended.as_mut()
+        {
+            ext.has_negative_ids |= id < 0;
+        }
+    }
+
+    fn dense_negative_ids(&mut self, id_data: &[u8], ids: usize) {
+        if self.need == NegativeIds
+            && let Some(ext) = self.state.extended.as_mut()
+            && !ext.has_negative_ids
+        {
+            let mut id: i64 = 0;
+            ext.has_negative_ids = PackedSint64Iter::new(id_data).take(ids).any(|delta| {
+                id = id.wrapping_add(delta);
+                id < 0
+            });
         }
     }
 }
@@ -222,24 +309,28 @@ impl GroupProjection for InspectProjection {
 
     fn node(&mut self, node: &WireNode<'_>, info: Option<&WireInfo>) {
         self.state.node_count += 1;
-        if self.first_tag_resolves(node.keys_data, node.vals_data) {
+        self.observe_negative_id(node.id);
+        if matches!(self.need, Header | Scan | Extended)
+            && self.first_tag_resolves(node.keys_data, node.vals_data)
+        {
             self.state.tagged_node_count += 1;
         }
         if self.state.node_ids.is_some() {
             self.plain_ids.update(node.id);
         }
-        if self.state.extended.is_some() {
+        if matches!(self.need, Extended | Bounds) {
             let lat = self.nano(self.fields.lat_offset, node.lat);
             let lon = self.nano(self.fields.lon_offset, node.lon);
             if let Some(ext) = self.state.extended.as_mut() {
                 ext.data_bbox.update(lat, lon);
             }
-            self.census_info(info);
         }
+        self.census_info(info);
     }
 
     fn way(&mut self, way: &WireWay<'_>, info: Option<&WireInfo>) {
         self.state.way_count += 1;
+        self.observe_negative_id(way.id);
         if let Some(ids) = self.state.way_ids.as_mut() {
             ids.update(way.id);
         }
@@ -260,6 +351,7 @@ impl GroupProjection for InspectProjection {
 
     fn relation(&mut self, relation: &WireRelation<'_>, info: Option<&WireInfo>) {
         self.state.relation_count += 1;
+        self.observe_negative_id(relation.id);
         if let Some(ids) = self.state.relation_ids.as_mut() {
             ids.update(relation.id);
         }
@@ -268,7 +360,10 @@ impl GroupProjection for InspectProjection {
 
     fn dense(&mut self, dense: &WireDenseNodes<'_>, ids: usize, info: Option<&WireDenseInfo<'_>>) {
         self.state.node_count += ids as u64;
-        self.state.tagged_node_count += self.tagged_dense(dense.keys_vals_data);
+        self.dense_negative_ids(dense.id_data, ids);
+        if matches!(self.need, Header | Scan | Extended) {
+            self.state.tagged_node_count += self.tagged_dense(dense.keys_vals_data);
+        }
         if self.state.node_ids.is_some() {
             let mut id: i64 = 0;
             for delta in PackedSint64Iter::new(dense.id_data).take(ids) {
@@ -276,43 +371,25 @@ impl GroupProjection for InspectProjection {
                 self.dense_ids.update(id);
             }
         }
-        if self.state.extended.is_none() {
-            return;
+        if matches!(self.need, Extended | Bounds) {
+            self.dense_bounds(dense, ids);
         }
-        // Each coordinate is scaled before its extremum: raw extrema do not
-        // survive wrapping or a negative granularity.
-        let (lat_offset, lon_offset) = (self.fields.lat_offset, self.fields.lon_offset);
-        let mut lat_range = (i64::MAX, i64::MIN);
-        let mut raw: i64 = 0;
-        for delta in PackedSint64Iter::new(dense.lat_data).take(ids) {
-            raw = raw.wrapping_add(delta);
-            let nano = self.nano(lat_offset, raw);
-            lat_range = (lat_range.0.min(nano), lat_range.1.max(nano));
-        }
-        let mut lon_range = (i64::MAX, i64::MIN);
-        raw = 0;
-        for delta in PackedSint64Iter::new(dense.lon_data).take(ids) {
-            raw = raw.wrapping_add(delta);
-            let nano = self.nano(lon_offset, raw);
-            lon_range = (lon_range.0.min(nano), lon_range.1.max(nano));
-        }
-        if let Some(ext) = self.state.extended.as_mut() {
+        if self.need.collects_metadata()
+            && let Some(ext) = self.state.extended.as_mut()
+        {
             ext.metadata.total += ids as u64;
-            if ids > 0 {
-                let bb = &mut ext.data_bbox;
-                bb.min_lat = bb.min_lat.min(lat_range.0);
-                bb.max_lat = bb.max_lat.max(lat_range.1);
-                bb.min_lon = bb.min_lon.min(lon_range.0);
-                bb.max_lon = bb.max_lon.max(lon_range.1);
-            }
         }
-        if let Some(info) = info {
+        if self.need.validates_timestamps()
+            && let Some(info) = info
+        {
             self.dense_census(info, ids);
         }
     }
 
     fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
-        self.state.kind_order.group(kinds);
+        if matches!(self.need, Header | Scan | Extended | OrderedIds) {
+            self.state.kind_order.group(kinds);
+        }
         if let Some(ids) = self.state.node_ids.as_mut() {
             ids.append(&self.dense_ids);
             ids.append(&self.plain_ids);
@@ -345,7 +422,8 @@ mod tests {
         ext: bool,
     ) -> crate::Result<((ScanState, BlockKind, u64), ())> {
         let buffer = crate::read::block::BlockBuffer::new(bytes.to_vec(), None, st, gr, None);
-        super::scan_block_buffer(buffer, ids, locs, ext).map(|scan| (scan, ()))
+        let need = if ext { super::Extended } else { super::Scan };
+        super::scan_block_buffer(buffer, ids, locs, need).map(|scan| (scan, ()))
     }
 
     fn range(r: Option<&TypeIdRange>) -> String {
@@ -667,6 +745,37 @@ mod tests {
         }
     }
 
+    fn project_need(bytes: &[u8], need: super::InspectGetNeed) -> crate::Result<ScanState> {
+        let (mut st, mut gr) = (Vec::new(), Vec::new());
+        let buffer =
+            crate::read::block::BlockBuffer::new(bytes.to_vec(), None, &mut st, &mut gr, None);
+        super::scan_block_buffer(buffer, false, false, need).map(|(state, _, _)| state)
+    }
+
+    #[test]
+    fn timestamp_projection_skips_other_collectors() {
+        for (label, bytes) in fixtures().into_iter().chain(wire_fixtures()) {
+            let expected = project_need(&bytes, super::Extended)
+                .unwrap()
+                .extended
+                .unwrap();
+            let timestamps = project_need(&bytes, super::Timestamps).unwrap();
+            assert!(timestamps.node_ids.is_none(), "{label}");
+            assert_eq!(timestamps.tagged_node_count, 0, "{label}");
+            let actual = timestamps.extended.unwrap();
+            assert!(!actual.data_bbox.has_data(), "{label}");
+            assert_eq!(actual.min_timestamp, expected.min_timestamp, "{label}");
+            assert_eq!(actual.max_timestamp, expected.max_timestamp, "{label}");
+            assert_eq!(
+                actual.has_timestamps(),
+                expected.has_timestamps(),
+                "{label}"
+            );
+            assert_eq!(actual.metadata.has_version, 0, "{label}");
+            assert_eq!(actual.metadata.has_user, 0, "{label}");
+        }
+    }
+
     /// The extended census scan of `bytes`: its refusal message, or its
     /// timestamp coverage and range.
     fn census(bytes: &[u8]) -> Result<(u64, i64, i64), String> {
@@ -715,6 +824,12 @@ mod tests {
         let dense = builder.take().unwrap().unwrap().to_vec();
         for (what, bytes) in [("plain", plain), ("dense versionless wrap to 0", dense)] {
             let refusal = census(&bytes).expect_err(what);
+            for need in [super::Timestamps, super::Bounds, super::Versions] {
+                match project_need(&bytes, need) {
+                    Err(e) => assert_eq!(e.to_string(), refusal, "{what} {need:?}"),
+                    Ok(_) => panic!("{what} {need:?} accepted an overflowing timestamp"),
+                }
+            }
             assert!(
                 refusal.contains("overflows i64 milliseconds"),
                 "{what}: {refusal}"

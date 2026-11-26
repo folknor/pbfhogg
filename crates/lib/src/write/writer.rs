@@ -715,7 +715,7 @@ impl PbfWriter<FileWriter> {
     /// with `--io-uring` (~1.49 GB/s of ~5 GB/s NVMe peak). The
     /// writer-thread still reorders items in global seq order; each
     /// WriteOp carries its final offset so pool workers run
-    /// `pwrite` / `copy_file_range(out_offset)` independently.
+    /// `pwrite`, `pwritev` or `copy_file_range(out_offset)` independently.
     pub fn to_path_parallel(
         path: &Path,
         compression: Compression,
@@ -1238,8 +1238,8 @@ impl<W: Write> PbfWriter<W> {
     /// Write multiple pre-framed raw blob chunks without concatenating them.
     ///
     /// Like [`write_raw_owned`](Self::write_raw_owned) but accepts a list of
-    /// owned chunks. The writer thread writes each chunk sequentially.
-    /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
+    /// owned chunks. Chunks are written in order and file backends can
+    /// submit them together with vectored I/O.
     pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
         let _call = self.cancel.call();
         let result = self

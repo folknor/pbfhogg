@@ -14,7 +14,7 @@
 //!    kind before it is closed and its upserts are all written. An item of a
 //!    later kind closes every kind from the open one up to its own
 //!    ([`close_kinds_before`]): flush the `copy_file_range` coalescer + the
-//!    `OwnedBytes` passthrough buffer, then write each closed kind's
+//!    frame buffers, then write each closed kind's
 //!    remaining upserts. This is what writes OSC creates for kinds the base
 //!    never holds, before its first blob or between two of its kinds. An
 //!    item of an earlier kind than the open one is refused as unsorted.
@@ -29,8 +29,8 @@
 //!    - [`DrainItem::OwnedBytes`]: flush copy-range coalescer; push
 //!      the frame into the passthrough chunk buffer for
 //!      `write_raw_chunks`.
-//!    - [`DrainItem::Rewritten`]: flush both coalescers; write each
-//!      worker-framed chunk with `write_raw_owned`, held in the item or,
+//!    - [`DrainItem::Rewritten`]: flush passthrough coalescers; batch
+//!      consecutive worker-framed chunks, held in the item or,
 //!      for a deferred blob, read from its stream until its end (the
 //!      main channel is not received meanwhile); advance the
 //!      cursor past `blob_osm_last_key(min_id, max_id)` (the
@@ -367,7 +367,8 @@ pub(super) fn run_drain(
             process_item(item, &cfg, &mut state, writer, &mut stats, counters)?;
             state.next_seq += 1;
             // After processing, so an item blocked handing output to the
-            // writer still counts against the window.
+            // writer still counts against the window. Buffered frames
+            // are bounded separately by the rewrite group cap.
             window.release();
         }
         #[cfg(pbfhogg_test_hooks)]
@@ -398,6 +399,7 @@ pub(super) fn run_drain(
             && node_end_seq.is_some_and(|end| state.next_seq >= end)
             && let Some(DrainLoc::Pending(pending)) = state.loc.take()
         {
+            state.rewrites.flush(writer, counters)?;
             // Taken and replaced in one step: a failed publication leaves
             // the drain through this `?`, never with the state left empty.
             state.loc = Some(DrainLoc::Published(pending.publish(
@@ -443,6 +445,7 @@ pub(super) fn run_drain(
     }
 
     // Final flush of any in-flight coalescers.
+    state.rewrites.flush(writer, counters)?;
     flush_copy_range(&mut state, &cfg, writer, counters)?;
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
 
@@ -501,6 +504,7 @@ struct DrainState<'a> {
     /// Coalesced `OwnedBytes` passthrough chunks. Flushed as a single
     /// `write_raw_chunks` when broken.
     passthrough_chunks: Vec<Vec<u8>>,
+    rewrites: RewriteGroup,
     /// `--locations-on-ways` state, `None` with the mode off: pending until
     /// the node→way barrier, then the published map, which the drain's own
     /// gap, transition and trailing creates are written against (workers
@@ -523,9 +527,65 @@ impl<'a> DrainState<'a> {
             creates,
             copy_range_run: None,
             passthrough_chunks: Vec::new(),
+            rewrites: RewriteGroup::default(),
             loc,
             order_watermark: crate::osm_id::OrderWatermark::default(),
         }
+    }
+}
+
+/// Pending worker-framed output. A frame larger than the byte cap is
+/// submitted alone. Neither cap needs to include the reorder window,
+/// which tracks items still waiting for dispatch.
+#[derive(Default)]
+struct RewriteGroup {
+    chunks: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl RewriteGroup {
+    fn push(
+        &mut self,
+        chunk: Vec<u8>,
+        writer: &mut PbfWriter<FileWriter>,
+        counters: &DrainCounters,
+    ) -> Result<()> {
+        use crate::tunables::{APPLY_CHANGES_REWRITE_GROUP_BYTES, WRITE_GROUP_MAX_CHUNKS};
+
+        if self.bytes + chunk.len() > APPLY_CHANGES_REWRITE_GROUP_BYTES {
+            self.flush(writer, counters)?;
+        }
+        self.bytes += chunk.len();
+        self.chunks.push(chunk);
+        if self.bytes >= APPLY_CHANGES_REWRITE_GROUP_BYTES
+            || self.chunks.len() == WRITE_GROUP_MAX_CHUNKS
+        {
+            self.flush(writer, counters)?;
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &mut self,
+        writer: &mut PbfWriter<FileWriter>,
+        counters: &DrainCounters,
+    ) -> Result<()> {
+        let count = self.chunks.len();
+        match count {
+            0 => return Ok(()),
+            1 => {
+                let chunk = self.chunks.pop().ok_or_else(|| {
+                    Error::internal("drain: missing frame in a singleton rewrite group")
+                })?;
+                writer.write_raw_owned(chunk)?;
+            }
+            _ => writer.write_raw_chunks(std::mem::take(&mut self.chunks))?,
+        }
+        self.bytes = 0;
+        counters
+            .rewrite_blocks_written
+            .fetch_add(count as u64, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -681,6 +741,7 @@ fn advance_to_kind(
         return Ok(());
     }
 
+    state.rewrites.flush(writer, counters)?;
     flush_copy_range(state, cfg, writer, counters)?;
     let had_chunks = !state.passthrough_chunks.is_empty();
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
@@ -722,6 +783,7 @@ fn handle_gap_creates(
     let len =
         upserts[cursor..].partition_point(|&id| crate::osm_id::osm_id_cmp(id, osm_first).is_lt());
     check_run_order(state, item_kind, &upserts[..cursor + len], cursor)?;
+    state.rewrites.flush(writer, counters)?;
     flush_copy_range(state, cfg, writer, counters)?;
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
     let loc = loc_mode(state.loc.as_ref());
@@ -837,6 +899,8 @@ fn dispatch_variant(
             }
             flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
 
+            state.rewrites.flush(writer, counters)?;
+
             let new_end = frame_start + frame_len as u64;
             match state.copy_range_run {
                 Some((run_start, run_end)) if run_end == frame_start => {
@@ -880,6 +944,7 @@ fn dispatch_variant(
             count,
             verbatim,
         } => {
+            state.rewrites.flush(writer, counters)?;
             // Flush the copy_range coalescer so on-disk order is right.
             flush_copy_range(state, cfg, writer, counters)?;
             // Workers copy one validated original frame here; sampled per
@@ -932,23 +997,14 @@ fn dispatch_variant(
             flush_copy_range(state, cfg, writer, counters)?;
             flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
             let mut rewrite_bytes: u64 = 0;
-            // P1.5: workers already framed each chunk. Drain ships
-            // them through `write_raw_owned` so the writer's
-            // rayon-spawn-per-block path (and its
-            // `pipeline_send_wait_ns` blowup) is bypassed entirely.
-            // Each chunk's kind is its output block's; placement above and
-            // the cursor use the input blob's `kind` and `id_range`.
-            // Taken only for a stream, so a held blob mints nothing.
+            // Frames are ready for the sink and bypass the writer's framing
+            // workers. Placement and cursor advancement use the input blob.
             let cancel = matches!(frames, RewrittenFrames::Stream(_))
                 .then(|| writer.cancel_token().permit());
             let mut write = |chunk: Vec<u8>| -> Result<()> {
                 rewrite_bytes += chunk.len() as u64;
                 stats.record_data_frame(chunk.len());
-                writer.write_raw_owned(chunk)?;
-                counters
-                    .rewrite_blocks_written
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                state.rewrites.push(chunk, writer, counters)
             };
             match frames {
                 RewrittenFrames::Held(chunks) => {
@@ -1189,5 +1245,45 @@ impl DrainLocations {
             map,
             _barrier_tx: barrier_tx,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::host::Executor;
+    use crate::tunables::APPLY_CHANGES_REWRITE_GROUP_BYTES;
+    use crate::writer::Compression;
+
+    #[test]
+    fn rewrite_group_caps_bytes_and_preserves_frame_order() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("rewrite-group.pbf");
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let mut writer =
+            PbfWriter::to_path_parallel(&path, Compression::None, &header, Executor::for_tests())
+                .unwrap();
+        let counters = DrainCounters::new();
+        let mut group = RewriteGroup::default();
+        group.push(vec![1, 2], &mut writer, &counters).unwrap();
+        group.push(vec![3], &mut writer, &counters).unwrap();
+        assert_eq!(counters.rewrite_blocks_written.load(Ordering::Relaxed), 0);
+
+        let oversized = vec![4; APPLY_CHANGES_REWRITE_GROUP_BYTES + 1];
+        group
+            .push(oversized.clone(), &mut writer, &counters)
+            .unwrap();
+        assert_eq!(counters.rewrite_blocks_written.load(Ordering::Relaxed), 3);
+        group.push(vec![5], &mut writer, &counters).unwrap();
+        group.flush(&mut writer, &counters).unwrap();
+        writer.flush().unwrap();
+
+        let metrics = &writer.cancel_token().metrics().writer;
+        assert_eq!(metrics.payload_raw_chunk_items.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.payload_raw_items.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.rewrite_blocks_written.load(Ordering::Relaxed), 4);
+        let expected = [&[1, 2, 3][..], oversized.as_slice(), &[5][..]].concat();
+        assert!(std::fs::read(path).unwrap().ends_with(&expected));
     }
 }

@@ -57,7 +57,7 @@ impl<T> Route<T> {
 /// `copy_file_range` is incompatible with the backend; workers pread the
 /// **full framed bytes** from `(frame_start, frame_len)` and emit an
 /// [`DrainItem::OwnedBytes`] carrying the complete frame, so the
-/// drain can forward via `write_raw_owned` without re-framing.
+/// drain can forward it without re-framing.
 pub(super) struct BlobDescriptor {
     /// Monotonic sequence number assigned by the scanner in file order.
     /// The drain's reorder buffer keys on this.
@@ -138,7 +138,7 @@ pub(super) enum DrainItem {
         index: BlobIndex,
     },
     /// A complete frame held in memory, which the drain writes via
-    /// `write_raw_owned` without re-framing. Two producers, both workers:
+    /// its passthrough chunk buffer. Two producers, both workers:
     ///
     /// - On the owned route (`--direct-io`), an indexed blob that leaves
     ///   unchanged - a scanner passthrough, a precise-check false positive,
@@ -167,10 +167,8 @@ pub(super) enum DrainItem {
     },
     /// Rewritten blob, with each output block already framed by the
     /// worker (compression + protobuf framing applied in-line via
-    /// `frame_blob_pipelined`). Drain calls `write_raw_owned` per
-    /// chunk - this bypasses the writer's per-block `rayon::spawn`
-    /// dispatch and the associated `writer_pipeline_send_wait_ns`
-    /// spike (P1.5 in the plan). Stats merge as before.
+    /// `frame_blob_pipelined`). The drain batches consecutive frames
+    /// for the writer, bypassing its per-block framing dispatch.
     Rewritten {
         seq: u64,
         /// The output blocks' frames, in output order.

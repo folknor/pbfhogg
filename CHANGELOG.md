@@ -4,6 +4,13 @@
 
 ### Breaking
 
+- **Geocode index format 10: rebuild existing indexes.** Each
+  interpolation section now stores its total length and per-segment prefix
+  lengths, so a query no longer rescans a section to place a number, and
+  an unresolved interpolation way is no longer written to the index (it
+  could never answer). Readers refuse format 9 and older; run
+  `build-geocode-index` again. Answers are unchanged.
+
 - **`IdSet::pre_allocate` reserves instead of allocating, and
   `IdSet::has_any` no longer turns true on a reservation alone.** Below
   ID 2^43 the range is made atomically writable without allocating it;
@@ -655,6 +662,18 @@
   groups.
 
 ### Changed
+
+- **A dense node group with no tags omits its `keys_vals` column.** Every
+  re-encoding command used to write one zero delimiter per node even when
+  no node in the group had a tag; such a group now carries no column,
+  which the PBF specification and libosmium both accept. Output bytes
+  change for tagless groups (element content does not), so a byte or hash
+  comparison against output of an earlier release differs.
+
+- **`geocode-query` answers points in parallel.** Queries run in ordered
+  batches on every core and each answer is serialized directly; the output
+  is byte-identical and is still written only once every query has
+  answered, so an interrupted run prints nothing.
 
 - **`merge-changes` and `tags-filter --input-kind osc` parse an OSC that is
   a regular file on their workers.** Each input's reader thread now only

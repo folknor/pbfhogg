@@ -5,7 +5,7 @@
 //! enum and the compiler optimizes away the match.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, IoSlice, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -70,6 +70,28 @@ impl FileWriter {
         })
     }
 
+    /// Write a group at the buffered file's current cursor. The flush
+    /// preserves the order with pending singles and cursor-based splices.
+    /// Direct I/O keeps its page-aligned buffer path.
+    pub(super) fn write_buffered_group(&mut self, chunks: &[Vec<u8>]) -> io::Result<bool> {
+        match &mut self.inner {
+            Inner::Buffered(writer) => {
+                writer.flush()?;
+                let mut file = writer.get_ref();
+                let metrics = &self.invocation.metrics().writer;
+                write_group_all(chunks, |slices| {
+                    let n = file.write_vectored(slices)?;
+                    metrics.buffered_write_calls.fetch_add(1, Relaxed);
+                    metrics.buffered_write_bytes.fetch_add(n as u64, Relaxed);
+                    Ok(n)
+                })?;
+                Ok(true)
+            }
+            #[cfg(feature = "linux-direct-io")]
+            Inner::Direct(_) => Ok(false),
+        }
+    }
+
     /// Flush buffered bytes and then `fsync` the file: finish *and* make
     /// durable.
     ///
@@ -100,6 +122,36 @@ impl FileWriter {
         };
         Ok(result?)
     }
+}
+
+/// Write borrowed buffers in bounded iovec batches. Consume partial
+/// writes across slice boundaries and retry interrupted writes in place.
+pub(super) fn write_group_all(
+    chunks: &[Vec<u8>],
+    mut write: impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
+) -> io::Result<()> {
+    use crate::tunables::WRITE_GROUP_MAX_CHUNKS;
+
+    for batch in chunks.chunks(WRITE_GROUP_MAX_CHUNKS) {
+        let mut slices = [IoSlice::new(&[]); WRITE_GROUP_MAX_CHUNKS];
+        let mut len = 0;
+        for chunk in batch.iter().filter(|chunk| !chunk.is_empty()) {
+            slices[len] = IoSlice::new(chunk);
+            len += 1;
+        }
+        let mut remaining = &mut slices[..len];
+        // loop-ends: each successful write consumes bytes; errors other
+        // than Interrupted return immediately
+        while !remaining.is_empty() {
+            match write(remaining) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => IoSlice::advance_slices(&mut remaining, n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `fsync` a buffered output through the writer-metrics funnel, treating
@@ -222,6 +274,59 @@ mod tests {
     use super::FileWriter;
     use std::io::Write;
     use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn vectored_writes_retry_and_advance_across_chunks() {
+        use crate::tunables::WRITE_GROUP_MAX_CHUNKS;
+        use std::io;
+
+        let mut chunks = vec![b"ab".to_vec(), Vec::new(), b"cdef".to_vec()];
+        chunks.extend((0..WRITE_GROUP_MAX_CHUNKS).map(|_| b"x".to_vec()));
+        let expected = chunks.concat();
+        let mut actual = Vec::new();
+        let mut interrupted = false;
+        super::write_group_all(&chunks, |slices| {
+            assert!(slices.len() <= WRITE_GROUP_MAX_CHUNKS);
+            if !interrupted {
+                interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let start = actual.len();
+            actual.extend(
+                slices
+                    .iter()
+                    .flat_map(|slice| slice.iter().copied())
+                    .take(3),
+            );
+            Ok(actual.len() - start)
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
+
+        let err = super::write_group_all(&chunks, |_| Ok(0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffered_group_keeps_cursor_order() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("buffered-group.bin");
+        let token = crate::host::Call::detached();
+        let mut writer = FileWriter::buffered_in(&path, &token).unwrap();
+        writer.write_all(b"before").unwrap();
+        let calls = &token.metrics().writer.buffered_write_calls;
+        let before = calls.load(Relaxed);
+        assert!(
+            writer
+                .write_buffered_group(&[b"first".to_vec(), b"second".to_vec()])
+                .unwrap()
+        );
+        assert_eq!(calls.load(Relaxed) - before, 1);
+        writer.write_all(b"after").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"beforefirstsecondafter");
+    }
 
     /// `Write::flush` must push bytes onward, and must not `fsync`.
     ///

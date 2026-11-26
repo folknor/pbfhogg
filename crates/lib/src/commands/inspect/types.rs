@@ -538,9 +538,10 @@ impl ExtendedStats {
         self.metadata.has_timestamp > 0
     }
 
-    /// Fold in a later blob's stats. `objects_ordered` and
-    /// `has_negative_ids` are decided after the scan, so they are not merged.
+    /// Fold in a later blob's stats. Full reports derive the ID predicates
+    /// after the scan. A negative-ID query folds its per-blob predicate here.
     fn append(&mut self, part: &ExtendedStats) {
+        self.has_negative_ids |= part.has_negative_ids;
         self.min_timestamp = self.min_timestamp.min(part.min_timestamp);
         self.max_timestamp = self.max_timestamp.max(part.max_timestamp);
         let (bb, pb) = (&mut self.data_bbox, &part.data_bbox);
@@ -617,6 +618,24 @@ impl ScanState {
             },
             kind_order: KindOrder::new(),
         }
+    }
+
+    pub(super) fn for_need(
+        show_id_ranges: bool,
+        show_locations: bool,
+        need: super::keys::InspectGetNeed,
+    ) -> Self {
+        use super::keys::InspectGetNeed::{Extended, OrderedIds};
+
+        let mut state = Self::new(
+            show_id_ranges || need == OrderedIds,
+            show_locations,
+            need == Extended,
+        );
+        if need.validates_timestamps() && state.extended.is_none() {
+            state.extended = Some(ExtendedStats::new());
+        }
+        state
     }
 
     /// Append `part`, the state of one later data blob scanned on its own

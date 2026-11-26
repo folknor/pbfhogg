@@ -9,8 +9,11 @@
 // their gzip member layouts differ (single stream, per-input members, ordered
 // parallel chunks).
 
-use quick_xml::Writer;
-use quick_xml::events::{BytesEnd, BytesStart, Event};
+#[cfg(test)]
+use quick_xml::{
+    Writer,
+    events::{BytesEnd, BytesStart, Event},
+};
 
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::{ElementKind, MemberId};
@@ -87,6 +90,7 @@ pub(crate) fn in_element(kind: ElementKind, id: i64) -> impl FnOnce(crate::Error
 /// writes the five markup characters and `&#9;` / `&#10;` / `&#13;`, the
 /// same bytes [`append_attr_escaped`] writes. A character XML cannot carry
 /// is refused ([`check_xml_chars`]).
+#[cfg(test)]
 fn push_attribute_escaped<'a>(
     elem: &mut BytesStart<'a>,
     key: &'a str,
@@ -107,8 +111,7 @@ pub(crate) fn append_attr(content: &mut String, key: &str, value: &str) {
     content.push('"');
 }
 
-/// Append ` key="n"`: an integer needs no escaping, and `to_string`'s
-/// spelling is the writers'.
+/// Append a decimal integer attribute directly into the existing buffer.
 pub(crate) fn append_int_attr(content: &mut String, key: &str, n: i64) {
     use std::fmt::Write as _;
     content.push(' ');
@@ -118,7 +121,7 @@ pub(crate) fn append_int_attr(content: &mut String, key: &str, n: i64) {
     content.push('"');
 }
 
-/// Append ` key="value"` as [`push_attribute_escaped`] writes it: escaped,
+/// Append ` key="value"` with quick-xml attribute escaping,
 /// with newline, carriage return and tab as character references, and a
 /// character XML cannot carry refused ([`check_xml_chars`]). This is the
 /// OSC re-emitters' one user-text boundary: tags, roles and every metadata
@@ -161,8 +164,7 @@ pub(crate) fn append_attr_escaped(
 // raw version and its writer filters it. A common element trait must preserve
 // those distinctions, attribute order, empty-element shape and scratch reuse;
 // converting borrowed elements to owned strings would add per-element work to
-// the measured diff/derive output path. Share the tag event loop below without
-// changing either metadata representation or the emitted XML event sequence.
+// the measured diff/derive output path.
 //
 // Owned element types - Vec fields are not converted to Box<[T]> because these
 // are low-volume types (derive_changes/diff output), not hot-path allocations.
@@ -431,16 +433,6 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: &[(String, String)],
 ) -> crate::Result<()> {
-    write_borrowed_tags_xml(writer, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-}
-
-/// The tag event loop. A block's tag strings always resolve (block
-/// construction refuses an index past the string table), so the list is
-/// never shortened.
-fn write_borrowed_tags_xml<'a, W: std::io::Write>(
-    writer: &mut Writer<W>,
-    tags: impl Iterator<Item = (&'a str, &'a str)>,
-) -> crate::Result<()> {
     for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
         push_attribute_escaped(&mut tag, "k", k)?;
@@ -453,6 +445,87 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 // ---------------------------------------------------------------------------
 // Borrowed element XML writing - zero-clone path for derive_changes
 // ---------------------------------------------------------------------------
+
+/// Reuse one tag buffer across elements and children, and one coordinate
+/// buffer across both axes. Each tag is validated before it is written.
+#[derive(Default)]
+pub(crate) struct ElementXmlScratch {
+    tag: String,
+    coord: String,
+}
+
+impl ElementXmlScratch {
+    fn start(&mut self, name: &str) {
+        self.tag.clear();
+        self.tag.push('<');
+        self.tag.push_str(name);
+    }
+
+    fn start_node(&mut self, id: i64, lat: i32, lon: i32) {
+        self.start("node");
+        append_int_attr(&mut self.tag, "id", id);
+        for (key, value) in [("lat", lat), ("lon", lon)] {
+            format_coord(&mut self.coord, from_decimicro(value));
+            append_raw_attr(&mut self.tag, key, &self.coord);
+        }
+    }
+
+    fn write(&mut self, out: &mut impl std::io::Write, suffix: &str) -> crate::Result<()> {
+        self.tag.push_str(suffix);
+        out.write_all(self.tag.as_bytes())?;
+        Ok(())
+    }
+}
+
+fn append_raw_attr(tag: &mut String, key: &str, value: &str) {
+    tag.push(' ');
+    tag.push_str(key);
+    tag.push_str("=\"");
+    tag.push_str(value);
+    tag.push('"');
+}
+
+fn append_user_attr(tag: &mut String, key: &str, value: &str) -> crate::Result<()> {
+    check_xml_chars(key, value)?;
+    tag.push(' ');
+    tag.push_str(key);
+    tag.push_str("=\"");
+    let mut start = 0;
+    for (i, byte) in value.bytes().enumerate() {
+        let escaped = match byte {
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'&' => "&amp;",
+            b'\'' => "&apos;",
+            b'"' => "&quot;",
+            b'\t' => "&#9;",
+            b'\n' => "&#10;",
+            b'\r' => "&#13;",
+            _ => continue,
+        };
+        // Every escaped byte is ASCII and therefore a UTF-8 boundary.
+        tag.push_str(&value[start..i]);
+        tag.push_str(escaped);
+        start = i + 1;
+    }
+    tag.push_str(&value[start..]);
+    tag.push('"');
+    Ok(())
+}
+
+fn write_borrowed_tags_xml<'a>(
+    out: &mut impl std::io::Write,
+    scratch: &mut ElementXmlScratch,
+    tags: impl Iterator<Item = (&'a str, &'a str)>,
+) -> crate::Result<()> {
+    for (k, v) in tags {
+        scratch.start("tag");
+        append_user_attr(&mut scratch.tag, "k", k)?;
+        append_user_attr(&mut scratch.tag, "v", v)?;
+        scratch.write(out, "/>")?;
+    }
+    Ok(())
+}
 
 /// Emit the metadata attribute set from a borrowed element's info fields.
 ///
@@ -489,8 +562,8 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 /// on every node of a pbfhogg-written file and print the same element
 /// differently by representation.
 #[allow(clippy::too_many_arguments)]
-fn push_info_attrs(
-    elem: &mut BytesStart<'_>,
+fn append_info_attrs(
+    tag: &mut String,
     kind: ElementKind,
     id: i64,
     version: Option<i32>,
@@ -501,8 +574,7 @@ fn push_info_attrs(
     visible: Option<bool>,
 ) -> crate::Result<()> {
     if let Some(version) = version {
-        let v_str = version.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+        append_int_attr(tag, "version", i64::from(version));
     }
     // The claim is scaled exactly; an overflow is refused rather than
     // printed as the wrapped date.
@@ -511,6 +583,8 @@ fn push_info_attrs(
         // Floor, not truncate, so a pre-1970 millisecond timestamp lands in
         // the right second. OSC keeps whole seconds because pbfhogg's own
         // OSC reader parses only `YYYY-MM-DDTHH:MM:SSZ`.
+        // Keep the shared calendar formatter so the OSC spelling and year
+        // bounds stay in sync with other commands.
         let ts = crate::commands::format_rfc3339_utc(milli_timestamp.div_euclid(1000)).map_err(
             |err| {
                 crate::Error::invalid_data_from(err).context(format!(
@@ -519,23 +593,21 @@ fn push_info_attrs(
                 ))
             },
         )?;
-        elem.push_attribute(("timestamp", ts.as_str()));
+        append_raw_attr(tag, "timestamp", &ts);
     }
     if let Some(changeset) = changeset {
-        let c_str = changeset.to_string();
-        elem.push_attribute(("changeset", c_str.as_str()));
+        append_int_attr(tag, "changeset", changeset);
     }
     if let Some(uid) = uid {
-        let u_str = uid.to_string();
-        elem.push_attribute(("uid", u_str.as_str()));
+        append_int_attr(tag, "uid", i64::from(uid));
     }
     if let Some(u) = user
         && !u.is_empty()
     {
-        push_attribute_escaped(elem, "user", u).map_err(in_element(kind, id))?;
+        append_user_attr(tag, "user", u).map_err(in_element(kind, id))?;
     }
     if visible == Some(false) {
-        elem.push_attribute(("visible", "false"));
+        append_raw_attr(tag, "visible", "false");
     }
     Ok(())
 }
@@ -579,33 +651,26 @@ fn osc_node_coords(
 /// printed is therefore never silently shortened; an element that is only
 /// compared, or only deleted (which prints id and version), is not
 /// validated here. See `crate::content` for the comparison side.
-pub(crate) fn write_element_xml<W: std::io::Write>(
-    writer: &mut Writer<W>,
+pub(crate) fn write_element_xml(
+    out: &mut impl std::io::Write,
     elem: &crate::Element<'_>,
-    coord_buf: &mut String,
+    scratch: &mut ElementXmlScratch,
 ) -> crate::Result<()> {
     match elem {
-        crate::Element::DenseNode(dn) => write_dense_node_xml(writer, dn, coord_buf),
-        crate::Element::Node(n) => write_borrowed_node_xml(writer, n, coord_buf),
-        crate::Element::Way(w) => write_borrowed_way_xml(writer, w),
-        crate::Element::Relation(r) => write_borrowed_relation_xml(writer, r),
+        crate::Element::DenseNode(dn) => write_dense_node_xml(out, dn, scratch),
+        crate::Element::Node(n) => write_borrowed_node_xml(out, n, scratch),
+        crate::Element::Way(w) => write_borrowed_way_xml(out, w, scratch),
+        crate::Element::Relation(r) => write_borrowed_relation_xml(out, r, scratch),
     }
 }
 
-fn write_dense_node_xml<W: std::io::Write>(
-    writer: &mut Writer<W>,
+fn write_dense_node_xml(
+    out: &mut impl std::io::Write,
     node: &crate::dense::DenseNode<'_>,
-    coord_buf: &mut String,
+    scratch: &mut ElementXmlScratch,
 ) -> crate::Result<()> {
-    let mut elem = BytesStart::new(ElementKind::Node.as_str());
-    let id_str = node.id().to_string();
     let (lat, lon) = osc_node_coords(node.decimicro_lat(), node.decimicro_lon(), node.id())?;
-    format_coord(coord_buf, from_decimicro(lat));
-    let lat_str = coord_buf.clone();
-    format_coord(coord_buf, from_decimicro(lon));
-    elem.push_attribute(("id", id_str.as_str()));
-    elem.push_attribute(("lat", lat_str.as_str()));
-    elem.push_attribute(("lon", coord_buf.as_str()));
+    scratch.start_node(node.id(), lat, lon);
     // A DenseInfo block decodes every field for every element, so presence
     // is read from the values: `claims` says which fields this slot claims
     // (every present column for a version of 1 or more; below 1, a negative
@@ -613,8 +678,8 @@ fn write_dense_node_xml<W: std::io::Write>(
     // store a node without metadata in a block whose other nodes carry it).
     if let Some(info) = node.info() {
         let claims = info.claims();
-        push_info_attrs(
-            &mut elem,
+        append_info_attrs(
+            &mut scratch.tag,
             ElementKind::Node,
             node.id(),
             claims.version,
@@ -628,39 +693,33 @@ fn write_dense_node_xml<W: std::io::Write>(
 
     let mut tags = node.tags().peekable();
     if tags.peek().is_none() {
-        writer.write_event(Event::Empty(elem))?;
+        scratch.write(out, "/>")?;
     } else {
-        writer.write_event(Event::Start(elem))?;
-        write_borrowed_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
-        writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
+        scratch.write(out, ">")?;
+        write_borrowed_tags_xml(out, scratch, tags)
+            .map_err(in_element(ElementKind::Node, node.id()))?;
+        out.write_all(b"</node>")?;
     }
     Ok(())
 }
 
-fn write_borrowed_node_xml<W: std::io::Write>(
-    writer: &mut Writer<W>,
+fn write_borrowed_node_xml(
+    out: &mut impl std::io::Write,
     node: &crate::elements::Node<'_>,
-    coord_buf: &mut String,
+    scratch: &mut ElementXmlScratch,
 ) -> crate::Result<()> {
-    let mut elem = BytesStart::new(ElementKind::Node.as_str());
-    let id_str = node.id().to_string();
     let (lat, lon) = osc_node_coords(node.decimicro_lat(), node.decimicro_lon(), node.id())?;
-    format_coord(coord_buf, from_decimicro(lat));
-    let lat_str = coord_buf.clone();
-    format_coord(coord_buf, from_decimicro(lon));
-    elem.push_attribute(("id", id_str.as_str()));
-    elem.push_attribute(("lat", lat_str.as_str()));
-    elem.push_attribute(("lon", coord_buf.as_str()));
+    scratch.start_node(node.id(), lat, lon);
     let info = node.info();
     // Called unconditionally: every field is independently optional in the
     // wire format, so gating the whole call on `version` being present would
     // discard a timestamp, changeset, uid or user carried by an Info block
-    // that happens to omit `version`. `push_info_attrs` emits per field on
+    // that happens to omit `version`. `append_info_attrs` emits per field on
     // presence, so an entirely empty Info contributes no attributes. The
     // version alone is filtered to a claim: 0 is how PBF writers spell "no
     // version" inside an Info that carries other fields.
-    push_info_attrs(
-        &mut elem,
+    append_info_attrs(
+        &mut scratch.tag,
         ElementKind::Node,
         node.id(),
         info.claimed_version(),
@@ -673,27 +732,28 @@ fn write_borrowed_node_xml<W: std::io::Write>(
 
     let mut tags = node.tags().peekable();
     if tags.peek().is_none() {
-        writer.write_event(Event::Empty(elem))?;
+        scratch.write(out, "/>")?;
     } else {
-        writer.write_event(Event::Start(elem))?;
-        write_borrowed_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
-        writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
+        scratch.write(out, ">")?;
+        write_borrowed_tags_xml(out, scratch, tags)
+            .map_err(in_element(ElementKind::Node, node.id()))?;
+        out.write_all(b"</node>")?;
     }
     Ok(())
 }
 
-fn write_borrowed_way_xml<W: std::io::Write>(
-    writer: &mut Writer<W>,
+fn write_borrowed_way_xml(
+    out: &mut impl std::io::Write,
     way: &crate::elements::Way<'_>,
+    scratch: &mut ElementXmlScratch,
 ) -> crate::Result<()> {
-    let mut elem = BytesStart::new(ElementKind::Way.as_str());
-    let id_str = way.id().to_string();
-    elem.push_attribute(("id", id_str.as_str()));
+    scratch.start(ElementKind::Way.as_str());
+    append_int_attr(&mut scratch.tag, "id", way.id());
     let info = way.info();
     // Unconditional for the same reason as the node path above: presence is
     // per field, not gated on `version`.
-    push_info_attrs(
-        &mut elem,
+    append_info_attrs(
+        &mut scratch.tag,
         ElementKind::Way,
         way.id(),
         info.claimed_version(),
@@ -707,33 +767,33 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     let mut refs = way.refs().peekable();
     let mut tags = way.tags().peekable();
     if refs.peek().is_none() && tags.peek().is_none() {
-        writer.write_event(Event::Empty(elem))?;
+        scratch.write(out, "/>")?;
     } else {
-        writer.write_event(Event::Start(elem))?;
+        scratch.write(out, ">")?;
         for r in refs {
-            let mut nd = BytesStart::new("nd");
-            let r_str = r.to_string();
-            nd.push_attribute(("ref", r_str.as_str()));
-            writer.write_event(Event::Empty(nd))?;
+            scratch.start("nd");
+            append_int_attr(&mut scratch.tag, "ref", r);
+            scratch.write(out, "/>")?;
         }
-        write_borrowed_tags_xml(writer, tags).map_err(in_element(ElementKind::Way, way.id()))?;
-        writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
+        write_borrowed_tags_xml(out, scratch, tags)
+            .map_err(in_element(ElementKind::Way, way.id()))?;
+        out.write_all(b"</way>")?;
     }
     Ok(())
 }
 
-fn write_borrowed_relation_xml<W: std::io::Write>(
-    writer: &mut Writer<W>,
+fn write_borrowed_relation_xml(
+    out: &mut impl std::io::Write,
     rel: &crate::elements::Relation<'_>,
+    scratch: &mut ElementXmlScratch,
 ) -> crate::Result<()> {
-    let mut elem = BytesStart::new(ElementKind::Relation.as_str());
-    let id_str = rel.id().to_string();
-    elem.push_attribute(("id", id_str.as_str()));
+    scratch.start(ElementKind::Relation.as_str());
+    append_int_attr(&mut scratch.tag, "id", rel.id());
     let info = rel.info();
     // Unconditional for the same reason as the node path above: presence is
     // per field, not gated on `version`.
-    push_info_attrs(
-        &mut elem,
+    append_info_attrs(
+        &mut scratch.tag,
         ElementKind::Relation,
         rel.id(),
         info.claimed_version(),
@@ -747,22 +807,21 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     let mut members = rel.members().peekable();
     let mut tags = rel.tags().peekable();
     if members.peek().is_none() && tags.peek().is_none() {
-        writer.write_event(Event::Empty(elem))?;
+        scratch.write(out, "/>")?;
     } else {
-        writer.write_event(Event::Start(elem))?;
+        scratch.write(out, ">")?;
         for m in members {
-            let mut member = BytesStart::new("member");
             let type_str = member_type_str(m.id, rel.id())?;
-            let member_id = m.id.id().to_string();
-            member.push_attribute(("type", type_str));
-            member.push_attribute(("ref", member_id.as_str()));
-            let ctx = || in_element(ElementKind::Relation, rel.id());
-            push_attribute_escaped(&mut member, "role", m.role()?).map_err(ctx())?;
-            writer.write_event(Event::Empty(member))?;
+            scratch.start("member");
+            append_raw_attr(&mut scratch.tag, "type", type_str);
+            append_int_attr(&mut scratch.tag, "ref", m.id.id());
+            append_user_attr(&mut scratch.tag, "role", m.role()?)
+                .map_err(in_element(ElementKind::Relation, rel.id()))?;
+            scratch.write(out, "/>")?;
         }
-        write_borrowed_tags_xml(writer, tags)
+        write_borrowed_tags_xml(out, scratch, tags)
             .map_err(in_element(ElementKind::Relation, rel.id()))?;
-        writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
+        out.write_all(b"</relation>")?;
     }
     Ok(())
 }
@@ -909,8 +968,6 @@ mod tests {
 
     /// Build a one-element PBF block through `BlockBuilder` and hand the
     /// borrowed element to `write_element_xml`, returning the emitted XML.
-    /// Goes through the borrowed writers, which is where `push_info_attrs`
-    /// lives; the owned writers use `OwnedMetadata::push_attrs` instead.
     fn borrowed_way_xml(meta: &crate::write::block_builder::Metadata<'_>) -> crate::Result<String> {
         let mut bb = crate::write::block_builder::BlockBuilder::new();
         bb.add_way(7, [("highway", "residential")], &[1, 2], Some(meta));
@@ -920,12 +977,67 @@ mod tests {
             .to_vec();
         let block = crate::PrimitiveBlock::from_vec(bytes)?;
 
-        let mut writer = Writer::new(Vec::new());
-        let mut coord_buf = String::new();
+        let mut out_xml = Vec::new();
+        let mut scratch = ElementXmlScratch::default();
         for element in block.elements() {
-            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+            write_element_xml(&mut out_xml, &element, &mut scratch)?;
         }
-        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+        String::from_utf8(out_xml).map_err(crate::Error::invalid_data_from)
+    }
+
+    #[test]
+    fn borrowed_elements_keep_exact_xml_spelling() -> crate::Result<()> {
+        use crate::write::block_builder::{BlockBuilder, MemberData, Metadata};
+
+        let mut bb = BlockBuilder::new();
+        let mut out = Vec::new();
+        let mut scratch = ElementXmlScratch::default();
+        let mut write_block = |bb: &mut BlockBuilder| -> crate::Result<()> {
+            let bytes = bb.take()?.expect("fixture block").to_vec();
+            let block = crate::PrimitiveBlock::from_vec(bytes)?;
+            for element in block.elements() {
+                write_element_xml(&mut out, &element, &mut scratch)?;
+            }
+            Ok(())
+        };
+
+        bb.add_node(-7, -1, 125_000_000, [], None);
+        write_block(&mut bb)?;
+        bb.add_way(
+            7,
+            [("a&b", "<>'\"\t\n\r\u{00e9}")],
+            &[-12, 34],
+            Some(&Metadata {
+                user: "a&b\t",
+                visible: false,
+                ..meta(3, 0)
+            }),
+        );
+        write_block(&mut bb)?;
+        bb.add_relation(
+            i64::MAX,
+            [],
+            &[MemberData {
+                id: MemberId::Way(-7),
+                role: "outer\r&",
+            }],
+            None,
+        );
+        write_block(&mut bb)?;
+        assert_eq!(
+            out.as_slice(),
+            concat!(
+                r#"<node id="-7" lat="-0.0000001" lon="12.5"/>"#,
+                r#"<way id="7" version="3" timestamp="1970-01-02T00:00:00Z""#,
+                r#" changeset="555" uid="0" user="a&amp;b&#9;" visible="false">"#,
+                r#"<nd ref="-12"/><nd ref="34"/><tag k="a&amp;b""#,
+                " v=\"&lt;&gt;&apos;&quot;&#9;&#10;&#13;\u{00e9}\"/></way>",
+                r#"<relation id="9223372036854775807">"#,
+                r#"<member type="way" ref="-7" role="outer&#13;&amp;"/></relation>"#,
+            )
+            .as_bytes()
+        );
+        Ok(())
     }
 
     /// Zero-valued metadata is legitimate - `uid="0"` is the anonymous mapper
@@ -1089,12 +1201,12 @@ mod tests {
         let block = crate::PrimitiveBlock::from_vec(handmade_way_block(
             version, timestamp, changeset, uid,
         ))?;
-        let mut writer = Writer::new(Vec::new());
-        let mut coord_buf = String::new();
+        let mut out_xml = Vec::new();
+        let mut scratch = ElementXmlScratch::default();
         for element in block.elements() {
-            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+            write_element_xml(&mut out_xml, &element, &mut scratch)?;
         }
-        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+        String::from_utf8(out_xml).map_err(crate::Error::invalid_data_from)
     }
 
     /// The emitter itself must be able to produce the ordinary shape, or the
@@ -1221,15 +1333,13 @@ mod tests {
             .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
             .to_vec();
         let block = crate::PrimitiveBlock::from_vec(bytes)?;
-        let mut coord_buf = String::new();
+        let mut scratch = ElementXmlScratch::default();
         let mut out = Vec::new();
         for element in block.elements() {
             assert!(matches!(element, crate::Element::DenseNode(_)));
-            let mut writer = Writer::new(Vec::new());
-            write_element_xml(&mut writer, &element, &mut coord_buf)?;
-            out.push(
-                String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)?,
-            );
+            let mut out_xml = Vec::new();
+            write_element_xml(&mut out_xml, &element, &mut scratch)?;
+            out.push(String::from_utf8(out_xml).map_err(crate::Error::invalid_data_from)?);
         }
         Ok(out)
     }
@@ -1310,12 +1420,12 @@ mod tests {
             .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
             .to_vec();
         let block = crate::PrimitiveBlock::from_vec(bytes)?;
-        let mut writer = Writer::new(Vec::new());
-        let mut coord_buf = String::new();
+        let mut out_xml = Vec::new();
+        let mut scratch = ElementXmlScratch::default();
         for element in block.elements() {
-            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+            write_element_xml(&mut out_xml, &element, &mut scratch)?;
         }
-        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+        String::from_utf8(out_xml).map_err(crate::Error::invalid_data_from)
     }
 
     /// The dense writer's XML for one node carrying the tag `(k, v)`.
@@ -1327,12 +1437,12 @@ mod tests {
             .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
             .to_vec();
         let block = crate::PrimitiveBlock::from_vec(bytes)?;
-        let mut writer = Writer::new(Vec::new());
-        let mut coord_buf = String::new();
+        let mut out_xml = Vec::new();
+        let mut scratch = ElementXmlScratch::default();
         for element in block.elements() {
-            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+            write_element_xml(&mut out_xml, &element, &mut scratch)?;
         }
-        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+        String::from_utf8(out_xml).map_err(crate::Error::invalid_data_from)
     }
 
     /// A PBF string is valid UTF-8 but may hold a character XML 1.0 cannot

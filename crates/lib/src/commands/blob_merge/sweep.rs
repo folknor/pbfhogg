@@ -130,8 +130,7 @@ use crate::osm_id::{OsmIdKey, osm_id_cmp, osm_id_key};
 use crate::owned::{
     OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, declared_way_locations, dense_node_metadata,
     element_metadata, read_declared_way, read_dense_node, read_node, read_relation, read_way,
-    write_declared_way_local, write_single_node_local, write_single_relation_local,
-    write_single_way_local,
+    write_declared_way_local, write_single_node_local, write_single_way_local,
 };
 use crate::read::block::BlockElementsIter;
 use crate::write::metrics::WriterMetrics;
@@ -226,6 +225,8 @@ impl Item {
             Element::Node(n) => Item::Node(read_node(n)?),
             Element::Way(w) if keep_locations => Item::Way(read_declared_way(w)?),
             Element::Way(w) => Item::Way(read_way(w)?),
+            // Demotion releases the source block, so the staged item must
+            // own its members and roles until the sweep picks a winner.
             Element::Relation(r) => Item::Relation(read_relation(r)?),
         })
     }
@@ -475,6 +476,46 @@ struct Output<'s> {
 }
 
 impl Output<'_> {
+    fn encode_held_relation(&mut self, relation: &crate::Relation<'_>) -> Result<()> {
+        crate::commands::ensure_relation_capacity_local(&mut self.bb, &mut self.filled)?;
+        let members = relation.members().enumerate().map(|(position, member)| {
+            let role = relation.member_role(position, &member)?;
+            Ok(MemberData {
+                id: member.id,
+                role,
+            })
+        });
+        let meta = match element_metadata(ElementKind::Relation, relation.id(), &relation.info()) {
+            Ok(meta) => meta,
+            Err(err) => {
+                // Preserve the role error if both lookups fail.
+                for member in members {
+                    member?;
+                }
+                return Err(err);
+            }
+        };
+        self.bb
+            .add_relation_partial_iter(relation.id(), relation.tags(), members, meta.as_ref())
+    }
+
+    fn encode_owned_relation(&mut self, relation: &OwnedRelation) -> Result<()> {
+        crate::commands::ensure_relation_capacity_local(&mut self.bb, &mut self.filled)?;
+        let members = relation.members.iter().map(|member| {
+            Ok(MemberData {
+                id: member.id,
+                role: &member.role,
+            })
+        });
+        let meta = relation.metadata.as_ref().map(OwnedMetadata::as_partial);
+        self.bb.add_relation_partial_iter(
+            relation.id,
+            relation.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            members,
+            meta.as_ref(),
+        )
+    }
+
     /// Encode one surviving element.
     fn encode(&mut self, item: &Item) -> Result<()> {
         match item {
@@ -507,22 +548,7 @@ impl Output<'_> {
                     self.way.prepare(w, self.coords)?;
                     self.way.write(&mut self.bb, w.tags(), meta.as_ref());
                 }
-                Element::Relation(r) => {
-                    crate::commands::ensure_relation_capacity_local(
-                        &mut self.bb,
-                        &mut self.filled,
-                    )?;
-                    // A fresh vector per relation: its entries borrow roles
-                    // from this item's block, so it cannot live on `self`
-                    // across items. Reusing it would need builder-owned
-                    // scratch holding member IDs and interned roles, and the
-                    // allocation's share of a dedupe run is unmeasured.
-                    let mut members: Vec<MemberData<'_>> = Vec::new();
-                    r.members_into(&mut members)?;
-                    let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                    self.bb
-                        .add_relation_partial(r.id(), r.tags(), &members, meta.as_ref());
-                }
+                Element::Relation(r) => self.encode_held_relation(r)?,
             },
             Item::Node(n) => write_single_node_local(n, &mut self.bb, &mut self.filled)?,
             // Owned by `into_owned` under the same flag, so its locations
@@ -531,7 +557,7 @@ impl Output<'_> {
                 write_declared_way_local(w, &mut self.bb, &mut self.filled)?;
             }
             Item::Way(w) => write_single_way_local(w, &mut self.bb, &mut self.filled)?,
-            Item::Relation(r) => write_single_relation_local(r, &mut self.bb, &mut self.filled)?,
+            Item::Relation(r) => self.encode_owned_relation(r)?,
         }
         Ok(())
     }

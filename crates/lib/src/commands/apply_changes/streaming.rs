@@ -1082,7 +1082,7 @@ fn handle_candidate(
 
     let t_rewrite = crate::counters::Stopwatch::start();
     // P1.5: the rewrite frames each output block in-line, on this worker,
-    // so the drain side can `write_raw_owned` without the writer's
+    // so drain submissions bypass the writer's
     // `rayon::spawn`-per-block dispatch (which was the dominant contributor
     // to `writer_pipeline_send_wait_ns` at planet). The rewrite makes its
     // own complete walk (on a precise-check hit the walk above stopped at
@@ -1225,7 +1225,7 @@ fn single_kind_range(block: &crate::PrimitiveBlock) -> Result<Option<(ElementKin
 
 /// The scanner's passthrough of an indexed blob on the owned route
 /// (`--direct-io`): pread the **full framed bytes** and ship them so the
-/// drain can `write_raw_owned` without re-framing.
+/// drain can forward the frame without re-framing.
 fn handle_owned_passthrough(
     file: &crate::read::input::InputFile,
     desc: &mut BlobDescriptor,

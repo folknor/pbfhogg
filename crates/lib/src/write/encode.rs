@@ -440,23 +440,17 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
     members: &[MemberData<'_>],
     metadata: Option<&M>,
 ) {
-    elem.clear();
-    encode_int64_field_always(elem, 1, id);
-
-    // Fields 2+3: keys/vals
-    encode_tags(
+    encode_relation_prefix(
         string_table,
         elem,
         packed,
         packed_vals,
+        info_buf,
         tag_key_indices,
+        id,
         tags,
+        metadata,
     );
-
-    if let Some(meta) = metadata {
-        meta.encode_info(info_buf, string_table);
-        encode_bytes_field(elem, 4, info_buf);
-    }
 
     // Members: three parallel packed arrays
     if !members.is_empty() {
@@ -494,6 +488,38 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
 
     // PrimitiveGroup field 4 = Relation
     encode_bytes_field_always(group_buf, 4, elem);
+}
+
+/// Write the fields that precede the three packed member columns.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_relation_prefix<'t, M: EncodeMetadata>(
+    string_table: &mut StringTable,
+    elem: &mut Vec<u8>,
+    packed: &mut Vec<u8>,
+    packed_vals: &mut Vec<u8>,
+    info_buf: &mut Vec<u8>,
+    tag_key_indices: &mut KeySet,
+    id: i64,
+    tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+    metadata: Option<&M>,
+) {
+    elem.clear();
+    encode_int64_field_always(elem, 1, id);
+
+    // Fields 2+3: keys/vals
+    encode_tags(
+        string_table,
+        elem,
+        packed,
+        packed_vals,
+        tag_key_indices,
+        tags,
+    );
+
+    if let Some(meta) = metadata {
+        meta.encode_info(info_buf, string_table);
+        encode_bytes_field(elem, 4, info_buf);
+    }
 }
 
 /// Encode a Relation from raw wire-format bytes (zero decode/reencode passthrough).

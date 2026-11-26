@@ -503,13 +503,12 @@ pub(crate) fn renumber_external_to<'a>(
         .fold(0_u64, |acc, t| acc.saturating_add(t.element_count));
 
     // One shared IdSet, pre-allocated so workers can insert atomically
-    // through `&self` (word-batched per blob, `AtomicWordBatch`). A
-    // reservation materialises a whole 4 MiB bit array for the first ID
-    // written in its chunk, so sparse IDs under the bound still cost
-    // bitmap memory per touched chunk. The whole schedule is scanned for the claimed max
-    // rather than trusting the last blob; the claim is then bounded by the
-    // file size (see `RENUMBER_PREALLOC_IDS_PER_BYTE`).
-    let mut node_id_set = crate::idset::IdSet::new();
+    // through `&self` (word-batched per blob, `AtomicWordBatch`). Only
+    // pages hit by observed IDs materialise, including in overflow chunks.
+    // Keep the decision independent of indexdata density claims, which
+    // cannot establish which pages will actually be hit. The maximum
+    // claimed by the whole schedule is bounded by the file size.
+    let mut node_id_set = crate::idset::IdSet::new_paged_atomic();
     if let Some(claimed_max) = pass1_schedule.iter().map(|t| t.max_id).max() {
         let bound = crate::idset::IdSet::file_bounded_max_id(
             claimed_max,
@@ -594,7 +593,7 @@ pub(crate) fn renumber_external_to<'a>(
     host.invocation.check()?;
     host.invocation.marker("RENUMBER_EXT_STAGE2D_START");
     // One shared way IdSet, pre-allocated like the node set above.
-    let mut way_id_set = crate::idset::IdSet::new();
+    let mut way_id_set = crate::idset::IdSet::new_paged_atomic();
     if let Some(claimed_max) = way_schedule.iter().map(|t| t.max_id).max() {
         let bound = crate::idset::IdSet::file_bounded_max_id(
             claimed_max,

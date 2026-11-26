@@ -25,7 +25,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
-use crate::pbf_frames::{self, Framing, Origin};
+use crate::pbf_frames::{self, BlobClaim, Framing, Origin};
 use crate::verify_reencode::{
     self as reencode, DEFAULT_CAP, LayoutCheck, Ran, References, RepackBuilder, Witnesses,
 };
@@ -40,7 +40,7 @@ struct Case<'a> {
     cap: Option<u64>,
     force: bool,
     /// Whose claims predict the layout, when any can.
-    claims_of: Option<&'a Path>,
+    claims_of: Option<&'a [Vec<BlobClaim>; 3]>,
 }
 
 /// Run repack cross-validation (module doc).
@@ -65,7 +65,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let mut witnesses = Witnesses::default();
     let mut verified = 0u32;
 
-    let claims_of = input.indexed.then_some(pbf);
+    let claims_of = input.indexed.then_some(&input.claims);
     let mut cases = vec![Case {
         label: "default cap".to_owned(),
         source: pbf,
@@ -107,7 +107,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             source: &stripped,
             cap: None,
             force: true,
-            claims_of: Some(pbf),
+            claims_of,
         });
     } else {
         gaps.push(
@@ -207,19 +207,19 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
 /// Compare `output`'s blobs with repack's rule run over the claims of
 /// `claims_of`, kind by kind; the first disagreement.
 fn predict(
-    claims_of: &Path,
+    claims_of: &[Vec<BlobClaim>; 3],
     output: &Path,
     cap: u64,
     witnesses: &mut Witnesses,
 ) -> Result<Option<String>, Error> {
     let mut layout = LayoutCheck::open(output)?;
-    for kind in 0..3 {
+    for (kind, claims) in claims_of.iter().enumerate() {
         let mut builder = RepackBuilder::new(cap);
         {
             let mut emit = |n| layout.expect(kind, n);
-            reencode::each_claim(claims_of, kind, |claim| {
-                builder.blob(claim.count, &mut emit)
-            })?;
+            for claim in claims {
+                builder.blob(claim.count, &mut emit)?;
+            }
             builder.finish(&mut emit)?;
         }
         witnesses.remainder_then_grow |= builder.witnesses.remainder_then_grow;

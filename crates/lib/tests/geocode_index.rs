@@ -722,47 +722,27 @@ fn write_street_cell_overflow_input(path: &Path) {
 /// `encode_list` in `crates/lib/src/geocode_index/builder/pass3.rs`.
 #[allow(clippy::cast_possible_wrap)]
 fn write_interp_cell_overflow_input(path: &Path) {
-    // Pass 3 lists every interpolation way under its cells, resolved or
-    // not, so these ways reach the per-cell cap without resolving (the end
-    // nodes carry no addr:street, so they are not address points). Should
-    // the builder ever stop listing unresolved ways, this fixture needs
-    // resolvable ones to keep exercising the cap. Node 3 is one unrelated
-    // address point: an index whose only content is unresolved
-    // interpolation is refused as empty, so without it the build would stop
-    // at that gate and never reach Pass 3.
     let nodes = vec![
         TestNode {
             id: 1,
             lat: 557_000_000,
             lon: 125_000_000,
-            tags: vec![("addr:housenumber", "1")],
+            tags: vec![("addr:housenumber", "1"), ("addr:street", "Interp")],
             meta: None,
         },
         TestNode {
             id: 2,
             lat: 557_000_010,
             lon: 125_000_010,
-            tags: vec![("addr:housenumber", "3")],
-            meta: None,
-        },
-        TestNode {
-            id: 3,
-            lat: 557_100_000,
-            lon: 125_100_000,
-            tags: vec![("addr:housenumber", "9"), ("addr:street", "Elsewhere")],
+            tags: vec![("addr:housenumber", "3"), ("addr:street", "Interp")],
             meta: None,
         },
     ];
-    let names: Vec<String> = (0..65_536u32).map(|i| format!("Interp{i}")).collect();
     let ways: Vec<TestWay> = (0..65_536u32)
-        .zip(&names)
-        .map(|(i, street)| TestWay {
+        .map(|i| TestWay {
             id: 1_000 + i64::from(i),
             refs: vec![1, 2],
-            tags: vec![
-                ("addr:interpolation", "all"),
-                ("addr:street", street.as_str()),
-            ],
+            tags: vec![("addr:interpolation", "all"), ("addr:street", "Interp")],
             meta: None,
         })
         .collect();
@@ -1640,7 +1620,7 @@ fn builder_refuses_a_truly_empty_index() {
 
 /// An input whose only content is an `addr:interpolation` way between two
 /// untagged nodes stages an interpolation way, but with no address points
-/// it can only resolve to the zero sentinel and never answer. The build is
+/// it has no sections that can answer. The build is
 /// refused as empty and publishes nothing.
 #[test]
 fn builder_refuses_an_index_whose_only_content_is_unresolvable_interpolation() {
@@ -2892,13 +2872,14 @@ fn wrong_parity_interpolation_neither_answers_nor_shadows_the_fallback() {
     );
 
     // Rewrite the near way (record 0, the `all` one; the far way is `even`)
-    // as `even` 10..13: end_number is bytes 16..20 of a 24-byte record and
+    // as `even` 10..13: end_number is bytes 16..20 of an interpolation record and
     // the mode is byte 22 (format.rs pins the field offsets).
     let path = index_dir.join("interp_ways.bin");
     let mut bytes = std::fs::read(&path).expect("read interp_ways.bin");
-    assert_eq!(bytes.len(), 48, "two interpolation records");
+    let record_size = pbfhogg::geocode_index::format::InterpWay::SIZE;
+    assert_eq!(bytes.len(), 2 * record_size, "two interpolation records");
     assert_eq!(
-        (bytes[22], bytes[24 + 22]),
+        (bytes[22], bytes[record_size + 22]),
         (0, 1),
         "near is all, far is even"
     );
@@ -2969,7 +2950,7 @@ fn an_unsupported_interpolation_mode_does_not_answer() {
             &crate::common::test_host(),
         )
         .expect("build should succeed");
-        assert_eq!(stats.interp_ways, 1, "{mode}: the way is still indexed");
+        assert_eq!(stats.interp_ways, 0, "{mode}: omit the unsupported way");
         let reader =
             pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
         assert!(
@@ -3011,6 +2992,78 @@ fn build_small_index(
     let reader =
         pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
     (dir, stats, reader)
+}
+
+#[test]
+fn interpolation_later_segment_uses_its_section_prefix() {
+    let node = |id, lon, tags| TestNode {
+        id,
+        lat: 557_000_000,
+        lon,
+        tags,
+        meta: None,
+    };
+    let nodes = [
+        node(
+            100,
+            125_000_000,
+            vec![("addr:housenumber", "10"), ("addr:street", "Main")],
+        ),
+        node(101, 125_060_000, vec![]),
+        node(
+            102,
+            125_080_000,
+            vec![("addr:housenumber", "50"), ("addr:street", "Main")],
+        ),
+    ];
+    let ways = [TestWay {
+        id: 200,
+        refs: vec![100, 101, 102],
+        tags: vec![("addr:interpolation", "all")],
+        meta: None,
+    }];
+    let (_dir, stats, reader) = build_small_index(&nodes, &ways);
+    assert_eq!(stats.interp_ways, 1);
+    let result = reader.query(55.7, 12.507).expect("valid query");
+    assert_eq!(
+        result.interpolation.expect("interpolation").house_number,
+        45
+    );
+    let result = reader
+        .candidates(55.7, 12.507)
+        .expect("valid query")
+        .into_result();
+    assert_eq!(
+        result.interpolation.expect("interpolation").house_number,
+        45
+    );
+}
+
+#[test]
+fn dense_address_uses_the_last_value_for_each_matching_key() {
+    let nodes = [TestNode {
+        id: 100,
+        lat: 557_000_000,
+        lon: 125_000_000,
+        tags: vec![
+            ("addr:housenumber", "10"),
+            ("addr:street", "First"),
+            ("addr:suburb", "Ignore"),
+            ("addr:place", "Village"),
+            ("addr:postcode", "1234"),
+            ("addr:street", "Main"),
+            ("addr:housenumber", "20"),
+        ],
+        meta: None,
+    }];
+    let (_dir, stats, reader) = build_small_index(&nodes, &[]);
+    assert_eq!(stats.addr_points, 1);
+    let result = reader.query(55.7, 12.5).expect("valid query");
+    let address = result.address.expect("dense address");
+    assert_eq!(address.house_number, "20");
+    assert_eq!(address.street, Some("Main"));
+    assert_eq!(address.place, Some("Village"));
+    assert_eq!(address.postcode, Some("1234"));
 }
 
 /// `addr:interpolation=4` steps by four from the lower anchor, whichever
@@ -3105,7 +3158,7 @@ fn place_addresses_are_indexed_and_interpolated() {
 }
 
 #[test]
-fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
+fn unresolved_interpolation_is_omitted() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
@@ -3129,8 +3182,8 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
         "fixture has only one matching endpoint address"
     );
     assert_eq!(
-        stats.interp_ways, 1,
-        "fixture still writes one interpolation way"
+        stats.interp_ways, 0,
+        "the unresolved way emits no interpolation record"
     );
 
     let reader =
@@ -3145,7 +3198,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
     );
     assert!(
         result.interpolation.is_none(),
-        "unresolved endpoints stay at 0/0 and must not surface as an interpolation result"
+        "an unresolved way must not surface as an interpolation result"
     );
 
     // candidates() must NOT expose a segment it cannot resolve. Its emptiness
@@ -3157,7 +3210,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
         .expect("valid query");
     assert!(
         candidates.interpolations.is_empty(),
-        "a 0/0 interpolation way is unresolvable and must not be offered as a candidate"
+        "an unresolved way must not be offered as a candidate"
     );
     assert!(
         reader
@@ -3333,8 +3386,8 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
     )
     .expect("build should succeed");
     assert_eq!(
-        stats.interp_ways, 2,
-        "both the unresolvable near way and the resolvable far way are indexed"
+        stats.interp_ways, 1,
+        "only the resolvable far way is indexed"
     );
 
     let reader =

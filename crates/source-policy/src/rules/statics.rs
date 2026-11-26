@@ -58,6 +58,12 @@ pub const INVENTORY: &[(&str, &str, usize)] = &[
         1,
     ),
     (
+        "crates/lib/src/write/parallel_gzip.rs",
+        "static MEMBER_ENCODER: RefCell<MemberEncoder> = \
+         RefCell::new(MemberEncoder::new(compression_level()));",
+        1,
+    ),
+    (
         "crates/lib/src/threads.rs",
         "static HELD: Cell<Option<SlowTeardown>> = const { Cell::new(None) };",
         1,

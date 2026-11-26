@@ -17,11 +17,8 @@
 //! `--corrupt-indexdata-kind` / `--corrupt-tagdata` can manufacture a file whose
 //! hints are well-formed and false - but the pair was one-sided. This is the
 //! other side: it decompresses every blob, re-derives the metadata from the
-//! payload with `crate::blob_meta::try_scan_block_ids_checked`, or, where
-//! the blob carries tagdata to compare, with
-//! `crate::blob_meta::try_scan_block_ids_and_tags`, whose one walk yields
-//! the same index and the key set `try_scan_block_tags` would, and diffs.
-//! Those are
+//! payload with `crate::blob_meta::scan_index_claims` and compares the claims.
+//! One walk uses the same validation as
 //! the writer's *passthrough*-path scanners; the ordinary write path derives
 //! its index incrementally inside `BlockBuilder` and never rescans what it
 //! emitted, so against it this check is genuinely independent.
@@ -543,15 +540,15 @@ fn verify_blob(ordinal: u64, frame: &RawBlobFrame, block: &mut Vec<u8>) -> Resul
     // key set).
     let malformed =
         |e: crate::Error| e.context(format!("OsmData blob {ordinal}: malformed payload"));
-    let (observed, observed_tags) = if frame.tagdata.is_some() {
-        crate::blob_meta::try_scan_block_ids_and_tags(block).map_err(malformed)?
-    } else {
-        (
-            crate::blob_meta::try_scan_block_ids_checked(block).map_err(malformed)?,
-            None,
-        )
-    };
-    let observed = observed.map(|(index, _sorted)| index);
+    let (observed, observed_tags) = crate::blob_meta::scan_index_claims(
+        block,
+        frame.tagdata.is_some(),
+        frame
+            .index
+            .as_ref()
+            .is_some_and(|index| index.bbox.is_some()),
+    )
+    .map_err(malformed)?;
 
     let mut found = Vec::new();
     diff_blob(
@@ -703,6 +700,55 @@ mod tests {
             max_id,
             count,
             bbox: None,
+        }
+    }
+
+    #[test]
+    fn observed_bbox_is_collected_only_for_a_stored_claim() {
+        use crate::read::wire_fixtures::{Group, block, dense};
+
+        let raw = block(
+            &[""],
+            &[Group {
+                dense: Some(dense(&[(2, 10, 20), (1, -3, 5)], &[])),
+                ..Group::default()
+            }],
+        );
+        let (observed, _) = crate::blob_meta::scan_index_claims(&raw, false, false).unwrap();
+        let observed = observed.unwrap();
+        assert_eq!(
+            (observed.min_id, observed.max_id, observed.count),
+            (1, 2, 2)
+        );
+        assert!(observed.bbox.is_none());
+
+        let (observed, _) = crate::blob_meta::scan_index_claims(&raw, false, true).unwrap();
+        assert_eq!(
+            observed.unwrap().bbox.as_ref().map(bbox_array),
+            Some([-3, 10, 5, 20])
+        );
+    }
+
+    #[test]
+    fn boxless_scan_still_validates_dense_coordinates() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes};
+
+        for lat in [&[][..], &[0x80][..]] {
+            let mut dense = Vec::new();
+            field_bytes(&mut dense, 1, &[2]);
+            field_bytes(&mut dense, 8, lat);
+            field_bytes(&mut dense, 9, &[0]);
+            let raw = block(
+                &[""],
+                &[Group {
+                    dense: Some(dense),
+                    ..Group::default()
+                }],
+            );
+            for compare_bbox in [false, true] {
+                // any-error-deliberate: the claim is only that a malformed lat column is refused whether or not the bbox is compared; its kind is pinned by the scanner's own tests
+                assert!(crate::blob_meta::scan_index_claims(&raw, false, compare_bbox).is_err());
+            }
         }
     }
 

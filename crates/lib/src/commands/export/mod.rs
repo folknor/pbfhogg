@@ -19,8 +19,8 @@ use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::tunables::{EXPORT_CONSUMER_BATCH_BYTES, EXPORT_WORKER_CHUNK_CAP};
 use crate::{Element, ElementKind, ElementReader, PrimitiveBlock};
 
-use geometry::{Ordinate, Positions, is_area_way, way_shape, write_point, write_way};
-use properties::{MetaClaims, SeenKeys, Stop, reserve, write_properties};
+use geometry::{Ordinate, Positions, is_area_tags, way_shape, write_point, write_way};
+use properties::{EscapedStrings, MetaClaims, SeenKeys, Stop, reserve, write_properties};
 use writer::FeatureWriter;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -154,16 +154,6 @@ fn way_kind() -> TypeFilter {
     }
 }
 
-/// Node and way positions reach here as f64 degrees, and both go through the
-/// one point test, `Bbox::contains`, which rounds the point to its nearest
-/// decimicrodegree and compares it with the edges quantized as `extract
-/// --bbox` quantizes them, inclusively. A node and the same
-/// coordinate on a way therefore always land on the same side of the edge.
-fn way_hits_bbox(way: &crate::Way<'_>, bbox: &Bbox) -> bool {
-    way.node_locations()
-        .any(|location| bbox.contains(location.lat(), location.lon()))
-}
-
 /// One block's formatted features.
 #[derive(Default)]
 struct Chunk {
@@ -191,9 +181,9 @@ impl Chunk {
 enum Formatted {
     Chunk(Chunk),
     /// Its text would pass [`EXPORT_WORKER_CHUNK_CAP`]: the consumer formats
-    /// it again and writes it a batch at a time. The worker's own bytes and
-    /// counts are discarded, so the block is counted once.
-    Oversize(PrimitiveBlock),
+    /// it again and writes it a batch at a time, reusing escaped strings.
+    /// The worker's feature bytes and counts are discarded.
+    Oversize(PrimitiveBlock, EscapedStrings),
 }
 
 /// The decode-worker side of export: skips a data blob whose indexdata
@@ -231,16 +221,18 @@ impl DecodeTransform for ExportBlocks<'_> {
         Some(decode.block().map(|block| {
             let mut chunk = Chunk::default();
             let mut positions = Positions::default();
+            let mut escaped = EscapedStrings::default();
             match format_block(
                 &block,
                 self.opts,
                 &mut positions,
+                &mut escaped,
                 &mut chunk,
                 self.cap,
                 &mut |_| true,
             ) {
                 Ok(()) => Formatted::Chunk(chunk),
-                Err(Overflow) => Formatted::Oversize(block),
+                Err(Overflow) => Formatted::Oversize(block, escaped),
             }
         }))
     }
@@ -266,6 +258,7 @@ fn format_block(
     block: &PrimitiveBlock,
     opts: &ExportOptions,
     positions: &mut Positions,
+    escaped: &mut EscapedStrings,
     chunk: &mut Chunk,
     cap: usize,
     drained: &mut dyn FnMut(&mut Chunk) -> bool,
@@ -280,7 +273,7 @@ fn format_block(
     let mut seen = SeenKeys::default();
     for element in elements {
         let start = chunk.bytes.len();
-        match format_element(&element, opts, positions, &mut seen, chunk, cap) {
+        match format_element(&element, opts, positions, &mut seen, escaped, chunk, cap) {
             Ok(false) => continue,
             Ok(true) => {
                 chunk.ends.push(chunk.bytes.len());
@@ -306,6 +299,7 @@ fn format_element<'a>(
     opts: &ExportOptions,
     positions: &mut Positions,
     seen: &mut SeenKeys<'a>,
+    escaped: &mut EscapedStrings,
     chunk: &mut Chunk,
     cap: usize,
 ) -> Result<bool, Stop> {
@@ -313,6 +307,7 @@ fn format_element<'a>(
         opts,
         positions,
         seen,
+        escaped,
         chunk,
         cap,
     };
@@ -364,6 +359,7 @@ struct Feature<'f, 'a> {
     opts: &'f ExportOptions,
     positions: &'f mut Positions,
     seen: &'f mut SeenKeys<'a>,
+    escaped: &'f mut EscapedStrings,
     chunk: &'f mut Chunk,
     cap: usize,
 }
@@ -406,6 +402,7 @@ impl<'a> Feature<'_, 'a> {
         end_feature(
             out,
             self.seen,
+            self.escaped,
             id,
             "node",
             tags,
@@ -431,16 +428,15 @@ impl<'a> Feature<'_, 'a> {
         if !matches_expressions(&opts.expressions, &tags, &way_kind()) {
             return Ok(false);
         }
-        let is_area = is_area_way(way);
-        if opts
-            .bbox
-            .as_ref()
-            .is_some_and(|bbox| !way_hits_bbox(way, bbox))
-        {
+        let scan = self.positions.fill_way(way, opts.bbox.as_ref());
+        if !scan.hits_bbox {
             return Ok(false);
         }
-        let shape = if self.positions.fill_way(way) {
-            way_shape(self.positions, is_area)
+        let shape = if scan.valid {
+            way_shape(
+                self.positions,
+                scan.closed_refs && is_area_tags(tags.clone()),
+            )
         } else {
             None
         };
@@ -455,6 +451,7 @@ impl<'a> Feature<'_, 'a> {
         end_feature(
             out,
             self.seen,
+            self.escaped,
             way.id(),
             "way",
             tags,
@@ -481,6 +478,7 @@ fn begin_feature(out: &mut Vec<u8>, positions: &Positions, cap: usize) -> Result
 fn end_feature<'a, T>(
     out: &mut Vec<u8>,
     seen: &mut SeenKeys<'a>,
+    escaped: &mut EscapedStrings,
     id: i64,
     object_type: &str,
     tags: T,
@@ -492,7 +490,7 @@ where
     T: Iterator<Item = (&'a str, &'a str)>,
 {
     out.extend_from_slice(b",\"properties\":");
-    write_properties(out, seen, id, object_type, tags, meta, opts, cap)?;
+    write_properties(out, seen, escaped, id, object_type, tags, meta, opts, cap)?;
     out.push(b'}');
     Ok(())
 }
@@ -542,7 +540,7 @@ fn export_capped<W: Write>(
     // the engine's rule: checked here before each wait and on each arrival.
     reader.for_each_fused_blob(ExportBlocks { opts, cap }, |formatted| match formatted {
         Formatted::Chunk(chunk) => drain(&mut writer, &mut stats, chunk),
-        Formatted::Oversize(block) => {
+        Formatted::Oversize(block, mut escaped) => {
             oversize += 1;
             let mut chunk = Chunk::default();
             let mut failed = None;
@@ -550,6 +548,7 @@ fn export_capped<W: Write>(
                 &block,
                 opts,
                 &mut positions,
+                &mut escaped,
                 &mut chunk,
                 usize::MAX,
                 &mut |chunk| {
@@ -715,6 +714,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn way_bbox_and_reference_closure_preserve_export_selection() {
+        let mut builder = BlockBuilder::new();
+        let ring = [(0, 0), (0, 10_000_000), (10_000_000, 0), (0, 0)];
+        let open = [(0, 10_000_000), (0, 0), (10_000_000, 0), (0, 10_000_000)];
+        let invalid_then_hit = [(950_000_000, 0), (0, 0)];
+        let invalid_without_hit = [(950_000_000, 0), (10_000_000, 0)];
+        for (id, refs, locations) in [
+            (1, &[1, 2, 3, 1][..], &ring[..]),
+            (2, &[1, 2, 3, 4][..], &open[..]),
+            (3, &[1, 2][..], &invalid_then_hit[..]),
+            (4, &[1, 2][..], &invalid_without_hit[..]),
+        ] {
+            builder.add_way_with_locations(id, [("building", "yes")], refs, locations, None);
+        }
+        let bytes = builder.take().expect("take").expect("block").to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).expect("decode");
+        let mut opts = options(ExportFormat::GeoJsonSeq, false);
+        opts.bbox = Some(Bbox::try_new(-0.1, -0.1, 0.1, 0.1).expect("bbox"));
+        let mut chunk = Chunk::default();
+        assert!(
+            format_block(
+                &block,
+                &opts,
+                &mut Positions::default(),
+                &mut EscapedStrings::default(),
+                &mut chunk,
+                usize::MAX,
+                &mut |_| true,
+            )
+            .is_ok()
+        );
+        assert!(chunk.error.is_none());
+        assert_eq!(chunk.stats.ways, 2);
+        assert_eq!(chunk.stats.skipped_invalid_ways, 1);
+        assert_eq!(chunk.ends.len(), 2);
+        let polygon = &chunk.bytes[..chunk.ends[0]];
+        let line = &chunk.bytes[chunk.ends[0]..chunk.ends[1]];
+        assert!(
+            std::str::from_utf8(polygon)
+                .expect("JSON")
+                .contains(r#""type":"Polygon","coordinates":[[[0,0],[1,0],[0,1],[0,0]]]"#)
+        );
+        assert!(
+            std::str::from_utf8(line)
+                .expect("JSON")
+                .contains(r#""type":"LineString","coordinates":[[1,0],[0,0],[0,1],[1,0]]"#)
+        );
     }
 
     /// A writer that fails once it has accepted `budget` calls.

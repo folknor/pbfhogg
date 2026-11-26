@@ -88,7 +88,7 @@ pub(crate) enum IdOrder {
 /// See the module docs for what `Err` and `Ok(None)` mean.
 #[hotpath::measure]
 pub(crate) fn try_scan_block_ids_checked(raw: &[u8]) -> Result<Option<(BlobIndex, IdOrder)>> {
-    Ok(Walk::run(raw, false)?.index())
+    Ok(Walk::<true, true>::run(raw, false)?.index())
 }
 
 /// The index with its ID order, and the tag key set, of one block.
@@ -207,8 +207,35 @@ fn versions_walk(raw: &[u8]) -> Result<bool> {
 /// need both, the indexdata-generating passthrough paths, use this.
 #[hotpath::measure]
 pub(crate) fn try_scan_block_ids_and_tags(raw: &[u8]) -> Result<BlockScan> {
-    let walk = Walk::run(raw, true)?;
+    let walk = Walk::<true, true>::run(raw, true)?;
     Ok((walk.index(), walk.tags()))
+}
+
+/// The index fields and optional tag key set needed to verify stored claims.
+#[cfg(feature = "commands")]
+pub(crate) type IndexClaims = (Option<BlobIndex>, Option<TagIndex>);
+
+/// Scan the payload for claims that the stored metadata can make.
+#[cfg(feature = "commands")]
+#[hotpath::measure]
+pub(crate) fn scan_index_claims(
+    raw: &[u8],
+    compare_tags: bool,
+    compare_bbox: bool,
+) -> Result<IndexClaims> {
+    fn claims<const BBOX: bool>(raw: &[u8], compare_tags: bool) -> Result<IndexClaims> {
+        let walk = Walk::<false, BBOX>::run(raw, compare_tags)?;
+        Ok((
+            walk.blob_index(),
+            if compare_tags { walk.tags() } else { None },
+        ))
+    }
+
+    if compare_bbox {
+        claims::<true>(raw, compare_tags)
+    } else {
+        claims::<false>(raw, compare_tags)
+    }
 }
 
 /// Scan a PrimitiveBlock for the set of unique tag keys its elements carry.
@@ -221,7 +248,7 @@ pub(crate) fn try_scan_block_ids_and_tags(raw: &[u8]) -> Result<BlockScan> {
 /// `DenseNodes` in one group is an `Err`).
 #[hotpath::measure]
 pub(crate) fn try_scan_block_tags(raw: &[u8]) -> Result<Option<TagIndex>> {
-    Ok(Walk::run(raw, true)?.tags())
+    Ok(Walk::<true, true>::run(raw, true)?.tags())
 }
 
 /// Raw coordinate extremes of every node seen, before the block's
@@ -235,7 +262,7 @@ struct RawExtent {
 }
 
 /// One pass over a whole block, accumulating everything both scanners need.
-struct Walk<'a> {
+struct Walk<'a, const ORDER: bool, const BBOX: bool> {
     collect_keys: bool,
     /// Entries of the block's one data-bearing `StringTable` occurrence,
     /// selected by the decoder's rule.
@@ -268,9 +295,9 @@ struct Walk<'a> {
     max_tag_sid: Option<u64>,
 }
 
-impl<'a> Walk<'a> {
+impl<'a, const ORDER: bool, const BBOX: bool> Walk<'a, ORDER, BBOX> {
     fn run(raw: &'a [u8], collect_keys: bool) -> Result<Self> {
-        let mut walk = Walk {
+        let mut walk = Self {
             collect_keys,
             strings: Vec::new(),
             granularity: 100, // PrimitiveBlock default
@@ -363,7 +390,9 @@ impl<'a> Walk<'a> {
                 (1, WIRE_LEN) => {
                     let node = WireNode::parse(cur.read_len_delimited()?)?;
                     self.packed_keys(node.keys_data, node.vals_data)?;
-                    self.coordinate(node.lat, node.lon);
+                    if BBOX {
+                        self.coordinate(node.lat, node.lon);
+                    }
                     self.element(ElementKind::Node, node.id);
                 }
                 (2, WIRE_LEN) => {
@@ -414,6 +443,15 @@ impl<'a> Walk<'a> {
             Some(k) if k != kind => self.kinds_differ = true,
             Some(_) => {}
         }
+        if ORDER {
+            self.record_order(id);
+        }
+        self.min_id = self.min_id.min(id);
+        self.max_id = self.max_id.max(id);
+        self.count += 1;
+    }
+
+    fn record_order(&mut self, id: i64) {
         if let Some(prev) = self.prev_id {
             match crate::osm_id::osm_id_cmp(id, prev) {
                 std::cmp::Ordering::Less => self.order = IdOrder::Descends,
@@ -425,9 +463,6 @@ impl<'a> Walk<'a> {
             }
         }
         self.prev_id = Some(id);
-        self.min_id = self.min_id.min(id);
-        self.max_id = self.max_id.max(id);
-        self.count += 1;
     }
 
     /// Fold one node's raw coordinate into the extent.
@@ -488,20 +523,21 @@ impl<'a> Walk<'a> {
     /// The blob's index and ID order, or `None` when no single index
     /// describes it.
     fn index(&self) -> Option<(BlobIndex, IdOrder)> {
+        self.blob_index().map(|index| (index, self.order))
+    }
+
+    fn blob_index(&self) -> Option<BlobIndex> {
         if self.unsupported_group || self.kinds_differ {
             return None;
         }
         let kind = self.kind?;
-        Some((
-            BlobIndex {
-                kind,
-                min_id: self.min_id,
-                max_id: self.max_id,
-                count: self.count,
-                bbox: self.bbox(kind),
-            },
-            self.order,
-        ))
+        Some(BlobIndex {
+            kind,
+            min_id: self.min_id,
+            max_id: self.max_id,
+            count: self.count,
+            bbox: if BBOX { self.bbox(kind) } else { None },
+        })
     }
 
     /// The tag key set, or `None` when it cannot be described. Requires a
@@ -544,9 +580,12 @@ impl<'a> Walk<'a> {
             let dlon = lons.read_sint64()?;
             // Modulo 2^64, matching the decoder; see the module docs.
             id = id.wrapping_add(did);
-            lat = lat.wrapping_add(dlat);
-            lon = lon.wrapping_add(dlon);
-            self.coordinate(lat, lon);
+            // Read both varints even without a bbox claim, for validation.
+            if BBOX {
+                lat = lat.wrapping_add(dlat);
+                lon = lon.wrapping_add(dlon);
+                self.coordinate(lat, lon);
+            }
             self.element(ElementKind::Node, id);
             nodes += 1;
         }

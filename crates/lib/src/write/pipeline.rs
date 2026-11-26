@@ -20,13 +20,12 @@ use std::thread::JoinHandle;
 /// `Raw` is the common case: one whole frame, either assembled by a framing
 /// job (a compressed `OSMData` blob, see `framing::frame_blob_into`) or
 /// pre-framed by the caller. `RawChunks` carries several pre-framed buffers
-/// (passthrough). `CopyRange` asks the backend to splice bytes from another
+/// (passthrough or rewrites). `CopyRange` asks the backend to splice bytes from another
 /// fd via `copy_file_range`.
 pub(crate) enum OutputChunk {
     /// One whole frame's bytes.
     Raw(Vec<u8>),
-    /// Multiple framed blob chunks, written sequentially. Avoids
-    /// concatenating passthrough frames into a single Vec.
+    /// Multiple framed blob chunks in output order, kept in their own buffers.
     RawChunks(Vec<Vec<u8>>),
     /// Kernel-space copy from the input file (avoids a userspace copy for
     /// passthrough).
@@ -196,6 +195,17 @@ pub(crate) trait OutputSink {
     /// Accept one whole buffer of output bytes, consuming it.
     fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()>;
 
+    /// Accept a group in output order. Backends with a group operation
+    /// credit the group's bytes once it has been accepted. The aligned and
+    /// registered-buffer sinks can reuse their single-buffer copy path:
+    /// the submitted heap buffers cannot be used for their fixed writes.
+    fn write_chunks(&mut self, chunks: Vec<Vec<u8>>, metrics: &WriterMetrics) -> Result<()>
+    where
+        Self: Sized,
+    {
+        accept_chunks(self, chunks, metrics)
+    }
+
     /// Accept `len` bytes of `in_file` from `offset` as the next output.
     fn copy_range(
         &mut self,
@@ -215,27 +225,37 @@ pub(crate) trait OutputSink {
     }
 }
 
+fn accept_owned<S: OutputSink>(
+    sink: &mut S,
+    bytes: Vec<u8>,
+    metrics: &WriterMetrics,
+) -> Result<()> {
+    let len = bytes.len() as u64;
+    sink.write_owned(bytes)?;
+    metrics.record_accepted(len);
+    Ok(())
+}
+
+pub(super) fn accept_chunks<S: OutputSink>(
+    sink: &mut S,
+    chunks: Vec<Vec<u8>>,
+    metrics: &WriterMetrics,
+) -> Result<()> {
+    chunks
+        .into_iter()
+        .try_for_each(|chunk| accept_owned(sink, chunk, metrics))
+}
+
 /// Hand one ordered chunk to `sink`; the caller times it as one handoff.
-/// Every chunk arrives as owned buffers, and accepted bytes are counted
-/// per successful constituent operation (`writer_bytes_written`). A free
-/// function rather than a trait method, so no backend can override the
-/// bookkeeping.
+/// Accepted bytes are counted after each successful backend operation.
 fn hand_off<S: OutputSink>(
     sink: &mut S,
     chunk: OutputChunk,
     metrics: &WriterMetrics,
 ) -> Result<()> {
-    fn accept<S: OutputSink>(sink: &mut S, bytes: Vec<u8>, metrics: &WriterMetrics) -> Result<()> {
-        let len = bytes.len() as u64;
-        sink.write_owned(bytes)?;
-        metrics.record_accepted(len);
-        Ok(())
-    }
     match chunk {
-        OutputChunk::Raw(bytes) => accept(sink, bytes, metrics),
-        OutputChunk::RawChunks(chunks) => chunks
-            .into_iter()
-            .try_for_each(|chunk| accept(sink, chunk, metrics)),
+        OutputChunk::Raw(bytes) => accept_owned(sink, bytes, metrics),
+        OutputChunk::RawChunks(chunks) => sink.write_chunks(chunks, metrics),
         OutputChunk::CopyRange {
             in_file,
             offset,
@@ -289,6 +309,15 @@ impl OutputSink for FileOutputSink {
 
     fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()> {
         Ok(self.writer.write_all(&bytes)?)
+    }
+
+    fn write_chunks(&mut self, chunks: Vec<Vec<u8>>, metrics: &WriterMetrics) -> Result<()> {
+        if chunks.len() > 1 && self.writer.write_buffered_group(&chunks)? {
+            metrics.record_accepted(chunks.iter().map(|chunk| chunk.len() as u64).sum());
+            Ok(())
+        } else {
+            accept_chunks(self, chunks, metrics)
+        }
     }
 
     fn copy_range(

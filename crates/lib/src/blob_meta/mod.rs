@@ -24,6 +24,8 @@ mod scan;
 mod tag_index;
 mod tally;
 
+#[cfg(feature = "commands")]
+pub(crate) use scan::scan_index_claims;
 pub(crate) use scan::{
     IdOrder, try_scan_block_ids_and_tags, try_scan_block_ids_checked, try_scan_block_tags,
     versions_ascend,

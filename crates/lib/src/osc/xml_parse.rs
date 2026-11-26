@@ -2077,6 +2077,15 @@ pub(crate) enum HiddenUpserts {
 }
 
 /// Sink that appends into a [`CompactDiffOverlay`].
+///
+/// Its per-element staging vectors, owned tag strings, fresh role strings
+/// through `parse_member` and separate start-tag attribute walks are kept on
+/// purpose: reusing staging and fusing the walks was proposed and declined
+/// (2026-11-26). The whole ingest, this sink included, measured 4.8 s of a
+/// 203.7 s planet daily apply on bygg (cell e765fb59, commit 67bcd55c), so
+/// even a free ingest is about 2.4 % of wall, and these allocations are a
+/// fraction of it. Reuse would also have to keep parsing and validating the
+/// children of hidden upserts recorded as deletes.
 pub(crate) struct CompactSink<'a> {
     overlay: &'a mut CompactDiffOverlay,
     hidden: HiddenUpserts,

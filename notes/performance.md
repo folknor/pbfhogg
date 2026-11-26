@@ -1018,44 +1018,41 @@ placement.
 
 Kind: coherent topology rewrite.
 
-## PERF-036 - apply-changes ingest is serial and goes through a hash-indexed overlay
+## PERF-036 - apply-changes cannot apply a backlog of OSCs natively
 
 Reported by: osc, apply-core.
 
-Mechanism: apply-changes (`rewrite.rs`) parses one OSC into `CompactDiffOverlay`
-then converts it to `SortedDiff`, all serially before parallel PBF work.
-Attributes are scanned separately per field; `CompactSink` allocates fresh
-staging vectors per element and key and value strings per tag (a key string
-even when interning hits), and a member's role through `parse_member`, which
-passes fresh strings where `parse_member_into` takes scratch (any staging
-reuse must still parse and validate the children of hidden upserts recorded
-as deletes); element end allocates another borrowed-pair vector
-and copies into the arena; insertion consults the index and version-floor map
-and removes from the deleted set; `KindTable::build` extracts, sorts, unzips and
-sorts deletes. The command accepts one OSC path, so merge-then-apply goes
-through XML, gzip, inflate and parse again.
+Mechanism: apply-changes takes one OSC and parses it serially on the calling
+thread (one inflater, one tokenizer) before any pipeline thread starts. For a
+single daily planet OSC that does not pay: ingest ended at 4.8 s of 203.7 s
+on bygg (e765fb59, 67bcd55c, zlib output) and 5.3 of 97.9 s on a zstd:1 cell
+(3608960f). Parallel ingest and `CompactSink` staging reuse were declined on
+those numbers, with comments at `merge_to` and `CompactSink`. The residue is
+catch-up: a merged multi-day OSC keeps every change (26.26 M for planet
+4914..4920 unsimplified), and apply reparses all of it through one tokenizer
+after merge-changes rendered and compressed it.
 
-Redesign (osc): an ingest compiler - stable source positions; workers parse
-batches straight into native headers and batch arenas (refs, members, tags as
-spans); one pass over each attribute list; partition descriptors by kind and ID
-range, integer-key sort, reduce histories in source order with batch-local
-summaries; produce an immutable range-partitioned change set (sorted upserts
-and tombstones, native metadata with presence bits, coordinate columns,
-addressable payloads, shard-local dictionaries, range slicing, node lookup);
-apply-changes accepts that frozen set or an ordered list of OSCs. Redesign
-(apply-core): keep `SortedDiff`'s sorted access; add a sorted per-kind event
-view (ID, action, payload location, winner-selection metadata) so planning
-assigns slices once instead of separate upsert, delete and create cursors.
+Redesign: apply-changes takes an ordered list of OSCs, reads them with
+merge-changes' concurrent per-input readers and lexical batches, replays the
+batches with apply semantics into position-keyed records, and sorts and
+reduces them straight into `SortedDiff`.
 
-Payoff: parallelizes interpretation, allocation, compaction and conflict
-resolution; removes several allocations per element.
+First step: measure a valid chain (base at 4913, OSCs 4914..4920, default
+unsimplified merge then one apply): merge-plus-apply wall, apply ingest wall,
+peak anon during ingest and across the run. No measurement exists yet.
 
-Risks: reduction semantics - the winner is last by position, not highest
-version; equal versions legal; unversioned changes keep the floor; deletes carry
-history; batch summaries must detect cross-batch regressions with the offending
-position. Arbitrary OSC needs sorted runs and a final reduction.
+Constraints: reduce by kind and ID in source order (input ordinal, position),
+carrying the version floor as well as the winner - modify v9 then a claimless
+delete must still refuse against base v10, which merge --simplify then apply
+loses; batch-local winners must not hide a cross-batch regression (v8, then
+v7 and v9 in the next batch). Validate before reducing, hidden upserts as
+deletes with their children checked, since a superseded malformed change still
+refuses; decide which of competing errors is reported. Match ordered merge
+followed by one apply, not successive applies (v8 then v11 passes against base
+v10 combined, v8 alone refuses), and document that. Count retained payloads,
+sort descriptors, scratch and the frozen set at their overlap for peak memory.
 
-Kind: highest priority for ingest (osc).
+Kind: capability with an unmeasured payoff (catch-up).
 
 ## PERF-037 - merge-changes --simplify renders every change before choosing winners
 

@@ -371,6 +371,15 @@ pub(crate) fn merge_to<'a>(
         // The output is a snapshot, so a `visible="false"` create or modify
         // is the object's deleted state: it is recorded as a versioned delete
         // (`HiddenUpserts::AsDelete` says why).
+        // The parse is serial on this thread, ahead of every pipeline
+        // thread. Parallelizing it (merge-changes' lexical batch readers, or
+        // workers building a sorted change set directly) was proposed and
+        // declined for one daily OSC (2026-11-26): parse plus `into_sorted`
+        // ended at 4.8 s of a 203.7 s planet apply on bygg (cell e765fb59,
+        // commit 67bcd55c, zlib output), so removing it entirely saves about
+        // 2.4 % of wall, and the hash overlay's conversion is 105 ms of that.
+        // Where it may pay is applying a multi-day backlog in one run, which
+        // today goes through a merged OSC reparsed here by one tokenizer.
         crate::osc::parse::parse_osc_file_into_until(
             osc_file,
             &mut overlay,

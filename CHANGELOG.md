@@ -651,6 +651,11 @@
 
 ### Changed
 
+- **`add-locations-to-ways --index-type auto` keeps sparse for a file
+  with no ways.** Such a file has nothing to join, yet its node count
+  could route a large sorted, indexed file to external and its scratch
+  demand. Files with ways route as before.
+
 - **Sparse `add-locations-to-ways` decodes each node blob once, for indexed
   input.** Node coordinates are stored and node output written in one
   pass, and relation members are collected before it, so the relation

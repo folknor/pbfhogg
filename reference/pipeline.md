@@ -567,7 +567,16 @@ The below-headroom case is a compatibility rule, not a resource model. The
 host's memory would leave a zero budget that sends even a store of a few
 megabytes to external. The rule is not monotonic in memory: a large store
 routes external with a little more than 3 GiB available and sparse with a
-little less.
+little less. A monotone rule was weighed and refused: the model charges
+only sparse's page-cache store, never either backend's input-dependent
+anon. External's anon grows with reference occurrences per bucket at
+capped worker concurrency (recorded peaks about 3 GB on germany, 6.9 GB on
+europe, 11.6 GB on planet), while sparse's store is a file-backed map that
+is evicted rather than killed, so sending large inputs to external under
+severe memory pressure is not the safe side; sparse's own anon can also
+grow with the referenced-ID set's shape (scattered negative IDs promote
+whole bitmap chunks). Monotonicity needs a footprint model of both
+backends, not a different threshold.
 
 The store estimate's header walk refuses a partially indexed input (some
 OsmData blobs indexed, others not) with the missing-indexdata error, so a
@@ -618,12 +627,15 @@ Limits of the rule, both accepted with auto as the default:
   it the measured ordering holds, and with no budget auto behaves as the
   old sparse default did.
 - The store estimate counts every indexed node, while the sparse store
-  holds only way-referenced ones. A sorted file with many standalone nodes
-  and few ways can therefore route external with a small real store, and
-  external's scratch check (above) can then refuse a run sparse would have
-  completed. Indexdata counts elements, not references, so no tighter
-  bound is available without decoding; `--index-type sparse` is the
-  remedy. The opposite error, an estimate below the real store, is caught
+  holds only way-referenced ones. A file with no way blob at all is
+  estimated at an empty store and stays sparse. A sorted file with many
+  standalone nodes and few ways can still route external with a small
+  real store, and external's scratch check (above) can then refuse a run
+  sparse would have completed. Indexdata counts elements, not references,
+  so no tighter bound is available without decoding, and running sparse's
+  first pass before every external route would add its full cost to large
+  inputs, where the referenced-ID count is within a few percent of the
+  node count; `--index-type sparse` is the remedy. The opposite error, an estimate below the real store, is caught
   by the recheck.
 
 ### renumber

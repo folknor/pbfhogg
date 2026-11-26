@@ -904,6 +904,7 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: u64) -> Resolved
 fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<RouteWalk> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let mut node_count: u64 = 0;
+    let mut saw_way = false;
     let mut admission = external::HeaderAdmission::new();
     while let Some(meta) = walker.next_header()? {
         if meta.blob_type != crate::blob::BlobKind::OsmData {
@@ -914,6 +915,7 @@ fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Ro
                 if idx.kind == crate::ElementKind::Node {
                     node_count = node_count.saturating_add(idx.count);
                 }
+                saw_way |= idx.kind == crate::ElementKind::Way;
                 admission.observe(idx);
             }
             None => {
@@ -927,9 +929,33 @@ fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Ro
         }
     }
     Ok(RouteWalk {
-        store_estimate: Some(node_count.saturating_mul(8)),
+        store_estimate: Some(store_estimate_bytes(node_count, saw_way)),
         external: admission.finish(),
     })
+}
+
+/// The header estimate of the sparse store. Only way node references take
+/// store slots (relation node members are collected separately and never
+/// enter it), so a file with no way blob has an empty store whatever its
+/// node count, and is judged after the whole walk so a late way blob still
+/// counts. Otherwise every indexed node is charged.
+///
+/// No tighter bound on the referenced-ID count exists in the headers:
+/// indexdata gives element counts and ID ranges, which cannot tell ways
+/// that share nodes from ways that reference disjoint ones, and a bound
+/// from way payload sizes (at least one byte per reference) is far looser
+/// than the node count on any real file. Running sparse's reference pass
+/// before an external route to judge the exact store was weighed and
+/// refused: at planet scale the referenced-ID count is within a few percent
+/// of the node count, so the pass would add its full cost to every large
+/// external run to correct only standalone-heavy files, which
+/// `--index-type sparse` already serves.
+fn store_estimate_bytes(node_count: u64, saw_way: bool) -> u64 {
+    if saw_way {
+        node_count.saturating_mul(8)
+    } else {
+        0
+    }
 }
 
 /// What auto's header walk learned: the store estimate, and whether the
@@ -954,6 +980,17 @@ struct RouteWalk {
 /// monotonic in memory (a large store routes external just above the
 /// allowance and sparse just below it), and it is documented as such in
 /// `reference/pipeline.md`.
+///
+/// Making it monotonic (external whenever a known budget is small) was
+/// weighed and refused: the model charges only sparse's page-cache store,
+/// and neither backend's input-dependent anon. External's anon grows with
+/// reference occurrences per bucket at capped worker concurrency (recorded
+/// peaks about 3 GB germany, 6.9 GB europe, 11.6 GB planet), while sparse's
+/// store is a file-backed map that is evicted rather than killed, so routing
+/// large inputs external under severe memory pressure is not the safe side.
+/// Sparse's own anon can also grow with the shape of the referenced-ID set
+/// (scattered negative IDs promote whole bitmap chunks). A monotone rule
+/// needs a footprint model of both backends, not a different threshold.
 fn page_cache_budget_bytes(available: Option<u64>) -> Option<u64> {
     available
         .filter(|&bytes| bytes > AUTO_ANON_HEADROOM_BYTES)
@@ -1697,6 +1734,23 @@ mod tests {
     };
 
     const GB: u64 = 1_000_000_000;
+
+    /// A file without ways has an empty store, so even a node count far
+    /// over any budget keeps sparse; with ways every node is charged.
+    #[test]
+    fn wayless_input_estimates_an_empty_store() {
+        let budget = 8 * GB;
+        let nodes = 10 * GB;
+        assert_eq!(super::store_estimate_bytes(nodes, false), 0);
+        assert_eq!(
+            route_sorted_indexed(Some(super::store_estimate_bytes(nodes, false)), budget),
+            ResolvedBackend::Sparse
+        );
+        assert_eq!(
+            route_sorted_indexed(Some(super::store_estimate_bytes(nodes, true)), budget),
+            ResolvedBackend::External
+        );
+    }
 
     /// A claimed count that overflows a statistic is refused, and the
     /// refused merge leaves the receiver as it was.

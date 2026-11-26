@@ -817,17 +817,23 @@ consumption.
 
 Kind: high conviction in the fitting-memory regime.
 
-## PERF-028 - ALTW routing uses 8N and is non-monotonic under memory pressure
+## PERF-028 - ALTW routing models only sparse's page-cache store
 
 Reported by: altw-sparse.
 
-Mechanism: the router compares an estimated 8N store with 80 % of available
-memory minus 3 GiB; unknown memory, or available memory at or below the
-allowance, selects sparse. An 8N estimate below the real 8U store (dangling
-refs take slots) is now caught by the post-pass-0 recheck, which re-routes
-external; an 8N far above 8U (standalone nodes) still routes external with
-no correction. Lower memory flips back to the random-access engine. Past
-residency each `SparseArrayIndex::get` can be a dependent page fault.
+Mechanism: auto charges only sparse's file-backed store (8N up front, 8U on
+the recheck) against available memory minus a fixed 3 GiB anon allowance.
+Neither backend's input-dependent anon is modelled: external grows with
+reference occurrences per bucket at capped concurrency (peak anon about
+3 GB germany, 6.9 GB europe, 11.6 GB planet, sidecars 975f18d9, 36c31139,
+d9bdc5d7, no host budget), and sparse pass 0 grows with the referenced-ID
+set's shape (scattered negative IDs promote 4 MiB bitmap chunks before any
+recheck; below the allowance no recheck is armed). Until both footprints
+are modelled the below-allowance fallback to sparse stays (a monotone rule
+toward external was refused, reasoning at `page_cache_budget_bytes`), and a
+sorted file with many standalone nodes and some ways still routes external
+on 8N far above 8U (a no-way file now stays sparse; up-front pass 0 refused,
+reasoning at `store_estimate_bytes`).
 
 Redesign: regime choice - all-node store fits: actual-node dictionary, skip
 collection; only reference-selected fits: sharded collection and compact store;

@@ -111,15 +111,26 @@ impl Route {
         }
     }
 
-    /// The transport of each open on the direct routes this file drives,
-    /// single sorted extracts (`common::witness_transports`): the front
-    /// reads (probes, the header read) direct, the schedule walks and the
-    /// classify and write-pass preads buffered.
+    /// The transport of each open on every route run direct
+    /// (`common::witness_transports`), following the extract row of
+    /// `io_reach.rs`: the front reads (the indexdata front read, the
+    /// probes, the header read) and the unsorted fallback's streaming
+    /// readers direct; the schedule walks and the classify and write-pass
+    /// preads buffered. A declined multi-extract probe is followed by each
+    /// region's single extract without its front read.
     fn transports(self) -> &'static str {
         match (self.multi, self.strategy, self.sorted) {
             (false, Strategy::Simple, true) => "DBDBBB",
             (false, Strategy::Complete, true) => "DDBDB",
-            _ => panic!("{self:?}: no direct transport spec"),
+            (false, Strategy::Simple, false) => "DDDDD",
+            (false, Strategy::Complete, false) => "DDDDDDBB",
+            (false, Strategy::Smart, true) => "DDBBDB",
+            (true, Strategy::Simple, true) => "DB",
+            (true, Strategy::Simple, false) => "DDDDDDDDDDD",
+            (false, Strategy::Smart, false) => "DDDDDBDBB",
+            (true, Strategy::Complete | Strategy::Smart, true) => "DDBB",
+            (true, Strategy::Complete, false) => "DDDDDDDBBDDDDDBB",
+            (true, Strategy::Smart, false) => "DDDDDDBDBBDDDDBDBB",
         }
     }
 
@@ -460,6 +471,7 @@ fn multi_extract_reads_only_the_pinned_input() {
     check_route(Route::multi(Strategy::Complete, true));
     check_route(Route::multi(Strategy::Smart, true));
     check_route(Route::multi(Strategy::Complete, false));
+    check_route(Route::multi(Strategy::Smart, false));
     // Cleaning takes the single pass too.
     check_route(Route {
         clean: true,
@@ -470,22 +482,62 @@ fn multi_extract_reads_only_the_pinned_input() {
 /// The probe and header reads open `O_DIRECT` when asked to, through the
 /// pin's own direct open.
 #[cfg(feature = "linux-direct-io")]
+fn check_direct_route(route: Route) {
+    let route = Route {
+        direct: true,
+        ..route
+    };
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_input(&input, route);
+    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
+    let Reference::Outputs(expected) = reference(route, &input, dir.path(), |e| {
+        crate::common::direct_io_unavailable(e)
+    }) else {
+        return;
+    };
+    check_replacements(route, dir.path(), &input, &expected);
+}
+
+#[cfg(feature = "linux-direct-io")]
 #[test]
-fn direct_reads_follow_the_pinned_input() {
-    for strategy in [Strategy::Simple, Strategy::Complete] {
-        let route = Route {
-            direct: true,
-            ..Route::single(strategy, true)
-        };
-        let dir = crate::common::test_scratch();
-        let input = dir.path().join("in.osm.pbf");
-        write_input(&input, route);
-        // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
-        let Reference::Outputs(expected) = reference(route, &input, dir.path(), |e| {
-            crate::common::direct_io_unavailable(e)
-        }) else {
-            return;
-        };
-        check_replacements(route, dir.path(), &input, &expected);
+fn direct_simple_reads_follow_the_pinned_input() {
+    for sorted in [true, false] {
+        check_direct_route(Route::single(Strategy::Simple, sorted));
     }
+}
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_complete_ways_reads_follow_the_pinned_input() {
+    for sorted in [true, false] {
+        check_direct_route(Route::single(Strategy::Complete, sorted));
+    }
+}
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_smart_reads_follow_the_pinned_input() {
+    for sorted in [true, false] {
+        check_direct_route(Route::single(Strategy::Smart, sorted));
+    }
+    check_direct_route(Route {
+        ways: false,
+        ..Route::single(Strategy::Smart, true)
+    });
+}
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_multi_extract_reads_follow_the_pinned_input() {
+    check_direct_route(Route::multi(Strategy::Simple, true));
+    check_direct_route(Route::multi(Strategy::Simple, false));
+    check_direct_route(Route::multi(Strategy::Complete, true));
+    check_direct_route(Route::multi(Strategy::Smart, true));
+    check_direct_route(Route::multi(Strategy::Complete, false));
+    check_direct_route(Route::multi(Strategy::Smart, false));
+    check_direct_route(Route {
+        clean: true,
+        ..Route::multi(Strategy::Simple, true)
+    });
 }

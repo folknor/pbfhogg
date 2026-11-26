@@ -100,7 +100,7 @@ pub(super) const REACH: &[Reach] = &[
     },
     Reach {
         path: &["add-locations-to-ways"],
-        reads: "Front reads direct; index, dependency and external-stage preads buffered",
+        reads: "Front reads and unindexed fallback stream direct; index, dependency and external-stage preads buffered",
         writes: "All PBF writes direct",
         uring: "-",
     },

@@ -67,15 +67,16 @@ impl Route {
         2 + u64::from(!self.unindexed)
     }
 
-    /// The transport of each open on a direct run of an indexed input
+    /// The transport of each open on a direct run
     /// (`common::witness_transports`): the dispatch probe direct, the
     /// estimate walk buffered, then the full scan's stream direct or the
     /// walker's scheduled preads buffered.
     fn transports(self) -> &'static str {
-        assert!(!self.unindexed, "{self:?}: no direct transport spec");
-        match self.taken() {
-            Arm::FullScan => "DBD",
-            Arm::Walker => "DBB",
+        match (self.unindexed, self.taken()) {
+            (false, Arm::FullScan) => "DBD",
+            (false, Arm::Walker) => "DBB",
+            // No estimate walk: the probe, then the walker.
+            (true, _) => "DB",
         }
     }
 
@@ -415,12 +416,21 @@ fn full_scan_reads_only_the_pinned_input() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_reads_follow_the_pinned_input() {
-    for route in [Route::WALKER, Route::FULL_SCAN] {
+    let unindexed = |arm| Route {
+        arm,
+        unindexed: true,
+        ..Route::WALKER
+    };
+    for route in [
+        Route::WALKER,
+        Route::FULL_SCAN,
+        unindexed(Arm::Walker),
+        unindexed(Arm::FullScan),
+    ] {
         let route = Route {
             direct: true,
             ..route
         };
-        assert_eq!(route.opens(), 3, "{route:?}");
         let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         write_input(&input, route);

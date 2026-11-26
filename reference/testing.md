@@ -32,7 +32,10 @@ Tests go where they couple least.
   guard's control test) calls `skip::fail_if_required`, which fails
   the test where the run requires that backend. By convention these
   predicates are the only route to a backend skip; nothing enforces
-  that structurally. Tests that assert a refusal itself inspect the
+  that structurally. A source-policy rule confining matches on
+  `PlatformUnsupported` to the predicates would not: a hand-rolled skip
+  can as well read error text, an errno or the CLI's exit 3, and an
+  early return needs no match at all. Tests that assert a refusal itself inspect the
   error directly and are not affected. What the gate guarantees is
   that a required backend's refusal cannot pass as a skip, so it goes
   green only on a host, and a test scratch filesystem, that does not
@@ -94,16 +97,22 @@ Tests go where they couple least.
   several direct paths is satisfied by any one. The fault plan's
   input replacement records the transport of every verified open of
   its pinned target, in order (`InputReplacement::transports`, tagged
-  by the pin constructor, `open` or `open_direct`), and every
-  `fault_*_input` reference run, buffered runs included, asserts its
-  route's exact list through `common::witness_transports`, as does
-  the getid full-scan unit cell; the expected lists follow the reach
-  each command documents (`crates/cli/src/io_reach.rs`). That covers
-  the routes those files drive: the extract cells drive only sorted
-  single extracts direct (not the unsorted, Smart or multi-extract
-  routes), and sort and add-locations-to-ways have no direct fault
-  cell. The CLI cells assert only that a direct open happened, which
-  witnesses the flag reaching the library. The io_uring cells that write
+  by the pin constructor, `open` or `open_direct`), and the
+  `fault_*_input` reference runs, buffered runs included, assert their
+  route's exact list through `common::witness_transports` (two do not:
+  inspect's node-stats cell asserts only a direct read, and degrade's
+  passthrough reference does not arm the hook), as do the getid
+  full-scan unit cell and the apply-changes
+  `direct_reads_reach_every_base_open` cell; the expected lists follow
+  the reach each command documents (`crates/cli/src/io_reach.rs`).
+  The extract, sort, add-locations-to-ways and getparents fault files
+  drive direct every route they drive buffered, so each route's direct
+  list is pinned; a new route there gets both. The other fault files
+  drive only some of their routes direct. The CLI cells witness the flag reaching the library, which
+  each command wires by hand: they assert a direct open in every
+  direction the command's reach row claims (reads, writes or both),
+  not an exact count, since the per-open attribution is the library
+  cells' and a CLI count would restate it plus opens no pin sees. The io_uring cells that write
   also assert `writer_uring_registered_buffers` (the call's metrics in
   unit and library tests, the marker stream in CLI cells), which
   proves the ring was set up; the fault plan's dispatch count, in hook

@@ -1240,6 +1240,7 @@ mod backends {
             "add-locations-to-ways --direct-io failed unexpectedly; stderr:\n{}",
             out.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&direct_markers(&output), "read");
         crate::invoker::assert_direct_opened(&direct_markers(&output), "write");
 
         let ways = read_way_locations(&output);

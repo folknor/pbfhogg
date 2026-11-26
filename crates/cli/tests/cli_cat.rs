@@ -1715,6 +1715,7 @@ mod backends {
             out.stderr_str(),
         );
         crate::invoker::assert_direct_opened(&direct_markers(&output), "read");
+        crate::invoker::assert_direct_opened(&direct_markers(&output), "write");
 
         assert!(
             out.stderr_str().contains("blobs passed through"),

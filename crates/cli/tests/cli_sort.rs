@@ -1190,6 +1190,7 @@ mod backends {
             "sort --direct-io failed unexpectedly; stderr:\n{}",
             run.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&markers, "read");
         crate::invoker::assert_direct_opened(&markers, "write");
 
         let contents = read_all_elements_with_coords(&output);

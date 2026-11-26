@@ -4152,6 +4152,7 @@ mod backends {
             "apply-changes --direct-io failed; stderr:\n{}",
             out.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&markers, "read");
         crate::invoker::assert_direct_opened(&markers, "write");
         check_basic_output(&output);
         assert!(

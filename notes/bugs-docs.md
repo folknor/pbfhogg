@@ -300,3 +300,18 @@ included". `cat --dedupe` re-encodes the way blobs in its overlap runs
 otherwise), so the stated reason covers only copied blobs. The rule is
 right; the justification should name the re-encode too.
 
+## DOC-061 - pipeline.md's sort run list omits restructured blocks
+
+Reported by: the spar accounting of the restructured way witness item,
+from a scout lateral (2026-11-26); read from source.
+
+`reference/pipeline.md`'s sort section lists one sweep per run as "an
+overlap component ... or one internally unsorted blob that overlaps
+nothing", and says sorted views are held by "a cursor over an internally
+unsorted blob". A block no single index describes also becomes a
+one-entry run per kind when it overlaps nothing, and `Sweep::open` reads
+it through the same sorted views (`entry.intra_unsorted ||
+entry.restructured` in `crates/lib/src/commands/blob_merge/sweep.rs`),
+so the list reads as complete and is not. Name restructured entries in
+both places.
+

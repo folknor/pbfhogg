@@ -602,6 +602,14 @@ mod backends {
                 counter(&events, "direct_io_write_opens").is_some_and(|n| n > 0),
                 "{flag}: no O_DIRECT write open\n{events}"
             );
+            // `--direct-io` also reads the base direct; `--io-uring` alone
+            // does not.
+            let reads = counter(&events, "direct_io_read_opens").unwrap_or(0);
+            if flag == "--direct-io" {
+                assert!(reads > 0, "{flag}: no O_DIRECT read open\n{events}");
+            } else {
+                assert_eq!(reads, 0, "{flag}\n{events}");
+            }
         }
     }
 }

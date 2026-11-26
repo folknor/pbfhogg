@@ -2797,7 +2797,7 @@ Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring
 | getid | Front reads and sequential fallback direct; scheduled and ID-file preads buffered | All PBF writes direct | - |
 | getparents | Dispatch probe and fallback stream direct; scheduled preads buffered | All PBF writes direct | - |
 | time-filter | Header and history stream direct; snapshot classify preads buffered | All PBF writes direct | - |
-| add-locations-to-ways | Front reads direct; index, dependency and external-stage preads buffered | All PBF writes direct | - |
+| add-locations-to-ways | Front reads and unindexed fallback stream direct; index, dependency and external-stage preads buffered | All PBF writes direct | - |
 | apply-changes | All base PBF reads direct, including copied ranges; OSC read buffered | All PBF writes direct | Yes |
 | diff | All PBF reads direct, including indexed parallel comparison | No PBF output | - |
 | digest | All reads direct | - | - |

@@ -136,6 +136,7 @@ fn write_replacement(path: &Path) {
 
 fn run<'a>(
     route: Route,
+    direct: bool,
     input: impl Into<pbfhogg::read::input::InputSource<'a>>,
     output: &Path,
     host: &pbfhogg::host::Host,
@@ -146,6 +147,7 @@ fn run<'a>(
         crate::common::out(output),
         &WriteOptions {
             force,
+            direct_reads: direct,
             ..WriteOptions::default()
         },
         &pbfhogg::HeaderOverrides::default(),
@@ -154,19 +156,71 @@ fn run<'a>(
     .map(drop)
 }
 
+/// The unreplaced run's output, with its opens and their transports
+/// checked: armed past the last open, the replacement never fires and only
+/// counts. Every open is direct on a direct run, following the sort row of
+/// `io_reach.rs` ("all reads direct"). Skipped when the host refused
+/// O_DIRECT setup, the one refusal that skips.
+fn reference(route: Route, direct: bool, input: &Path, dir: &Path) -> Reference {
+    let opens = route.opens();
+    let what = format!("{route:?}, direct {direct}");
+    let reference = dir.join("reference.osm.pbf");
+    let host = crate::common::test_host();
+    host.invocation
+        .faults()
+        .arm_input_replacement(input, &dir.join("unused.osm.pbf"), opens + 1);
+    match run(route, direct, input, &reference, &host) {
+        Ok(()) => {}
+        #[cfg(feature = "linux-direct-io")]
+        Err(e) if direct && crate::common::direct_io_unavailable(&e) => {
+            crate::common::skip(format!("{what}: {e}"));
+            return Reference::Skipped;
+        }
+        Err(e) => panic!("{what}: unreplaced run: {e}"),
+    }
+    crate::common::witness_direct_reads(direct, &host.invocation, &what);
+    let counted = host
+        .invocation
+        .faults()
+        .input_replacement()
+        .expect("armed replacement");
+    assert!(!counted.fired, "{what}: {counted:?}");
+    assert_eq!(counted.attempts, opens, "{what}: {counted:?}");
+    assert_eq!(counted.verified, opens, "{what}: {counted:?}");
+    crate::common::witness_transports(direct, &counted, || "DDD", &what);
+    let expected = std::fs::read(&reference).expect("read reference output");
+    std::fs::remove_file(&reference).expect("remove reference output");
+    Reference::Output(expected)
+}
+
+/// What [`reference`] found.
+enum Reference {
+    /// The output's bytes.
+    Output(Vec<u8>),
+    /// The host refused O_DIRECT setup.
+    #[cfg_attr(
+        not(feature = "linux-direct-io"),
+        expect(dead_code, reason = "only a direct run skips")
+    )]
+    Skipped,
+}
+
 /// Run `route` with the replacement armed after each of its opens but the
 /// last in turn, in both reopen modes.
 fn check_route(route: Route) {
+    check_route_with(route, false);
+}
+
+fn check_route_with(route: Route, direct: bool) {
     let opens = route.opens();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
     write_input(route, &input);
 
-    let reference = dir.path().join("reference.osm.pbf");
-    run(route, &input, &reference, &crate::common::test_host())
-        .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {e}"));
-    let expected = std::fs::read(&reference).expect("read reference output");
+    let Reference::Output(expected) = reference(route, direct, &input, dir.path()) else {
+        return;
+    };
 
     for after in 1..opens {
         for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
@@ -179,7 +233,7 @@ fn check_route(route: Route) {
                     .arm_input_replacement(&input, &replacement, after);
                 let output = dir.path().join("out.osm.pbf");
                 let before = snapshot_dir(dir.path());
-                let result = run(route, pin, &output, &host);
+                let result = run(route, direct, pin, &output, &host);
 
                 let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
                 let report = host
@@ -277,5 +331,18 @@ fn concurrent_overlap_runs_read_only_the_pinned_input() {
             overlaps: Overlaps::Both,
             indexed,
         });
+    }
+}
+
+/// Every route again with direct reads: the front read, the header walker
+/// and the pass 2 source all open `O_DIRECT` through the pin.
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_reads_follow_the_pinned_input() {
+    check_route_with(Route::DeclaredSorted, true);
+    for overlaps in [Overlaps::Nodes, Overlaps::Ways, Overlaps::Both] {
+        for indexed in [true, false] {
+            check_route_with(Route::Unsorted { overlaps, indexed }, true);
+        }
     }
 }

@@ -36,11 +36,38 @@ enum Route {
     /// Forced sparse on an unindexed input: the pass 2 walk is replaced by
     /// the decode-all reader.
     DecodeAll,
+    /// Auto on an indexed input holding negative node IDs, under a budget
+    /// its header estimate fits but its exact store does not: sparse up
+    /// front, then the post-pass-0 recheck re-routes external, which opens
+    /// a second front read.
+    Rechecked,
 }
 
 /// Write the run's input: 60 nodes, ways over the first six, relations over
-/// the ways, five elements per blob.
-fn write_input(path: &Path, indexed: bool) {
+/// the ways, five elements per blob. [`Route::Rechecked`] takes one way over
+/// four nodes, two of them at IDs 0 and -1.
+fn write_input(path: &Path, route: Route) {
+    if matches!(route, Route::Rechecked) {
+        let nodes: Vec<crate::common::TestNode> = [0, -1, 1, 2]
+            .into_iter()
+            .map(|id| crate::common::TestNode {
+                id,
+                lat: 550_000_000,
+                lon: 120_000_000,
+                tags: vec![],
+                meta: None,
+            })
+            .collect();
+        let way = [crate::common::TestWay {
+            id: 1,
+            refs: vec![-1, 0, 1, 2],
+            tags: vec![],
+            meta: None,
+        }];
+        crate::common::write_indexed_pbf(path, &nodes, &way, &[]);
+        return;
+    }
+    let indexed = !matches!(route, Route::DecodeAll);
     let nodes = generate_nodes(60, 1);
     let ways = generate_ways(10, 10_000, 6, 1);
     let relations = generate_relations(2, 20_000, 2, 10_000);
@@ -80,12 +107,14 @@ fn run<'a>(
     output: &Path,
     host: &pbfhogg::host::Host,
     scratch_dir: &Path,
+    direct: bool,
 ) -> pbfhogg::Result<()> {
     let input = input.into();
     let scratch = pbfhogg::scratch::RunScratch::create(scratch_dir, host)?;
     let (index_type, force) = match route {
         Route::Indexed(index_type) => (index_type, false),
         Route::DecodeAll => (IndexType::Sparse, true),
+        Route::Rechecked => (IndexType::Auto, false),
     };
     add_locations_to_ways(
         input,
@@ -95,6 +124,7 @@ fn run<'a>(
             keep_untagged_nodes: false,
             write: WriteOptions {
                 force,
+                direct_reads: direct,
                 ..WriteOptions::default()
             },
             index_type,
@@ -108,44 +138,111 @@ fn run<'a>(
     .map(drop)
 }
 
-/// Run `route` with the replacement armed after each of its `opens` in
-/// turn, in both reopen modes. `racing` is the arming point after which
-/// two concurrent opens (external stage 1 and the relation scan) both
-/// follow the replacement.
-fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: Option<u64>) {
+/// One route's shape: the host's `memory_available`, its `opens`, `racing`
+/// (the arming point after which two concurrent opens, external stage 1
+/// and the relation scan, both follow the replacement), and `transports`,
+/// the transport of each open when run direct (`common::witness_transports`),
+/// following the add-locations-to-ways row of `io_reach.rs`: the front read
+/// and the unindexed fallback's streaming reader direct, the index,
+/// dependency and external-stage walks and preads buffered.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    memory_available: Option<u64>,
+    opens: u64,
+    racing: Option<u64>,
+    transports: &'static str,
+}
+
+/// Run `route` with the replacement armed after each of its opens in turn,
+/// in both reopen modes, after a reference run that checks its opens and
+/// their transports.
+fn check_route(route: Route, shape: Shape, direct: bool) {
     // One run at a time; any route may be external.
     crate::common::with_heavy_ticket(1, &format!("check_route {route:?}"), |ticket| {
-        check_admitted_route(ticket, route, memory_available, opens, racing);
+        check_admitted_route(ticket, route, shape, direct);
     });
+}
+
+/// The unreplaced run's output: armed past the last open, the replacement
+/// never fires and only counts. Skipped when the host refused O_DIRECT
+/// setup, the one refusal that skips.
+fn reference(
+    ticket: &Arc<crate::common::FdTicket>,
+    route: Route,
+    shape: Shape,
+    direct: bool,
+    input: &Path,
+    dir: &Path,
+) -> Reference {
+    let what = format!("{route:?}, {shape:?}, direct {direct}");
+    let reference = dir.join("reference.osm.pbf");
+    let host = host(ticket, shape.memory_available);
+    host.invocation.faults().arm_input_replacement(
+        input,
+        &dir.join("unused.osm.pbf"),
+        shape.opens + 1,
+    );
+    match run(route, input, &reference, &host, dir, direct) {
+        Ok(()) => {}
+        #[cfg(feature = "linux-direct-io")]
+        Err(e) if direct && crate::common::direct_io_unavailable(&e) => {
+            crate::common::skip(format!("{what}: {e}"));
+            return Reference::Skipped;
+        }
+        Err(e) => panic!("{what}: unreplaced run: {e}"),
+    }
+    crate::common::witness_direct_reads(direct, &host.invocation, &what);
+    let counted = host
+        .invocation
+        .faults()
+        .input_replacement()
+        .expect("armed replacement");
+    assert!(!counted.fired, "{what}: {counted:?}");
+    assert_eq!(counted.attempts, shape.opens, "{what}: {counted:?}");
+    assert_eq!(counted.verified, shape.opens, "{what}: {counted:?}");
+    crate::common::witness_transports(direct, &counted, || shape.transports, &what);
+    let expected = std::fs::read(&reference).expect("read reference output");
+    std::fs::remove_file(&reference).expect("remove reference output");
+    Reference::Output(expected)
+}
+
+/// What [`reference`] found.
+enum Reference {
+    /// The output's bytes.
+    Output(Vec<u8>),
+    /// The host refused O_DIRECT setup.
+    #[cfg_attr(
+        not(feature = "linux-direct-io"),
+        expect(dead_code, reason = "only a direct run skips")
+    )]
+    Skipped,
 }
 
 fn check_admitted_route(
     ticket: &Arc<crate::common::FdTicket>,
     route: Route,
-    memory_available: Option<u64>,
-    opens: u64,
-    racing: Option<u64>,
+    shape: Shape,
+    direct: bool,
 ) {
+    let Shape {
+        memory_available,
+        opens,
+        racing,
+        ..
+    } = shape;
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
-    let indexed = !matches!(route, Route::DecodeAll);
-    write_input(&input, indexed);
+    write_input(&input, route);
 
-    let reference = dir.path().join("reference.osm.pbf");
-    run(
-        route,
-        &input,
-        &reference,
-        &host(ticket, memory_available),
-        dir.path(),
-    )
-    .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {e}"));
-    let expected = std::fs::read(&reference).expect("read reference output");
+    let Reference::Output(expected) = reference(ticket, route, shape, direct, &input, dir.path())
+    else {
+        return;
+    };
 
     for after in 1..opens {
         for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, indexed);
+            write_input(&input, route);
             write_replacement(&replacement);
             let host = host(ticket, memory_available);
             let run_cell = |pin: &pbfhogg::read::input::PinnedInput, scenario| {
@@ -154,7 +251,7 @@ fn check_admitted_route(
                     .arm_input_replacement(&input, &replacement, after);
                 let output = dir.path().join("out.osm.pbf");
                 let before = snapshot_dir(dir.path());
-                let result = run(route, pin, &output, &host, dir.path());
+                let result = run(route, pin, &output, &host, dir.path(), direct);
 
                 let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
                 let report = host
@@ -217,52 +314,139 @@ fn check_admitted_route(
     }
 }
 
-#[test]
-fn sparse_reads_only_the_pinned_input() {
-    check_route(Route::Indexed(IndexType::Sparse), Some(8 << 30), 5, None);
-}
+const SPARSE: (Route, Shape) = (
+    Route::Indexed(IndexType::Sparse),
+    Shape {
+        memory_available: Some(8 << 30),
+        opens: 5,
+        racing: None,
+        transports: "DBBBB",
+    },
+);
 
-#[test]
-fn sparse_decode_all_reads_only_the_pinned_input() {
-    check_route(Route::DecodeAll, Some(8 << 30), 5, None);
-}
+const DECODE_ALL: (Route, Shape) = (
+    Route::DecodeAll,
+    Shape {
+        memory_available: Some(8 << 30),
+        opens: 5,
+        racing: None,
+        // The decode-all reader streams the file sequentially, direct.
+        transports: "DBBBD",
+    },
+);
 
 /// Stage 1 and the relation scan open concurrently after the metadata
 /// scan, so a replacement after the metadata scan's open is followed by
 /// both. A replacement after the third open lands between them in either
 /// order (the hook serializes opens), and only the later one is refused:
 /// which of the two that is varies between runs.
+const EXTERNAL: (Route, Shape) = (
+    Route::Indexed(IndexType::External),
+    Shape {
+        memory_available: Some(8 << 30),
+        opens: 6,
+        racing: Some(2),
+        transports: "DBBBBB",
+    },
+);
+
+const AUTO_SPARSE: (Route, Shape) = (
+    Route::Indexed(IndexType::Auto),
+    Shape {
+        memory_available: Some(8 << 30),
+        opens: 6,
+        racing: None,
+        transports: "DBBBBB",
+    },
+);
+
+/// One byte above the sparse run's fixed 3 GiB anon allowance leaves a
+/// one-byte page-cache budget: auto routes this indexed input external,
+/// after its estimate walk. Racing as [`EXTERNAL`], one open later.
+const AUTO_EXTERNAL: (Route, Shape) = (
+    Route::Indexed(IndexType::Auto),
+    Shape {
+        memory_available: Some((3 << 30) + 1),
+        opens: 7,
+        racing: Some(3),
+        transports: "DBBBBBB",
+    },
+);
+
+/// Unknown memory: auto keeps sparse and skips the estimate walk, so it
+/// opens the input exactly as many times as explicit sparse.
+const AUTO_UNKNOWN_MEMORY: (Route, Shape) = (
+    Route::Indexed(IndexType::Auto),
+    Shape {
+        memory_available: None,
+        opens: 5,
+        racing: None,
+        transports: "DBBBB",
+    },
+);
+
+/// A 40-byte page-cache budget above the sparse allowance: the header
+/// estimate fits, the exact store does not. The front read, the estimate
+/// walk and pass 0, then the re-route's second front read (direct) and the
+/// external join's opens on this input, its stage 1 and relation scan
+/// racing after the sixth.
+const RECHECKED: (Route, Shape) = (
+    Route::Rechecked,
+    Shape {
+        memory_available: Some((3 << 30) + 40),
+        opens: 10,
+        racing: Some(6),
+        transports: "DBBDBBBBBB",
+    },
+);
+
+#[test]
+fn sparse_reads_only_the_pinned_input() {
+    check_route(SPARSE.0, SPARSE.1, false);
+}
+
+#[test]
+fn sparse_decode_all_reads_only_the_pinned_input() {
+    check_route(DECODE_ALL.0, DECODE_ALL.1, false);
+}
+
 #[test]
 fn external_reads_only_the_pinned_input() {
-    check_route(
-        Route::Indexed(IndexType::External),
-        Some(8 << 30),
-        6,
-        Some(2),
-    );
+    check_route(EXTERNAL.0, EXTERNAL.1, false);
 }
 
 #[test]
 fn auto_routed_sparse_reads_only_the_pinned_input() {
-    check_route(Route::Indexed(IndexType::Auto), Some(8 << 30), 6, None);
+    check_route(AUTO_SPARSE.0, AUTO_SPARSE.1, false);
 }
 
-/// One byte above the sparse run's fixed 3 GiB anon allowance leaves a
-/// one-byte page-cache budget: auto routes this indexed input external,
-/// after its estimate walk.
 #[test]
 fn auto_routed_external_reads_only_the_pinned_input() {
-    check_route(
-        Route::Indexed(IndexType::Auto),
-        Some((3 << 30) + 1),
-        7,
-        Some(3),
-    );
+    check_route(AUTO_EXTERNAL.0, AUTO_EXTERNAL.1, false);
 }
 
-/// Unknown memory: auto keeps sparse and skips the estimate walk, so it
-/// opens the input exactly as many times as explicit sparse.
+#[test]
+fn auto_rechecked_external_reads_only_the_pinned_input() {
+    check_route(RECHECKED.0, RECHECKED.1, false);
+}
+
 #[test]
 fn auto_unknown_memory_skips_the_estimate_walk() {
-    check_route(Route::Indexed(IndexType::Auto), None, 5, None);
+    check_route(AUTO_UNKNOWN_MEMORY.0, AUTO_UNKNOWN_MEMORY.1, false);
+}
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_sparse_reads_follow_the_pinned_input() {
+    for (route, shape) in [SPARSE, DECODE_ALL, AUTO_SPARSE, AUTO_UNKNOWN_MEMORY] {
+        check_route(route, shape, true);
+    }
+}
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn direct_external_reads_follow_the_pinned_input() {
+    for (route, shape) in [EXTERNAL, AUTO_EXTERNAL, RECHECKED] {
+        check_route(route, shape, true);
+    }
 }

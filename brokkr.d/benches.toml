@@ -605,8 +605,9 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 script_file = "../benches/getparents/parent-select.lua"
 description = "Select parent elements of configured IDs from a dataset or snapshot"
 version = 1
-date = 2026-11-09
+date = 2026-11-26
 changelog = [
+  { date = 2026-11-26, note = "Add --add-self; default no keeps the workload unchanged" },
   { date = 2026-11-09, note = "Use shared compression, stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed getparents: configured IDs, snapshots, compression, direct I/O and profiling with marker stops" },
 ]
@@ -618,6 +619,7 @@ params.dataset = { from = "datasets", default = "denmark", help = "the dataset; 
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT" }
+params.add-self = { choices = ["yes", "no"], default = "no", help = "yes: pass --add-self, also emitting the queried objects" }
 params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }

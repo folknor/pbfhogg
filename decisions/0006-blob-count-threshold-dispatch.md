@@ -29,9 +29,9 @@ emit the exact count observed during the scan.
 the streaming scan is possible but unmeasured. Inputs forced without
 indexdata also remain walker-only because the filtered full-scan regime
 has not been measured. The indexdata gate probes the first data blob
-only, so a file with an indexed head and an unindexed tail can still
-dispatch to the full scan; both scan mechanisms decode unindexed blobs
-conservatively, which keeps that choice correct, merely unpriced.
+only; a file with an indexed head and an unindexed tail is refused as
+partially indexed by the frame readers of both arms, so the gate's choice
+never meets one.
 
 ## Alternatives considered
 

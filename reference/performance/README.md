@@ -218,6 +218,7 @@ Tables covering several commands stay intact in cross-command or subsystem files
 - [extract](extract.md)
 - [geocode](geocode.md)
 - [getid](getid.md)
+- [getparents](getparents.md) (earlier getparents cells stay in the cross-command and subsystem files)
 - [inspect](inspect.md)
 - [library-capabilities](library-capabilities.md)
 - [memory](memory.md)

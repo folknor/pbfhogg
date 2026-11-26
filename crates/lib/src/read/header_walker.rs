@@ -792,7 +792,8 @@ impl<P: Positional> HeaderWalker<P> {
     }
 
     /// Report a filtered schedule retaining an unindexed data blob. Call only
-    /// where a schedule uses type or spatial index pruning, not on every walk.
+    /// where a schedule uses type, spatial or ID-range index pruning, not on
+    /// every walk.
     /// Mixed indexed/unindexed files also need this note: later missing indexes
     /// disable pruning even when the first data blob was indexed.
     pub(crate) fn observe_filter_index(&mut self, index: Option<&BlobIndex>) {
@@ -810,7 +811,7 @@ impl<P: Positional> HeaderWalker<P> {
             &call,
             Note,
             "reader.filter_without_indexdata",
-            "Input contains blobs without indexdata; blob type and spatial filters cannot skip those blobs"
+            "Input contains blobs without indexdata; blob type, spatial and ID-range filters cannot skip those blobs"
         );
         call.counter("schedule_filter_without_indexdata", 1);
     }

@@ -1409,31 +1409,24 @@ Kind: hypothesis, unsized. The path is CPU-bound on bygg's planet `history2`
 (about 27 cores), but the hotpath cell does not split selection from
 encoding inside `select_blob`; validation stays either way.
 
-## PERF-052 - getparents --add-self reads every blob of a queried kind
+## PERF-052 - getparents reads every way and relation blob for any query
 
 Reported by: copy.
 
-Residue, getparents only. The getid side landed: `getid --add-referenced`
-selects way, second-relation and output blobs by claimed ID range on the one
-header walk (planet nine IDs about 40 s to 7 s, now the cold walk; see
-`reference/performance/getid.md`). Refused there, with the reasoning at the
-code: probe-recorded spans instead of rebuilding a hit block
-(`included_block`), a decode pool for the include walker
-(`filter_by_id_walker`), frontier traversal of relations (the first
-relation read is under 0.3 s at planet and the edge store bounds reads at
-two). A persisted blob directory is PERF-004's question.
+Residue. Claimed-range selection landed for `getid --add-referenced` and for
+`getparents --add-self` (node blobs, and way blobs when only ways are
+queried; `Selection` in `getparents/mod.rs`, cells in
+`reference/performance/getparents.md`). What remains is structural: a parent
+is found through its refs and members, which no indexdata claim describes,
+so a node query still reads every way blob and any query every relation
+blob. A reverse index from referenced IDs to blobs would transform repeated
+small getparents queries, conditional on reuse and on binding to the exact
+file (the persisted-directory question of PERF-004). On the full scan arm
+(high-blob-count encodings) the wall is the sequential stream of every byte
+whatever is decoded (europe 34 GB in about 10.5 s, unchanged by the
+selection), so only a read that skips bytes would move it.
 
-Open: `getparents --add-self` schedules every node blob when a node is
-queried (`needed_blob_kinds`, kind only); node blobs, and way blobs needed
-only for `--add-self` of a queried way, could be selected by claimed range.
-Both arms need it (the walker's hand-written schedule loop and the FullScan
-arm's `BlobFilter`, which carries no ID range), and the arm-equality tests
-pin them together; the `parent-select` bench has no `--add-self` param, so
-there is no cell to measure it on yet. A reverse index from referenced IDs
-to blobs would transform repeated small getparents queries, conditional on
-reuse and on binding to the exact file.
-
-Kind: medium conviction.
+Kind: low conviction (conditional on repeated queries against one file).
 
 ## PERF-053 - Geocode admin lookup reconstructs polygons per query
 

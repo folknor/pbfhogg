@@ -663,6 +663,15 @@
   reported, as with plain `getid`. With no way or relation listed, `-r`
   pulls nothing in and runs as plain `getid`.
 
+- **`getparents --add-self` reads only the node blobs that can hold a
+  queried node.** Node blobs, and way blobs when only ways are queried,
+  are selected by their indexdata ID range instead of by kind alone
+  (germany, two nodes and a way: about 1.0 s to 0.67 s, the plain query's
+  wall). Output is unchanged on files whose indexdata is honest; a blob
+  the ranges skip is not decoded, so a damaged payload there is not
+  reported, as with `getid`. Way blobs are still all read when a node is
+  queried, and relation blobs whenever anything is.
+
 - **Plain `cat` indexes an unindexed input in parallel.** From an input's
   first blob without indexdata on, blobs are decompressed and scanned on a
   worker pool instead of the reading thread (germany raw 20.4 s to about

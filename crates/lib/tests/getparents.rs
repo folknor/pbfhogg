@@ -363,6 +363,104 @@ fn run_getparents(input: &std::path::Path, output: &std::path::Path) -> pbfhogg:
     .map(|_| ())
 }
 
+const NODE_BLOB: usize = 1;
+
+/// `query` with `--add-self` over `input`, every element of the output as
+/// (kind, id) in file order, on each arm this build can select: the
+/// dispatched arm, and (under the test-hook cfg) both forced arms.
+fn add_self_on_every_arm(input: &std::path::Path, query: &[&str]) -> Vec<Vec<(char, i64)>> {
+    let id_set = parse_ids(&ids(query)).expect("parse ids");
+    let opts = GetparentsOptions { add_self: true };
+    let dir = crate::common::test_scratch();
+    #[cfg_attr(not(pbfhogg_test_hooks), allow(unused_mut))]
+    let mut runs: Vec<Option<u64>> = vec![None];
+    #[cfg(pbfhogg_test_hooks)]
+    runs.extend([Some(1), Some(u64::MAX)]);
+    let mut outputs = Vec::new();
+    for (i, min_blobs) in runs.into_iter().enumerate() {
+        let output = dir.path().join(format!("out-{i}.osm.pbf"));
+        match min_blobs {
+            None => getparents(
+                input,
+                crate::common::out(&output),
+                &id_set,
+                &opts,
+                &WriteOptions::default(),
+                &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
+            ),
+            #[cfg(pbfhogg_test_hooks)]
+            Some(min_blobs) => pbfhogg::getparents::getparents_with_min_blobs(
+                input,
+                crate::common::out(&output),
+                &id_set,
+                &opts,
+                &WriteOptions::default(),
+                &pbfhogg::HeaderOverrides::default(),
+                min_blobs,
+                &crate::common::test_host(),
+            ),
+            #[cfg(not(pbfhogg_test_hooks))]
+            Some(_) => unreachable!("forced arms need the test-hook cfg"),
+        }
+        .expect("getparents");
+        let elements = read_all_elements(&output);
+        outputs.push(
+            node_ids(&elements)
+                .into_iter()
+                .map(|id| ('n', id))
+                .chain(way_ids(&elements).into_iter().map(|id| ('w', id)))
+                .chain(relation_ids(&elements).into_iter().map(|id| ('r', id)))
+                .collect(),
+        );
+    }
+    outputs
+}
+
+/// `--add-self` selects node blobs, and way blobs when no node is queried,
+/// by their claimed ID range, believing it (`reference/indexdata-trust.md`):
+/// a blob whose claimed range misses the queried ID is not read, so a
+/// forged range hides the queried element itself. That a forged range
+/// changes the output is the proof the blob was skipped. A way blob is
+/// still read whole when a node is queried, whatever its range.
+#[test]
+fn add_self_selects_node_and_way_blobs_by_claimed_range() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_claim_fixture(&honest);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let forge = |blob: usize, kind: u8| {
+        let lying =
+            crate::common::adversarial::mutate_blob_header_indexdata(&bytes, blob, |index| {
+                assert_eq!(index[1], kind, "frame {blob} holds the expected kind");
+                index[2..10].copy_from_slice(&100i64.to_le_bytes());
+                index[10..18].copy_from_slice(&200i64.to_le_bytes());
+            });
+        let path = dir.path().join(format!("forged-{blob}.osm.pbf"));
+        std::fs::write(&path, lying).expect("write the forged file");
+        path
+    };
+    let nodes_forged = forge(NODE_BLOB, 0);
+    let ways_forged = forge(WAY_BLOB, 1);
+
+    let all = |input: &std::path::Path, query: &[&str], expected: &[(char, i64)]| {
+        for run in add_self_on_every_arm(input, query) {
+            assert_eq!(run, expected, "{query:?} on {}", input.display());
+        }
+    };
+    all(&honest, &["n1"], &[('n', 1), ('w', 10)]);
+    all(&nodes_forged, &["n1"], &[('w', 10)]);
+    all(&honest, &["w10"], &[('w', 10), ('r', 30)]);
+    all(&ways_forged, &["w10"], &[('r', 30)]);
+    // With a node queried every way blob is read: the forged way range
+    // hides nothing.
+    all(
+        &ways_forged,
+        &["n1", "w10"],
+        &[('n', 1), ('w', 10), ('r', 30)],
+    );
+}
+
 /// A way blob claiming relations is scheduled for a node query (any
 /// relation may reference the node) and refused after decoding. Before
 /// the refusal the way holding the parent of node 1 was dropped from the

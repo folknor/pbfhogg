@@ -461,29 +461,6 @@ where
     }
 }
 
-/// The projecting command transform: each data blob's decompressed buffer
-/// goes to the closure, which validates it through a projection (and may
-/// build the block from the validated bytes); every other blob is skipped.
-/// What `ElementReader::for_each_fused_buffer` runs.
-pub(crate) struct BufferOnly<X>(pub(crate) X);
-
-impl<T, X> DecodeTransform for BufferOnly<X>
-where
-    T: Send,
-    X: Fn(super::block::BlockBuffer<'_>) -> Result<T> + Sync,
-{
-    type Out = T;
-    const PARSE_INDEXDATA: bool = false;
-
-    #[inline]
-    fn apply(&self, blob: &crate::blob::Blob, decode: Decoder<'_>) -> Option<Result<T>> {
-        if blob.get_type() != BlobType::OsmData {
-            return None;
-        }
-        Some(decode.buffer(&self.0))
-    }
-}
-
 /// Forwards a reader error as a sequenced item. Only a send that finds the
 /// channel full records its wait, like every other send in the engine.
 fn send_direct_error<T>(

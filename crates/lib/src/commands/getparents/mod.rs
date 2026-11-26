@@ -4,10 +4,12 @@
 //! contribute matches. Workers decode and scan; a reorder buffer delivers
 //! owned blocks to the writer in file order.
 //!
-//! Node blobs are skipped unless `--add-self` matches a node ID, saving the
-//! ~75 % of planet bytes that nodes occupy. Way blobs are skipped when no
-//! node IDs are in the query (nothing to ref), and relation blobs when the
-//! query is empty of node/way/relation IDs.
+//! Node blobs are read only for `--add-self`, and then only those whose
+//! claimed ID range holds a queried node, so the ~75 % of planet bytes that
+//! nodes occupy stay unread. Way blobs are all read when a node is queried
+//! (any way may ref it), otherwise only for `--add-self` of a way whose ID
+//! the blob's claimed range holds; relation blobs when the query is
+//! non-empty. `Selection` is that rule, applied by both arms.
 
 use super::getid::ElementIds;
 use super::{
@@ -22,7 +24,7 @@ use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
-use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::Result;
 
@@ -204,17 +206,89 @@ pub(crate) fn getparents_with_arm(
     }
 }
 
-/// Which blob kinds can contribute matches?
-/// - node blobs: only for --add-self on node IDs
-/// - way blobs: any way may reference a query node ID; --add-self on way IDs
-/// - relation blobs: any relation may reference a query node/way/relation ID;
-///   --add-self on relation IDs
-fn needed_blob_kinds(ids: &ElementIds, opts: &GetparentsOptions) -> (bool, bool, bool) {
-    (
-        opts.add_self && ids.node_ids.has_any(),
-        ids.node_ids.has_any() || (opts.add_self && ids.way_ids.has_any()),
-        ids.node_ids.has_any() || ids.way_ids.has_any() || ids.relation_ids.has_any(),
-    )
+/// Which data blobs can contribute a match, judged from each blob's
+/// indexdata claim. The one rule both arms select by: the walker schedules
+/// through it, the full scan's transform skips before decoding through it.
+///
+/// - node blob: only a queried node itself (`--add-self`), so only when the
+///   claimed ID range holds a queried node ID;
+/// - way blob: any way may reference a queried node, whatever its own ID,
+///   so every way blob when a node is queried; otherwise only a queried way
+///   itself (`--add-self`), so only when the claimed range holds a queried
+///   way ID;
+/// - relation blob: any relation may reference a queried ID, so every
+///   relation blob when anything is queried (a relation's own ID range says
+///   nothing about its members, which is why `--add-self` of a relation
+///   adds no range test here).
+///
+/// An unindexed blob is kept: its kind and range are unknown. The kind and
+/// range claims are believed (`reference/indexdata-trust.md`): a node or way
+/// blob whose range understates its IDs is skipped with the queried element
+/// in it, as `getid` skips one. A blob that is read still has its kind claim
+/// refused at decode.
+struct Selection<'q> {
+    ids: &'q ElementIds,
+    add_self: bool,
+    any_nodes: bool,
+    any_query: bool,
+}
+
+impl<'q> Selection<'q> {
+    fn new(ids: &'q ElementIds, opts: &GetparentsOptions) -> Self {
+        let any_nodes = ids.node_ids.has_any();
+        Self {
+            ids,
+            add_self: opts.add_self,
+            any_nodes,
+            any_query: any_nodes || ids.way_ids.has_any() || ids.relation_ids.has_any(),
+        }
+    }
+
+    fn wants(&self, index: Option<&crate::blob_meta::BlobIndex>) -> bool {
+        let Some(index) = index else {
+            return true;
+        };
+        let (min, max) = (index.min_id, index.max_id);
+        match index.kind {
+            ElementKind::Node => self.add_self && self.ids.node_ids.any_in_numeric_range(min, max),
+            ElementKind::Way => {
+                self.any_nodes || (self.add_self && self.ids.way_ids.any_in_numeric_range(min, max))
+            }
+            ElementKind::Relation => self.any_query,
+        }
+    }
+}
+
+/// The full scan arm's transform: a data blob [`Selection`] refuses is
+/// skipped before it is decompressed and counted; every other data blob
+/// goes through [`parents_in`].
+struct SelectedParents<'q, 'l> {
+    selection: Selection<'q>,
+    coords: crate::owned::WayCoords,
+    limits: &'l crate::commands::split::Limits,
+    skipped: &'l std::sync::atomic::AtomicU64,
+}
+
+impl crate::read::pipeline::DecodeTransform for SelectedParents<'_, '_> {
+    type Out = (Vec<OwnedBlock>, (u64, u64, u64));
+    const PARSE_INDEXDATA: bool = true;
+
+    fn apply(
+        &self,
+        blob: &crate::blob::Blob,
+        decode: crate::read::pipeline::Decoder<'_>,
+    ) -> Option<crate::Result<Self::Out>> {
+        if blob.get_type() != crate::blob::BlobType::OsmData {
+            return None;
+        }
+        if !self.selection.wants(blob.index().as_ref()) {
+            self.skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let (ids, add_self) = (self.selection.ids, self.selection.add_self);
+        Some(decode.buffer(|buffer| parents_in(buffer, ids, add_self, self.coords, self.limits)))
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -227,7 +301,7 @@ fn getparents_walker(
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
-    let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
+    let selection = Selection::new(ids, opts);
 
     host.invocation.marker("GETPARENTS_SCHEDULE_START");
     let mut walker = HeaderWalker::open(input, host)?;
@@ -248,19 +322,11 @@ fn getparents_walker(
                 );
             }
             BlobKind::OsmData => {
-                // A kind filter only prunes when some kind is unwanted.
-                if !(need_node_blobs && need_way_blobs && need_relation_blobs) {
-                    walker.observe_filter_index(meta.index.as_ref());
-                }
-                let keep = match meta.index.as_ref().map(|i| i.kind) {
-                    Some(ElementKind::Node) => need_node_blobs,
-                    Some(ElementKind::Way) => need_way_blobs,
-                    Some(ElementKind::Relation) => need_relation_blobs,
-                    // Unindexed blob: include conservatively since we don't
-                    // know its kind without decoding.
-                    None => true,
-                };
-                if keep {
+                // The selection prunes indexed blobs for every query (by
+                // kind, or by claimed ID range for `--add-self`), so a
+                // retained unindexed blob is always worth the note.
+                walker.observe_filter_index(meta.index.as_ref());
+                if selection.wants(meta.index.as_ref()) {
                     // The walk has already refused a payload running past
                     // EOF, so the schedule's preads stay in the file.
                     schedule.push(crate::scan::classify::ScheduledBlob::from_meta(
@@ -358,14 +424,10 @@ fn getparents_pipelined(
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<GetparentsStats> {
-    let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
-    let reader = ElementReader::open_in(input, write.direct_reads, host)?
-        .refusing_kind_claims()
-        .with_blob_filter(BlobFilter::new(
-            need_node_blobs,
-            need_way_blobs,
-            need_relation_blobs,
-        ));
+    // No `BlobFilter`: the selection needs the query's ID sets, which a
+    // filter cannot borrow, so the transform applies it, at the same point
+    // in the decode task (before decompression) where a filter would.
+    let reader = ElementReader::open_in(input, write.direct_reads, host)?.refusing_kind_claims();
     let coords = crate::owned::WayCoords::of_input(reader.header());
     let header_bytes = super::output_header::build_one(
         reader.header(),
@@ -389,19 +451,27 @@ fn getparents_pipelined(
 
     host.invocation.marker("GETPARENTS_DECODE_START");
     let limits = crate::commands::split::Limits::new(writer.compression());
-    reader.for_each_fused_buffer(
-        |buffer| parents_in(buffer, ids, opts.add_self, coords, &limits),
-        |(blocks, (nodes, ways, relations))| {
-            for block in blocks {
-                writer.write_primitive_block_owned(block)?;
-            }
-            stats.nodes_written += nodes;
-            stats.ways_written += ways;
-            stats.relations_written += relations;
-            Ok(())
-        },
-    )?;
+    let skipped = std::sync::atomic::AtomicU64::new(0);
+    let transform = SelectedParents {
+        selection: Selection::new(ids, opts),
+        coords,
+        limits: &limits,
+        skipped: &skipped,
+    };
+    reader.for_each_fused_blob(transform, |(blocks, (nodes, ways, relations))| {
+        for block in blocks {
+            writer.write_primitive_block_owned(block)?;
+        }
+        stats.nodes_written += nodes;
+        stats.ways_written += ways;
+        stats.relations_written += relations;
+        Ok(())
+    })?;
     writer.flush()?;
+    host.invocation.counter(
+        "getparents_blobs_skipped",
+        skipped.load(std::sync::atomic::Ordering::Relaxed),
+    );
     host.invocation.marker("GETPARENTS_DECODE_END");
     Ok(stats)
 }
@@ -426,7 +496,7 @@ fn getparents_pipelined(
 /// per-blob `Vec<OwnedBlock>` before returning. Not because the builder is
 /// not `Send` (the ordered arm's worker state is built on the worker's
 /// thread and could hold one): a query hits few blobs, so a builder per hit
-/// costs next to nothing, and the fused arm (`for_each_fused_buffer`) has
+/// costs next to nothing, and the fused arm (`for_each_fused_blob`) has
 /// no per-worker state to keep one in.
 fn parents_in(
     buffer: crate::read::block::BlockBuffer<'_>,
@@ -628,7 +698,7 @@ mod tests {
     use crate::commands::getid::parse_ids;
     use crate::write::WriteOptions;
     use crate::writer::{Compression, PbfWriter};
-    use crate::{Element, ElementReader, HeaderOverrides, MemberId};
+    use crate::{Element, ElementKind, ElementReader, HeaderOverrides, MemberId};
 
     /// For every fixture, every truncation and every probed byte value, and
     /// a spread of queries with and without `--add-self`: `parents_in`
@@ -881,7 +951,7 @@ mod tests {
     }
 
     /// Fixture exercising cross-kind blob skipping. Each kind lands in its
-    /// own indexed blob so the walker's `needed_blob_kinds` skip applies per
+    /// own indexed blob so the arms' `Selection` skip applies per
     /// kind, and the relation-of-relation pins single-level parent semantics:
     ///   node blob:     nodes 1, 2
     ///   way blob:      way 10 -> refs [1, 2]
@@ -1040,6 +1110,116 @@ mod tests {
         })
     }
 
+    /// Two node blobs, two way blobs and a relation blob, each indexed:
+    ///   node blobs:    nodes 1, 2 | nodes 50, 51
+    ///   way blobs:     way 10 -> [1, 2] | way 60 -> [50, 51]
+    ///   relation blob: rel 100 -> [node 1, way 10]
+    fn write_ranged_fixture(path: &std::path::Path) {
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+            .expect("write header");
+        let mut block = BlockBuilder::new();
+        for ids in [[1i64, 2], [50, 51]] {
+            for id in ids {
+                block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            }
+            writer
+                .write_primitive_block(block.take().expect("node block").expect("nodes"))
+                .expect("write nodes");
+        }
+        for (id, refs) in [(10i64, [1i64, 2]), (60, [50, 51])] {
+            block.add_way(id, std::iter::empty::<(&str, &str)>(), &refs, None);
+            writer
+                .write_primitive_block(block.take().expect("way block").expect("ways"))
+                .expect("write ways");
+        }
+        let members = [
+            MemberData {
+                id: MemberId::Node(1),
+                role: "",
+            },
+            MemberData {
+                id: MemberId::Way(10),
+                role: "",
+            },
+        ];
+        block.add_relation(100, std::iter::empty::<(&str, &str)>(), &members, None);
+        writer
+            .write_primitive_block(block.take().expect("relation block").expect("relations"))
+            .expect("write relations");
+        writer.flush().expect("flush fixture");
+    }
+
+    /// The selection rule on claims: node and way blobs by claimed range
+    /// under `--add-self` (ways only when no node is queried), relation
+    /// blobs whenever anything is queried, an unindexed blob always.
+    #[test]
+    fn selection_reads_node_and_way_blobs_by_claimed_range() {
+        let claim = |kind, min_id, max_id| crate::blob_meta::BlobIndex {
+            kind,
+            min_id,
+            max_id,
+            count: 1,
+            bbox: None,
+        };
+        let (node, way, rel) = (ElementKind::Node, ElementKind::Way, ElementKind::Relation);
+        let wants = |query: &[&str], add_self: bool, index: Option<crate::blob_meta::BlobIndex>| {
+            let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
+            let ids = parse_ids(&query).expect("ids");
+            super::Selection::new(&ids, &GetparentsOptions { add_self }).wants(index.as_ref())
+        };
+        assert!(wants(&["n5"], true, Some(claim(node, 1, 9))));
+        assert!(!wants(&["n5"], true, Some(claim(node, 10, 19))));
+        assert!(!wants(&["n5"], false, Some(claim(node, 1, 9))));
+        assert!(wants(&["n5"], false, Some(claim(way, 100, 199))));
+        assert!(wants(&["w5"], true, Some(claim(way, 1, 9))));
+        assert!(!wants(&["w5"], true, Some(claim(way, 10, 19))));
+        assert!(wants(&["n1", "w5"], true, Some(claim(way, 10, 19))));
+        assert!(!wants(&["w5"], false, Some(claim(way, 1, 9))));
+        assert!(wants(&["r5"], true, Some(claim(rel, 10, 19))));
+        assert!(!wants(&["r5"], true, Some(claim(node, 1, 9))));
+        // A negative queried ID against a range spanning zero.
+        assert!(wants(&["n-3"], true, Some(claim(node, -5, 5))));
+        assert!(wants(&["n5"], true, None));
+    }
+
+    /// Both arms agree with the hand-computed answer across two node and
+    /// two way blobs: a way blob is still read whole whenever a node is
+    /// queried, so a parent way outside the queried ways' ranges survives.
+    /// (That a range-missed blob is not read at all is pinned in the
+    /// library's `getparents` integration tests with a forged range.)
+    #[test]
+    fn add_self_over_several_ranged_blobs() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("ranged.pbf");
+        write_ranged_fixture(&input);
+        let case = |query: &'static [&'static str], expected: &'static [(char, i64)]| Case {
+            query,
+            add_self: true,
+            expected,
+        };
+        let cases = [
+            case(&["n1"], &[('n', 1), ('w', 10), ('r', 100)]),
+            case(&["w60"], &[('w', 60)]),
+            case(
+                &["n50", "w10"],
+                &[('n', 50), ('w', 10), ('w', 60), ('r', 100)],
+            ),
+            case(&["w999"], &[]),
+        ];
+        for case in &cases {
+            for arm in [ScanArm::Walker, ScanArm::FullScan] {
+                let run = run_arm(&input, case.query, case.add_self, arm).expect("getparents");
+                assert_eq!(run.elements, case.expected, "{:?} {arm:?}", case.query);
+            }
+        }
+    }
+
     /// Both arms give every case's output byte for byte alike, with the
     /// same stats: the queried node itself (`--add-self`), a way parent, a
     /// relation parent, a relation-of-relation parent. (A partially indexed
@@ -1095,7 +1275,7 @@ mod tests {
     }
 
     // The four tests below assert against hand-computed parent sets, NOT just
-    // walker-vs-pipelined agreement: both arms share `needed_blob_kinds`, so a
+    // walker-vs-pipelined agreement: both arms share `Selection`, so a
     // wrong kind-mapping would drop the same parent in both and cross-arm
     // equality alone would still pass. The expected literals are the oracle.
 

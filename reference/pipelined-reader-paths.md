@@ -130,8 +130,10 @@ dropped queue releases a pipeline parked in its send.
 
 ### `getparents` FullScan arm
 
-- **Surface:** fused (`for_each_fused_buffer`: a projection on the
-  block validator, the block built only for a blob holding a match)
+- **Surface:** fused (`for_each_fused_blob`: a blob the command's
+  indexdata selection refuses is skipped before decompression, then a
+  projection on the block validator, the block built only for a blob
+  holding a match)
 - **Path:** `crates/lib/src/commands/getparents/mod.rs`, FullScan arm
 - **Scale:** high-blob-count encodings only. ADR-0006 dispatches
   low-blob-count planet (~50 k blobs) to the `HeaderWalker` arm; the

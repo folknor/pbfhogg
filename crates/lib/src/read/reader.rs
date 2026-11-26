@@ -379,19 +379,6 @@ impl<R: Read + Send> ElementReader<R> {
         self.for_each_fused_blob(super::pipeline::BlockOnly(transform), consume)
     }
 
-    /// [`Self::for_each_fused_block`] whose transform receives each data
-    /// blob's decompressed buffer before validation, to validate it through
-    /// a projection ([`BlockBuffer::project`](super::block::BlockBuffer::project))
-    /// and build the block only where it needs one.
-    pub(crate) fn for_each_fused_buffer<T, X, F>(self, transform: X, consume: F) -> Result<()>
-    where
-        T: Send,
-        X: Fn(super::block::BlockBuffer<'_>) -> Result<T> + Sync,
-        F: FnMut(T) -> Result<()>,
-    {
-        self.for_each_fused_blob(super::pipeline::BufferOnly(transform), consume)
-    }
-
     /// [`Self::for_each_fused_block`] with a transform that sees every blob
     /// after the leading header, not only the decoded data blocks: its kind,
     /// indexdata and provenance, for a consumer that checks the envelope in

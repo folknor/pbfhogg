@@ -40,6 +40,7 @@ function bench(params)
     table.insert(args, {
         output = output("parents.pbf"),
         ["direct-io"] = params["direct-io"] == "yes",
+        ["add-self"] = params["add-self"] == "yes",
         compression = compression.parse(params.compression),
     })
     local options = profiling.options("getparents", params.stop)

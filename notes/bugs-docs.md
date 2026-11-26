@@ -427,3 +427,17 @@ validation copy exists: the module doc of
 decompressed blob is "validated where it lies, never copied". Drop "a copy
 for validation" from the docs sentence.
 
+## DOC-070 - pipelined-reader-paths.md says only a summary of each digest blob crosses
+
+Reported by: the spar accounting of the digest item, from a scout lateral
+(2026-11-26); read from source.
+
+`reference/pipelined-reader-paths.md`, the `digest` entry, says the
+transform "returns a per-blob summary" and that "only the summary crosses to
+the ordered consumer, which absorbs it". In
+`crates/lib/src/commands/digest.rs` the value each blob returns carries the
+block's whole canonical record stream (`BlockContent.records`, about 14 MB
+for a planet full-form block), which the consumer hashes; only counts and
+ID bounds are a summary. Reword the entry to say the worker serializes the
+block's canonical records and the consumer hashes them in file order.
+

@@ -1524,7 +1524,7 @@ fn getid_include_refuses_a_way_blob_claiming_nodes() {
     assert!(!output.exists(), "nothing is published on a refusal");
 }
 
-/// `--add-referenced` pass 2 (the pipelined reader) refuses the same lie.
+/// `--add-referenced` pass 2 refuses the same lie.
 #[test]
 fn getid_add_referenced_refuses_a_way_blob_claiming_nodes() {
     let dir = crate::common::test_scratch();
@@ -1545,13 +1545,15 @@ fn getid_add_referenced_refuses_a_way_blob_claiming_nodes() {
 /// `--add-referenced` pass 1 schedules way blobs on the claim: a node blob
 /// claiming ways is decoded there and refused. Before the refusal the
 /// node blob was scanned as a way blob, found no ways, and the referenced
-/// nodes of way 10 were silently never collected.
+/// nodes of way 10 were silently never collected. Pass 1 reads a way blob
+/// only when its claimed range holds a wanted way, so `w1` (inside the
+/// forged blob's range 1..2) is requested to make the phase decode it.
 #[test]
 fn getid_add_referenced_pass1_refuses_a_node_blob_claiming_ways() {
     let dir = crate::common::test_scratch();
     let input = forged_claim(dir.path(), NODE_BLOB, 1);
     let output = dir.path().join("out.osm.pbf");
-    let err = run_getid(&input, &output, &["w10"], &add_ref_opts())
+    let err = run_getid(&input, &output, &["w1", "w10"], &add_ref_opts())
         .expect_err("a lying claim must be refused");
     assert_contradiction(
         &err,
@@ -1581,6 +1583,90 @@ fn getid_add_referenced_relation_phase_refuses_a_way_blob_claiming_relations() {
         "add-referenced relation phase",
     );
     assert!(!output.exists(), "nothing is published on a refusal");
+}
+
+/// `--add-referenced` selects relation blobs for its second relation read
+/// and for pass 2 by their claimed ranges, so the first relation read,
+/// which decodes every relation blob, holds each to its exact claim: a
+/// relation blob claiming `31..31` while holding relation 30 is refused
+/// there, not believed by the reads after it.
+#[test]
+fn getid_add_referenced_refuses_a_relation_blob_outside_its_claimed_range() {
+    const RELATION_BLOB: usize = 3;
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_claim_fixture(&honest);
+    let bytes = std::fs::read(&honest).expect("read the fixture");
+    let lying =
+        crate::common::adversarial::forge_indexdata_range(&bytes, RELATION_BLOB, 31, 31, None);
+    let input = dir.path().join("relation-range.osm.pbf");
+    std::fs::write(&input, lying).expect("write the forged file");
+    let output = dir.path().join("out.osm.pbf");
+    let err = run_getid(&input, &output, &["r30"], &add_ref_opts())
+        .expect_err("a false range on a decoded relation blob must be refused");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::IndexdataMismatch { .. }),
+        "{err:?}"
+    );
+    assert_eq!(err.kind_contradiction(), None, "{err:?}");
+    assert_eq!(err.blob_index(), Some(RELATION_BLOB as u64), "{err:?}");
+    assert!(!output.exists(), "nothing is published on a refusal");
+}
+
+/// Each phase selects a blob by its own frame's claim, so a way stored in
+/// two blobs is read from both: the way phase collects the refs of both
+/// records and pass 2 writes both, while the way blob holding only an
+/// unrequested way and the node blob holding only its node are skipped.
+/// Forced on the same elements without indexdata, every blob is read and
+/// each is written from once: the output is identical.
+#[test]
+fn getid_add_referenced_reads_every_blob_a_repeated_way_occupies() {
+    let node = |id| TestNode {
+        id,
+        lat: 100_000_000,
+        lon: 100_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    let way = |id, refs: Vec<i64>| TestWay {
+        id,
+        refs,
+        tags: vec![("highway", "primary")],
+        meta: None,
+    };
+    let nodes = [node(1), node(2), node(3), node(4)];
+    let ways = [way(10, vec![1, 2]), way(10, vec![3]), way(20, vec![4])];
+    let expected = vec![
+        ('n', 1, false),
+        ('n', 2, false),
+        ('n', 3, false),
+        ('w', 10, true),
+        ('w', 10, true),
+    ];
+    let dir = crate::common::test_scratch();
+    for indexed in [true, false] {
+        let input = dir.path().join(format!("repeated-{indexed}.osm.pbf"));
+        let output = dir.path().join(format!("out-{indexed}.osm.pbf"));
+        let write = if indexed {
+            crate::common::write_test_pbf_impl(&input, &nodes, &ways, &[], true, Some(1));
+            WriteOptions::default()
+        } else {
+            crate::common::write_multi_block_non_indexed_pbf(&input, &nodes, &ways, &[], 1);
+            forced_write_options()
+        };
+        let id_set = parse_ids(&ids(&["w10"])).expect("parse");
+        getid(
+            &input,
+            crate::common::out(&output),
+            &id_set,
+            &add_ref_opts(),
+            &write,
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        )
+        .expect("getid -r");
+        assert_eq!(written(&output), expected, "indexed {indexed}");
+    }
 }
 
 /// Invert mode (`removeid`): the way blob claiming nodes is decoded when a

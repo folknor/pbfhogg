@@ -78,24 +78,31 @@ impl Route {
         ..Self::INCLUDE
     };
 
+    /// Whether the run takes `add_referenced`'s reference route: with no
+    /// way or relation requested nothing is pulled in, and the run is the
+    /// include route.
+    fn references(self) -> bool {
+        self.mode == Mode::AddReferenced && (self.ways || self.relations)
+    }
+
     fn opens(self) -> u64 {
         match self.mode {
-            Mode::Include => 2 + u64::from(!self.unindexed),
-            Mode::AddReferenced => 2 + u64::from(self.ways || self.relations),
+            _ if self.references() => 3,
+            Mode::Include | Mode::AddReferenced => 2 + u64::from(!self.unindexed),
             Mode::Remove => 2,
         }
     }
 
     /// The transport of each open on a direct run, following the getid row
     /// of `crates/cli/src/io_reach.rs`: the probe direct, the estimate and
-    /// schedule walks buffered, and pass 2's sequential reader of
-    /// `add_referenced` direct.
+    /// schedule walks buffered (the scheduled preads use the walk's
+    /// descriptor), and `add_referenced`'s front read of the header for
+    /// pass 2 direct.
     fn transports(self) -> &'static str {
         match self.mode {
-            Mode::Include if self.unindexed => "DB",
-            Mode::Include => "DBB",
-            Mode::AddReferenced if self.ways || self.relations => "DBD",
-            Mode::AddReferenced => "DD",
+            _ if self.references() => "DBD",
+            Mode::Include | Mode::AddReferenced if self.unindexed => "DB",
+            Mode::Include | Mode::AddReferenced => "DBB",
             Mode::Remove => "DB",
         }
     }
@@ -261,13 +268,14 @@ fn include_reads_only_the_pinned_input() {
 #[test]
 fn add_referenced_reads_only_the_pinned_input() {
     check_route(Route::ADD_REFERENCED, 3);
-    // No way or relation requested: no pass 1.
+    // No way or relation requested: nothing is pulled in, and the run is
+    // the include route, arm estimate included.
     check_route(
         Route {
             ways: false,
             ..Route::ADD_REFERENCED
         },
-        2,
+        3,
     );
     // A relation and no way: one walk serves both relation reads and the
     // way phase, indexed or forced on an input without indexdata.

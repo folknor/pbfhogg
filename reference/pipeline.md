@@ -436,7 +436,15 @@ counterpart doesn't exist yet.
   walked in memory, and a second relation read collects the node and way
   members of the relations it reached (only when it reached one); then a
   read of the way blobs collects the nodes of every way requested or
-  pulled in. Pass 2 writes the requested and pulled-in objects.
+  pulled in. Pass 2 writes the requested and pulled-in objects, in file
+  order on the ordered pread pool (`parallel_project_phase_ordered`). The
+  walk keeps each blob's indexdata claim, and every read but the first
+  relation read takes only the blobs whose claimed ID range holds an ID it
+  needs; the first relation read takes every relation blob (it needs every
+  relation's relation members) and holds each to its exact claim, because
+  the later relation reads select by it. Unindexed input (forced) is read
+  whole by each phase. A request naming no way or relation pulls nothing
+  in and runs as plain include on the dispatched arms.
 - `getparents`: reverse-lookup of ways/relations referencing given IDs.
 
 ### add-locations-to-ways

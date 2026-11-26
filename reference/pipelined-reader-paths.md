@@ -128,18 +128,6 @@ dropped queue releases a pipeline parked in its send.
 
 ## Callers
 
-### `getid --add-referenced` pass 2
-
-- **Surface:** fused (`for_each_fused_buffer`: a projection on the
-  block validator, the block built only for a blob holding a selected
-  element)
-- **Path:** `crates/lib/src/commands/getid/mod.rs`, `--add-referenced` mode only
-- **Scale:** the plain include / invert path is the common one and uses
-  `HeaderWalker` + raw-frame reads, no pipelined decode at all.
-- **Per-block work:** light - `IdSet::get` per element during
-  validation, most blobs selecting nothing, a few re-encoded through
-  `BlockBuilder`
-
 ### `getparents` FullScan arm
 
 - **Surface:** fused (`for_each_fused_buffer`: a projection on the
@@ -227,7 +215,12 @@ should stay that way:
   `parallel_project_phase` (pread workers, a projection on the block
   validator)
 - `getid --add-referenced` pass 1 and `getid -I` -
-  `parallel_project_phase`
+  `parallel_project_phase`; `--add-referenced` pass 2 -
+  `parallel_project_phase_ordered` over the blobs whose claimed ID range
+  holds a selected ID, from pass 1's header walk. It was a fused
+  pipelined caller until the range selection: a pass that reads a
+  handful of blobs has nothing to gain from a reader that frames every
+  one
 - `tags-filter` two-pass - pread workers
 - `cat --type` / `cat --clean` re-encoding - pread classification
   and writer-side reframe paths
@@ -243,8 +236,9 @@ should stay that way:
   converted to pread workers when the external-join rewrite landed.
 - ALTW external stages 1-4 (`crates/lib/src/commands/altw/external/`) -
   pread workers
-- `getid` single-pass (include / invert) - `HeaderWalker` +
-  raw-frame reads
+- `getid` single-pass (include / invert) - walker arm `HeaderWalker` +
+  raw-frame reads; the include FullScan arm (ADR-0006) is a sequential
+  `Frames` stream, not the pipelined reader
 - `getparents` walker arm - `HeaderWalker` (pread-only). The FullScan
   arm IS a fused pipelined caller (see Callers above); ADR-0006 picks
   the arm by blob count.

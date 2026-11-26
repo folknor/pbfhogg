@@ -49,23 +49,48 @@ pub(crate) struct RelationRefs {
 /// contents contradict is refused) before anything it recorded is read.
 /// Every member is taken by its exact signed ID. `threads` is the caller's
 /// fixed worker count, `None` for the host-derived default.
+///
+/// `claims`, when given, holds each schedule entry's indexdata claim by
+/// position, and every blob is held to its claim being exact for the
+/// relations it holds (`ClaimWalk`: count, minimum and maximum), refused
+/// before anything it recorded reaches `merge`. A caller passes them when a
+/// later read selects relation blobs by their claimed range: this read
+/// decodes every relation blob, so a claim that would hide a relation from
+/// that read is refused here instead of believed there.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn relation_phase(
     shared_file: &InputFile,
     schedule: &[ScheduledBlob],
+    claims: Option<&[crate::blob_meta::BlobIndex]>,
     collect: &IdSet,
     seed_edges: bool,
     threads: Option<usize>,
     mut merge: impl FnMut(RelationRefs),
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
+    if let Some(claims) = claims
+        && claims.len() != schedule.len()
+    {
+        return Err(Error::internal(
+            "relation phase: claims do not match the schedule entry for entry",
+        ));
+    }
     crate::scan::classify::parallel_project_phase(
         shared_file,
         schedule,
         threads,
         Vec::new,
-        |_, buffer, relations| -> Result<RelationRefs> {
+        |position, buffer, relations| -> Result<RelationRefs> {
             let (RelationSpans { .. }, accepted) =
                 buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
+            if let Some(claim) = claims.and_then(|c| c.get(position)) {
+                let mut walk =
+                    crate::blob_meta::ClaimWalk::new(Some(claim), crate::blob_meta::Order::Free);
+                for relation in relations.iter() {
+                    walk.observe(relation.id)?;
+                }
+                walk.finish()?;
+            }
             let mut refs = RelationRefs::default();
             for relation in relations.iter() {
                 let collected = collect.get(relation.id);

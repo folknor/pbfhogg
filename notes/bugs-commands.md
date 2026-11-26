@@ -155,3 +155,19 @@ has ever been recorded, so whether that wall is the change, the mode, or the
 host is unknown. Next: one planet cell at `9bbd64df` to establish the mode's
 baseline, then a matched pair; if the change is the cost, it comes out or
 is made cheaper.
+
+## CMD-091 - The planet 8k snapshot had relations out of ID order after repack
+
+Reported by: the spar accounting of the full ID check item, from a scout
+lateral (2026-11-26); not reproduced.
+
+`reference/blob-density.md`, the side finding under the blob-density sweep
+(2026-07-12), records that `check --ids` on the planet 8k snapshot
+(`snapshot.8k`, built with `repack`) found 7 non-monotonic relation
+violations, nodes and ways clean, attributed to "repack relation-blob
+ordering", and says "Open as a repack work item". No entry or ticket ever
+carried it. Repack and the read path have changed much since July, so
+whether current `repack` still writes relations out of canonical order is
+unknown. Next: rerun `check --ids` on the 8k snapshot (or on a fresh repack
+at a small blob cap); if clean, record that and drop the side finding's
+"open" wording; if not, find where repack orders relation blobs.

@@ -502,13 +502,19 @@ fn getid_dispatched<'a>(
     let pin = input.into().pin(host)?;
     let input = &pin;
     // Every element is still matched against the requested IDs on a forced
-    // run; what is lost is the blob skipping. The include paths skip on kind
-    // and ID range, `add_referenced`'s passes on kind alone (the reference
-    // phases read relation and way blobs only; pass 2 skips the kinds
-    // nothing was requested or pulled in of).
-    let reason = if opts.add_referenced.is_some() {
+    // run; what is lost is the blob skipping. Every path skips on kind and
+    // ID range; `add_referenced`'s first relation read alone reads every
+    // relation blob.
+    // `--add-referenced` with no way or relation requested pulls nothing in
+    // (only ways and relations reference anything), so it is plain include
+    // and runs on the include arms.
+    let add_referenced = opts
+        .add_referenced
+        .as_ref()
+        .filter(|_| ids.way_ids.has_any() || ids.relation_ids.has_any());
+    let reason = if add_referenced.is_some() {
         "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
-         element type, so blobs of types a pass does not need are decompressed too."
+         element type or ID range, so blobs a pass does not need are decompressed too."
     } else {
         "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
          element type or ID range, so blobs holding none of the requested IDs are \
@@ -528,7 +534,7 @@ fn getid_dispatched<'a>(
     // blob count picked. An unindexed first data blob is refused by the probe
     // above before that, unless `--force`. reference/indexdata-trust.md,
     // "Missing and partial indexdata".
-    let (arm, result) = if let Some(add) = &opts.add_referenced {
+    let (arm, result) = if let Some(add) = add_referenced {
         let stats = getid_with_refs(
             input,
             output,
@@ -693,6 +699,12 @@ fn filter_by_id(
     )
 }
 
+/// The walker arm: one header walk, decoding on this thread each blob the
+/// claimed kind and range keep. Decoding serially is deliberate: an
+/// include query decodes only the blobs whose range holds a requested ID,
+/// a handful on a narrow query (planet include warm under 0.2 s), and a
+/// file with enough blobs for the walk to dominate goes to the full scan
+/// arm (ADR-0006). A decode pool here would only add a hop.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_walker(
@@ -1143,40 +1155,69 @@ fn getid_with_refs(
     // relations in relations closed transitively, then the nodes of every
     // way requested or pulled in. Everything pulled in lands in `pulled`,
     // which pass 2 selects from beside `ids`.
+    //
+    // One header walk sorts the blobs by kind, keeps each one's claim and
+    // serves every phase: the reference phases and pass 2 each read only
+    // the blobs whose claimed ID range holds an ID they need, as the include
+    // arms do (the claim is believed, reference/indexdata-trust.md). The
+    // exception is the first relation read, which needs every relation's
+    // relation members and so reads every relation blob, holding each to
+    // its exact claim, because the later reads select relation blobs by it.
+    // A blob is selected by its own frame's claim, so every frame holding a
+    // repeated ID is read. Unindexed input (only on a forced run) is read
+    // whole by every phase, and pass 2 reads its one file-order schedule
+    // once. A partially indexed file is refused by the walk as on every
+    // getid path (see `getid_dispatched`); a blob whose claim its contents
+    // contradict is refused when a phase decodes it. Only a request naming
+    // a way or a relation comes here: nodes alone pull nothing in, and that
+    // request is plain include.
     host.invocation.marker("GETID_PASS1_START");
     let mut pulled = ElementIds::empty();
+    let (schedules, indexes, shared_file) =
+        crate::scan::classify::build_classify_schedules_split_with_claims(input, host)?;
+    let indexed = matches!(
+        schedules,
+        crate::scan::classify::KindSchedules::Indexed { .. }
+    );
+    let (node_schedule, way_schedule, relation_schedule) = schedules.into_replicated();
+    fn claims(
+        indexed: bool,
+        of: &[crate::blob_meta::BlobIndex],
+    ) -> Option<&[crate::blob_meta::BlobIndex]> {
+        indexed.then_some(of)
+    }
 
-    if ids.way_ids.has_any() || ids.relation_ids.has_any() {
-        // One header walk sorts the blobs by kind for both reference
-        // phases, and its descriptor serves both pools. Unindexed input
-        // (only on a forced run) puts every blob in each phase's schedule.
-        // A partially indexed file is refused here as on every getid path
-        // (see `getid_dispatched`); a blob whose claim its contents
-        // contradict is refused when a phase decodes it.
-        let (schedules, shared_file, _) = crate::scan::classify::build_classify_schedules_split(
-            input,
-            crate::scan::classify::KindClaims::Refuse,
+    if ids.relation_ids.has_any() {
+        host.invocation.marker("GETID_RELATIONS_START");
+        close_relations(
+            &shared_file,
+            &relation_schedule,
+            claims(indexed, &indexes.relations),
+            ids,
+            &mut pulled,
             host,
         )?;
-        let (_, way_schedule, relation_schedule) = schedules.into_replicated();
+        host.invocation.marker("GETID_RELATIONS_END");
+        crate::debug::emit_mallinfo2(&host.invocation, "getid_after_relations");
+    }
 
-        if ids.relation_ids.has_any() {
-            host.invocation.marker("GETID_RELATIONS_START");
-            close_relations(&shared_file, &relation_schedule, ids, &mut pulled, host)?;
-            host.invocation.marker("GETID_RELATIONS_END");
-            crate::debug::emit_mallinfo2(&host.invocation, "getid_after_relations");
-        }
-
-        // The way phase reads the requested ways and the pulled-in ones
-        // alike, so the requested ones join the pulled set: selection and
-        // tag stripping test `ids` first, so the overlap changes neither.
-        pulled.way_ids.merge_from(&ids.way_ids);
-        if pulled.way_ids.has_any() {
-            host.invocation.marker("GETID_WAYS_START");
-            collect_way_nodes(&shared_file, &way_schedule, &mut pulled, host)?;
-            host.invocation.marker("GETID_WAYS_END");
-            crate::debug::emit_mallinfo2(&host.invocation, "getid_after_ways");
-        }
+    // The way phase reads the requested ways and the pulled-in ones
+    // alike, so the requested ones join the pulled set: selection and
+    // tag stripping test `ids` first, so the overlap changes neither.
+    pulled.way_ids.merge_from(&ids.way_ids);
+    if pulled.way_ids.has_any() {
+        host.invocation.marker("GETID_WAYS_START");
+        let selected = in_claimed_range(
+            &way_schedule,
+            claims(indexed, &indexes.ways),
+            &pulled.way_ids,
+            None,
+        )?;
+        host.invocation
+            .counter("getid_way_phase_blobs", selected.len());
+        collect_way_nodes(&shared_file, &selected, &mut pulled, host)?;
+        host.invocation.marker("GETID_WAYS_END");
+        crate::debug::emit_mallinfo2(&host.invocation, "getid_after_ways");
     }
     host.invocation.marker("GETID_PASS1_END");
     // Cheap one-time counts; give the pulled-set sizes before pass 2
@@ -1190,22 +1231,47 @@ fn getid_with_refs(
     host.invocation
         .counter("getid_dep_relation_ids", pulled.relation_ids.len());
 
-    // Pass 2: Write requested and pulled-in elements (transform fused into
-    // the decode workers).
+    // Pass 2: write the requested and pulled-in elements, in file order,
+    // from the blobs whose claimed range holds one of them (`included_block`
+    // and `process_block` select by the same union); an unindexed file's
+    // every blob once.
     host.invocation.marker("GETID_PASS2_START");
-    let reader = ElementReader::open_in(input, write.direct_reads, host)?.refusing_kind_claims();
-    // Skip the blob kinds nothing was requested or pulled in of.
-    // `included_block` and `process_block` select by the same union.
-    let reader = reader.with_blob_filter(BlobFilter::new(
-        ids.node_ids.has_any() || pulled.node_ids.has_any(),
-        ids.way_ids.has_any() || pulled.way_ids.has_any(),
-        ids.relation_ids.has_any() || pulled.relation_ids.has_any(),
-    ));
-    let coords = crate::owned::WayCoords::of_input(reader.header());
+    let schedule = if indexed {
+        let mut schedule = in_claimed_range(
+            &node_schedule,
+            Some(&indexes.nodes),
+            &ids.node_ids,
+            Some(&pulled.node_ids),
+        )?;
+        schedule.extend(in_claimed_range(
+            &way_schedule,
+            Some(&indexes.ways),
+            &ids.way_ids,
+            Some(&pulled.way_ids),
+        )?);
+        schedule.extend(in_claimed_range(
+            &relation_schedule,
+            Some(&indexes.relations),
+            &ids.relation_ids,
+            Some(&pulled.relation_ids),
+        )?);
+        schedule.sort_unstable_by_key(ScheduledBlob::frame_start);
+        schedule
+    } else {
+        // Replicated, so each kind's schedule is the whole file in order.
+        node_schedule
+    };
+    drop((way_schedule, relation_schedule));
+    host.invocation.counter("getid_pass2_blobs", schedule.len());
+    // The header, from a front read of the pinned input.
+    let header = ElementReader::open_in(input, write.direct_reads, host)?
+        .header()
+        .clone();
+    let coords = crate::owned::WayCoords::of_input(&header);
     let mut writer = writer_from_header(
         output,
         write.compression,
-        reader.header(),
+        &header,
         &OutputFacts::carry(coords.rewritten()),
         overrides,
         write.backend,
@@ -1221,8 +1287,13 @@ fn getid_with_refs(
     // from the validator's pass and builds the block only for a blob that
     // does.
     let limits = crate::commands::split::Limits::new(writer.compression());
-    reader.for_each_fused_buffer(
-        |buffer| {
+    crate::scan::classify::parallel_project_phase_ordered(
+        &shared_file,
+        &schedule,
+        None,
+        None,
+        || (),
+        |buffer, _| {
             let Some(block) = included_block(buffer, ids, pulled_ref)? else {
                 return Ok((Vec::new(), BlockOutcome::default()));
             };
@@ -1243,7 +1314,7 @@ fn getid_with_refs(
             crate::commands::split::fit_blocks(&mut output, &limits)?;
             Ok((output, outcome))
         },
-        |(blocks, outcome)| {
+        |_position, (blocks, outcome)| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
             }
@@ -1257,6 +1328,7 @@ fn getid_with_refs(
             }
             Ok(())
         },
+        host,
     )?;
 
     writer.flush()?;
@@ -1295,9 +1367,14 @@ fn getid_with_refs(
 /// Every member is followed by its exact signed ID, negative ones
 /// included; osmium abs-folds a negative member (`positive_ref`), so for
 /// a reference to `-N` it adds object `N`.
+///
+/// With `claims` (an indexed file, one claim per schedule entry), the first
+/// read holds every relation blob to its exact claim and the second reads
+/// only the blobs whose claimed range holds a reached relation.
 fn close_relations(
     shared_file: &InputFile,
     schedule: &[ScheduledBlob],
+    claims: Option<&[crate::blob_meta::BlobIndex]>,
     ids: &ElementIds,
     pulled: &mut ElementIds,
     host: &crate::host::Entered<'_>,
@@ -1308,6 +1385,7 @@ fn close_relations(
     relation_phase(
         shared_file,
         schedule,
+        claims,
         &ids.relation_ids,
         true,
         None,
@@ -1343,9 +1421,13 @@ fn close_relations(
     drop(edges);
 
     if added {
+        let reached = in_claimed_range(schedule, claims, &pulled.relation_ids, None)?;
+        host.invocation
+            .counter("getid_reached_relation_blobs", reached.len());
         relation_phase(
             shared_file,
-            schedule,
+            &reached,
+            None,
             &pulled.relation_ids,
             false,
             None,
@@ -1357,6 +1439,36 @@ fn close_relations(
         )?;
     }
     Ok(())
+}
+
+/// The entries of `schedule` whose claimed ID range holds an ID of `set`
+/// or of `also`, in schedule order; every entry when `claims` is `None` (an
+/// unindexed file, whose blobs claim nothing). `claims` holds one claim per
+/// entry. Each entry is tested on its own claim, so overlapping ranges and
+/// an ID repeated across blobs select every blob that may hold it.
+fn in_claimed_range(
+    schedule: &[ScheduledBlob],
+    claims: Option<&[crate::blob_meta::BlobIndex]>,
+    set: &IdSet,
+    also: Option<&IdSet>,
+) -> Result<Vec<ScheduledBlob>> {
+    let Some(claims) = claims else {
+        return Ok(schedule.to_vec());
+    };
+    if claims.len() != schedule.len() {
+        return Err(Error::internal(
+            "getid: blob claims do not match the schedule entry for entry",
+        ));
+    }
+    Ok(schedule
+        .iter()
+        .zip(claims)
+        .filter(|(_, claim)| {
+            set.any_in_numeric_range(claim.min_id, claim.max_id)
+                || also.is_some_and(|a| a.any_in_numeric_range(claim.min_id, claim.max_id))
+        })
+        .map(|(entry, _)| *entry)
+        .collect())
 }
 
 /// Add the node refs of every way in `pulled.way_ids` to `pulled.node_ids`.
@@ -1415,6 +1527,12 @@ fn collect_way_nodes(
 /// written, in what order, and every error a selected element raises (a
 /// bad user or role index) are as before. A blob without one cannot raise
 /// any: `process_block` resolves strings only for the elements it emits.
+///
+/// Recording the selected elements' spans during validation, so a hit
+/// blob need not be rebuilt and walked again, was weighed and not done: a
+/// narrow query has a handful of hit blobs, and the whole of
+/// `--add-referenced`'s pass 2, rebuilds included, is 81 ms of a 7 s
+/// planet run (bygg, 2026-11-26, reference/performance/getid.md).
 ///
 /// Invert mode does not come here: it emits every element not requested,
 /// so a blob it decodes is a hit at its first unrequested element and a

@@ -651,6 +651,18 @@
 
 ### Changed
 
+- **`getid --add-referenced` reads only the blobs that can hold what it
+  needs.** The way read, the second relation read and the output pass
+  select blobs by their indexdata ID range, as plain `getid` does, instead
+  of reading every blob of a kind (planet, nine IDs: about 40 s to 7 s,
+  now mostly the header walk; germany warm 1.6 s to 0.08 s). Output is
+  unchanged. The first relation read still reads every relation blob, and
+  now refuses one whose ID range or count is not exact
+  (`IndexdataMismatch`), since the later reads rely on it. A blob the
+  ranges skip is no longer decoded, so a damaged payload there is not
+  reported, as with plain `getid`. With no way or relation listed, `-r`
+  pulls nothing in and runs as plain `getid`.
+
 - **Plain `cat` indexes an unindexed input in parallel.** From an input's
   first blob without indexdata on, blobs are decompressed and scanned on a
   worker pool instead of the reading thread (germany raw 20.4 s to about

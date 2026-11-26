@@ -1409,32 +1409,31 @@ Kind: hypothesis, unsized. The path is CPU-bound on bygg's planet `history2`
 (about 27 cores), but the hotpath cell does not split selection from
 encoding inside `select_blob`; validation stays either way.
 
-## PERF-052 - getid with references scans whole kinds
+## PERF-052 - getparents --add-self reads every blob of a queried kind
 
 Reported by: copy.
 
-Mechanism: `getid_with_refs` scans all relation blobs for closure (building
-edges for unrequested relations), may scan relations again for members,
-`collect_way_nodes` scans every way blob for one way, and output filters by
-kind only, decompressing every blob of each selected kind. Basic getid's walker
-and streaming paths decompress candidates serially. `SelectProbe` and
-`ParentProbe` return a Boolean and the command rebuilds the block on a hit.
+Residue, getparents only. The getid side landed: `getid --add-referenced`
+selects way, second-relation and output blobs by claimed ID range on the one
+header walk (planet nine IDs about 40 s to 7 s, now the cold walk; see
+`reference/performance/getid.md`). Refused there, with the reasoning at the
+code: probe-recorded spans instead of rebuilding a hit block
+(`included_block`), a decode pool for the include walker
+(`filter_by_id_walker`), frontier traversal of relations (the first
+relation read is under 0.3 s at planet and the edge store bounds reads at
+two). A persisted blob directory is PERF-004's question.
 
-Redesign: a searchable blob directory from one header walk; frontier traversal
-of relations over intersecting blobs, then candidate way blobs; output only
-blobs intersecting the final sets; probes record selected spans or dense
-positions during validation; broad queries degrade to coalesced scans. Minimal
-decode: getid, own IDs then selected content (plus refs and typed members for
-dependencies); getparents, refs and member IDs until decided; dense selection,
-IDs then the delta prefixes for selected positions. Getparents `--add-self`
-should select node blobs by ID range. A reverse index from referenced IDs to
-blobs would transform repeated small getparents queries (conditional on reuse).
+Open: `getparents --add-self` schedules every node blob when a node is
+queried (`needed_blob_kinds`, kind only); node blobs, and way blobs needed
+only for `--add-self` of a queried way, could be selected by claimed range.
+Both arms need it (the walker's hand-written schedule loop and the FullScan
+arm's `BlobFilter`, which carries no ID range), and the arm-equality tests
+pin them together; the `parent-select` bench has no `--add-self` param, so
+there is no cell to measure it on yet. A reverse index from referenced IDs
+to blobs would transform repeated small getparents queries, conditional on
+reuse and on binding to the exact file.
 
-Risks: validator still checks unrelated arrays and UTF-8; avoiding element
-construction must keep refusals; directory reuse needs binding to the exact
-file.
-
-Kind: high conviction.
+Kind: medium conviction.
 
 ## PERF-053 - Geocode admin lookup reconstructs polygons per query
 

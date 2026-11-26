@@ -1341,6 +1341,7 @@ fn collect_relation_member_closure(
     relation_phase(
         shared_file,
         schedule,
+        None,
         direct_relation_ids,
         true,
         jobs,
@@ -1399,6 +1400,7 @@ fn collect_relation_member_closure(
     relation_phase(
         shared_file,
         schedule,
+        None,
         &reached,
         false,
         jobs,

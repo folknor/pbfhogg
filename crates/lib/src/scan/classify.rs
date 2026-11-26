@@ -727,6 +727,40 @@ pub(crate) fn build_classify_schedules_split<'a>(
     claims: KindClaims,
     host: &crate::host::Entered<'_>,
 ) -> Result<(KindSchedules, InputFile, [i64; 3])> {
+    split_walk(input, claims, None, host)
+}
+
+/// Each indexed entry's whole indexdata claim, by kind and schedule
+/// position, beside a [`KindSchedules::Indexed`]: `nodes[i]` is the claim of
+/// the `i`th node-schedule entry. Empty for an unindexed file.
+#[derive(Debug, Default)]
+pub(crate) struct KindIndexes {
+    pub(crate) nodes: Vec<crate::blob_meta::BlobIndex>,
+    pub(crate) ways: Vec<crate::blob_meta::BlobIndex>,
+    pub(crate) relations: Vec<crate::blob_meta::BlobIndex>,
+}
+
+/// [`build_classify_schedules_split`] under [`KindClaims::Refuse`], also
+/// returning each indexed entry's whole claim (kind, range, count): for a
+/// caller that selects blobs by their claimed ID range, or holds a decoded
+/// blob to its exact claim ([`ClaimWalk`](crate::blob_meta::ClaimWalk)).
+pub(crate) fn build_classify_schedules_split_with_claims<'a>(
+    input: impl Into<InputSource<'a>>,
+    host: &crate::host::Entered<'_>,
+) -> Result<(KindSchedules, KindIndexes, InputFile)> {
+    let mut indexes = KindIndexes::default();
+    let (schedules, file, _) = split_walk(input, KindClaims::Refuse, Some(&mut indexes), host)?;
+    Ok((schedules, indexes, file))
+}
+
+/// The one split walk; `indexes`, when given, receives each indexed entry's
+/// claim at its position in its kind's schedule.
+fn split_walk<'a>(
+    input: impl Into<InputSource<'a>>,
+    claims: KindClaims,
+    mut indexes: Option<&mut KindIndexes>,
+    host: &crate::host::Entered<'_>,
+) -> Result<(KindSchedules, InputFile, [i64; 3])> {
     let source = input.into();
     let input = source.path();
     host.invocation.marker("SCHEDULE_SCANNER_OPEN_START");
@@ -746,6 +780,13 @@ pub(crate) fn build_classify_schedules_split<'a>(
         }
         let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
         let entry = ScheduledBlob::from_meta(&meta, claims)?;
+        if let (Some(indexes), Some(index)) = (indexes.as_deref_mut(), meta.index) {
+            match index.kind {
+                crate::ElementKind::Node => indexes.nodes.push(index),
+                crate::ElementKind::Way => indexes.ways.push(index),
+                crate::ElementKind::Relation => indexes.relations.push(index),
+            }
+        }
         match meta.index.as_ref().map(|i| i.kind) {
             Some(crate::ElementKind::Node) => {
                 max_ids[0] = max_ids[0].max(reported_max);

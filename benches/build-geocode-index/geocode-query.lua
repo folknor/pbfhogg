@@ -31,7 +31,7 @@
 --   brokkr bench --dry-run geocode-query --dataset germany
 --   brokkr bench --iterations 1 geocode-query --dataset germany --bbox 5.9,47.3,15.0,55.0
 
-local bboxes = require("bbox")
+local geocode = require("geocode")
 
 -- --bbox, --queries, --rounds and --seed have typed domains in the
 -- registry (bbox, positive u32, positive u32, u64), matching the
@@ -39,11 +39,7 @@ local bboxes = require("bbox")
 -- bbox's strict order, which the instrument would refuse only after the
 -- index build.
 function validate(params)
-    local bbox = params.bbox or params.dataset.bbox
-    if bbox == nil then
-        fail("the dataset has no bbox in this host's config: pass --bbox")
-    end
-    bboxes.parse(bbox)
+    geocode.bbox(params)
 end
 
 function bench(params)

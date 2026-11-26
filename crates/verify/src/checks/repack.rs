@@ -27,7 +27,7 @@ use crate::error::Error;
 use crate::harness::Harness;
 use crate::pbf_frames::{self, BlobClaim, Framing, Origin};
 use crate::verify_reencode::{
-    self as reencode, DEFAULT_CAP, LayoutCheck, Ran, References, RepackBuilder, Witnesses,
+    self as reencode, DEFAULT_CAP, Ran, References, RepackBuilder, Witnesses,
 };
 
 /// Fixed verification cases: a non-dividing cap and a growing cap.
@@ -148,12 +148,18 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             reencode::Prediction::Unchanged,
         )?;
         reencode::record_identical(harness, &label, &compared)?;
-        reencode::judge_header(harness, &label, &out, input.sorted_claim, input.locations)?;
-        reencode::judge_index(harness, &outdir, &label, &out)?;
-        let blobs = reencode::output_blobs(&out, cap)?;
-        reencode::record_blobs(harness, &label, &blobs);
+        let blobs = reencode::judge_output(
+            harness,
+            &outdir,
+            &label,
+            &out,
+            input.sorted_claim,
+            input.locations,
+            cap,
+            None,
+        )?;
         if let Some(claims_of) = case.claims_of {
-            let mismatch = predict(claims_of, &out, cap, &mut witnesses)?;
+            let mismatch = predict(claims_of, &blobs, cap, &mut witnesses)?;
             reencode::record_layout(harness, &label, mismatch);
         }
     }
@@ -208,11 +214,11 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
 /// `claims_of`, kind by kind; the first disagreement.
 fn predict(
     claims_of: &[Vec<BlobClaim>; 3],
-    output: &Path,
+    blobs: &reencode::OutputBlobs,
     cap: u64,
     witnesses: &mut Witnesses,
 ) -> Result<Option<String>, Error> {
-    let mut layout = LayoutCheck::open(output)?;
+    let mut layout = blobs.layout();
     for (kind, claims) in claims_of.iter().enumerate() {
         let mut builder = RepackBuilder::new(cap);
         {
@@ -225,7 +231,7 @@ fn predict(
         witnesses.remainder_then_grow |= builder.witnesses.remainder_then_grow;
         witnesses.coalesced |= builder.witnesses.coalesced;
     }
-    layout.finish()
+    Ok(layout.finish())
 }
 
 #[cfg(test)]

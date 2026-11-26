@@ -40,34 +40,34 @@ pub(crate) fn entries(path: &Path) -> Result<Vec<Entry>, Error> {
     let mut out = Vec::new();
     let mut claims = pbf_frames::Claims::open(path, Origin::Other)?;
     while let Some(blob) = claims.next_blob()? {
-        let (ids, single_field) = pbf_frames::blob_ids_and_shape(
+        let observed = pbf_frames::blob_ids_and_shape(
             path,
             Origin::Other,
             blob.payload_offset,
             blob.datasize,
         )?;
-        let Some(&(kind, min)) = ids.first() else {
+        let Some(&(kind, min)) = observed.ids.first() else {
             return Err(outside(&blob, "holds no element".into()));
         };
-        if !single_field {
+        if !observed.single_field {
             return Err(outside(&blob, "has a group with two element fields".into()));
         }
-        if ids.iter().any(|&(k, _)| k != kind) {
+        if observed.first_other_kind(kind).is_some() {
             return Err(outside(&blob, "holds more than one element kind".into()));
         }
         if min < 0 {
             return Err(outside(&blob, "holds a negative ID".into()));
         }
-        if ids.windows(2).any(|w| w[0].1 >= w[1].1) {
+        if !observed.ascending {
             return Err(outside(
                 &blob,
                 "is not in strictly ascending ID order".into(),
             ));
         }
-        let max = ids[ids.len() - 1].1;
+        let max = observed.extrema.map_or(min, |(_, max)| max);
         if let Some(claim) = blob.claim
             && (claim.kind, claim.min_id, claim.max_id, claim.count)
-                != (kind, min, max, ids.len() as u64)
+                != (kind, min, max, observed.count())
         {
             return Err(outside(
                 &blob,
@@ -182,6 +182,7 @@ pub(crate) fn judge(
 ) -> Result<Result<(), String>, Error> {
     let mut blobs = pbf_frames::Claims::open(out, Origin::Pbfhogg)?;
     let mut next = blobs.next_blob()?;
+    let mut buffers = pbf_frames::PayloadBuffers::default();
     for (n, seg) in plan.iter().enumerate() {
         match seg {
             Segment::Pass { input, entry } => {
@@ -192,7 +193,7 @@ pub(crate) fn judge(
                         entry.blob.index
                     )));
                 };
-                if !pbf_frames::same_payload(
+                if !buffers.same_payload(
                     (out, Origin::Pbfhogg),
                     &got,
                     (inputs[*input], Origin::Other),

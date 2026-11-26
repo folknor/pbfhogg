@@ -53,6 +53,9 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             h.run.watch(&input).unwrap();
             let judged = super::judge(&mut h, "encoding", |h| check(h, &input, true));
             assert_encoding(fault, arms, &judged);
+            if fault == "content" {
+                assert_content_listing(&h.run.dir, arms);
+            }
         }
     }
     // An input whose ways carry coordinates, declared or not: the expected
@@ -86,6 +89,25 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         assert_eq!(
             matches!(result, Ok(verify_reencode::Ran::TooLarge)),
             accepted
+        );
+    }
+}
+
+fn assert_content_listing(run: &Path, arms: &[(&str, u32)]) {
+    let repack = ["default-cap", "cap-3000", "cap-64000"];
+    let (check, stems): (_, &[_]) = if arms[0].0.starts_with("repack") {
+        ("repack", &repack)
+    } else {
+        ("degrade", &["strip-locations"])
+    };
+    for stem in stems {
+        let listing = run
+            .join("checks")
+            .join(check)
+            .join(format!("{stem}.diff.opl"));
+        assert_eq!(
+            std::fs::read(listing).unwrap(),
+            b"-n1 v1 Ta=bc\n+n1 v1 Tab=c\n"
         );
     }
 }

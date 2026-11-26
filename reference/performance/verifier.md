@@ -1,5 +1,17 @@
 # pbfhogg-verify
 
+## Frame audit reuse and cold equality scans
+
+Measurement pending. Compare the new verifier against `da1f1a55` using
+the same pbfhogg binary and serial, matched Denmark runs of `degrade` and
+`repack`. Add `--fresh-reference` to both cold arms to bypass persistent
+reference artifacts and OPL summaries. This measures a cold verifier
+cache and leaves the OS page cache alone. For warm arms, prime each
+check without the flag, then measure repeated runs without it. Compare
+the check wall and the `opl-compare.1`, `opl summary scan`, and
+`opl merge` step walls. Matching cold whole-stream comparisons should
+shift from merge to scan. Drop and unsort still merge on a cold run.
+
 ## Shared expected file and the pooled frame reader (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 Degrade and repack share one expected file per run and reuse input

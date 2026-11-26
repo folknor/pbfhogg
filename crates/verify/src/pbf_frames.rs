@@ -3,19 +3,13 @@
 //! `verify getid-removeid` picks the IDs it requests from the dataset under
 //! test, and at planet scale it may not read the dataset to do so; `verify
 //! check-ids` reads from the same walk the kind claims pbfhogg judges type
-//! order from ([`framing`]), and `verify repack` and `verify degrade` read
-//! every blob's claim, pulled one blob at a time ([`Claims`]), to hold an
-//! output's block layout to a prediction. This walk
-//! reads each blob's `BlobHeader` (a few dozen bytes) by positional read
-//! with random-access advice and skips its payload, so its I/O is
-//! proportional to the blob count, never to the data. The one payload it reads is the leading `OSMHeader`'s,
-//! for the header's required features; [`blob_ids`] reads one named data
-//! blob's elements on request, the bounded exception `verify degrade` takes
-//! for the few elements it locates, and [`index_truth`] reads every data
-//! blob carrying indexdata to hold each claim's kind, count and ID range to
-//! its elements. [`header`] reads the header's required and optional
-//! features, the claims checks route on, without asking the pbfhogg CLI
-//! under test.
+//! order from ([`framing`]). This walk reads each `BlobHeader` by
+//! positional read with random-access advice and skips its payload. The
+//! one payload it reads is the leading `OSMHeader`'s. [`blob_ids`] reads
+//! a named data blob on request. Repack and degrade use [`TruthWalk`] to
+//! decode each indexed blob, hold its kind, count and ID range to its
+//! elements, and retain the claims for layout checks. [`header`] reads
+//! the required and optional features without asking pbfhogg.
 //!
 //! Where pbfhogg and libosmium disagree on a frame, the payload or header
 //! fields it reads, the reader refuses: the checks that read content also
@@ -454,25 +448,34 @@ pub(crate) struct Claims {
     offset: u64,
     ordinal: u64,
     index: u64,
-    required_features: Vec<String>,
+    header: Header,
 }
 
 impl Claims {
     pub(crate) fn open(path: &Path, origin: Origin) -> Result<Self, Error> {
-        Self::open_with(path, origin, Positioned::random)
+        Self::open_with(path, origin, Positioned::random, false)
     }
 
     fn open_with(
         path: &Path,
         origin: Origin,
         cursor: impl FnOnce(File) -> Positioned,
+        report_header: bool,
     ) -> Result<Self, Error> {
         let (file, len) = open(path, origin)?;
         let mut file = cursor(file);
-        let walk =
-            FrameWalk::open(&mut file, len).map_err(|why| Self::error_at(path, origin, &why))?;
-        let (offset, ordinal, required_features) =
-            (walk.offset, walk.ordinal, walk.required_features);
+        let walk = FrameWalk::open(&mut file, len).map_err(|why| {
+            if report_header {
+                header_error(path, origin, &why)
+            } else {
+                Self::error_at(path, origin, &why)
+            }
+        })?;
+        let (offset, ordinal) = (walk.offset, walk.ordinal);
+        let header = Header {
+            required: walk.required_features,
+            optional: walk.optional_features,
+        };
         Ok(Self {
             path: path.to_path_buf(),
             origin,
@@ -481,7 +484,7 @@ impl Claims {
             offset,
             ordinal,
             index: 0,
-            required_features,
+            header,
         })
     }
 
@@ -499,7 +502,7 @@ impl Claims {
 
     /// The header's required features.
     pub(crate) fn required_features(&self) -> &[String] {
-        &self.required_features
+        &self.header.required
     }
 
     /// The next data blob, `None` at the end of the file.
@@ -578,35 +581,15 @@ pub(crate) fn blob_ids(
     block_ids(&block).map_err(fail)
 }
 
-/// [`blob_ids`] plus whether every group of the block carries at most one
-/// element field (plain nodes, dense nodes, ways or relations): a group with
-/// two is a block no single index describes, whatever its IDs decode to.
+/// The identities and shape of a data blob, read in one group walk.
 pub(crate) fn blob_ids_and_shape(
     path: &Path,
     origin: Origin,
     payload_offset: u64,
     datasize: u64,
-) -> Result<(Vec<(usize, i64)>, bool), Error> {
+) -> Result<BlockObservation, Error> {
     let (block, fail) = read_block(path, origin, payload_offset, datasize)?;
-    let ids = block_ids(&block).map_err(&fail)?;
-    let mut single = true;
-    for field in Fields::new(&block) {
-        if let (2, Value::Bytes(group)) = field.map_err(&fail)? {
-            let mut seen: Option<u32> = None;
-            for f in Fields::new(group) {
-                // Only a length-delimited field 1 to 4 is an element field;
-                // another wire type is an unknown field `block_ids` skips,
-                // so it never makes a group mixed.
-                if let (number @ 1..=4, Value::Bytes(_)) = f.map_err(&fail)? {
-                    if seen.is_some_and(|s| s != number) {
-                        single = false;
-                    }
-                    seen = Some(number);
-                }
-            }
-        }
-    }
-    Ok((ids, single))
+    block_observation(&block).map_err(fail)
 }
 
 /// The decompressed `PrimitiveBlock` of the payload at `payload_offset`,
@@ -661,26 +644,41 @@ impl IndexTruth {
 /// indexdata is counted, not decoded) and hold each claim to the blob's
 /// elements: every element of the claimed kind, the claimed count,
 /// and, for a nonempty blob, the claimed minimum and maximum ID exactly.
+#[cfg(test)]
 pub(crate) fn index_truth(path: &Path, origin: Origin) -> Result<IndexTruth, Error> {
     index_truth_with_claims(path, origin, |_| {})
 }
 
+#[cfg(test)]
 pub(crate) fn index_truth_with_claims(
     path: &Path,
     origin: Origin,
     mut each: impl FnMut(BlobClaim),
 ) -> Result<IndexTruth, Error> {
-    let mut decoded = TruthWalk::open(path, origin)?;
+    let mut decoded = TruthWalk::open(path, origin, false)?;
     while let Some((blob, ids)) = decoded.next(false)? {
-        if let Some(claim) = decoded.fold(blob, ids)? {
+        decoded.fold(blob, ids)?;
+        if let Some(claim) = blob.claim {
             each(claim);
         }
     }
-    Ok(std::mem::take(&mut decoded.truth))
+    Ok(std::mem::take(&mut decoded.audit.truth))
 }
 
 type Ids = Vec<(usize, i64)>;
-type Decoded = (ClaimedBlob, Result<Ids, Error>);
+type Decoded = (ClaimedBlob, Result<BlockObservation, Error>);
+
+/// Compact evidence shared by the index, cap, order and layout judges.
+/// Only the first two indexed blobs of each kind retain their identities:
+/// those are the only payloads the unsort placement judges revisit.
+#[derive(Default)]
+pub(crate) struct FrameAudit {
+    pub header: Header,
+    pub truth: IndexTruth,
+    pub claims: Vec<ClaimedBlob>,
+    pub witnesses: [[Ids; 2]; 3],
+    witness_counts: [usize; 3],
+}
 
 /// A bounded pool with one in-flight blob per worker. Collect slots in
 /// dispatch order, including a framing error discovered after those slots.
@@ -689,19 +687,28 @@ pub(crate) struct TruthWalk {
     workers: Vec<DecodeWorker>,
     pending: std::ops::Range<usize>,
     terminal: Option<Result<(), Error>>,
-    truth: IndexTruth,
+    audit: FrameAudit,
 }
 
 impl TruthWalk {
-    pub(crate) fn open(path: &Path, origin: Origin) -> Result<Self, Error> {
+    pub(crate) fn open(path: &Path, origin: Origin, report_header: bool) -> Result<Self, Error> {
+        // This cursor also reads payloads, so leave kernel readahead on.
+        let claims = Claims::open_with(path, origin, Positioned::new, report_header)?;
+        let audit = FrameAudit {
+            header: claims.header.clone(),
+            ..FrameAudit::default()
+        };
         Ok(Self {
-            // This cursor also reads payloads, so leave kernel readahead on.
-            claims: Claims::open_with(path, origin, Positioned::new)?,
+            claims,
             workers: Vec::new(),
             pending: 0..0,
             terminal: None,
-            truth: IndexTruth::default(),
+            audit,
         })
+    }
+
+    pub(crate) fn header(&self) -> &Header {
+        &self.claims.header
     }
 
     fn fill(&mut self, all: bool) {
@@ -745,32 +752,39 @@ impl TruthWalk {
 
     /// Count unindexed blobs but leave their candidate-only decode errors
     /// out of the truth verdict, which has always skipped their payloads.
-    pub(crate) fn observe(&mut self, blob: ClaimedBlob, ids: &[(usize, i64)]) {
-        self.truth.blobs += 1;
+    pub(crate) fn observe(&mut self, blob: ClaimedBlob, block: &BlockObservation) {
+        let audit = &mut self.audit;
+        audit.claims.push(blob);
+        audit.truth.blobs += 1;
         if let Some(claim) = blob.claim {
-            self.truth.blobs_with_indexdata += 1;
-            self.truth.check(blob.index, claim, ids);
+            audit.truth.blobs_with_indexdata += 1;
+            audit.truth.check(blob.index, claim, block);
+            let count = &mut audit.witness_counts[claim.kind];
+            if let Some(slot) = audit.witnesses[claim.kind].get_mut(*count) {
+                slot.clone_from(&block.ids);
+                *count += 1;
+            }
         }
     }
 
     fn fold(
         &mut self,
         blob: ClaimedBlob,
-        ids: Result<Ids, Error>,
-    ) -> Result<Option<BlobClaim>, Error> {
+        block: Result<BlockObservation, Error>,
+    ) -> Result<(), Error> {
         if blob.claim.is_some() {
-            self.observe(blob, &ids?);
+            self.observe(blob, &block?);
         } else {
-            self.observe(blob, &[]);
+            self.observe(blob, &BlockObservation::default());
         }
-        Ok(blob.claim)
+        Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<IndexTruth, Error> {
-        while let Some((blob, ids)) = self.next(false)? {
-            self.fold(blob, ids)?;
+    pub(crate) fn finish(mut self) -> Result<FrameAudit, Error> {
+        while let Some((blob, block)) = self.next(false)? {
+            self.fold(blob, block)?;
         }
-        Ok(std::mem::take(&mut self.truth))
+        Ok(std::mem::take(&mut self.audit))
     }
 }
 
@@ -805,7 +819,7 @@ impl DecodeWorker {
                 let ids = if read {
                     decode_ids(&mut reader, &mut payload, &path, origin, blob)
                 } else {
-                    Ok(Vec::new())
+                    Ok(BlockObservation::default())
                 };
                 if done.send((blob, ids)).is_err() {
                     break;
@@ -838,7 +852,7 @@ fn decode_ids(
     path: &Path,
     origin: Origin,
     blob: ClaimedBlob,
-) -> Result<Ids, Error> {
+) -> Result<BlockObservation, Error> {
     let fail = |why: String| {
         origin.refuse(format!(
             "cannot read the data blob at byte {} of {}: {why}",
@@ -853,30 +867,27 @@ fn decode_ids(
         .read_exact(payload)
         .map_err(|e| fail(e.to_string()))?;
     let block = blob_content(payload).map_err(fail)?;
-    block_ids(&block).map_err(fail)
+    block_observation(&block).map_err(fail)
 }
 
 impl IndexTruth {
-    fn check(&mut self, index: u64, claim: BlobClaim, ids: &[(usize, i64)]) {
+    fn check(&mut self, index: u64, claim: BlobClaim, block: &BlockObservation) {
         const SHOWN: usize = 10;
         let mut found = Vec::new();
-        if let Some((kind, id)) = ids.iter().find(|(kind, _)| *kind != claim.kind) {
+        if let Some((kind, id)) = block.first_other_kind(claim.kind) {
             found.push(format!(
                 "claims kind {} but holds element {id} of kind {kind}",
                 claim.kind
             ));
         }
-        if ids.len() as u64 != claim.count {
+        if block.count() != claim.count {
             found.push(format!(
                 "claims {} elements but holds {}",
                 claim.count,
-                ids.len()
+                block.count()
             ));
         }
-        if let (Some(min), Some(max)) = (
-            ids.iter().map(|(_, id)| *id).min(),
-            ids.iter().map(|(_, id)| *id).max(),
-        ) {
+        if let Some((min, max)) = block.extrema {
             if min != claim.min_id {
                 found.push(format!(
                     "claims min_id {} but its smallest ID is {min}",
@@ -909,7 +920,7 @@ impl IndexTruth {
 /// beyond them - a repeated or absent scalar ID, a wrapping dense delta, an
 /// ID split across `DenseNodes` occurrences the two readers resolve
 /// differently - is its declared domain, never a reading of its own.
-fn block_ids(block: &[u8]) -> Result<Vec<(usize, i64)>, String> {
+fn block_ids(block: &[u8]) -> Result<Ids, String> {
     let mut ids = Vec::new();
     for field in Fields::new(block) {
         if let (2, Value::Bytes(group)) = field? {
@@ -919,10 +930,66 @@ fn block_ids(block: &[u8]) -> Result<Vec<(usize, i64)>, String> {
     Ok(ids)
 }
 
-fn group_ids(group: &[u8], ids: &mut Vec<(usize, i64)>) -> Result<(), String> {
+#[derive(Default)]
+pub(crate) struct BlockObservation {
+    pub ids: Ids,
+    pub single_field: bool,
+    pub extrema: Option<(i64, i64)>,
+    pub ascending: bool,
+    other_kind: Option<(usize, i64)>,
+}
+
+impl BlockObservation {
+    pub(crate) fn count(&self) -> u64 {
+        self.ids.len() as u64
+    }
+
+    pub(crate) fn first_other_kind(&self, kind: usize) -> Option<(usize, i64)> {
+        self.ids.first().copied().and_then(|first| {
+            if first.0 == kind {
+                self.other_kind
+            } else {
+                Some(first)
+            }
+        })
+    }
+}
+
+fn block_observation(block: &[u8]) -> Result<BlockObservation, String> {
+    let mut observed = BlockObservation {
+        single_field: true,
+        ascending: true,
+        ..BlockObservation::default()
+    };
+    let mut last = None;
+    for field in Fields::new(block) {
+        if let (2, Value::Bytes(group)) = field? {
+            let start = observed.ids.len();
+            observed.single_field &= group_ids(group, &mut observed.ids)?;
+            for &(kind, id) in &observed.ids[start..] {
+                let (min, max) = observed.extrema.unwrap_or((id, id));
+                observed.extrema = Some((min.min(id), max.max(id)));
+                observed.ascending &= last.is_none_or(|prev| prev < id);
+                last = Some(id);
+                if observed.other_kind.is_none() && kind != observed.ids[0].0 {
+                    observed.other_kind = Some((kind, id));
+                }
+            }
+        }
+    }
+    Ok(observed)
+}
+
+fn group_ids(group: &[u8], ids: &mut Ids) -> Result<bool, String> {
     let mut dense_seen = false;
+    let mut seen = None;
+    let mut single = true;
     for field in Fields::new(group) {
-        match field? {
+        let field = field?;
+        if let (number @ 1..=4, Value::Bytes(_)) = field {
+            single &= seen.replace(number).is_none_or(|prev| prev == number);
+        }
+        match field {
             (1, Value::Bytes(node)) => ids.push((0, zigzag(message_id(node)?))),
             (2, Value::Bytes(dense)) => {
                 // pbfhogg refuses a second `dense` field in one group, empty
@@ -937,7 +1004,7 @@ fn group_ids(group: &[u8], ids: &mut Vec<(usize, i64)>) -> Result<(), String> {
             _ => {}
         }
     }
-    Ok(())
+    Ok(single)
 }
 
 /// Field 1 of a `Node`, `Way` or `Relation` message, as its raw varint.
@@ -1055,35 +1122,47 @@ pub(crate) fn same_data_payloads(
     }
 }
 
-/// Whether data blob `x` of `a` and data blob `y` of `b` carry the same
-/// serialized `Blob` payload, compression included, whatever their blob
-/// headers say.
-pub(crate) fn same_payload(
-    (a, a_origin): (&Path, Origin),
-    x: &ClaimedBlob,
-    (b, b_origin): (&Path, Origin),
-    y: &ClaimedBlob,
-) -> Result<bool, Error> {
-    if x.datasize != y.datasize {
-        return Ok(false);
-    }
-    let (mut fa, _) = open(a, a_origin)?;
-    let (mut fb, _) = open(b, b_origin)?;
-    fa.seek(SeekFrom::Start(x.payload_offset))?;
-    fb.seek(SeekFrom::Start(y.payload_offset))?;
-    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
-    let mut rest = x.datasize;
-    while rest > 0 {
-        let n =
-            usize::try_from(rest.min(ba.len() as u64)).map_err(|e| Error::tool(e.to_string()))?;
-        fa.read_exact(&mut ba[..n])?;
-        fb.read_exact(&mut bb[..n])?;
-        if ba[..n] != bb[..n] {
+/// Reused scratch for dedupe's passthrough pairs.
+#[derive(Default)]
+pub(crate) struct PayloadBuffers {
+    left: Vec<u8>,
+    right: Vec<u8>,
+}
+
+impl PayloadBuffers {
+    /// Whether data blob `x` of `a` and data blob `y` of `b` carry the same
+    /// serialized `Blob` payload, compression included, whatever their blob
+    /// headers say.
+    pub(crate) fn same_payload(
+        &mut self,
+        (a, a_origin): (&Path, Origin),
+        x: &ClaimedBlob,
+        (b, b_origin): (&Path, Origin),
+        y: &ClaimedBlob,
+    ) -> Result<bool, Error> {
+        if x.datasize != y.datasize {
             return Ok(false);
         }
-        rest -= n as u64;
+        let (mut fa, _) = open(a, a_origin)?;
+        let (mut fb, _) = open(b, b_origin)?;
+        fa.seek(SeekFrom::Start(x.payload_offset))?;
+        fb.seek(SeekFrom::Start(y.payload_offset))?;
+        let (ba, bb) = (&mut self.left, &mut self.right);
+        ba.resize(64 * 1024, 0);
+        bb.resize(64 * 1024, 0);
+        let mut rest = x.datasize;
+        while rest > 0 {
+            let n = usize::try_from(rest.min(ba.len() as u64))
+                .map_err(|e| Error::tool(e.to_string()))?;
+            fa.read_exact(&mut ba[..n])?;
+            fb.read_exact(&mut bb[..n])?;
+            if ba[..n] != bb[..n] {
+                return Ok(false);
+            }
+            rest -= n as u64;
+        }
+        Ok(true)
     }
-    Ok(true)
 }
 
 /// Append to the PBF at `path` one `OSMData` blob holding an empty
@@ -1448,7 +1527,7 @@ pub(crate) const SORT_TYPE_THEN_ID: &str = "Sort.Type_then_ID";
 /// A PBF's `OSMHeader` features, read by the verifier itself: the header
 /// claims a check routes on or holds an output to, never read through the
 /// pbfhogg CLI under test.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Header {
     pub required: Vec<String>,
     pub optional: Vec<String>,
@@ -1470,16 +1549,18 @@ impl Header {
 pub(crate) fn header(path: &Path, origin: Origin) -> Result<Header, Error> {
     let (file, len) = open(path, origin)?;
     let mut file = Positioned::random(file);
-    let walk = FrameWalk::open(&mut file, len).map_err(|why| {
-        origin.refuse(format!(
-            "cannot read the header of {}: {why}",
-            path.display()
-        ))
-    })?;
+    let walk = FrameWalk::open(&mut file, len).map_err(|why| header_error(path, origin, &why))?;
     Ok(Header {
         required: walk.required_features,
         optional: walk.optional_features,
     })
+}
+
+fn header_error(path: &Path, origin: Origin, why: &str) -> Error {
+    origin.refuse(format!(
+        "cannot read the header of {}: {why}",
+        path.display()
+    ))
 }
 
 /// Protobuf's largest field number, `2^29 - 1`.
@@ -1755,6 +1836,31 @@ mod tests {
             blob_content(&blob(MAX_BLOB_LEN + 1)),
             "raw_size 33554433 out of range",
         );
+    }
+
+    #[test]
+    fn block_observation_keeps_shape_and_first_wrong_kind() {
+        let mut group = Vec::new();
+        bytes_field(3, &[8, 7], &mut group);
+        bytes_field(3, &[8, 2], &mut group);
+        // Field 1 with the wrong wire type does not add an element field.
+        group.extend_from_slice(&[8, 1]);
+        let mut block = Vec::new();
+        bytes_field(2, &group, &mut block);
+        let ways = super::block_observation(&block).unwrap();
+        assert!(ways.single_field);
+        assert!(!ways.ascending);
+        assert_eq!(ways.extrema, Some((2, 7)));
+        assert_eq!(ways.count(), 2);
+        assert_eq!(ways.first_other_kind(0), Some((1, 7)));
+        assert_eq!(ways.first_other_kind(1), None);
+
+        bytes_field(1, &[8, 6], &mut group);
+        block.clear();
+        bytes_field(2, &group, &mut block);
+        let mixed = super::block_observation(&block).unwrap();
+        assert!(!mixed.single_field);
+        assert_eq!(mixed.first_other_kind(1), Some((0, 3)));
     }
 
     /// The ID walk skips wrong-typed and changeset fields as pbfhogg and
@@ -2169,13 +2275,13 @@ mod tests {
             counts.push(claim.count);
         })
         .unwrap();
-        let mut walk = super::TruthWalk::open(&path, super::Origin::Other).unwrap();
+        let mut walk = super::TruthWalk::open(&path, super::Origin::Other, false).unwrap();
         let (blob, ids) = walk.next(true).unwrap().unwrap();
         let ids = ids.unwrap();
-        assert_eq!(ids, [(1, 10)]);
+        assert_eq!(ids.ids, [(1, 10)]);
         walk.observe(blob, &ids);
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(walk.finish().unwrap(), truth);
+        assert_eq!(walk.finish().unwrap().truth, truth);
 
         assert_eq!(counts, (2..14).collect::<Vec<_>>());
         assert_eq!(

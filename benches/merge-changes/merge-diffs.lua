@@ -3,6 +3,7 @@
 -- Every input is bound, reserved, hashed and paired in supplied order.
 -- Snapshot selection uses its own OSC table, without primary fallback.
 -- --simplify yes keeps the last change per object; no retains every change.
+-- --output-name selects the filename and its suffix selects compression.
 -- Output and declared spill scratch live under host scratch's
 -- bench-iterations, isolated per iteration. The PBF-only typed --variant
 -- has no role in this workload.
@@ -22,7 +23,7 @@ end
 
 function bench(params)
     local options = profiling.options("merge", params.stop)
-    local out = output("merged.osc.gz")
+    local out = output(params["output-name"])
     local args = { "merge-changes" }
     for _, osc in ipairs(params.osc) do args[#args + 1] = osc.file end
     local flags = {

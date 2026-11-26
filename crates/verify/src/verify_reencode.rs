@@ -17,10 +17,9 @@
 //!
 //! **Layout.** Every output blob's indexdata is first held to its payload:
 //! kind, count and ID range by the verifier's own decode of every blob
-//! ([`super::pbf_frames::index_truth`]), bounding box and tag index by
+//! ([`super::pbf_frames::TruthWalk`]), bounding box and tag index by
 //! `pbfhogg check --index` (independent of the writer's `BlockBuilder` but
-//! not of pbfhogg); then it is read by the header-only claims walk
-//! ([`super::pbf_frames::Claims`]) and compared, in constant memory, with
+//! not of pbfhogg); then the saved claims are compared with
 //! what the documented rule predicts from the input's claims (proven the same
 //! way): [`RepackBuilder`] for repack, [`split`] for degrade's decode path
 //! without an unsort mode, [`continuous`] for `--unsort`.
@@ -40,8 +39,9 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use super::pbf_frames::{self, BlobClaim, ClaimedBlob, Claims, Framing, Origin};
+use super::pbf_frames::{self, BlobClaim, ClaimedBlob, Claims, FrameAudit, Framing, Origin};
 use super::verify_fileinfo::{FileInfo, fileinfo};
 use crate::argv::PbfArgv;
 use crate::error::Error;
@@ -116,9 +116,11 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
     );
     let mut claims: [Vec<BlobClaim>; 3] = Default::default();
     if indexed {
-        let truth = pbf_frames::index_truth_with_claims(pbf, Origin::Other, |claim| {
+        let audit = cached_audit(harness, pbf, Origin::Other, None)?;
+        for claim in audit.claims.iter().filter_map(|blob| blob.claim) {
             claims[claim.kind].push(claim);
-        })?;
+        }
+        let truth = &audit.truth;
         if !truth.passed() {
             return Err(Error::Tool(format!(
                 "the verifier's blob decode finds {} claims of {} false ({}): its blob layout \
@@ -239,29 +241,16 @@ pub(super) fn check_index(
 
 /// Record that every blob of `output` carries indexdata its payload bears
 /// out: kind, count and ID range by the verifier's own decode
-/// ([`pbf_frames::index_truth`]), and bounding box and tag index, which
+/// ([`pbf_frames::TruthWalk`]), and bounding box and tag index, which
 /// that decode does not read, by [`check_index`] (pbfhogg's own decoder,
 /// so same-project evidence for those two).
-pub(super) fn judge_index(
+fn judge_index(
     harness: &mut Harness,
     outdir: &Path,
     label: &str,
     output: &Path,
+    truth: &pbf_frames::IndexTruth,
 ) -> Result<(), Error> {
-    judge_index_with(harness, outdir, label, output, None)
-}
-
-pub(super) fn judge_index_with(
-    harness: &mut Harness,
-    outdir: &Path,
-    label: &str,
-    output: &Path,
-    decoded: Option<FrameIds>,
-) -> Result<(), Error> {
-    let truth = match decoded {
-        Some(decoded) => decoded.finish()?,
-        None => pbf_frames::index_truth(output, Origin::Pbfhogg)?,
-    };
     let ok = truth.passed() && truth.blobs_with_indexdata == truth.blobs;
     for line in &truth.shown {
         harness.msg(&format!("  {label}: blob decode: {line}"));
@@ -337,14 +326,13 @@ pub(super) fn reencode(harness: &mut Harness, argv: PbfArgv, label: &str) -> Res
 /// Record the output header's claims: `Sort.Type_then_ID` and
 /// `LocationsOnWays` among its optional features as `sorted` and
 /// `locations` say.
-pub(super) fn judge_header(
+fn judge_header(
     harness: &mut Harness,
     label: &str,
-    output: &Path,
+    header: &pbf_frames::Header,
     sorted: bool,
     locations: bool,
-) -> Result<(), Error> {
-    let header = pbf_frames::header(output, Origin::Pbfhogg)?;
+) {
     for (feature, want, got) in [
         (
             pbf_frames::SORT_TYPE_THEN_ID,
@@ -366,12 +354,81 @@ pub(super) fn judge_header(
         ));
         harness.record(&format!("{label} header {feature}"), Verdict::from_pass(ok));
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // References
 // ---------------------------------------------------------------------------
+
+/// Successful audits are memoized by the same file stamp as run watches.
+#[derive(Default)]
+pub(crate) struct FrameStore {
+    entries: Vec<(crate::run::Stamp, Rc<FrameAudit>)>,
+}
+
+impl FrameStore {
+    fn get(&self, stamp: Option<crate::run::Stamp>) -> Option<Rc<FrameAudit>> {
+        self.entries
+            .iter()
+            .find(|(key, _)| Some(*key) == stamp)
+            .map(|(_, audit)| Rc::clone(audit))
+    }
+}
+
+fn cached_audit(
+    harness: &mut Harness,
+    path: &Path,
+    origin: Origin,
+    walk: Option<FrameIds>,
+) -> Result<Rc<FrameAudit>, Error> {
+    let stamp = walk
+        .as_ref()
+        .map_or_else(|| crate::run::stamp(path).ok(), |walk| walk.stamp);
+    if let Some(audit) = harness.run.frames.get(stamp) {
+        return Ok(audit);
+    }
+    let audit = Rc::new(match walk {
+        Some(walk) => walk.finish()?,
+        None => pbf_frames::TruthWalk::open(path, origin, false)?.finish()?,
+    });
+    if let Some(stamp) = stamp
+        && crate::run::stamp(path).ok() == Some(stamp)
+    {
+        harness.run.frames.entries.push((stamp, Rc::clone(&audit)));
+    }
+    Ok(audit)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn judge_output(
+    harness: &mut Harness,
+    outdir: &Path,
+    label: &str,
+    output: &Path,
+    sorted: bool,
+    locations: bool,
+    cap: u64,
+    decoded: Option<FrameIds>,
+) -> Result<OutputBlobs, Error> {
+    let audit = match harness.run.frames.get(crate::run::stamp(output).ok()) {
+        Some(audit) => {
+            judge_header(harness, label, &audit.header, sorted, locations);
+            audit
+        }
+        None => {
+            let walk = match decoded {
+                Some(walk) => walk,
+                None => FrameIds::open(output, true)?,
+            };
+            judge_header(harness, label, walk.walk.header(), sorted, locations);
+            cached_audit(harness, output, Origin::Pbfhogg, Some(walk))?
+        }
+    };
+    judge_index(harness, outdir, label, output, &audit.truth)?;
+    let blobs = output_blobs(output, cap, audit)?;
+    record_blobs(harness, label, &blobs);
+    Ok(blobs)
+}
 
 /// An expected record sequence: an OPL file the verifier prepared from
 /// osmium's [`Policy::FULL`] decoding of the input.
@@ -383,7 +440,9 @@ pub(super) struct Expected {
     pub coordinate_ways: u64,
     /// The file's source, binding, counts and digest, when the input's
     /// decoding was sealed under a summary key.
-    pub basis: Option<opl_compare::Basis>,
+    basis: Option<opl_compare::Basis>,
+    summary: crate::reference_cache::Summary,
+    stamp: Option<crate::run::Stamp>,
 }
 
 /// Expected OPL files for the life of the run. A check can keep its usual
@@ -486,12 +545,18 @@ impl<'a> References<'a> {
             source: self.input.path.clone(),
             key,
             counts: written.counts,
-            digest: written.digest,
+            digest: written.digest.clone(),
         });
         Ok(Expected {
+            stamp: crate::run::stamp(&path).ok(),
             path,
             coordinate_ways: written.coordinate_ways,
             basis,
+            summary: crate::reference_cache::Summary {
+                ordered: written.ordered,
+                counts: written.counts,
+                digest: written.digest,
+            },
         })
     }
 }
@@ -506,6 +571,7 @@ struct Partitioned {
     /// decoding summary's digest is.
     digest: String,
     reused: bool,
+    ordered: bool,
 }
 
 /// The expected file's writer, digesting every byte it is handed.
@@ -568,6 +634,7 @@ fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<Partitioned, Er
         counts: plan.counts,
         digest,
         reused,
+        ordered: plan.ordered,
     })
 }
 
@@ -580,6 +647,8 @@ struct PartitionPlan {
     projected_end: u64,
     grouped: bool,
     last_kind: usize,
+    last_ids: [Option<i64>; 3],
+    ordered: bool,
 }
 
 impl Default for PartitionPlan {
@@ -593,6 +662,8 @@ impl Default for PartitionPlan {
             projected_end: 0,
             grouped: true,
             last_kind: 0,
+            last_ids: [None; 3],
+            ordered: true,
         }
     }
 }
@@ -612,11 +683,14 @@ impl PartitionPlan {
                 decoding.display()
             ))
         })?;
-        let (kind, _) = opl_compare::parse_key(body)
+        let (kind, id) = opl_compare::parse_key(body)
             .map_err(|why| Error::Failed(format!("{}: {why}", decoding.display())))?;
         let source_start = self.source_end;
         self.source_end += line.len() as u64;
         self.counts[kind] += 1;
+        if let Some(last) = self.last_ids[kind].replace(id) {
+            self.ordered &= opl_compare::rank((kind, last)) < opl_compare::rank((kind, id));
+        }
         self.grouped &= self.last_kind <= kind;
         self.last_kind = kind;
         let mut part = Part {
@@ -781,6 +855,15 @@ pub(super) fn compare(
     prediction: Prediction<'_>,
 ) -> Result<Compared, Error> {
     let listing = outdir.join(format!("{stem}.diff.opl"));
+    let audited = matches!(&prediction, Prediction::Survivors(_))
+        && harness
+            .run
+            .frames
+            .get(crate::run::stamp(output).ok())
+            .is_some();
+    let equality = matches!(&prediction, Prediction::Unchanged)
+        && expected.stamp.is_some()
+        && crate::run::stamp(&expected.path).ok() == expected.stamp;
     let merged = opl_compare::compare_sequence_with_opl(
         harness,
         &expected.path,
@@ -789,6 +872,7 @@ pub(super) fn compare(
         (output, Origin::Pbfhogg),
         &listing,
         Policy::FULL,
+        equality.then_some(&expected.summary),
         |staged| {
             let Some(basis) = &expected.basis else {
                 return Ok(None);
@@ -803,8 +887,9 @@ pub(super) fn compare(
                         Edit::Keep
                     }))
                 }),
+                Prediction::Survivors(_) if audited => Ok(None),
                 Prediction::Survivors(decoded) => {
-                    let Ok(mut survivors) = FrameIds::open(output) else {
+                    let Ok(mut survivors) = FrameIds::open(output, false) else {
                         return Ok(None);
                     };
                     let candidate = predict(&expected.path, whole, staged, |kind, id, _| {
@@ -827,11 +912,9 @@ pub(super) fn compare(
     Ok(Compared { merged, listing })
 }
 
-/// What stream a case predicts its output decodes to, so that a warm run's
-/// stored output summary can decide [`compare`] with no decode and no
-/// merge. Every prediction is only a candidate: the verdict is the
-/// equality of its counts and XXH3-128 with the summary of osmium's
-/// decoding of the output, and a miss decodes and merges.
+/// What stream a case predicts its output decodes to. A matching stored
+/// summary can decide every prediction. A fresh summary can also decide
+/// whole-stream equality. A difference goes to the merge.
 pub(super) enum Prediction<'a> {
     /// The expected file itself.
     Unchanged,
@@ -943,6 +1026,7 @@ fn predict(
 /// The identities an output's blobs hold, in file order, read by the
 /// verifier's frame decoder one blob at a time, with one held for a peek.
 pub(super) struct FrameIds {
+    stamp: Option<crate::run::Stamp>,
     walk: pbf_frames::TruthWalk,
     truth_error: Option<Error>,
     blob: std::vec::IntoIter<(usize, i64)>,
@@ -950,9 +1034,10 @@ pub(super) struct FrameIds {
 }
 
 impl FrameIds {
-    fn open(path: &Path) -> Result<Self, Error> {
+    fn open(path: &Path, report_header: bool) -> Result<Self, Error> {
         Ok(Self {
-            walk: pbf_frames::TruthWalk::open(path, Origin::Pbfhogg)?,
+            stamp: crate::run::stamp(path).ok(),
+            walk: pbf_frames::TruthWalk::open(path, Origin::Pbfhogg, report_header)?,
             truth_error: None,
             blob: Vec::new().into_iter(),
             pending: None,
@@ -977,13 +1062,14 @@ impl FrameIds {
             match ids {
                 Ok(ids) => {
                     self.walk.observe(blob, &ids);
-                    self.blob = ids.into_iter();
+                    self.blob = ids.ids.into_iter();
                 }
                 Err(error) => {
                     if blob.claim.is_some() {
                         self.truth_error = Some(error);
                     } else {
-                        self.walk.observe(blob, &[]);
+                        self.walk
+                            .observe(blob, &pbf_frames::BlockObservation::default());
                     }
                     return Err(());
                 }
@@ -992,7 +1078,7 @@ impl FrameIds {
         Ok(self.pending)
     }
 
-    fn finish(self) -> Result<pbf_frames::IndexTruth, Error> {
+    fn finish(self) -> Result<FrameAudit, Error> {
         if let Some(error) = self.truth_error {
             return Err(error);
         }
@@ -1307,21 +1393,13 @@ pub(super) fn continuous(cap: u64, total: u64, emit: &mut Emit<'_>) -> Result<()
 
 /// An output's blobs compared, in order, with a predicted layout: the first
 /// disagreement is kept and the rest ignored.
-pub(super) struct LayoutCheck {
-    claims: Claims,
+pub(super) struct LayoutCheck<'a> {
+    claims: std::slice::Iter<'a, ClaimedBlob>,
     position: u64,
-    pub mismatch: Option<String>,
+    mismatch: Option<String>,
 }
 
-impl LayoutCheck {
-    pub fn open(output: &Path) -> Result<Self, Error> {
-        Ok(Self {
-            claims: Claims::open(output, Origin::Pbfhogg)?,
-            position: 0,
-            mismatch: None,
-        })
-    }
-
+impl LayoutCheck<'_> {
     /// The next output blob must claim `count` elements of `kind`.
     pub fn expect(&mut self, kind: usize, count: u64) -> Result<(), Error> {
         if self.mismatch.is_some() {
@@ -1329,7 +1407,7 @@ impl LayoutCheck {
         }
         let at = self.position;
         self.position += 1;
-        self.mismatch = match self.claims.next_blob()? {
+        self.mismatch = match self.claims.next() {
             None => Some(format!(
                 "the output ends where block {at} ({count} {}s) was predicted",
                 KINDS[kind]
@@ -1350,25 +1428,39 @@ impl LayoutCheck {
 
     /// After the last predicted block: the output must hold no more blobs.
     /// Returns the first disagreement.
-    pub fn finish(mut self) -> Result<Option<String>, Error> {
-        if self.mismatch.is_none() && self.claims.next_blob()?.is_some() {
+    pub fn finish(mut self) -> Option<String> {
+        if self.mismatch.is_none() && self.claims.next().is_some() {
             self.mismatch = Some(format!(
                 "the output holds more than the {} predicted blocks",
                 self.position
             ));
         }
-        Ok(self.mismatch)
+        self.mismatch
     }
 }
 
 /// What one pass over an output's claims finds, per kind and overall.
-#[derive(Debug, Default)]
 pub(super) struct OutputBlobs {
+    audit: Rc<FrameAudit>,
     pub kinds: [KindBlobs; 3],
     /// The first blob over the cap, or with no element.
     pub bad_size: Option<String>,
     /// A blob claiming a kind after a later kind's blob.
     pub kind_step_back: Option<String>,
+}
+
+impl OutputBlobs {
+    pub fn layout(&self) -> LayoutCheck<'_> {
+        LayoutCheck {
+            claims: self.audit.claims.iter(),
+            position: 0,
+            mismatch: None,
+        }
+    }
+
+    pub fn ids(&self, kind: usize, position: usize) -> &[(usize, i64)] {
+        &self.audit.witnesses[kind][position]
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1386,11 +1478,15 @@ pub(super) struct KindBlobs {
 }
 
 /// One pass over `output`'s claims (every blob must carry one).
-pub(super) fn output_blobs(output: &Path, cap: u64) -> Result<OutputBlobs, Error> {
-    let mut out = OutputBlobs::default();
+fn output_blobs(output: &Path, cap: u64, audit: Rc<FrameAudit>) -> Result<OutputBlobs, Error> {
+    let mut out = OutputBlobs {
+        audit,
+        kinds: Default::default(),
+        bad_size: None,
+        kind_step_back: None,
+    };
     let mut highest: Option<usize> = None;
-    let mut claims = Claims::open(output, Origin::Pbfhogg)?;
-    while let Some(blob) = claims.next_blob()? {
+    for &blob in &out.audit.claims {
         let claim = blob.claim.ok_or_else(|| {
             Error::Failed(format!(
                 "data blob {} of {} carries no indexdata",
@@ -1435,10 +1531,9 @@ pub(super) fn located_ids(
     output: &Path,
     located: &(ClaimedBlob, BlobClaim),
     kind: usize,
+    elements: &[(usize, i64)],
 ) -> Result<Vec<i64>, Error> {
     let (blob, claim) = located;
-    let elements =
-        pbf_frames::blob_ids(output, Origin::Pbfhogg, blob.payload_offset, blob.datasize)?;
     if elements.len() as u64 != claim.count || elements.iter().any(|&(k, _)| k != kind) {
         return Err(Error::Failed(format!(
             "data blob {} of {} decodes to {} elements, not the {} {}s its claim checked by \
@@ -1450,11 +1545,11 @@ pub(super) fn located_ids(
             KINDS[kind]
         )));
     }
-    Ok(elements.into_iter().map(|(_, id)| id).collect())
+    Ok(elements.iter().map(|&(_, id)| id).collect())
 }
 
 /// Record the claims pass's cap and kind-order verdicts.
-pub(super) fn record_blobs(harness: &mut Harness, label: &str, blobs: &OutputBlobs) {
+fn record_blobs(harness: &mut Harness, label: &str, blobs: &OutputBlobs) {
     for (what, problem) in [
         ("block sizes", &blobs.bad_size),
         ("kind order", &blobs.kind_step_back),
@@ -1481,6 +1576,26 @@ pub(super) fn record_layout(harness: &mut Harness, label: &str, mismatch: Option
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn frame_audits_follow_the_inode_and_expire_when_the_file_changes() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.path().join("source.pbf");
+        let alias = scratch.path().join("alias.pbf");
+        std::fs::write(&input, b"old").unwrap();
+        std::fs::hard_link(&input, &alias).unwrap();
+
+        let audit = Rc::new(FrameAudit::default());
+        let key = crate::run::stamp(&input).unwrap();
+        let store = FrameStore {
+            entries: vec![(key, Rc::clone(&audit))],
+        };
+        let reused = store.get(crate::run::stamp(&alias).ok()).unwrap();
+        assert!(Rc::ptr_eq(&audit, &reused));
+
+        std::fs::write(&alias, b"new contents").unwrap();
+        assert!(store.get(crate::run::stamp(&input).ok()).is_none());
+    }
 
     /// Predict `edit` of `expected`, merge `expected` against `actual`, and
     /// require the two to agree on everything the judges read: the result,

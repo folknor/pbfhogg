@@ -1031,7 +1031,11 @@ Residue: each change carries a 40-byte `Element` record (`usize` offsets) and,
 during dedupe, a 24-byte sort key: about 1.7 GB at the planet week's 26.3 M
 changes, beside the rendered XML. A packed descriptor (u32 offsets within the
 batch, the key derived instead of copied) would cut resident data with mostly
-unique changes. Unmeasured: the split of peak anon between descriptors and XML.
+unique changes. Measured 2026-11-26 (bygg, `876d9dd7`, `--alloc` cell
+`6325ad69`): planet 4914..4920 simplified peaks at 7.3 GB RSS in 4.0 s, so
+the descriptors are about a quarter of the peak and a packed form would save
+about 1 GB. Memory only, on a command that takes seconds; build it when a
+host's memory makes the 7.3 GB matter.
 
 Declined, with reasons at the `simplify.rs` module doc and the cells in
 reference/performance/merge-changes.md: streaming chunks to the output in

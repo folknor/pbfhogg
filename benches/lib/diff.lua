@@ -21,8 +21,8 @@ end
 
 -- Exit 0 (same) and exit 1 (differs) both complete the iteration; the
 -- answer is not judged (benches/lib/answer.lua).
-function M.run(params, old, new)
-    local out = output(params.format == "osc" and "diff.osc" or "diff.txt")
+function M.run(params, old, new, output_name)
+    local out = output(output_name or (params.format == "osc" and "diff.osc" or "diff.txt"))
     local flags = { output = out, overwrite = true, jobs = params.jobs, type = params.type,
         ["direct-io"] = params["direct-io"] == "yes" }
     if params.format == "osc" then

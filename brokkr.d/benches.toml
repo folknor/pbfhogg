@@ -131,8 +131,9 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 script_file = "../benches/build-geocode-index/geocode-query.lua"
 description = "Reverse geocoding query latency over fixed pseudo-random points, against an index the bench builds"
 version = 6
-date = 2026-11-25
+date = 2026-11-26
 changelog = [
+  { date = 2026-11-26, note = "Share bbox selection with geocode-query-cli; library workload unchanged" },
   { version = 6, date = 2026-11-25, note = "Every query's whole answer goes to black_box instead of a sum of admin counts, so fat LTO cannot drop address, street or interpolation assembly; Reader::query and its level, admin and interpolation searches carry hotpath scopes, so --hotpath and --alloc attribute the query work instead of only the process wrapper" },
   { version = 5, date = 2026-11-24, note = "The instrument samples the box as typed instead of quantizing its edges to decimicrodegrees first; points are unchanged for a box whose edges all lie on the 1e-7 grid, every configured dataset bbox among them, and a box finer than that no longer collapses to one point" },
   { version = 4, date = 2026-11-15, note = "The instrument no longer tallies or digests its answers in the warm-up round, which is inside the ranked child wall, and the bench no longer reads answer fields; only measurement fields are parsed and the workload echo checked" },
@@ -367,10 +368,11 @@ params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", hel
 
 [bench.perturb-pbf]
 script_file = "../benches/degrade/perturb-pbf.lua"
-description = "Strip indexdata or inline locations and perturb blob ordering on a dataset or snapshot"
+description = "Strip indexdata or inline locations, perturb blob ordering or drop IDs on a dataset or snapshot"
 version = 1
-date = 2026-11-09
+date = 2026-11-26
 changelog = [
+  { date = 2026-11-26, note = "Add optional --drop-ids and --force; default workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed degrade: command flags, compression, snapshots, I/O and profiling with marker stops; snapshot promotion awaits brokkr 145" },
 ]
 profile = "release"
@@ -388,6 +390,8 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 params.strip-indexdata = { choices = ["yes", "no"], default = "no", help = "yes: clear every OsmData blob's indexdata" }
 params.strip-locations = { choices = ["yes", "no"], default = "no", help = "yes: drop LocationsOnWays and inline way coordinates" }
 params.unsort = { choices = ["yes", "no"], default = "no", help = "yes: clear Sort.Type_then_ID and overlap adjacent same-kind blob ID ranges" }
+params.drop-ids = { free = true, split = false, help = "drop N distinct IDs using SEED, as N:SEED; pbfhogg validates the pair" }
+params.force = { choices = ["yes", "no"], default = "no", help = "yes: accept unindexed input on the decode path" }
 
 # -- diff
 
@@ -422,8 +426,9 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "use O_DIRE
 script_file = "../benches/diff/diff-pair.lua"
 description = "Diff two independent snapshots with text or OSC output"
 version = 3
-date = 2026-11-15
+date = 2026-11-26
 changelog = [
+  { date = 2026-11-26, note = "Add --output-name to select a filename, including gzip OSC output; defaults unchanged" },
   { version = 3, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child and delegate jobs validation to pbfhogg" },
@@ -442,6 +447,7 @@ params.to = { from = "datasets.{dataset}.snapshot", required = true, help = "sec
 params.variant = { from = "datasets.{dataset}.snapshot.{from}.pbf", default = "indexed", help = "first variant; set to-variant to the same key" }
 
 params.to-variant = { from = "datasets.{dataset}.snapshot.{to}.pbf", default = "indexed", help = "second variant; must equal variant (set both explicitly for non-indexed pairs)" }
+params.output-name = { free = true, split = false, help = "output filename; defaults to diff.osc for OSC and diff.txt for text" }
 
 [bench.diff-text]
 script_file = "../benches/diff/diff-text.lua"
@@ -528,8 +534,9 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 script_file = "../benches/export/geojson-export.lua"
 description = "Export a LocationsOnWays dataset or snapshot to GeoJSON or GeoJSON sequence, to a file"
 version = 1
-date = 2026-11-24
+date = 2026-11-26
 changelog = [
+  { date = 2026-11-26, note = "Add optional --bbox spatial filtering; default workload unchanged" },
   { version = 1, date = 2026-11-24, note = "First export bench: format, type, metadata and an optional expression" },
 ]
 profile = "release"
@@ -543,6 +550,7 @@ params.type = { choices = ["all", "node", "way"], default = "all", help = "the e
 params.metadata = { choices = ["yes", "no"], default = "no", help = "yes: emit element metadata properties" }
 params.expression = { validated = true, help = "one tag expression, as export -e takes it; omitted exports every tagged element" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+params.bbox = { bbox = true, help = "min_lon,min_lat,max_lon,max_lat export bounds; omitted leaves the export unbounded" }
 
 # -- extract
 
@@ -573,6 +581,27 @@ params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io
 params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the CLI default" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
+# -- geocode
+
+[bench.geocode-query-cli]
+script_file = "../benches/geocode/geocode-query-cli.lua"
+description = "Reverse geocoding CLI throughput over fixed pseudo-random points, against an index the bench builds"
+version = 1
+date = 2026-11-26
+changelog = [
+  { version = 1, date = 2026-11-26, note = "Measure one CLI call over the library bench's fixed point sequence, with index and points prepared before timing" },
+]
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset; its bbox is the default point box" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant the index is built from" }
+params.bbox = { bbox = true, help = "min_lon,min_lat,max_lon,max_lat the points are drawn from, each minimum below its maximum; omitted uses the dataset bbox" }
+params.queries = { integer = "u32", min = 1, default = "100000", help = "points in the measured CLI call" }
+params.seed = { integer = "u64", default = "1", help = "seed of the point sequence" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the query child's stderr" }
 
 # -- getid
 
@@ -703,8 +732,9 @@ params.osc-seq = { from = "datasets.{dataset}.osc", many = true, default = "all"
 script_file = "../benches/merge-changes/merge-diffs.lua"
 description = "Merge configured OSC sequences or ranges, retaining all changes or simplifying per object"
 version = 3
-date = 2026-11-14
+date = 2026-11-26
 changelog = [
+  { date = 2026-11-26, note = "Add --output-name to select plain or gzip OSC output; default remains merged.osc.gz" },
   { version = 3, date = 2026-11-14, note = "The refusal-only direct-io, io-uring and compression params are gone; brokkr refuses them as unknown, and the explicit no-op spellings are refused too; workload unchanged" },
   { version = 2, date = 2026-11-10, note = "Only pass --tmp-dir for multiple inputs without --simplify; omit unused scratch for simplified and single-input merges" },
   { version = 1, date = 2026-11-09, note = "Ported typed merge-changes: scoped sequences, lists and inclusive ranges, simplify, spill scratch and profiling with marker stops" },
@@ -718,6 +748,7 @@ params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true,
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 params.simplify = { choices = ["yes", "no"], default = "no", help = "yes: keep only the last change per object" }
+params.output-name = { free = true, split = false, default = "merged.osc.gz", help = "output filename; use .osc for plain output or .osc.gz for gzip" }
 
 # -- repack
 

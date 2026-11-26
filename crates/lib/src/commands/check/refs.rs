@@ -5,7 +5,7 @@ use crate::counters::Stopwatch;
 use crate::{ElementKind, MemberId};
 
 use crate::error::Result;
-use crate::idset::IdSet;
+use crate::idset::{AtomicWordBatch, IdSet};
 use crate::read::input::{InputFile, InputSource};
 use crate::read::project_ids::{
     IdScratch, KindIds, RelationSpan, RelationSpans, WaySpan, WaySpans,
@@ -199,7 +199,7 @@ fn append_capped_missing_refs(
 /// found first. The main thread merges per-blob results in completion order.
 ///
 /// On an indexed file, phase 1 reads the node blobs and writes `node_ids` via
-/// `IdSet::try_insert_atomic`. Phase 2 reads the way blobs, checks their refs
+/// a word batch per blob. Phase 2 reads the way blobs, checks their refs
 /// against `node_ids` and, under `check_relations`, writes `way_ids`. Phase 3
 /// (only under `check_relations`) reads the relation blobs, checks their
 /// members against both and populates `relation_ids`. Forward
@@ -371,7 +371,8 @@ pub(super) struct PhaseBlobs {
 
 /// Insert one accepted blob's node IDs into `node_ids`, returning how many
 /// there were and those the pre-allocation does not cover (above it, or
-/// negative), for the serial merge.
+/// negative), for the serial merge. The last word is published when the
+/// batch drops, before the combined phase checks this blob's ways.
 pub(super) fn replay_nodes(
     scratch: &IdScratch,
     bytes: &[u8],
@@ -379,13 +380,14 @@ pub(super) fn replay_nodes(
 ) -> Result<(u64, Vec<i64>)> {
     let mut count: u64 = 0;
     let mut overflow = Vec::new();
+    let mut batch = AtomicWordBatch::new(node_ids);
     // The scratch may hold other kinds' IDs too (the default pair's
     // unindexed pass records relation IDs for the ID check beside them).
     scratch.each(bytes, |kind, id| {
         if kind != ElementKind::Node {
             return Ok(());
         }
-        if !node_ids.try_insert_atomic(id) {
+        if !batch.insert(id) {
             overflow.push(id);
         }
         count += 1;
@@ -396,6 +398,7 @@ pub(super) fn replay_nodes(
 
 /// Judge one accepted blob's ways, in element-walk order: each way's ID into
 /// `way_ids` (under `check_relations`), then its refs against `node_ids`.
+/// The way batch drops before the combined phase checks this blob's relations.
 pub(super) fn judge_ways(
     ways: &[WaySpan],
     bytes: &[u8],
@@ -403,10 +406,11 @@ pub(super) fn judge_ways(
     judge: Judge,
 ) -> Result<WayBlobResult> {
     let mut r = WayBlobResult::default();
+    let mut way_ids = AtomicWordBatch::new(&sets.ways);
     for way in ways {
         let wid = way.id;
         // Way IDs are tracked only for the relation phase.
-        if judge.check_relations && !sets.ways.try_insert_atomic(wid) {
+        if judge.check_relations && !way_ids.insert(wid) {
             r.overflow_ids.push(wid);
         }
         r.way_count += 1;
@@ -440,9 +444,10 @@ pub(super) fn judge_relations(
     judge: Judge,
 ) -> Result<RelBlobResult> {
     let mut r = RelBlobResult::default();
+    let mut relation_ids = AtomicWordBatch::new(&sets.relations);
     for rel in relations {
         let rid = rel.id;
-        if !sets.relations.try_insert_atomic(rid) {
+        if !relation_ids.insert(rid) {
             r.overflow_ids.push(rid);
         }
         r.relation_count += 1;
@@ -1097,4 +1102,53 @@ pub(super) fn finish(
     );
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_nodes;
+    use crate::ElementKind;
+    use crate::idset::IdSet;
+    use crate::read::block::BlockBuffer;
+    use crate::read::project_ids::{IdScratch, KindIds};
+    use crate::read::wire_fixtures::{Group, block, dense, plain_node};
+
+    #[test]
+    fn batched_node_replay_matches_per_node_insertion() {
+        let far = 1_i64 << 25;
+        let ids = [-1, -64, 62, 63, 64, 65, 65, 127, 128, far, 129];
+        let group = Group {
+            dense: Some(dense(&ids.map(|id| (id, 0, 0)), &[])),
+            nodes: vec![plain_node(192, 0, 0, &[], None)],
+            ..Group::default()
+        };
+        let mut scratch = IdScratch::default();
+        let (mut strings, mut groups) = (Vec::new(), Vec::new());
+        let bytes = block(&[""], &[group]);
+        let buffer = BlockBuffer::new(bytes, None, &mut strings, &mut groups, None);
+        let (_, accepted) = buffer
+            .project(|_, _| KindIds::of(ElementKind::Node, &mut scratch))
+            .expect("valid node block");
+
+        let mut plain = IdSet::new();
+        let mut batched = IdSet::new();
+        plain.pre_allocate(64);
+        batched.pre_allocate(64);
+        let expected_overflow: Vec<_> = ids
+            .into_iter()
+            .chain([192])
+            .filter(|&id| !plain.try_insert_atomic(id))
+            .collect();
+
+        let (count, overflow) =
+            replay_nodes(&scratch, accepted.bytes(), &batched).expect("accepted node replay");
+        assert_eq!(count, 12);
+        assert_eq!(overflow, expected_overflow);
+        assert_eq!(overflow, [-1, -64, far]);
+        assert!(batched.get(192));
+        assert_eq!(
+            batched.iter_canonical().collect::<Vec<_>>(),
+            plain.iter_canonical().collect::<Vec<_>>()
+        );
+    }
 }

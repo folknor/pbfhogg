@@ -60,8 +60,8 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::verify_reencode::{
-    self as reencode, Compared, DEFAULT_CAP, Expected, Input, KINDS, LayoutCheck, Listing,
-    Prediction, Ran, References, continuous, split,
+    self as reencode, Compared, DEFAULT_CAP, Expected, Input, KINDS, Listing, Prediction, Ran,
+    References, continuous, split,
 };
 
 /// The drop seeds: the first runs twice, the second once.
@@ -126,11 +126,16 @@ impl Run<'_> {
         sorted: bool,
         decoded: Option<reencode::FrameIds>,
     ) -> Result<reencode::OutputBlobs, Error> {
-        reencode::judge_header(self.harness, label, out, sorted, false)?;
-        reencode::judge_index_with(self.harness, &self.outdir, label, out, decoded)?;
-        let blobs = reencode::output_blobs(out, DEFAULT_CAP)?;
-        reencode::record_blobs(self.harness, label, &blobs);
-        Ok(blobs)
+        reencode::judge_output(
+            self.harness,
+            &self.outdir,
+            label,
+            out,
+            sorted,
+            false,
+            DEFAULT_CAP,
+            decoded,
+        )
     }
 
     /// [`reencode::compare`] of one output against the expected sequence.
@@ -274,16 +279,16 @@ fn strip_locations(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error>
     let label = "degrade --strip-locations";
     let compared = run.compare("strip-locations", reference, &out, Prediction::Unchanged)?;
     reencode::record_identical(run.harness, label, &compared)?;
-    run.common(label, &out, run.input.sorted_claim)?;
+    let blobs = run.common(label, &out, run.input.sorted_claim)?;
     if run.input.indexed {
-        let mut layout = LayoutCheck::open(&out)?;
+        let mut layout = blobs.layout();
         for (kind, claims) in run.input.claims.iter().enumerate() {
             let mut emit = |n| layout.expect(kind, n);
             for claim in claims {
                 split(DEFAULT_CAP, claim.count, &mut emit)?;
             }
         }
-        reencode::record_layout(run.harness, label, layout.finish()?);
+        reencode::record_layout(run.harness, label, layout.finish());
     }
     Ok(())
 }
@@ -335,9 +340,9 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
         for (most, removed) in removed_per_kind.iter_mut().zip(per_kind) {
             *most = (*most).max(removed);
         }
-        run.common_with(&label, out, run.input.sorted_claim, decoded)?;
+        let blobs = run.common_with(&label, out, run.input.sorted_claim, decoded)?;
         if run.input.indexed {
-            let mismatch = predict_drop(run.input, &compared.listing, out)?;
+            let mismatch = predict_drop(run.input, &compared.listing, &blobs)?;
             reencode::record_layout(run.harness, &label, mismatch);
         }
         if index == 0 {
@@ -448,7 +453,7 @@ fn judge_repeat(
     ));
     run.harness.record(&verdict, Verdict::from_pass(same));
     let label = format!("degrade --drop-ids {spec} second run");
-    run.common(&label, again, run.input.sorted_claim)?;
+    let blobs = run.common(&label, again, run.input.sorted_claim)?;
     if !same {
         run.harness.replay_listing(&compared.listing)?;
         return Ok(());
@@ -456,7 +461,7 @@ fn judge_repeat(
     if run.input.indexed
         && let Some(listing) = listing_a
     {
-        let mismatch = predict_drop(run.input, listing, again)?;
+        let mismatch = predict_drop(run.input, listing, &blobs)?;
         reencode::record_layout(run.harness, &label, mismatch);
     }
     run.gaps.push(format!(
@@ -545,8 +550,12 @@ fn judge_drop(
 /// its survivors: the removed IDs, from the listing, counted per input blob
 /// by its claimed range (the input in strict order, so ranges ascend and do
 /// not overlap).
-fn predict_drop(input: &Input, listing: &Path, output: &Path) -> Result<Option<String>, Error> {
-    let mut layout = LayoutCheck::open(output)?;
+fn predict_drop(
+    input: &Input,
+    listing: &Path,
+    blobs: &reencode::OutputBlobs,
+) -> Result<Option<String>, Error> {
+    let mut layout = blobs.layout();
     let mut removed = Listing::open(listing)?;
     let mut next = removed.next_group()?;
     for (kind, name) in KINDS.iter().enumerate() {
@@ -581,7 +590,7 @@ fn predict_drop(input: &Input, listing: &Path, output: &Path) -> Result<Option<S
             )));
         }
     }
-    layout.finish()
+    Ok(layout.finish())
 }
 
 /// Per kind, where an unsort mode documents its swap when the kind fires:
@@ -651,12 +660,12 @@ fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Er
     let blobs = run.common(&label, &out, false)?;
 
     if !intra {
-        let mut layout = LayoutCheck::open(&out)?;
+        let mut layout = blobs.layout();
         for (kind, &count) in counts.iter().enumerate() {
             let mut emit = |n| layout.expect(kind, n);
             continuous(DEFAULT_CAP, count, &mut emit)?;
         }
-        reencode::record_layout(run.harness, &label, layout.finish()?);
+        reencode::record_layout(run.harness, &label, layout.finish());
     }
     for kind in 0..3 {
         let kb = &blobs.kinds[kind];
@@ -683,9 +692,9 @@ fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Er
         }
         let Some(a) = moved[kind] else { continue };
         let placed = if intra {
-            place_intra(&out, kb, kind, a, run.input.info.min_ids[kind])?
+            place_intra(&out, &blobs, kind, a, run.input.info.min_ids[kind])?
         } else {
-            place_cross(&out, kb, kind, a)?
+            place_cross(&out, &blobs, kind, a)?
         };
         match placed {
             Ok(()) => run.harness.msg(&format!(
@@ -702,10 +711,11 @@ fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Er
 /// of its first, which holds `cap` elements.
 fn place_cross(
     out: &Path,
-    kb: &reencode::KindBlobs,
+    blobs: &reencode::OutputBlobs,
     kind: usize,
     a: i64,
 ) -> Result<Result<(), String>, Error> {
+    let kb = &blobs.kinds[kind];
     let (Some(first), Some(second)) = (&kb.first, &kb.second) else {
         return Ok(Err("the kind has fewer than two output blobs".to_owned()));
     };
@@ -715,8 +725,8 @@ fn place_cross(
             first.1.count
         )));
     }
-    let head = reencode::located_ids(out, first, kind)?;
-    let tail = reencode::located_ids(out, second, kind)?;
+    let head = reencode::located_ids(out, first, kind, blobs.ids(kind, 0))?;
+    let tail = reencode::located_ids(out, second, kind, blobs.ids(kind, 1))?;
     let (Some(&q), Some(&p)) = (head.last(), head.iter().rev().nth(1)) else {
         return Ok(Err(
             "the kind's first blob holds fewer than two elements".to_owned()
@@ -740,7 +750,7 @@ fn place_cross(
 /// blob.
 fn place_intra(
     out: &Path,
-    kb: &reencode::KindBlobs,
+    blobs: &reencode::OutputBlobs,
     kind: usize,
     a: i64,
     lowest: i64,
@@ -750,10 +760,10 @@ fn place_intra(
             "the moved object is not the kind's lowest ID {lowest}"
         )));
     }
-    let Some(first) = &kb.first else {
+    let Some(first) = &blobs.kinds[kind].first else {
         return Ok(Err("the kind has no output blob".to_owned()));
     };
-    let head = reencode::located_ids(out, first, kind)?;
+    let head = reencode::located_ids(out, first, kind, blobs.ids(kind, 0))?;
     if head.get(1) != Some(&a) {
         return Ok(Err(format!(
             "the first blob opens {:?}, the moved object not second",

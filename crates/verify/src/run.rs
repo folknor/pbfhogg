@@ -28,14 +28,14 @@ use crate::tunables;
 /// local single-user tool, so a same-size rewrite that leaves mtime equal is
 /// outside what it defends against, the same stamp policy cache lookups use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     dev: u64,
     ino: u64,
     size: u64,
     mtime: (i64, i64),
 }
 
-fn stamp(path: &Path) -> Result<Stamp, Error> {
+pub(crate) fn stamp(path: &Path) -> Result<Stamp, Error> {
     let meta = std::fs::metadata(path)
         .map_err(|e| Error::Environment(format!("{}: {e}", path.display())))?;
     Ok(Stamp::of(&meta))
@@ -68,6 +68,7 @@ pub(crate) struct Run {
     pub(crate) decodings: crate::opl_compare::Decodings,
     /// Expected OPL projections shared by the re-encoding checks.
     pub(crate) reencode_references: crate::verify_reencode::ReferenceStore,
+    pub(crate) frames: crate::verify_reencode::FrameStore,
     keep: bool,
 }
 
@@ -93,6 +94,7 @@ impl Run {
             digests: std::collections::HashMap::new(),
             decodings: crate::opl_compare::Decodings::default(),
             reencode_references: crate::verify_reencode::ReferenceStore::default(),
+            frames: crate::verify_reencode::FrameStore::default(),
             keep,
         })
     }

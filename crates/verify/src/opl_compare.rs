@@ -1306,7 +1306,9 @@ fn sequence_by_summary(
 /// (`expected`) and the second `pbf` decoded under `policy`; the decoding is
 /// the run's, kept on failure, and `expected` is kept. With `basis`, an
 /// output whose stored summary matches the stream `predict` names is
-/// decided without a decode ([`sequence_by_summary`]).
+/// decided without a decode ([`sequence_by_summary`]). For whole-stream
+/// equality, a fresh decoding can also decide from its summary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compare_sequence_with_opl(
     harness: &mut Harness,
     expected: &Path,
@@ -1314,6 +1316,7 @@ pub(crate) fn compare_sequence_with_opl(
     pbf: Operand<'_>,
     listing: &Path,
     policy: Policy,
+    equality: Option<&Summary>,
     predict: impl FnOnce(&Path) -> Result<Option<Predicted>, Error>,
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
@@ -1323,6 +1326,15 @@ pub(crate) fn compare_sequence_with_opl(
         return Ok(merged);
     }
     decoded(harness, pbf, policy, |harness, b| {
+        if let Some(want) = equality
+            && File::open(expected).is_ok()
+            && let Ok((_, _, summary)) = harness.timed("opl summary scan", || scan_order(b))
+            && let Some(merged) = equal_sequence(want, &summary, listing)?
+        {
+            publish_summary(harness, b, &summary)?;
+            log_merge(harness, listing, &merged);
+            return Ok(merged);
+        }
         let (merged, [_, summary]) = harness.timed(MERGE_STEP, || {
             merge(expected, b, listing, false, |_| {}, |_| {})
         })?;
@@ -1330,6 +1342,21 @@ pub(crate) fn compare_sequence_with_opl(
         log_merge(harness, listing, &merged);
         Ok(merged)
     })
+}
+
+/// Only equality may bypass the merge. The merge owns all differences and
+/// errors, including those a summary scan could not finish reading.
+fn equal_sequence(want: &Summary, got: &Summary, listing: &Path) -> Result<Option<Merged>, Error> {
+    if want != got {
+        return Ok(None);
+    }
+    File::create(listing)?;
+    Ok(Some(Merged {
+        first: got.counts,
+        second: got.counts,
+        same: got.counts.iter().sum(),
+        ..Merged::default()
+    }))
 }
 
 /// A strict comparison of `pbf`, decoded under `policy`, with an expected

@@ -3,7 +3,8 @@
 --
 -- diff-pair: typed diff-snapshots, two independently resolved inputs, with
 -- no merge or cache preparation. Text suppresses common lines; OSC uses
--- iteration scratch. Same-file pairs are allowed.
+-- iteration scratch. --output-name selects the filename, including the
+-- suffix that selects gzip for OSC. Same-file pairs are allowed.
 -- Both variant params must match; supply both for non-indexed input because
 -- param defaults cannot depend on another param. Binding both files keeps
 -- their reservations, digests and pairing in brokkr's input machinery.
@@ -25,5 +26,5 @@ function bench(params)
     local new = params["to-variant"]
     record.meta = { to_snapshot_file = new.file.path:match("[^/]+$"),
         to_snapshot_file_mb = filesize(new.file) / 1000000 }
-    return diff.run(params, old.file, new.file)
+    return diff.run(params, old.file, new.file, params["output-name"])
 end

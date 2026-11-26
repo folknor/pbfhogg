@@ -223,7 +223,11 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   order and count.
 - **Header claims** (`Sort.Type_then_ID` and `LocationsOnWays` among the
   optional features) are read by the verifier's own `OSMHeader` reader
-  (`pbf_frames::header`).
+  (`pbf_frames::header`). Degrade and repack retain the header, frame
+  claims, indexdata audit, and the first two indexed blobs' identities per
+  kind from one verifier frame walk. The cap, order, layout, and unsort
+  placement judges reuse those observations. A successful audit is held
+  for the run by device, inode, size, and nanosecond mtime.
 - **The frame reader's acceptance** (`pbf_frames`): where pbfhogg and
   libosmium disagree on what it reads, it refuses. Optional fields are
   recognised by number and wire type as both readers recognise them, so a
@@ -480,8 +484,12 @@ summary key, that key is observed again with the output's in one tool
 binding, and the output's stored summary has the counts and XXH3-128 the
 verifier computed for the expected file as it wrote it: byte-identical
 streams pair every record equal in any order, so the listing is written
-empty. Any other outcome decodes the output and merges. Where the output
-differs from the expected sequence by design, the stored summary is held
+empty. If the stored summary misses or differs for a whole-stream equality
+case, the verifier scans osmium's fresh OPL decoding for its order, counts,
+and XXH3-128. A match against the prepared expected stream gives the same
+empty listing and counts as the merge. A mismatch or scan error goes to
+the original merge for the verdict, diagnostics, and listing. Where the
+output differs from the expected sequence by design, the stored summary is held
 instead to a predicted stream the verifier derives by walking the expected
 file once (whose own bytes are re-digested and held to the file's recorded
 counts and digest in the same walk): for `--unsort-intra` each firing
@@ -495,10 +503,10 @@ would write for that
 stream (`-` for a removed record; `-a` then `+a` for a swapped `a < q`),
 and its counts. The frame decoder only picks a drop's candidate; the
 verdict is still the equality with osmium's stored summary, so a wrong
-candidate can only fall back to the merge. A cold run, or an output whose
-bytes changed, merges, and the merge publishes the summary a later run
-reads. The case's judge reads the decided counts and listing as it would
-a merge's. Degrade's
+candidate can only fall back to the merge. Cold or changed drop and unsort
+outputs still merge. Both the equality scan and the merge can publish the
+observed output summary under the decoding's sealed key. The case's judge
+reads the resulting counts and listing as it would a merge's. Degrade's
 comparison of the two drop seeds is decided from their removal listings
 when both passed their removals: each output is the expected sequence,
 whose identities are unique, less the records its listing names in walk
@@ -515,9 +523,10 @@ summary under a key derived from it (the renumber paragraph below).
 The other sequence walks, the derive model and field-policies, whose
 subject is the merge itself, always merge.
 
-Summaries are neither read nor written under `--fresh-reference`, which
-also bypasses reference-run hits. The fixture tests choose per fixture:
-those whose fake osmium answers every decode from the operand's bytes
+Persistent summaries are neither read nor written under
+`--fresh-reference`, which also bypasses reference-run hits. The
+whole-stream equality scan still runs on the fresh decoding. The fixture
+tests choose per fixture: those whose fake osmium answers every decode from the operand's bytes
 (apply, change, dedupe, extract, geocode, getid, getparents, inspect-tags, read, refs) run with the cache and
 summaries live, so they reach the summary-decided paths; the encoding
 fixture runs fresh because its fake decodes by file name and a fault side

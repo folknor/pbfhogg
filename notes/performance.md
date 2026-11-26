@@ -1271,23 +1271,26 @@ Kind: scaling payoff (check), smaller than first filed.
 
 Reported by: check.
 
-Mechanism: `summarize_block` builds a `PrimitiveBlock`, iterates elements and
-writes canonical records into a `Vec<u8>`; plain messages parsed twice, plain
-metadata accessed by `check_user` and again, dense tag runs found then read
-again, dense metadata reconstructed for content forms that discard it.
-`DigestState` hashes every canonical byte on one consumer; content and
-content-locations hash the node prefix into both `all` and `nodes`.
+Narrowed 2026-11-26: node prefix hashed once and the dense content record
+written as one fixed prefix, planet content -10.6 %; see
+reference/performance/digest.md "Content-form node records". The parallel
+XXH3 stripe variant stays refused (code comment at the hashing site): the
+consumer waits on its receive 74 % of wall on germany.
 
-Redesign: produce canonical bytes from checked wire projections with
-`content.rs` rules authoritative but not `Element`-bound; local: hash the node
-prefix once, take `digest128()` non-consumingly, continue that state for all
-elements. Medium conviction: assign canonical offsets from length summaries and
-have workers compute exact XXH3 stripe contributions and boundary fragments.
+Mechanism (residue): decode workers are the gate, record production 56 of 80
+worker core-s on germany content (node blocks 32.6, way blocks 23.2). Dense
+metadata is decoded in full for content forms that need only the user index
+(upper bound 4.5 core-s); dense tag runs are scanned then read again; plain
+messages and `Info` are parsed again after construction validated them.
 
-Risks: exact record framing and order; combining per-blob digests is invalid;
-XXH3 offset, scrambling, short input and final stripe handling.
+Candidates, each needing its own measured variant: a user_sid cursor in
+lockstep with the dense writer (keep error order user, ID order, record;
+the full form still checks the user unconditionally); a way writer, measured
+separately for message reuse and ref emission; a projection for all kinds
+only if message reuse pays (the `GroupProjection` hooks see provisional data
+before whole-block UTF-8 validation).
 
-Kind: high conviction on wasted work; medium on wall-time ceiling.
+Kind: medium.
 
 ## PERF-048 - Full ID verification rereads a whole kind after any disorder
 

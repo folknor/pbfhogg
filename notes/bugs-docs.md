@@ -414,3 +414,16 @@ original reasoning was (input plus output plus scratch, or a smaller cache
 on the host of the day), the parenthesis as written is false; reword it to
 the working set that actually exceeded the cache, or drop the parenthesis.
 
+## DOC-069 - check --locations memory text says each worker copies its blob for validation
+
+Reported by: the spar accounting of the location-check partition item, from
+a scout lateral (2026-11-26); read from source.
+
+`docs/cli/commands.md`, the `check --locations` "Memory" paragraph, says
+"each worker holds its decompressed blob, a copy for validation and a fixed
+ID batch". Since payloads are validated where they lie (2cd85f7e), no
+validation copy exists: the module doc of
+`crates/lib/src/commands/check/locations/mod.rs` says each worker's
+decompressed blob is "validated where it lies, never copied". Drop "a copy
+for validation" from the docs sentence.
+

@@ -609,6 +609,13 @@ struct DigestState {
     /// The content form's first-line hash over every record; `None` for the
     /// full form, whose first line is computed from the kind digests.
     all: Option<Xxh3>,
+    /// Content forms only: the node digest, taken from `all` when the first
+    /// non-node record arrives. Nodes come first, so until then `all` has
+    /// absorbed exactly the node record stream and its non-consuming
+    /// `digest128` is the node line; node records are therefore hashed once,
+    /// into `all`, and never into `kinds[0]`. `None` until taken; `finish`
+    /// takes it from the final `all` when no way or relation arrived.
+    node_hash: Option<u128>,
     kinds: [(u64, Xxh3); 3],
     /// Where a hashed block's record buffer goes back to.
     buffers: Arc<RecordBuffers>,
@@ -621,6 +628,7 @@ impl DigestState {
             buffers,
             last: None,
             all: hash_all_records.then(Xxh3::new),
+            node_hash: None,
             kinds: [(0, Xxh3::new()), (0, Xxh3::new()), (0, Xxh3::new())],
         }
     }
@@ -660,12 +668,19 @@ impl DigestState {
             }
         }
         self.last = Some((content.kind, content.last_id));
-        if let Some(all) = &mut self.all {
-            all.update(&content.records);
-        }
         let (count, hasher) = &mut self.kinds[usize::from(content.kind.ordinal())];
         *count += content.count;
-        hasher.update(&content.records);
+        match &mut self.all {
+            Some(all) if content.kind == ElementKind::Node => all.update(&content.records),
+            Some(all) => {
+                if self.node_hash.is_none() {
+                    self.node_hash = Some(all.digest128());
+                }
+                all.update(&content.records);
+                hasher.update(&content.records);
+            }
+            None => hasher.update(&content.records),
+        }
         // Hashing stays here, serial. An exact split of these XXH3-128
         // streams - each 1024-byte block's lane sums computed on a pool,
         // folded here in order, bit-identical output, no new version - was
@@ -710,10 +725,13 @@ impl DigestState {
     /// The digest. `header_record` is the full form's, `None` for the
     /// content form.
     fn finish(self, form: Form, header_record: Option<&[u8]>) -> Digest {
-        let [nodes, ways, relations] = self.kinds.map(|(count, hasher)| KindDigest {
+        let [mut nodes, ways, relations] = self.kinds.map(|(count, hasher)| KindDigest {
             count,
             hash: hasher.digest128(),
         });
+        if let Some(all) = &self.all {
+            nodes.hash = self.node_hash.unwrap_or_else(|| all.digest128());
+        }
         let all = match (self.all, header_record) {
             (Some(all), _) => all.digest128(),
             (None, header) => {

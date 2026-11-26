@@ -1,5 +1,33 @@
 # Digest
 
+## Content-form node records (bygg, 2026-11-26, against `ec2b2dc0`)
+
+Where the content form's time goes, germany `--form content`, hotpath
+builds: wall about 3.4 s at 25 cores; the ordered consumer waited on its
+receive 74 % of wall, so the decode workers are the gate. Worker transform
+80 core-s: record production (`summarize_block`) 56, decompression 14.7,
+block construction about 9; consumer hashing 0.86 s. By block kind, node
+blocks 32.6 core-s (about 76 ns per node), way blocks 23.2, relations 0.75.
+Dropping dense metadata decode and the user check outright (incorrect, an
+upper bound only) took 4.5 core-s off record production.
+
+Landed: a dense node's content record is written as one 18-byte prefix
+(kind, id, coordinate token) plus its tags and end byte instead of through
+the token loop, and the content forms hash node records once, into the
+all-records state, taking the node line from it non-consumingly when the
+first way or relation block arrives. Digests identical to `ec2b2dc0` on
+germany content (all four lines). Script bench `canonical-digest`,
+`--iterations 1`, interleaved after one fstrim:
+
+| Dataset | `ec2b2dc0` | change |
+|---|---:|---:|
+| germany content | 3427 / 3427 ms (`0d868e95`, `3da6fcc6`) | 3129 / 3117 ms (`656d74d8`, `b47c1f7f`) |
+| planet content | 54.0 / 54.0 s (`fe7e5b1b`, `f6200d2d`), 29.0 cores | 48.1 / 48.4 s (`d8a21b45`, `57397de8`), 28.6 cores |
+
+Planet -10.6 % at the same disk read; the pair does not apportion the gain
+between the two parts. The full form is untouched (no all-records hasher;
+its records go through `write_full_record`).
+
 ## digest v2 cost (bygg, 2026-11-08, against `110f0520`)
 
 What `digest --form full` (v2, the default) costs over `--form content`

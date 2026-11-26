@@ -402,7 +402,7 @@ const TOKEN_LOCATION_LIST: u8 = 0x19;
 /// end byte. Integers are fixed-width little-endian; strings are a
 /// little-endian u32 byte length then the bytes.
 ///
-/// Fails on the first token lookup failure, leaving `out` partially written;
+/// Fails on the first token lookup failure, `out` possibly partially written;
 /// the caller discards it.
 pub(crate) fn write_record(
     element: &Element<'_>,
@@ -410,6 +410,24 @@ pub(crate) fn write_record(
     relation: Relation,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    if let Element::DenseNode(n) = element {
+        // The dense node's record as the token loop below writes it: the
+        // fixed prefix (kind, id, coordinate token) in one append, then its
+        // tags, then the end byte. Same bytes, fewer appends on the node
+        // path that dominates a planet's record stream.
+        let mut prefix = [0u8; 18];
+        prefix[0] = KIND_NODE;
+        prefix[1..9].copy_from_slice(&id.to_le_bytes());
+        prefix[9] = TOKEN_COORD;
+        prefix[10..14].copy_from_slice(&n.decimicro_lat()?.to_le_bytes());
+        prefix[14..18].copy_from_slice(&n.decimicro_lon()?.to_le_bytes());
+        out.extend_from_slice(&prefix);
+        for tag in n.tags() {
+            write_tag(out, tag)?;
+        }
+        out.push(RECORD_END);
+        return Ok(());
+    }
     out.push(match element.content_kind() {
         ElementKind::Node => KIND_NODE,
         ElementKind::Way => KIND_WAY,

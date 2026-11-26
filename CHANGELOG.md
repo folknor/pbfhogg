@@ -651,6 +651,10 @@
 
 ### Changed
 
+- **`digest --form content` is about 10 % faster** (planet 54 s to 48 s);
+  `--form content-locations` shares the change, unmeasured. Digests are
+  unchanged and keep their form versions.
+
 - **`add-locations-to-ways --index-type auto` keeps sparse for a file
   with no ways.** Such a file has nothing to join, yet its node count
   could route a large sorted, indexed file to external and its scratch

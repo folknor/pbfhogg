@@ -629,7 +629,7 @@ Limits of the rule, both accepted with auto as the default:
 ### renumber
 
 Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) for old→new ID mapping (`crates/lib/src/commands/renumber/`):
-1. **Pass 1** (`pass1.rs`) - parallel wire-format node rewriter across work-stealing workers, sized from the host and capped (`RENUMBER_PASS1_WORKERS_CAP`); every worker records seen node IDs in one shared, pre-allocated `IdSet` through atomic inserts, and IDs outside the pre-allocation are inserted after the pass.
+1. **Pass 1** (`pass1.rs`) - parallel wire-format node rewriter across work-stealing workers, sized from the host, uncapped; every worker records seen node IDs in one shared, pre-allocated `IdSet` through atomic inserts, and IDs outside the pre-allocation are inserted after the pass.
 2. **Stage 2** (`stage2.rs`, `wire_rewrite.rs`) - parallel way assembly at host width; records way IDs in a second shared, pre-allocated `IdSet` the same way, and remaps node refs via rank-indexed lookup. The set's storage does not grow with the worker count.
 3. **Relations** (`relations.rs`) - sequential collect of relation IDs, then parallel rewrite remapping member refs across all three kinds.
 

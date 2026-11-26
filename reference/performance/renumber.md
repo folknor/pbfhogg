@@ -9,7 +9,7 @@ for all three element types - pass 1 (dense and plain nodes), stage 2d (ways),
 and R2d (relations) - patch only the ID/ref fields and copy everything
 else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
 construction. Pass 1 and stage 2d run work-stealing workers sized from
-the host (pass 1 capped); both record old IDs in one shared,
+the host, uncapped; both record old IDs in one shared,
 pre-allocated `IdSet` per kind, one atomic OR per 64-ID word run.
 R2d: parallel with inline rank() dispatch (relation_map replaced by
 `relation_id_set.rank()`). All member-ref lookups via
@@ -19,15 +19,49 @@ data phases (the header read and the schedule walk have their own).
 Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
 defaults to zlib:1.
 
-### Current baseline (planet, commit `b17276bc` plus word-batched ID sets, bygg, 2026-11-26)
+### Current baseline (planet, `e8fd4597` with pass 1 at host width, bygg, 2026-11-26)
 
-`id-remap` `--iterations 1`, cells `53b1ae16` and `d436f9a5`: 66.1 s and
-65.5 s. Pass 1 34.0 / 33.8 s, stage 2d 21.9 / 22.0 s, R1 2.4 s, R2D
-1.3 s; peak anon 3.6-3.7 GB. See "Word-batched ID set insertion" below.
+`id-remap` `--iterations 1`, cells `d843fa67` and `26bfcf75`: 64.5 s and
+58.8 s. Pass 1 31.9 / 31.3 s at 30 workers, stage 2d 22.0 / 22.5 s, R1
+2.6 / 2.5 s, R2D 1.35 s; peak RSS about 3.9 GB. See "Pass 1 at host
+width" below.
 
 ## History
 
 ### Renumber
+
+#### Pass 1 at host width (planet, baseline `e8fd4597`, bygg, 2026-11-26)
+
+Pass 1 was capped at 12 workers on Germany evidence (the same pass 1
+span at 12 and 28, with result-send waits at 28). On planet at 12 the
+shape is the opposite: the consumer waits for results almost the whole
+span and the writer is starved. One matched suite after `brokkr fstrim`,
+order A B B A, baseline `--commit e8fd4597` at 12, variant uncommitted
+with the cap lifted, so 30 workers on this 32-thread host:
+
+| Cell | Arm | Wall | Pass 1 span | consumer recv wait | consumer write | `pass1_decompress_ns` |
+|---|---|---:|---:|---:|---:|---:|
+| `ddcd8e4e` | 12 | 67.4 s | 33.9 s | 33.4 s | 0.44 s | 187 s |
+| `d843fa67` | 30 | 64.5 s | 31.9 s | 11.2 s | 20.7 s | 386 s |
+| `26bfcf75` | 30 | 58.8 s | 31.3 s | 8.7 s | 22.6 s | 385 s |
+| `ed934415` | 12 | 65.6 s | 39.0 s | 38.5 s | 0.42 s | 183 s |
+
+Pass 1 medians 36.4 s against 31.6 s, about -13 %, same sign in both
+pairs (-2.0 s and -7.7 s). The walls carry a 0.2-7 s pre-pass-1 setup
+spread unrelated to the arm, so the pass 1 span is the reading. At 30
+the pass 1 cores rise from 18 to 29, per-blob worker time roughly
+doubles (SMT sharing with the writer's framing pool), and the writer
+becomes the constraint: consumer write time 21-23 s of the span,
+`ordered_pool_result_send` 84 s, `writer_pipeline_send` 198 s
+(`26bfcf75`). Peak RSS about +0.3 GB. Verdict: cap removed; pass 1
+takes the host width like stage 2d. No intermediate cap was measured,
+and none has a basis here.
+
+#### Current baseline before the cap was lifted (planet, commit `b17276bc` plus word-batched ID sets, bygg, 2026-11-26)
+
+`id-remap` `--iterations 1`, cells `53b1ae16` and `d436f9a5`: 66.1 s and
+65.5 s. Pass 1 34.0 / 33.8 s, stage 2d 21.9 / 22.0 s, R1 2.4 s, R2D
+1.3 s; peak anon 3.6-3.7 GB. See "Word-batched ID set insertion" below.
 
 #### Word-batched ID set insertion (planet, baseline `b17276bc`, bygg, 2026-11-26)
 
@@ -93,8 +127,8 @@ counters summed to exactly that many busy threads (`d24df488`: stage 2d
 reframe + decompress + pread 283 s over a 47.3 s span = 6.0; pass 1
 268.7 s over 67.2 s = 4.0): the stages were thread-starved on a
 32-thread host, not bound by per-ref lookup cost. Both are now sized from
-the host (width less two; pass 1 capped at 12 because past that it waits
-on the writer), and stage 2d records way IDs in one shared, pre-allocated
+the host (width less two; pass 1 was capped at 12 here on the Germany
+reading below, lifted later, see "Pass 1 at host width"), and stage 2d records way IDs in one shared, pre-allocated
 `IdSet` through atomic inserts instead of one shard per worker merged in
 R1, so the set's storage does not grow with the width.
 

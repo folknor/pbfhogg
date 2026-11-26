@@ -130,7 +130,7 @@ use schedule::{BlobTask, build_all_blob_schedules};
 use stage2::stage2d_parallel_way_assembly;
 use wire_rewrite::IdSpace;
 
-use crate::tunables::{RENUMBER_PASS1_WORKERS_CAP, RENUMBER_PREALLOC_IDS_PER_BYTE};
+use crate::tunables::RENUMBER_PREALLOC_IDS_PER_BYTE;
 
 // ---------------------------------------------------------------------------
 // Shared instrumentation counters
@@ -521,18 +521,26 @@ pub(crate) fn renumber_external_to<'a>(
         }
     }
 
-    // Both rewrite stages are sized from the host: fixed at 4 and 6 they
-    // ran exactly that many threads busy (see the tunable).
+    // Both rewrite stages take the decode-worker width from the host,
+    // uncapped. Fixed at 4 and 6 workers they ran exactly that many threads
+    // busy, thread-starved rather than bound by per-element work
+    // (reference/performance/renumber.md, "Host-sized rewrite stages"). Pass
+    // 1 was then capped at 12 on the belief, from Germany, that it waited on
+    // the writer past that; on planet at 12 the consumer instead sat idle
+    // waiting for results, and host width (30 on a 32-thread host) ran pass
+    // 1 about 13 % faster in matched cells, with the writer only becoming
+    // the constraint there (renumber.md, "Pass 1 at host width"). Do not
+    // reintroduce a fixed cap without a matched planet A/B showing one pays.
+    // In-flight memory grows with width through the ordered pool's
+    // task-count window, the same as for stage 2d; a bound on that belongs
+    // to byte-aware admission, not to a worker count.
     let host_width = crate::host::sized_workers(
         &*host.resources,
         crate::tunables::DECODE_WORKERS_RESERVED,
         crate::tunables::DECODE_WORKERS_MIN,
         crate::tunables::DECODE_WORKERS_FALLBACK,
     );
-    let pass1_width = host_width
-        .min(RENUMBER_PASS1_WORKERS_CAP)
-        .min(pass1_schedule.len())
-        .max(1);
+    let pass1_width = host_width.min(pass1_schedule.len()).max(1);
     let stage2d_width = host_width.min(way_schedule.len()).max(1);
 
     let pass1 = pass1_parallel_scan(

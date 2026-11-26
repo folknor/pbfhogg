@@ -666,8 +666,7 @@
   in it about 0.7 GB lower. Unindexed input collects as before.
 
 - **`renumber` sizes its node and way rewrite stages from the host.** They
-  ran a fixed 4 and 6 workers; they now use the host's cores (the node
-  stage capped at 12), and the way stage records way IDs in one shared
+  ran a fixed 4 and 6 workers; they now use the host's cores, and the way stage records way IDs in one shared
   set instead of one per worker, so memory does not grow with the core
   count. Planet on a 32-thread host: about 2m08s to about 1m14s, peak
   memory about 0.4 GB higher.

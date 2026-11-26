@@ -745,18 +745,6 @@ pub(crate) const ALTW_PASS0_PREALLOC_IDS_PER_BYTE: u64 = 8;
 // Renumber
 // ---------------------------------------------------------------------------
 
-/// Cap on the pass 1 worker count, applied on top of the decode-worker
-/// sizing (host width less `DECODE_WORKERS_RESERVED`). Stage 2d takes the
-/// host-sized width uncapped. Both stages were fixed at 4 and 6 workers and
-/// ran exactly that many threads busy, so they were thread-starved, not
-/// bound by their per-element work: sizing them from the host took planet
-/// renumber on a 32-thread host from 126 and 131 s to 80 and 68 s in
-/// matched cells (reference/performance/renumber.md, "Host-sized rewrite
-/// stages"). Past
-/// about 12 workers pass 1 waits on the writer (Germany ran the same at 12
-/// and 28), so more only adds buffers and in-flight results.
-pub(crate) const RENUMBER_PASS1_WORKERS_CAP: usize = 12;
-
 /// Cap on the relation stage's decode-worker count (applied on top of the
 /// decode-worker sizing).
 pub(crate) const RENUMBER_RELATIONS_WORKERS_CAP: usize = 6;

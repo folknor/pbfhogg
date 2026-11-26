@@ -9,8 +9,6 @@
 //! default - an untagged id-0 way or relation with no refs, members or
 //! Info - while the block index still counts it.
 
-use rustc_hash::FxHashSet;
-
 use protohoggr::{
     encode_bytes_field, encode_bytes_field_always, encode_int64_field_always, encode_varint,
     zigzag_encode_64,
@@ -18,6 +16,69 @@ use protohoggr::{
 
 use super::block_builder::{MemberData, Metadata, member_type_value};
 use super::string_table::StringTable;
+
+/// The set of output string-table indices used as tag keys in the block
+/// being built: the source of its tagdata. A bit per index (string indices
+/// are dense from 0 and bounded by the block's string table) plus the
+/// distinct members in first-seen order, so an insert is a word test and a
+/// clear touches only the words of the members, not the whole bitset.
+#[derive(Clone, Default)]
+pub(super) struct KeySet {
+    words: Vec<u64>,
+    members: Vec<u32>,
+}
+
+impl KeySet {
+    /// Track `sid`. The bitset grows to cover it, whatever the table held
+    /// when the block began (a seeded raw path can intern past its seed).
+    #[inline]
+    pub(super) fn insert(&mut self, sid: u32) {
+        let word = (sid >> 6) as usize;
+        let bit = 1u64 << (sid & 63);
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        // `word` is in bounds: the resize above covers it.
+        let slot = &mut self.words[word];
+        if *slot & bit == 0 {
+            *slot |= bit;
+            self.members.push(sid);
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// The distinct indices, in first-seen order.
+    pub(super) fn members(&self) -> &[u32] {
+        &self.members
+    }
+
+    /// Empty the set, keeping both allocations for the next block.
+    pub(super) fn clear(&mut self) {
+        for &sid in &self.members {
+            if let Some(slot) = self.words.get_mut((sid >> 6) as usize) {
+                *slot = 0;
+            }
+        }
+        self.members.clear();
+    }
+
+    /// Bytes the two allocations hold, for the builder's outlier release.
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.words.capacity() * std::mem::size_of::<u64>()
+            + self.members.capacity() * std::mem::size_of::<u32>()
+    }
+
+    /// Contains `sid`. Tests only.
+    #[cfg(test)]
+    pub(super) fn contains(&self, sid: u32) -> bool {
+        self.words
+            .get((sid >> 6) as usize)
+            .is_some_and(|w| w & (1u64 << (sid & 63)) != 0)
+    }
+}
 
 /// Bytes `protohoggr::encode_varint` writes for `value`: one per started
 /// group of seven bits, and one for zero.
@@ -166,7 +227,7 @@ pub(super) fn encode_tags<'t>(
     elem: &mut Vec<u8>,
     keys_buf: &mut Vec<u8>,
     vals_buf: &mut Vec<u8>,
-    tag_key_indices: &mut FxHashSet<u32>,
+    tag_key_indices: &mut KeySet,
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
 ) {
     keys_buf.clear();
@@ -192,7 +253,7 @@ pub(super) fn encode_way<'t, M: EncodeMetadata>(
     packed_keys: &mut Vec<u8>,
     packed_vals: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
-    tag_key_indices: &mut FxHashSet<u32>,
+    tag_key_indices: &mut KeySet,
     id: i64,
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     refs: &[i64],
@@ -250,7 +311,7 @@ pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
     packed_lats: &mut Vec<u8>,
     packed_lons: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
-    tag_key_indices: &mut FxHashSet<u32>,
+    tag_key_indices: &mut KeySet,
     id: i64,
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     refs: &[i64],
@@ -373,7 +434,7 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
     packed: &mut Vec<u8>,
     packed_vals: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
-    tag_key_indices: &mut FxHashSet<u32>,
+    tag_key_indices: &mut KeySet,
     id: i64,
     tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     members: &[MemberData<'_>],
@@ -475,7 +536,7 @@ pub(super) fn encode_relation_raw_bytes(
 pub(super) fn collect_checked_keys(
     data: &[u8],
     seeded: usize,
-    indices: &mut FxHashSet<u32>,
+    indices: &mut KeySet,
 ) -> Result<(), u32> {
     for sid in crate::read::wire::PackedUint32Iter::new(data) {
         if usize::try_from(sid).is_ok_and(|s| s < seeded) {
@@ -506,11 +567,11 @@ mod tests {
             assert_eq!(varint_len(value), buf.len(), "{value}");
         }
     }
+    use super::KeySet;
     use crate::MemberId;
     use crate::read::wire::{Cursor, PackedSint64Iter, WireRelation, WireWay};
     use crate::write::block_builder::MemberData;
     use crate::write::string_table::StringTable;
-    use rustc_hash::FxHashSet;
 
     fn first_message(group: &[u8], expected_field: u32) -> &[u8] {
         let mut cursor = Cursor::new(group);
@@ -528,7 +589,7 @@ mod tests {
         let mut packed_keys = Vec::new();
         let mut packed_vals = Vec::new();
         let mut info = Vec::new();
-        let mut tag_key_indices = FxHashSet::default();
+        let mut tag_key_indices = KeySet::default();
 
         encode_way(
             &mut string_table,
@@ -561,7 +622,7 @@ mod tests {
         let mut packed_lats = Vec::new();
         let mut packed_lons = Vec::new();
         let mut info = Vec::new();
-        let mut tag_key_indices = FxHashSet::default();
+        let mut tag_key_indices = KeySet::default();
 
         encode_way_with_locations(
             &mut string_table,
@@ -595,7 +656,7 @@ mod tests {
         let mut packed = Vec::new();
         let mut packed_vals = Vec::new();
         let mut info = Vec::new();
-        let mut tag_key_indices = FxHashSet::default();
+        let mut tag_key_indices = KeySet::default();
         let members = [
             MemberData {
                 id: MemberId::Node(i64::MIN),
@@ -644,7 +705,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let mut keys = FxHashSet::default();
+        let mut keys = KeySet::default();
         let none = None::<&super::Metadata<'_>>;
 
         encode_way(
@@ -718,5 +779,28 @@ mod tests {
         group.clear();
         super::encode_relation_raw_bytes(&mut group, &mut elem, 0, &[], &[], &[], &[], &[], None);
         assert_eq!(group, relation, "encode_relation_raw_bytes");
+    }
+
+    /// The key set keeps each index once in first-seen order, covers any
+    /// index (zero, word edges, far past what it held), and a clear leaves
+    /// no stale bit behind for the next block.
+    #[test]
+    fn key_set_tracks_distinct_indices_and_clears_completely() {
+        let mut set = KeySet::default();
+        assert!(set.is_empty());
+        for sid in [5, 0, 63, 64, 5, 0, 10_000, 64] {
+            set.insert(sid);
+        }
+        assert_eq!(set.members(), &[5, 0, 63, 64, 10_000]);
+        assert!(set.contains(10_000) && !set.contains(1) && !set.contains(65));
+
+        set.clear();
+        assert!(set.is_empty());
+        for sid in [5, 0, 63, 64, 10_000] {
+            assert!(!set.contains(sid), "stale bit {sid} after clear");
+        }
+        set.insert(64);
+        set.insert(u32::MAX >> 12);
+        assert_eq!(set.members(), &[64, u32::MAX >> 12]);
     }
 }

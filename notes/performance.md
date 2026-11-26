@@ -484,7 +484,13 @@ and relation spans directly or reserve prefixes and compact once; choose the
 partial-node representation from accumulated sizes without encoding both.
 Encoding should write into the buffer compression reads; `lend_encoded` and
 `FramedBlocks` already provide that, so there is no universal builder to
-compressor copy to remove.
+compressor copy to remove. Once the representation is packed bytes, a bulk
+varint writer with one capacity reservation (instead of protohoggr's scalar
+pushes) becomes worth trying; not before. Iterator or column inputs for way
+refs and relation members belong here too (OSC-way temporaries in
+`add_osc_way` alone were refused as too rare to show). Note the recorded
+refusal of the eager width-prepass shape: `write-pipeline.md` "Dense-node
+direct encoding, refused" (`3f8ed0ec`); the shapes above are its untried ones.
 
 Payoff: removes work on every genuinely rebuilt node.
 
@@ -1565,29 +1571,39 @@ Reported by: framing, pipeline.
 
 ## PERF-060 - Write-side local changes
 
-Reported by: output, encoding, apply-locations, apply-core.
+Reported by: output, encoding, apply-locations, apply-core. Every bullet is
+unmeasured.
 
-- io_uring `submit_buffer` submits after every write; queue several before
-  submitting.
-- `parallel_gzip.rs` `compress_one` builds a new `GzEncoder` and output per
-  member; reuse deflate state preserving member boundaries, header, CRC and
-  trailer.
-- Buffered output has no writeback initiated behind the completed frontier;
-  overlapping it with compression could shorten the tail, keeping final fsync
-  and the publication protocol.
-- Per-tag `FxHashSet` insertion for key presence could be a SID-indexed bitset
-  or generation array.
-- Omit the dense tag stream for entirely tagless groups (the reader accepts an
-  empty stream).
-- Remove temporary ref and member vectors with iterator or column inputs.
-- Bulk varint output only after fixing representation.
-- Submit rewritten frame groups through `write_raw_chunks` instead of once per
-  frame (the backend still expands chunks into writes).
-- Carry refresh hit positions into coordinate encoding; for default framing a
-  changed coordinate alters its delta and the next, so intervening packed bytes
-  can be kept.
-- `AscendingTally` where nonnegative claims permit; drop unused tagdata
-  ownership in descriptors.
+- `compress_one` (`parallel_gzip.rs`) builds a new `GzEncoder` and output per
+  member. Members are not all large: `Unit::finish_into` (`diff/derive.rs`)
+  emits every nonempty section remainder per unit, and `GlueMembers`
+  compresses small document-framing fragments, so per-member deflate setup on
+  indexed `.osc.gz` output is an open cost. Two shapes: reuse deflate state
+  with member bytes unchanged, or aggregate same-section remainders across
+  ordered units (fewer members, which changes member boundaries).
+- Dense groups always write field 10 with one 0 delimiter per node. A
+  run-local form keeps the column empty until the first tagged node, then
+  backfills delimiters; it changes output bytes and the dense-versus-plain
+  size comparison for optional runs. How often a whole dense run is tagless
+  on real data is unmeasured (runs split on metadata shape, so 8000 is a
+  ceiling, not the run size). The reader and libosmium accept the absent
+  column.
+- The apply-changes drain submits rewritten frames one `write_raw_owned` at a
+  time (`drain.rs`). Grouping them saves reservations and channel handoffs,
+  but the backends expand `write_raw_chunks` into one write per chunk, so the
+  sink work remains unless a sink consumes groups. The planet `6ce554e3` cell
+  shows 21.7 s of `writer_pipeline_send` (permit and window waits under
+  0.1 s), and the node phase is writer-bound. Precedent: vectored buffered
+  writes once improved Japan by 21.9 % and regressed Europe by 3.8 %
+  (306.8 to 318.5 s) under an older framing shape. Per-frame
+  `record_data_frame` and `rewrite_blocks_written` must stay.
+- `refreshed_locations` (`apply_changes/refresh.rs`) decodes refs and probes
+  every ref again after `evaluate_way` already found the hits; the sorted
+  per-way `hits` list could drive coordinate output instead (an empty slice
+  where the probe was skipped, full rescaling kept for non-default framing,
+  repeated refs and coordinate validation preserved). The denominator is the
+  refs traversed on the second pass, not recorded. Preserving untouched
+  packed deltas under default framing is PERF-008's wire edit.
 
 ## PERF-061 - Copy-shaped local changes
 

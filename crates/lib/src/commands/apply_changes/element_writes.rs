@@ -73,6 +73,12 @@ pub(super) fn add_osc_node_bare_plain(
 /// run allows it: `rewrite::merge` counts unresolved references against the
 /// merged map and fails the command unless `--ignore-missing-nodes` asked
 /// for this fallback.
+///
+/// The `refs` and `locations` vectors (and `members` in
+/// [`add_osc_relation`]) are kept on purpose: replacing them with iterator
+/// inputs to the builder was proposed and refused (2026-11-26). These run
+/// once per OSC create or modify, a diff's worth of elements against a
+/// planet's worth of base elements, so the allocations cannot show in wall.
 pub(super) fn add_osc_way(
     bb: &mut BlockBuilder,
     way: &crate::osc::CompactWayRef<'_>,

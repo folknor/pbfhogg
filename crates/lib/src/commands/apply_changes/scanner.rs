@@ -126,10 +126,12 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
     host.invocation.marker("MERGE_SCANNER_START");
     #[cfg(feature = "linux-direct-io")]
     if cfg.direct_reads {
-        let walker = HeaderWalker::open_direct(cfg.base, host)?;
+        let walker = HeaderWalker::open_direct(cfg.base, host)?.skipping_tagdata();
         return scan(walker, cfg, host);
     }
-    let walker = HeaderWalker::open(cfg.base, host)?;
+    // Nothing downstream reads the input's tagdata: a passthrough copies the
+    // whole frame (header included) and a rewrite derives its own.
+    let walker = HeaderWalker::open(cfg.base, host)?.skipping_tagdata();
     scan(walker, cfg, host)
 }
 
@@ -233,7 +235,6 @@ fn scan<P: Positional>(
             kind,
             id_range,
             index: meta.index,
-            tagdata: meta.tagdata,
         };
 
         // Routing decision: fast-path only available when we have
@@ -476,8 +477,8 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
     use crate::tunables::DESCRIPTOR_OVERHEAD;
     match item {
         ScannerEmit::Drain(_, d) => d.byte_cost(),
-        ScannerEmit::Candidate(ScannedBlob::Passthrough(d) | ScannedBlob::Candidate(d)) => {
-            DESCRIPTOR_OVERHEAD + d.tagdata.as_ref().map_or(0, |t| t.len())
+        ScannerEmit::Candidate(ScannedBlob::Passthrough(_) | ScannedBlob::Candidate(_)) => {
+            DESCRIPTOR_OVERHEAD
         }
     }
 }

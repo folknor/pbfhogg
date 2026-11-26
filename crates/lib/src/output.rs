@@ -588,6 +588,13 @@ impl std::fmt::Debug for Hook {
 /// [`sync`](Self::sync), which records it in the invocation's
 /// `writer_sync_all_*` and in this publication's own tally from the one
 /// measurement. One tally for a whole group, whose parent syncs are shared.
+///
+/// Writers do not start writeback behind their output frontier (for example
+/// `sync_file_range`) to shorten this final sync: it was proposed and
+/// refused (2026-11-26) because there is no tail to shorten. Planet cells on
+/// bygg recorded `publish_sync_ns` of 0.88 ms (renumber, 2 calls) and 1.05 ms
+/// (apply-changes) for the whole publication, directory syncs included;
+/// kernel background writeback has already drained the file by then.
 struct PublishSync<'a> {
     metrics: &'a WriterMetrics,
     calls: std::cell::Cell<u64>,

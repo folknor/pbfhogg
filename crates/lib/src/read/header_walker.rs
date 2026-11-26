@@ -756,6 +756,17 @@ impl<P: Positional> HeaderWalker<P> {
         self
     }
 
+    /// Skip BlobHeader field 4 instead of copying it into
+    /// [`BlobHeaderMeta::tagdata`], which is then always `None`. For a walk
+    /// whose consumer never reads tagdata (apply-changes' scanner: a passthrough
+    /// copies the whole input frame, header included), so no box is allocated
+    /// per blob. Indexdata parsing and the partial-index refusal are unchanged.
+    #[must_use]
+    pub(crate) fn skipping_tagdata(mut self) -> Self {
+        self.frames.fields.tagdata = false;
+        self
+    }
+
     /// Report a filtered schedule retaining an unindexed data blob. Call only
     /// where a schedule uses type or spatial index pruning, not on every walk.
     /// Mixed indexed/unindexed files also need this note: later missing indexes

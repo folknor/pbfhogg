@@ -1,5 +1,24 @@
 # Write Pipeline
 
+### Tag-key set as a bitset (bygg, 2026-11-26, against `c3621ccb`)
+
+`BlockBuilder` tracks the tag keys behind each block's tagdata in a
+string-index bitset plus a first-seen member list (`KeySet`,
+`write/encode.rs`) instead of an `FxHashSet<u32>`: an insert is a word test,
+a clear touches only the members' words. Output is byte-identical (tagdata
+keys are sorted by content as before). Germany `copy-pbf --clean yes`,
+interleaved `--iterations 1` cells, variant uncommitted:
+
+| Pair | Variant | Baseline `c3621ccb` |
+|------|---------|---------------------|
+| 1 | 10.6 s (`017e695d`) | 11.7 s (`73eec6c1`, first cell, cold) |
+| 2 | 10.4 s (`681713f3`) | 10.5 s (`a8b1d586`) |
+| 3 | 10.5 s (`c3bba737`) | 10.5 s (`cd6366ba`) |
+
+Verdict: no difference beyond noise; adopted for the simpler primitive, not
+for a claimed win. Planet not measured: the per-tag hash insert was never
+a measured cost.
+
 ### Element ids and bodies always written (bygg, 2026-11-11, against `4f95b255`)
 
 Way and relation encoders write `id` unconditionally and wrap every element

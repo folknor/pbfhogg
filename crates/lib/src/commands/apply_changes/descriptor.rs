@@ -86,9 +86,8 @@ pub(super) struct BlobDescriptor {
     /// blob (`--force`); only a descriptor with one may become a
     /// [`DrainItem::CopyRange`], since that copies the input header as-is.
     pub index: Option<BlobIndex>,
-    /// Raw tagdata bytes from BlobHeader field 4, if present.
-    /// Forwarded byte-for-byte to the output writer on passthrough.
-    pub tagdata: Option<Box<[u8]>>,
+    // No tagdata: a passthrough copies the input frame with its header, and
+    // a rewrite or reframe derives its own, so the scanner skips field 4.
 }
 
 /// Scanner routing decision: based on `id_range` overlap against the OSC
@@ -137,7 +136,6 @@ pub(super) enum DrainItem {
         /// Indexdata for the output blob. Preserved byte-for-byte from
         /// the input BlobHeader indexdata field.
         index: BlobIndex,
-        tagdata: Option<Box<[u8]>>,
     },
     /// A complete frame held in memory, which the drain writes via
     /// `write_raw_owned` without re-framing. Two producers, both workers:
@@ -280,7 +278,7 @@ impl BlobDescriptor {
     /// Convert this descriptor into a [`DrainItem::CopyRange`] for the
     /// scanner's fast-path. Returns `None` when the descriptor lacks
     /// indexdata (only indexed blobs can take the splice fast-path).
-    pub(super) fn into_drain_copy_range(mut self) -> Option<DrainItem> {
+    pub(super) fn into_drain_copy_range(self) -> Option<DrainItem> {
         self.take_copy_range(None)
     }
 
@@ -295,10 +293,7 @@ impl BlobDescriptor {
     /// rewrites produce, a partially indexed file every command but `cat`
     /// refuses; the worker reframes it with an index derived from the
     /// payload instead.
-    ///
-    /// Moves the tagdata into the item, retaining the descriptor for error
-    /// diagnostics without cloning its allocation.
-    pub(super) fn take_copy_range(&mut self, observed_first: Option<i64>) -> Option<DrainItem> {
+    pub(super) fn take_copy_range(&self, observed_first: Option<i64>) -> Option<DrainItem> {
         let index = self.index?;
         let id_range = self.id_range.unwrap_or((index.min_id, index.max_id));
         Some(DrainItem::CopyRange {
@@ -309,7 +304,6 @@ impl BlobDescriptor {
             id_range,
             observed_first,
             index,
-            tagdata: self.tagdata.take(),
         })
     }
 }
@@ -411,9 +405,7 @@ impl DrainItem {
     pub(super) fn byte_cost(&self) -> usize {
         use crate::tunables::DESCRIPTOR_OVERHEAD;
         match self {
-            DrainItem::CopyRange { tagdata, .. } => {
-                DESCRIPTOR_OVERHEAD + tagdata.as_ref().map_or(0, |t| t.len())
-            }
+            DrainItem::CopyRange { .. } => DESCRIPTOR_OVERHEAD,
             DrainItem::OwnedBytes { frame_bytes, .. } => DESCRIPTOR_OVERHEAD + frame_bytes.len(),
             DrainItem::Rewritten { frames, .. } => {
                 DESCRIPTOR_OVERHEAD

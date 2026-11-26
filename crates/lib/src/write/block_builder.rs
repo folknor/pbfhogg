@@ -14,7 +14,6 @@ use crate::ElementKind;
 use crate::PrimitiveBlock;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
-use rustc_hash::FxHashSet;
 
 /// Encoded block bytes plus the metadata needed to frame them into a blob.
 ///
@@ -52,7 +51,7 @@ use protohoggr::{
 };
 
 use super::encode::{
-    collect_checked_keys, encode_relation, encode_relation_raw_bytes, encode_way,
+    KeySet, collect_checked_keys, encode_relation, encode_relation_raw_bytes, encode_way,
     encode_way_raw_bytes, encode_way_raw_bytes_with_locations, encode_way_with_locations,
 };
 use super::string_table::StringTable;
@@ -433,7 +432,7 @@ pub struct BlockBuilder {
     max_lon: i32,
 
     // Tag key string table indices (for pre-computed tagdata, avoids scan_block_tags rescan).
-    tag_key_indices: FxHashSet<u32>,
+    tag_key_indices: KeySet,
     // Scratch buffer for sorting tag key indices during tagdata serialization.
     tag_key_scratch: Vec<u32>,
     // Pre-serialized tagdata from the last encode_block() call.
@@ -600,7 +599,7 @@ impl BlockBuilder {
             min_lon: i32::MAX,
             max_lon: i32::MIN,
 
-            tag_key_indices: FxHashSet::default(),
+            tag_key_indices: KeySet::default(),
             tag_key_scratch: Vec::new(),
             last_tagdata: None,
 
@@ -2493,7 +2492,7 @@ impl BlockBuilder {
             self.tag_key_scratch.clear();
             // An empty string is still an explicit tag key; retain it.
             self.tag_key_scratch
-                .extend(self.tag_key_indices.iter().copied());
+                .extend_from_slice(self.tag_key_indices.members());
             let strings = &self.string_table;
             self.tag_key_scratch
                 .sort_by(|&a, &b| strings.get(a as usize).cmp(strings.get(b as usize)));
@@ -2905,9 +2904,10 @@ impl BlockBuilder {
         release(&mut self.packed_lon_scratch);
         release(&mut self.info_scratch);
         release(&mut self.tag_key_scratch);
-        // Approximate: buckets times entry size, ignoring control bytes.
-        if self.tag_key_indices.capacity() * std::mem::size_of::<u32>() > LIMIT {
-            self.tag_key_indices = FxHashSet::default();
+        // Both the bitset (grown by the highest key index) and the member
+        // list (grown by the distinct key count) count against the limit.
+        if self.tag_key_indices.retained_bytes() > LIMIT {
+            self.tag_key_indices = KeySet::default();
         }
         self.string_table.release_outliers(LIMIT);
     }

@@ -829,7 +829,6 @@ fn dispatch_variant(
             id_range: _,
             observed_first: _,
             index,
-            tagdata: _,
         } => {
             if !cfg.route.is_splice() {
                 return Err(Error::internal(

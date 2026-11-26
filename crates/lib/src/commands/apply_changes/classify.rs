@@ -30,6 +30,14 @@ use crate::{Element, ElementKind, PrimitiveBlock};
 ///   so an understated range duplicates a modify or writes a create out of
 ///   order, and an overstated one hands a neighbour's upsert to this blob as
 ///   well.
+///
+/// The full walk stays, rather than `AscendingTally` for non-negative
+/// claims (proposed and refused 2026-11-26): when claims were first checked
+/// on decoded blobs, the planet wall moved +0.1 % plain and +0.4 % under
+/// `-l` (reference/performance/apply-changes.md, "Claims checked on decoded
+/// blobs"), so the cheaper walk can recover nothing measurable, and a swap
+/// would still have to keep the first-disorder refusal across the precise
+/// check's early exits and the order-dependent rewrite work.
 pub(super) type BlobWalk<'c> = crate::blob_meta::ClaimWalk<'c>;
 
 /// A walk of a candidate blob carrying `claim` (`None` for an unindexed

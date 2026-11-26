@@ -257,6 +257,13 @@ impl UringState {
     /// `data_len` is zero.
     /// Does **not** update `logical_size`: `accept_buffered` already counted
     /// payload bytes, and alignment padding must never contribute.
+    ///
+    /// One submit per full 256 KiB buffer is deliberate, not an oversight:
+    /// queueing several before one `enter` was proposed and refused
+    /// (2026-11-26). A planet `sort --io-uring` cell (bygg, `1cddf081`, 53.1 s)
+    /// spent 217 ms in 350,993 submits in total, so removing every one saves
+    /// at most 0.4 % of wall, under the noise floor; and the same-disk
+    /// pwrite pool is the faster backend at most measured points anyway.
     #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by IO_BUF_BYTES/NUM_BUFS
     fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> Result<()> {
         if data_len == 0 {

@@ -130,7 +130,17 @@ Tests go where they couple least.
   each command wires by hand: they assert a direct open in every
   direction the command's reach row claims (reads, writes or both),
   not an exact count, since the per-open attribution is the library
-  cells' and a CLI count would restate it plus opens no pin sees. The io_uring cells that write
+  cells' and a CLI count would restate it plus opens no pin sees.
+  `crates/cli/tests/cli_direct_reach.rs` holds such cells, declared in one
+  table, for every flag-bearing path and for selected variant routes
+  that forward the flag on their own branch; its ungated coverage
+  test (path-and-direction coverage, blind to a missing variant)
+  fails when a subcommand path
+  carrying `--direct-io` has no cell, or when the directions a
+  path's cells assert differ from the typed claim (`Direct`) on its
+  reach row, which also carries the flag exactly when it claims a
+  direction. The per-command backend cells keep their content
+  assertions under the flag. The io_uring cells that write
   also assert `writer_uring_registered_buffers` (the call's metrics in
   unit and library tests, the marker stream in CLI cells), which
   proves the ring was set up; the fault plan's dispatch count, in hook

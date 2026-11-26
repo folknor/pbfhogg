@@ -40,22 +40,6 @@ without a witness. Residue:
   replaced-before-the-call caller-pin cells are hand-rolled and run buffered only;
   their direct transports are unpinned.
 
-## VER-160 - Most commands' `--direct-io` wiring has no CLI witness
-
-`crates/cli/src/lib.rs` wires `direct_reads` into each command's options by hand,
-and the CLI direct cells are what witness that the flag reaches the library. Only
-check, cat, sort, add-locations-to-ways and apply-changes have one (`cli.rs`,
-`cli_cat.rs`, `cli_sort.rs`, `cli_add_locations_to_ways.rs`,
-`cli_apply_changes.rs`; `cli_output_guard.rs` for apply-changes). getid,
-getparents, tags-filter, time-filter, repack, degrade, diff (and its OSC form),
-inspect, inspect tags, extract, renumber and build-geocode-index all have a direct
-read path in `crates/cli/src/io_reach.rs`, but no CLI cell passes `--direct-io` to
-them. The library fault cells pin those commands' direct lists, but only from a
-`WriteOptions` the test builds itself, so a CLI arm that dropped the flag would
-pass every test. `direct_io_help_and_feature_refusal_cover_every_command` checks
-help text and feature refusal, not that the flag reaches the run. Derived from the
-code; not observed.
-
 ## VER-133 - Geocode antimeridian and same-level paths the real-data check does not reach
 
 `pbfhogg-verify geocode` judges all four answer classes, and its admin model now assembles

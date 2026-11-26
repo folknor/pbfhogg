@@ -543,6 +543,17 @@ impl RetiredLong {
     }
 }
 
+pub use io_reach::Direct;
+
+/// The O_DIRECT directions the reach table claims for a subcommand path,
+/// `None` for a path it has no row for. The seam the CLI direct cells
+/// check their coverage against; not an API.
+#[doc(hidden)]
+#[must_use]
+pub fn direct_claim(path: &[&str]) -> Option<Direct> {
+    io_reach::direct_claim(path)
+}
+
 /// The command tree production parses: the derived one, plus the retired
 /// shorts and longs.
 #[must_use]

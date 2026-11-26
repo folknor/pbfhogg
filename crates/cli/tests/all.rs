@@ -52,6 +52,7 @@ mod cli_degrade;
 mod cli_derive_changes;
 mod cli_diff;
 mod cli_digest;
+mod cli_direct_reach;
 mod cli_error_naming;
 mod cli_exit_codes;
 mod cli_export;

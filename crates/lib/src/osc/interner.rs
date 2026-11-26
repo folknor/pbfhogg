@@ -30,7 +30,11 @@ pub(super) struct StringTable {
 ///
 /// The lookup map keys each string a second time; it exists only to
 /// deduplicate while interning, so a finished parse drops it
-/// ([`Self::into_strings`]).
+/// ([`Self::into_strings`]). Keying a `hashbrown::HashTable<u32>` by slot
+/// into `data`, as the PBF builder's string table does, was proposed and
+/// declined (2026-11-26): a hit allocates nothing here, and the whole map,
+/// keys included, measured 13,692 strings and 1.0 MB on a planet daily diff
+/// (`reference/performance/apply-changes.md`, retained lookup storage).
 pub(super) struct StringInterner {
     strings: StringTable,
     /// Maps string content -> intern_id for dedup lookup.

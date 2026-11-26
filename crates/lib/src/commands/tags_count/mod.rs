@@ -121,7 +121,10 @@ struct Plan {
     tf: TypeFilter,
     /// The schedule's kind filter: set only when exactly one kind is
     /// selected, since a two-kind filter still has to visit both kinds'
-    /// blobs.
+    /// blobs. A two-kind mask that also skips the third kind's blobs was
+    /// proposed and declined (2026-11-26): the CLI accepts one kind only,
+    /// so only a library caller could reach it, and gating on it would make
+    /// such a caller's raw input, accepted today, need indexdata or `force`.
     kind_filter: Option<ElementKind>,
     /// The same blob-level filter `tags-filter` uses. `inspect tags -e
     /// highway=*` counts only tags matching an expression, so a blob whose

@@ -651,6 +651,12 @@
 
 ### Changed
 
+- **Plain `cat` indexes an unindexed input in parallel.** From an input's
+  first blob without indexdata on, blobs are decompressed and scanned on a
+  worker pool instead of the reading thread (germany raw 20.4 s to about
+  2 s). Blob order and the summary are unchanged; an indexed input is still
+  copied on the walk without decoding.
+
 - **`check --ids --full` on a file out of ID order rereads only the blobs
   that could hold a duplicate**: blobs out of order inside themselves and
   blobs whose ID ranges overlap, not the whole kind (denmark unsorted

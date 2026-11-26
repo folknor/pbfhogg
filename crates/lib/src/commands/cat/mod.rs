@@ -456,14 +456,9 @@ fn cat_passthrough(
         write.backend,
         host,
     )?;
-    let mut blobs: u64 = 0;
-    // Touched only by the unclassifiable-block arm.
-    let mut blobs_reencoded: u64 = 0;
-    // The subset of `blobs_reencoded` that yielded no elements.
-    let mut blobs_omitted: u64 = 0;
-    let mut elements_reencoded: u64 = 0;
-    // Every unindexed blob: reframed (passed through) or re-encoded.
-    let mut payloads_opened: u64 = 0;
+    let compression = write.compression;
+    let metrics = &host.invocation.metrics().writer;
+    let mut tally = PassthroughTally::default();
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     for input in files {
@@ -477,93 +472,168 @@ fn cat_passthrough(
         // blob that lacks indexdata, so it is exempt from the refusal.
         frames.accept_partial_index();
 
+        // The indexed prefix is copied on the walk itself, with no decode and
+        // no pool hop: an indexed input never leaves this loop. The first
+        // blob without indexdata is processed here, and the rest of the walk
+        // goes to a frame pool, since each such blob is decompressed and
+        // scanned (a serial walk ran at one core). Whichever comes after it
+        // - indexed or not - takes the pool, so a partially indexed file is
+        // handled either way, with the blobs written in input order.
+        let mut first_unindexed = None;
         while let Some(mut frame) = frames.next_raw()? {
-            match &frame.blob_type {
-                BlobKind::OsmHeader => {}
-                BlobKind::OsmData => {
-                    if frame.index.is_some() {
-                        // Already has indexdata - pass through as-is.
-                        writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
-                    } else {
-                        // No indexdata - decompress to scan IDs/tags, reframe with index.
-                        let blob_bytes = frame.blob_bytes();
-                        // Name the input, the blob and its frame offset
-                        // through the crate error's own location, which
-                        // prints as "(in PATH, blob N, at byte offset M)".
-                        // The walk owns the provenance.
-                        let id = frame.id;
-                        let locate = |e: Error| frames.locate(id, e);
-                        decompress_blob_raw(blob_bytes, &mut decompress_buf).map_err(locate)?;
-                        payloads_opened += 1;
-                        let (index, tagdata) =
-                            scan_block_ids_and_tags(&decompress_buf).map_err(locate)?;
-                        let index = match index {
-                            Some(idx) => idx,
-                            None => {
-                                // No single index describes the block (no
-                                // elements, a multi-field group, kinds mixed
-                                // across groups). Copying it would leave the
-                                // output unindexed, and the indexing recipe
-                                // this command is would loop: re-encode it
-                                // into single-kind indexed blocks instead.
-                                let (blocks, count) = reencode_unclassifiable(
-                                    std::mem::take(&mut decompress_buf),
-                                    declared,
-                                    writer.compression(),
-                                )
-                                .map_err(locate)?;
-                                if blocks.is_empty() {
-                                    blobs_omitted += 1;
-                                }
-                                for block in blocks {
-                                    writer.write_primitive_block_owned(block)?;
-                                }
-                                blobs_reencoded += 1;
-                                elements_reencoded += count;
-                                continue;
-                            }
-                        };
-                        if declared.way_members && index.kind == crate::ElementKind::Way {
-                            return Err(locate(
-                                declared.broken_by_unindexed_way_blob("adding its indexdata"),
-                            ));
-                        }
-                        let tagdata_bytes = tagdata
-                            .as_ref()
-                            .and_then(crate::blob_meta::TagIndex::serialize);
-                        let reframed = reframe_raw_with_index(
-                            blob_bytes,
-                            &index.serialize(),
-                            tagdata_bytes.as_deref(),
-                            &writer.cancel_token().metrics().writer,
-                        )?;
-                        decompress_buf.clear();
-                        writer.write_raw_owned(reframed)?;
-                    }
-                    blobs += 1;
-                }
-                _ => {}
+            if !matches!(frame.blob_type, BlobKind::OsmData) {
+                continue;
+            }
+            if frame.index.is_some() {
+                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                tally.blobs += 1;
+            } else {
+                first_unindexed = Some(frame);
+                break;
             }
         }
+        let Some(first) = first_unindexed else {
+            continue;
+        };
+        let id = first.id;
+        let done = reindex_frame(first, &mut decompress_buf, declared, compression, metrics)
+            .map_err(|e| frames.locate(id, e))?;
+        tally.fold(done, &mut writer)?;
+        crate::read::frame_pool::map_frames_ordered(
+            &mut frames,
+            host,
+            |frame| matches!(frame.blob_type, BlobKind::OsmData).then_some(frame),
+            Vec::new,
+            |buf, frame| reindex_frame(frame, buf, declared, compression, metrics),
+            |done| tally.fold(done, &mut writer),
+        )?;
     }
 
     writer.flush()?;
-    note_reencoded(host, blobs_reencoded - blobs_omitted, blobs_omitted);
+    let PassthroughTally {
+        blobs,
+        reencoded,
+        omitted,
+        elements,
+        opened,
+    } = tally;
+    note_reencoded(host, reencoded - omitted, omitted);
     Ok(CatStats {
         blobs_passthrough: blobs,
         blobs_rewritten: 0,
-        blobs_reencoded,
-        elements_written: elements_reencoded,
-        blobs_payloads_opened: payloads_opened,
+        blobs_reencoded: reencoded,
+        elements_written: elements,
+        blobs_payloads_opened: opened,
         blobs_repaired: 0,
     })
+}
+
+/// What plain cat did with one data blob.
+enum Reindexed {
+    /// Already indexed: the frame, whole.
+    Copied(Vec<u8>),
+    /// Unindexed: its payload under a rebuilt blob header carrying indexdata.
+    Reframed(Vec<u8>),
+    /// Unindexed, and no single index describes its block: re-encoded into
+    /// these blocks (none when it yielded no elements).
+    Rebuilt {
+        blocks: Vec<OwnedBlock>,
+        elements: u64,
+    },
+}
+
+/// Plain cat's counts, folded in frame order.
+#[derive(Default)]
+struct PassthroughTally {
+    /// Copied or reframed: payload bytes passed through.
+    blobs: u64,
+    /// Re-encoded by the unclassifiable-block arm.
+    reencoded: u64,
+    /// The subset of `reencoded` that yielded no elements.
+    omitted: u64,
+    elements: u64,
+    /// Every unindexed blob: reframed or re-encoded.
+    opened: u64,
+}
+
+impl PassthroughTally {
+    fn fold<W: std::io::Write>(
+        &mut self,
+        done: Reindexed,
+        writer: &mut PbfWriter<W>,
+    ) -> Result<()> {
+        match done {
+            Reindexed::Copied(frame) => {
+                writer.write_raw_owned(frame)?;
+                self.blobs += 1;
+            }
+            Reindexed::Reframed(frame) => {
+                writer.write_raw_owned(frame)?;
+                self.blobs += 1;
+                self.opened += 1;
+            }
+            Reindexed::Rebuilt { blocks, elements } => {
+                self.omitted += u64::from(blocks.is_empty());
+                for block in blocks {
+                    writer.write_primitive_block_owned(block)?;
+                }
+                self.reencoded += 1;
+                self.opened += 1;
+                self.elements += elements;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Plain cat's work on one data blob, on whichever thread runs it: an
+/// indexed frame is handed back whole; an unindexed one is decompressed into
+/// `buf`, scanned, and reframed with the indexdata and tagdata the scan
+/// built, or re-encoded when no single index describes its block. Errors are
+/// unlocated; the caller places them at the frame.
+fn reindex_frame(
+    mut frame: crate::read::frame::RawBlobFrame,
+    buf: &mut Vec<u8>,
+    declared: Declared,
+    compression: Compression,
+    metrics: &crate::write::metrics::WriterMetrics,
+) -> Result<Reindexed> {
+    if frame.index.is_some() {
+        return Ok(Reindexed::Copied(std::mem::take(&mut frame.frame_bytes)));
+    }
+    let blob_bytes = frame.blob_bytes();
+    decompress_blob_raw(blob_bytes, buf)?;
+    let (index, tagdata) = scan_block_ids_and_tags(buf)?;
+    let Some(index) = index else {
+        // No single index describes the block (no elements, a multi-field
+        // group, kinds mixed across groups). Copying it would leave the
+        // output unindexed, and the indexing recipe this command is would
+        // loop: re-encode it into single-kind indexed blocks instead.
+        let (blocks, elements) =
+            reencode_unclassifiable(std::mem::take(buf), declared, compression)?;
+        return Ok(Reindexed::Rebuilt { blocks, elements });
+    };
+    if declared.way_members && index.kind == crate::ElementKind::Way {
+        return Err(declared.broken_by_unindexed_way_blob("adding its indexdata"));
+    }
+    let tagdata_bytes = tagdata
+        .as_ref()
+        .and_then(crate::blob_meta::TagIndex::serialize);
+    let reframed = reframe_raw_with_index(
+        blob_bytes,
+        &index.serialize(),
+        tagdata_bytes.as_deref(),
+        metrics,
+    )?;
+    buf.clear();
+    Ok(Reindexed::Reframed(reframed))
 }
 
 /// The passthrough path of [`repair`]: [`cat_passthrough`]'s output for
 /// every blob it accepts, with every data blob decoded and validated on a
 /// frame pool first, and a refused blob repaired where `repair.rs` can (its
 /// module doc gives the rules). A route of its own, chosen at dispatch, so
-/// plain `cat` keeps its sequential zero-decode loop.
+/// plain `cat` keeps its zero-decode copy of indexed blobs on the walk.
 fn repair_passthrough(
     files: &[PinnedInput],
     output: &crate::output::BoundOutput,

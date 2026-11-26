@@ -1041,7 +1041,10 @@ Mechanism: apply-changes (`rewrite.rs`) parses one OSC into `CompactDiffOverlay`
 then converts it to `SortedDiff`, all serially before parallel PBF work.
 Attributes are scanned separately per field; `CompactSink` allocates fresh
 staging vectors per element and key and value strings per tag (a key string
-even when interning hits); element end allocates another borrowed-pair vector
+even when interning hits), and a member's role through `parse_member`, which
+passes fresh strings where `parse_member_into` takes scratch (any staging
+reuse must still parse and validate the children of hidden upserts recorded
+as deletes); element end allocates another borrowed-pair vector
 and copies into the arena; insertion consults the index and version-floor map
 and removes from the deleted set; `KindTable::build` extracts, sorts, unzips and
 sorts deletes. The command accepts one OSC path, so merge-then-apply goes
@@ -1610,24 +1613,41 @@ unmeasured.
 
 ## PERF-061 - Copy-shaped local changes
 
-Reported by: copy, osc, merge.
+Reported by: copy, osc, merge. Narrowed 2026-11-26: plain cat's unindexed
+scan now runs on the frame pool, the dedupe sweep's loser validation stages
+no members, the interner and tags-count kind-filter proposals were declined
+at their code sites, and the `CompactSink` staging item joined PERF-036.
+Every payoff below is unmeasured.
 
-- Plain cat's unindexed scan decompresses serially; reindex and repair already
-  use the frame pool.
-- Degrade's drop selection builds blocks to hash IDs then decodes again; use ID
-  projections and bulk selection instead of one global heap.
-- OSC interner stores each string in its arena and in a `HashMap<String, u32>`;
-  the builder's arena `HashTable` is the slot-index pattern.
-- `osc/write.rs` creates temporary numeric strings, start tags and coordinate
-  clones per element.
-- Reuse parser staging and append helpers (`append_str_attr`,
-  `parse_member_into`) in `CompactSink`.
-- Stream simplified OSC chunks immediately; text diff `TextUnitSink` copies
-  formatted chunk slices (transfer ownership); reuse relation-member scratch in
-  the sweep.
-- The serial diff planner reads both payload streams on one thread and may be
-  the next limit once comparison work shrinks (not claimed dominant today).
-- tags-count derives its standalone kind filter only for a single kind.
+- Degrade `--drop-ids` on forced unindexed input sends every blob through all
+  three per-kind selection phases (`into_replicated`); one all-kind selection
+  pass would drop two of three inflates, and the `KindIds` projection
+  (`check/verify_ids.rs`) could replace full element iteration. Keep signed
+  IDs, distinct `(kind, id)` selection and the all-occurrence count. The
+  global fold is one serial `BTreeSet` capped at N, taking up to N
+  candidates from each block, not a heap.
+- `osc/write.rs` borrowed writers make a numeric `String` per attribute, way
+  ref and member, a `BytesStart` per element and child, and clone coordinate
+  text. They run on diff units (and serially on the unindexed OSC route); the
+  planet osc cell `3d544246` (bygg, `31c482e2`) shows 74 s consumer receive
+  wait, so a slow head unit can hold the run and worker cost is not ruled out.
+- Simplified OSC (`merge_changes/simplify.rs`) collects every chunk in
+  `all_chunks` before the drain; for plain `.osc` that is a second XML copy of
+  every survivor (planet `95b543e1` peaked at 12.0 GB anon in emit against
+  9.2 GB in simplify, a `.osc.gz` cell, so the plain-XML copy is read from
+  the code, not measured). An ordered drain with bounded in-flight bytes
+  stops the retention; capping chunk size only bounds each worker's
+  temporary XML; draining per action alone does neither.
+- Text diff `TextUnitSink` copies every full 1 MiB piece out of its buffer and
+  the tail again; a chunking writer filling owned pieces would avoid it, but
+  handing the buffer over whole retains oversized capacity that the overflow
+  allowance charges.
+- The dedupe sweep's winner path (`blob_merge/sweep.rs` `Output::encode`)
+  allocates a member vector per relation; reuse needs builder-owned scratch of
+  IDs and interned roles, since the entries borrow the item's block.
+- The serial diff planner reads both payload streams on one thread; the
+  denmark common-output record already shows planner and head delays, with no
+  evidence it limits planet today.
 
 ## PERF-062 - Ring assembly allocates a graph per relation
 

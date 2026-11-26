@@ -512,6 +512,11 @@ impl Output<'_> {
                         &mut self.bb,
                         &mut self.filled,
                     )?;
+                    // A fresh vector per relation: its entries borrow roles
+                    // from this item's block, so it cannot live on `self`
+                    // across items. Reusing it would need builder-owned
+                    // scratch holding member IDs and interned roles, and the
+                    // allocation's share of a dedupe run is unmeasured.
                     let mut members: Vec<MemberData<'_>> = Vec::new();
                     r.members_into(&mut members)?;
                     let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
@@ -680,8 +685,11 @@ fn validate_loser(item: &Item, keep_locations: bool) -> Result<()> {
         }
         Element::Relation(r) => {
             element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-            let mut members: Vec<MemberData<'_>> = Vec::new();
-            r.members_into(&mut members)?;
+            // The roles `members_into` would resolve, resolved without
+            // staging a vector that is only dropped.
+            for (position, m) in r.members().enumerate() {
+                r.member_role(position, &m)?;
+            }
         }
     }
     Ok(())

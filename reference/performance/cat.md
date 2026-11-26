@@ -3,7 +3,8 @@
 ## Cat passthrough (indexdata generation)
 
 No `--type` filter. Decompresses each blob to scan IDs/tags, reframes BlobHeader
-with indexdata+tagdata, preserves original compressed bytes. No re-compression.
+with indexdata+tagdata, preserves original compressed bytes. No re-compression,
+except a block no single index describes, which is re-encoded.
 
 | Dataset | Size | Time | Notes |
 |---------|------|------|-------|
@@ -11,8 +12,23 @@ with indexdata+tagdata, preserves original compressed bytes. No re-compression.
 | Europe | 32.4 GB | 112s | commit `69a127f`, `--direct-io`, `--type node,way,relation` (filtered path, +3.8% size) |
 | Planet | 87 GB | **86.5s** | commit `aee7727`, buffered, UUID `5d90623f`, `--bench 1` |
 
-Passthrough is buffered-only; `--direct-io` adds alignment overhead without
-the concurrent read/write pattern that makes it faster for merge.
+### Unindexed blobs on the frame pool (bygg, 2026-11-26, against `131e68ea`)
+
+Plain cat now copies an input's indexed prefix on the walk, processes the
+first blob without indexdata on the calling thread, and hands the rest of
+the walk to the frame pool (`read/frame_pool.rs`), whose workers
+decompress, scan and reframe while the calling thread writes the results in
+input order. Germany raw (`brokkr bench --iterations 1
+copy-pbf --dataset germany --variant raw`), interleaved: baseline 20.4 s
+(`d1f31fc3`) and 20.7 s (`de1da92e`); variant 2.3 s (`a7c4e8ba`, dirty) and
+1.7 s (`d1232b35`, dirty; `CAT_SCAN` at 16.4 cores, 110 MB peak anon). The
+indexed input takes the unchanged walk: germany indexed 1.4 s variant
+against 1.2 s baseline (`0c821154`, `4566b0a0`; a first variant cell at
+2.4 s, `0bbfda2c`, followed the raw cells cold). No planet cell: the
+germany split already shows the serial scan gone.
+
+Passthrough honours `--direct-io` on its reads and writes (the I/O
+capability matrix in `docs/cli/commands.md`); the cells above are buffered.
 
 The `--clean` path measured below ran `parallel_classify_phase` once per
 kind with framed output streamed via `ReorderBuffer` (commits `6184602` +

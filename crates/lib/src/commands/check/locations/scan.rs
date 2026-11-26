@@ -315,8 +315,25 @@ fn next_delta(cursor: &mut Cursor<'_>, acc: &mut i64, err: fn() -> Error) -> Res
     Ok(*acc)
 }
 
+/// Whether any reference in a way's `refs` array satisfies `owned`.
+fn refs_any(refs_data: &[u8], owned: &dyn Fn(i64) -> bool) -> Result<bool> {
+    let mut refs = Cursor::new(refs_data);
+    let mut node_id = 0_i64;
+    while !refs.is_empty() {
+        if owned(next_delta(&mut refs, &mut node_id, refs_err)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Scan every way of a blob, streaming one `Way` event and then one `Ref`
 /// event per reference.
+///
+/// With `owned`, a way none of whose references satisfies it is skipped
+/// whole: no events, and its coordinate arrays are neither decoded nor
+/// checked. Only a caller that has already scanned the same blob without a
+/// filter, so every structural fault was judged there, may pass one.
 ///
 /// Coordinate arrays are optional as a pair, as the decoder has them
 /// (`validate_way_geometry_arrays` in `read/block.rs`): absent together they
@@ -329,6 +346,7 @@ fn next_delta(cursor: &mut Cursor<'_>, acc: &mut i64, err: fn() -> Error) -> Res
 pub(super) fn scan_ways(
     block: &[u8],
     claim: Option<ElementKind>,
+    owned: Option<&dyn Fn(i64) -> bool>,
     groups: &mut Groups,
     mut sink: impl FnMut(&WayEvent) -> Result<()>,
 ) -> Result<Kinds> {
@@ -342,6 +360,12 @@ pub(super) fn scan_ways(
                 return Ok(());
             };
             let way = WireWay::parse(data)?;
+            if let Some(owned) = owned
+                && !refs_any(way.refs_data, owned)?
+            {
+                ordinal += 1;
+                return Ok(());
+            }
             let has_coords = !way.lat_data.is_empty() || !way.lon_data.is_empty();
             sink(&WayEvent::Way {
                 ordinal,

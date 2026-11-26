@@ -1240,32 +1240,32 @@ serial inflate.
 
 Kind: unmeasured, moderate conviction.
 
-## PERF-046 - Location checking rereads every way blob per partition
+## PERF-046 - Location checking decompresses every way blob per partition
 
 Reported by: check.
 
-Mechanism: `check_locations_inner` discovers node keys, optionally scans ways,
-then `run_partition` reads applicable node blobs and every way blob per
-partition, so P partitions decode way refs and inline coordinates about P times.
+Mechanism: `check_locations_inner` splits the node-ID space into P partitions
+when the coordinate store does not fit (planet `altw-keep-untagged` on a
+28 GB-class host: 6), and every partition decompresses every way blob and
+scans every ref; later partitions skip the coordinate decode of ways they do
+not own. Skipping whole blobs and spilling observations to scratch were both
+refused with measurements and arithmetic (reference/performance/check.md,
+2026-11-26).
 
-Redesign: decode once, route node records and way-reference observations into
-buckets by target node ID, reduce each bucket (the `Store` slot algebra stays),
-reduce counters and violations by report-order keys; resident when it fits,
-spill when not; partition ownership removes shared atomics.
+Redesign: fewer partitions, or none. Candidates: a lossless compressed
+coordinate store (blocks of nearby ranks, bit-packed deltas, exact escape
+blocks; about 12 bits per key would fit planet keep-untagged in one
+partition here), or a node-side lookup (way blobs read once, node blobs as
+backing store with a bounded decoded-projection cache, a rank-indexed
+mismatch bitset across batches). `--agreement` needs exact first-coordinate
+or disagree state for absent IDs in either.
 
-Risks: scratch records far larger than compressed PBF, bad for one-partition
-files; skew; every node record represented; coordinate-domain arithmetic,
-duplicate precedence, absent-node agreement and violation order. The report
-exposes `partitions` and `blob_decodes`; their old values cannot be kept
-honestly under a different algorithm.
+Risks: coordinate locality decides whether the compressed store fits; node
+read amplification for the lookup; duplicate precedence, absent-node
+agreement, violation order and the `partitions` / `blob_decodes` cost
+figures. The verifier runs this check several times per `verify all`.
 
-Kind: highest scaling payoff (check).
-
-2026-11-21 verifier hunt (heavy-codex): `verify add-locations-to-ways` runs
-`check --locations --agreement` on both engine outputs, and apply-changes -l
-runs it too, so this cost is paid several times per `verify all`. The
-proposal is the same one: project node coordinates and ordered way-reference
-observations once, and route compact observations by node ID.
+Kind: scaling payoff (check), smaller than first filed.
 
 ## PERF-047 - Digest builds elements and hashes on one consumer
 

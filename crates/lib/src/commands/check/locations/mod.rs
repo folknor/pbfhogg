@@ -844,6 +844,14 @@ fn check_locations_inner(
         agreement: opts.agreement,
         cap,
     };
+    // Every partition decompresses every way blob; a later one skips, way by
+    // way, the ways without a reference it owns. Two ways of not rereading
+    // were judged and refused (reference/performance/check.md, "check
+    // --locations skips ways a partition does not own"): skipping whole
+    // blobs by the partitions their refs touch skips nothing on a planet
+    // (every blob touches every partition), and routing way-reference
+    // observations to node-ID buckets on scratch writes and reads back more
+    // bytes than the rereads cost, against a check that uses no scratch.
     for k in 0..plan.partitions() {
         host.invocation.check()?;
         host.invocation.marker("CHECKLOC_PARTITION_START");
@@ -950,7 +958,7 @@ fn key_refs(
         KeyWorker::default,
         |pos, block, worker, gate| {
             let KeyWorker { groups, batch, .. } = worker;
-            let kinds = scan_ways(block, facts[pos].claim, groups, |event| {
+            let kinds = scan_ways(block, facts[pos].claim, None, groups, |event| {
                 if let WayEvent::Ref { node_id, .. } = *event {
                     shards.add(batch, node_id);
                 }
@@ -1107,32 +1115,39 @@ impl RunCtx<'_> {
                 let mut out = WayBlob::default();
                 let mut local = Details::new(cap);
                 let mut way = (0_u64, 0_i64);
-                let kinds = scan_ways(block, ctx.facts.claim, &mut worker.groups, |event| {
-                    match *event {
-                        WayEvent::Way {
-                            ordinal,
-                            id,
-                            has_refs,
-                            has_coords,
-                        } => {
-                            way = (ordinal, id);
-                            if ctx.designated {
-                                ctx.way_start(way, has_refs, has_coords, &mut out, &mut local);
+                // The designated partition sees every way; any other only
+                // the ways holding a reference it owns, the designated
+                // partition having made every structural check.
+                let owns = |id: i64| in_partition(id, range);
+                let owned: Option<&dyn Fn(i64) -> bool> =
+                    if ctx.designated { None } else { Some(&owns) };
+                let kinds =
+                    scan_ways(block, ctx.facts.claim, owned, &mut worker.groups, |event| {
+                        match *event {
+                            WayEvent::Way {
+                                ordinal,
+                                id,
+                                has_refs,
+                                has_coords,
+                            } => {
+                                way = (ordinal, id);
+                                if ctx.designated {
+                                    ctx.way_start(way, has_refs, has_coords, &mut out, &mut local);
+                                }
+                            }
+                            WayEvent::Ref {
+                                position, node_id, ..
+                            } => {
+                                if ctx.designated {
+                                    ctx.structural_ref(
+                                        way, position, node_id, event, &mut out, &mut local,
+                                    );
+                                }
+                                ctx.compare(way, position, node_id, event, &mut out, &mut local);
                             }
                         }
-                        WayEvent::Ref {
-                            position, node_id, ..
-                        } => {
-                            if ctx.designated {
-                                ctx.structural_ref(
-                                    way, position, node_id, event, &mut out, &mut local,
-                                );
-                            }
-                            ctx.compare(way, position, node_id, event, &mut out, &mut local);
-                        }
-                    }
-                    Ok(())
-                })?;
+                        Ok(())
+                    })?;
                 out.details = local.finish();
                 Ok((gate.admit(kinds)?, out))
             },

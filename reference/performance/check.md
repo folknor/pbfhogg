@@ -1,5 +1,41 @@
 # Check
 
+## check --locations skips ways a partition does not own (bygg, 2026-11-26, against `3789a66a`)
+
+Input: planet `altw-keep-untagged` (10,447,738,627 node records,
+1,165,589,744 ways, 12,435,459,911 refs), 6 partitions on this host.
+Every partition after the first decompresses every way blob; the variant
+pre-scans each way's refs and skips the way whole (no coordinate decode,
+no events) when none falls in the partition. The first partition still
+reads every way unfiltered and makes every structural check.
+`brokkr bench --iterations 1 location-integrity --dataset planet`,
+interleaved, variants uncommitted (dirty rows):
+
+| Arm | UUID | Wall | Partitions total |
+|---|---|---:|---:|
+| base | `fc544bcf` | 175.0 s | 151.2 s |
+| blob masks | `caf54bff` | 175.9 s | - |
+| per-way skip | `8bb3d5b5` | 162.6 s | - |
+| base | `95bbb36c` | 175.4 s | - |
+| per-way skip | `291166a7` | 163.8 s | 140.5 s |
+
+Per-way skip: 163.2 s against 175.2 s, -6.8 %, both pairs the same sign;
+the node pass (16.6 s, 16.7 s) is unchanged. Landed.
+
+Blob masks (the first partition records which partitions each way blob's
+refs touch, later partitions read only the blobs touching them): 171,300
+blob decodes against 171,301, one blob skipped planet-wide, because at
+blob granularity every way blob touches every partition. Refused.
+
+Routing way-reference observations into node-ID buckets on scratch,
+decoding each way blob once, was refused on arithmetic, not measured:
+12.4 billion refs at 16 to 24 bytes is 200 to 300 GB written and read
+back, at a few GB/s as much time as the whole current run, on a check whose
+contract uses no scratch. What remains of the rereads (each later
+partition still decompresses every way blob and scans every ref) needs
+fewer partitions: a lossless compressed coordinate store, or a node-side
+lookup that leaves the way blobs read once.
+
 ## Reserved ID-set chunks materialise on first write (bygg, 2026-11-25, against `186acde8`)
 
 `IdSet::pre_allocate` now reserves its direct chunks and an atomic setter

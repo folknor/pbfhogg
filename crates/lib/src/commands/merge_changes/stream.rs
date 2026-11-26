@@ -12,18 +12,22 @@
 //! - **Readers.** One standard thread per input, at most `readers` alive,
 //!   started strictly in input order (so the head input's reader is always
 //!   running or finished). A slot is reused only once its input is complete
-//!   (every member written), which also bounds open spill files by the cap. Each drives its document through the one OSC
-//!   driver with a [`LexSink`]: framing and every structural check happen
-//!   there, but no attribute is interpreted. At an element end past
-//!   [`MERGE_CHANGES_BATCH_BYTES`] the reader seals a batch: it takes credit
+//!   (every member written), which also bounds open spill files by the cap.
+//!   Each reads its document with [`frame_osc_path`]: a regular file is
+//!   framed into spans of document bytes, parsed nowhere on the reader; a
+//!   stream is driven through the one OSC driver, which records each
+//!   element's tags as a transcript without interpreting an attribute. Past
+//!   [`MERGE_CHANGES_BATCH_BYTES`], at the next cut point (a span) or element
+//!   end (a transcript), the reader seals a batch: it takes credit
 //!   for the batch's bytes from the [`Ledger`] (waiting if the budget is
 //!   spent), then hands its encode job, tagged `(input, seq)`, to the
 //!   [`Encoder`], which runs it on the executor within the plan's lanes.
 //!   Credit is taken before the sequence number becomes outstanding, and an
 //!   input's batches are sealed in order.
-//! - **Workers.** Replay a batch into the byte sink, re-emit XML and gzip
-//!   it into one self-contained member with its own action sections. They
-//!   never block.
+//! - **Workers.** Parse a span with the full OSC driver, or replay a
+//!   transcript, into the byte sink, re-emit XML and gzip it into one
+//!   self-contained member with its own action sections. A batch with no
+//!   change is no member. They never block.
 //! - **Coordinator.** The only owner of every sink. It writes each member
 //!   the moment it is next in order for its own input: the head input's to
 //!   the output, every other input's to that input's spill file in the run
@@ -42,11 +46,12 @@
 //!
 //! # Memory
 //!
-//! Admitted batches hold at most [`MERGE_CHANGES_INFLIGHT_BYTES`] of recorded
-//! tag bytes; resident memory is a bounded multiple of that (the batch, its
+//! Admitted batches hold at most [`MERGE_CHANGES_INFLIGHT_BYTES`] of batch
+//! bytes; resident memory is a bounded multiple of that (the batch, its
 //! descriptors and the encoded member it becomes, which re-emission can make
-//! larger than its input), plus per reader one batch under construction, one
-//! element, the XML reader's buffer and inflate state, and for a gzip input
+//! larger than its input), plus per reader one batch under construction (a
+//! span at most `OSC_SPAN_CEILING_BYTES` before the reader falls back to
+//! tokenizing), one element, the XML reader's buffer and inflate state, and for a gzip input
 //! that is a regular file the inflated read-ahead its inflate thread keeps
 //! (`OSC_INFLATE_AHEAD_CHUNKS + 2` chunks of `OSC_INFLATE_CHUNK_BYTES`;
 //! each reader then runs two threads). It does not grow with
@@ -55,13 +60,15 @@
 //!
 //! # Failure
 //!
-//! The first failure the coordinator receives is returned, ahead of a
+//! The first input to fail decides the failure, and within it the failure
+//! earliest in its document ([`Failure`]): the coordinator waits for every
+//! earlier batch of that input to answer before it returns, ahead of a
 //! cancellation observed after it. Before any scope joins, a guard stops
 //! the ledger: that wakes every reader waiting for credit, makes every
-//! reader refuse at its next recorded callback (inside a huge element too),
-//! and makes queued encode jobs answer without encoding. A stretch of input
-//! that produces no callbacks at all is still read to its end, without
-//! recording anything. Readers and
+//! reader refuse at its next read or recorded callback (inside a huge
+//! element too), and makes queued encode jobs answer without encoding. A
+//! stream's stretch of input that produces no callbacks at all is still
+//! read to its end, without recording anything. Readers and
 //! workers catch panics and answer with an error, so no admitted position
 //! goes unanswered. Nothing is published unless the whole merge succeeded.
 //!
@@ -76,7 +83,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use crate::osc::xml_parse::{LexBatch, LexSink, parse_osc_path};
+use crate::osc::xml_parse::{Framing, LexBatch, frame_osc_path};
 use crate::scratch::{RunScratch, ScratchPath};
 
 /// How readers cut batches and how many batch bytes may be in flight. The
@@ -89,8 +96,11 @@ use crate::scratch::{RunScratch, ScratchPath};
 /// budget never does.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Batching {
-    /// Raw element bytes at which a reader seals a batch.
+    /// Batch bytes at which a reader seals a batch.
     pub(crate) batch_bytes: usize,
+    /// Unsealed span bytes past which a framing reader falls back to
+    /// tokenizing the rest of its input.
+    pub(crate) span_ceiling: usize,
     /// Admitted, not yet written batch bytes over every input ([`Ledger`]).
     pub(crate) inflight_bytes: usize,
 }
@@ -98,8 +108,16 @@ pub(crate) struct Batching {
 impl Batching {
     pub(crate) const PRODUCTION: Self = Self {
         batch_bytes: crate::tunables::MERGE_CHANGES_BATCH_BYTES,
+        span_ceiling: crate::tunables::OSC_SPAN_CEILING_BYTES,
         inflight_bytes: crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES,
     };
+
+    fn framing(self) -> Framing {
+        Framing {
+            target: self.batch_bytes,
+            ceiling: self.span_ceiling,
+        }
+    }
 }
 
 /// What one streaming merge needs.
@@ -127,7 +145,13 @@ enum Msg<T> {
         input: usize,
         batches: usize,
     },
-    ReaderFailed(crate::Error),
+    /// The reader of `input` failed after sealing `sealed` batches, so its
+    /// failure lies past every one of them in the document.
+    ReaderFailed {
+        input: usize,
+        sealed: usize,
+        error: crate::Error,
+    },
     /// Sent after every encode-job spawn, so a coordinator parked in
     /// [`recv`] after its pool reported idle runs the job it could not
     /// see: a spawn from a reader thread is injected into the pool, and one
@@ -571,7 +595,15 @@ fn collect_results<T>(
             "merge-changes input {input} answered out of protocol"
         ))
     };
+    let mut failure: Option<Failure> = None;
     while complete < n {
+        if let Some(f) = failure.take() {
+            let answered = |s: usize| slots[f.input].get(s).is_some_and(Option::is_some);
+            if (0..f.at).all(answered) {
+                return Err(f.error);
+            }
+            failure = Some(f);
+        }
         // A message is handled before the cancellation check, so an error
         // it carries is returned rather than replaced by the cancellation.
         match recv(rx, plan.executor)? {
@@ -581,8 +613,14 @@ fn collect_results<T>(
                 credit,
                 result,
             } => {
-                let value = result?;
                 ledger.release(credit);
+                let value = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        Failure::note(&mut failure, input, seq, error);
+                        continue;
+                    }
+                };
                 let slot = &mut slots[input];
                 if slot.len() <= seq {
                     slot.resize_with(seq + 1, || None);
@@ -609,19 +647,32 @@ fn collect_results<T>(
                 if received[input] == count {
                     complete += 1;
                 }
-                if started < n {
+                // A run that has failed starts no further reader: one
+                // could block in its open (a FIFO without a writer) that
+                // nothing would release.
+                if failure.is_none() && started < n {
                     spawn_reader(started)?;
                     started += 1;
                 }
             }
-            Msg::ReaderFailed(error) => return Err(error),
+            Msg::ReaderFailed {
+                input,
+                sealed,
+                error,
+            } => Failure::note(&mut failure, input, sealed, error),
             Msg::Wake => {
                 return Err(crate::Error::internal(
                     "merge-changes: recv returned a wake",
                 ));
             }
         }
-        plan.cancel.check()?;
+        // A held failure waits out a cancellation too (see `Failure`).
+        if failure.is_none() {
+            plan.cancel.check()?;
+        }
+    }
+    if let Some(f) = failure {
+        return Err(f.error);
     }
     plan.cancel.counter("merge_changes_batches", batches_total);
     slots
@@ -657,12 +708,12 @@ fn read_input<'s, T, E>(
     let stopped = || ledger.halted() || cancel.is_cancelled();
     #[cfg(not(pbfhogg_test_hooks))]
     let _ = ordered;
+    let seq = Cell::new(0usize);
     let body = || -> crate::Result<usize> {
         #[cfg(pbfhogg_test_hooks)]
         if ordered {
             cancel.faults().before_merge_changes_read(input, stopped)?;
         }
-        let seq = Cell::new(0usize);
         let seal = |batch: LexBatch| -> crate::Result<()> {
             #[cfg(pbfhogg_test_hooks)]
             if ordered {
@@ -686,20 +737,33 @@ fn read_input<'s, T, E>(
             );
             Ok(())
         };
-        let mut sink = LexSink::new(plan.batching.batch_bytes, seal, || ledger.halted());
         // Deliberately use the shared historical per-file decompression counter.
         // Command-specific names or accumulation would break brokkr comparisons.
-        parse_osc_path(path, &mut sink, cancel)?;
-        sink.finish()?;
+        frame_osc_path(
+            path,
+            plan.batching.framing(),
+            seal,
+            || ledger.halted(),
+            cancel,
+        )?;
         Ok(seq.get())
     };
-    let msg = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    // A reader's failure lies past every batch it sealed.
+    let sealed = seq.get();
+    let msg = match outcome {
         Ok(Ok(batches)) => Msg::ReaderDone { input, batches },
-        Ok(Err(error)) => Msg::ReaderFailed(error),
-        Err(payload) => Msg::ReaderFailed(
-            crate::error::panic_error("merge-changes reader", payload)
+        Ok(Err(error)) => Msg::ReaderFailed {
+            input,
+            sealed,
+            error,
+        },
+        Err(payload) => Msg::ReaderFailed {
+            input,
+            sealed,
+            error: crate::error::panic_error("merge-changes reader", payload)
                 .context(format!("while reading {}", path.display())),
-        ),
+        },
     };
     drop(tx.send(msg));
 }
@@ -711,7 +775,8 @@ fn read_input<'s, T, E>(
 /// bytes, spilling only past it, never waiting on it) was measured on
 /// planet 7-OSC (bygg, 2026-11-26, over `eecbc773`): 3105/3128/3149 ms
 /// against 3097/3078/3063 ms, with about 100 MB per input held and the
-/// rest spilled. The run is bound by its readers; each promotion copies
+/// rest spilled. The run was then bound by its readers, and since the
+/// readers only frame it is bound by worker CPU; each promotion copies
 /// in about 15 ms from the page cache at the tail, so neither the spill
 /// write nor the copy-back is on the critical path. Re-measure only after
 /// a change that makes the coordinator or promotion the bound.
@@ -794,9 +859,13 @@ impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
             started += 1;
         }
         let mut batches_total = 0usize;
+        let mut failure: Option<Failure> = None;
         while self.head < n {
+            if let Some(error) = self.decided(&mut failure) {
+                return Err(error);
+            }
             let head = &self.states[self.head];
-            if head.batches == Some(head.next) {
+            if failure.is_none() && head.batches == Some(head.next) {
                 self.advance_head()?;
                 continue;
             }
@@ -810,7 +879,14 @@ impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
                     credit,
                     result,
                 } => {
-                    let (bytes, changes) = result?;
+                    let (bytes, changes) = match result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.ledger.release(credit);
+                            Failure::note(&mut failure, input, seq, error);
+                            continue;
+                        }
+                    };
                     let state = &mut self.states[input];
                     let beyond = state.batches.is_some_and(|b| seq >= b);
                     if seq < state.next || beyond || state.waiting.contains_key(&seq) {
@@ -819,8 +895,16 @@ impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
                         )));
                     }
                     state.waiting.insert(seq, (bytes, changes, credit));
-                    self.drain(input)?;
-                    if self.close_if_complete(input)? && started < n {
+                    // A failing write does not replace a held failure.
+                    let closed = self
+                        .drain(input)
+                        .and_then(|()| self.close_if_complete(input));
+                    let closed = match closed {
+                        Ok(closed) => closed,
+                        Err(e) => return Err(failure.map_or(e, |f| f.error)),
+                    };
+                    // A held failure admits no reader (see `Failure`).
+                    if closed && failure.is_none() && started < n {
                         spawn_reader(started)?;
                         started += 1;
                     }
@@ -841,24 +925,48 @@ impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
                     }
                     state.batches = Some(batches);
                     batches_total += batches;
-                    if self.close_if_complete(input)? && started < n {
+                    let closed = match self.close_if_complete(input) {
+                        Ok(closed) => closed,
+                        Err(e) => return Err(failure.map_or(e, |f| f.error)),
+                    };
+                    if closed && failure.is_none() && started < n {
                         spawn_reader(started)?;
                         started += 1;
                     }
                 }
-                Msg::ReaderFailed(error) => return Err(error),
+                Msg::ReaderFailed {
+                    input,
+                    sealed,
+                    error,
+                } => Failure::note(&mut failure, input, sealed, error),
                 Msg::Wake => {
                     return Err(crate::Error::internal(
                         "merge-changes: recv returned a wake",
                     ));
                 }
             }
-            self.plan.cancel.check()?;
+            // A held failure waits out a cancellation too (see `Failure`).
+            if failure.is_none() {
+                self.plan.cancel.check()?;
+            }
         }
         self.plan
             .cancel
             .counter("merge_changes_batches", batches_total);
         Ok(self.total)
+    }
+
+    /// The held failure's error, taken, once every earlier batch of its
+    /// input has been written (they drain in order, and the failed one
+    /// never is).
+    fn decided(&self, failure: &mut Option<Failure>) -> Option<crate::Error> {
+        let at = failure.as_ref()?.at;
+        let input = failure.as_ref()?.input;
+        if self.states[input].next >= at {
+            failure.take().map(|f| f.error)
+        } else {
+            None
+        }
     }
 
     /// Mark `input` complete once its reader has finished and every one of
@@ -901,6 +1009,13 @@ impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
             };
             state.next += 1;
             state.changes += changes;
+            if bytes.is_empty() {
+                // A batch that wrote nothing (a span of comments, or one
+                // whose changes a filter dropped) touches no sink, so an
+                // input that is not the head makes no spill file for it.
+                self.ledger.release(credit);
+                continue;
+            }
             if matches!(state.sink, Sink::Pending) {
                 let path =
                     spill_scratch(self.scratch, input)?.file(&format!("merge-input-{input}"))?;
@@ -991,6 +1106,36 @@ impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
             .faults()
             .on_merge_changes_promoted(self.head, copied);
         Ok(())
+    }
+}
+
+/// The failure a run reports: the first input to fail, and within it the
+/// failure earliest in its document. Positions are batch sequence numbers;
+/// a reader's failure stands at the count of batches it sealed, past every
+/// one of them. A failure is reported once every batch of its input before
+/// it has answered, so a later batch, which may start where an earlier
+/// fault left the document's framing, never decides which error is shown:
+/// the report is the one a serial parse of the input gives. The wait is
+/// bounded without the cancellation check, which it therefore skips: every
+/// earlier batch is already submitted and answers whatever the token says.
+/// While a failure is held no reader is started (an open of a FIFO with no
+/// writer could not be released), and a failure of the coordinator's own
+/// writes does not replace it.
+struct Failure {
+    input: usize,
+    at: usize,
+    error: crate::Error,
+}
+
+impl Failure {
+    fn note(slot: &mut Option<Self>, input: usize, at: usize, error: crate::Error) {
+        let replace = match slot {
+            None => true,
+            Some(held) => held.input == input && at < held.at,
+        };
+        if replace {
+            *slot = Some(Self { input, at, error });
+        }
     }
 }
 

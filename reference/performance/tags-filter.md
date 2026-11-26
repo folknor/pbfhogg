@@ -1,5 +1,27 @@
 # Tags Filter
 
+### OSC reader frames spans, workers tokenize (bygg, 2026-11-26, `a1d7434a` + change)
+
+Before the change, `perf record` of `tag-select --input-kind osc --input
+4920` on planet (1.33 s wall) put the one reader thread at about 1.19 s busy:
+quick-xml tokenizing (`read_event_impl`, `memchr3`, `ElementParser::feed`,
+buffer refills, `emit_start`) about 55 %, `from_utf8` 13 %, the `Char`
+check 12 %, recording the transcript (`LexBatch::push` and its copy) about
+7 %, hierarchy dispatch 4 %. Copying less of the transcript could never
+have moved the wall. The reader now only frames regular files into spans,
+and the workers run the full driver on them (`reference/pipeline.md`,
+merge-changes). `w/highway=primary`, `--iterations 1`, interleaved against
+`--commit a1d7434a`:
+
+| baseline | variant |
+|---|---|
+| `6d5cc937` 1.3 s, `90cb0e03` 1.3 s | `7477e33b` 693 ms, `ca6cbf30` 691 ms |
+
+About -48 %. The variant runs at 7.7 average cores, against 4.0 before;
+its inflate thread spends 375 ms in decoder reads (`ca6cbf30`) of the
+687 ms command, so the serial single-member inflate is now the largest
+single cost of a one-input read, though not yet all of its wall.
+
 ### OSC tags-filter renders only kept changes (bygg, 2026-11-26, `1a2ca6bf` + change)
 
 The OSC byte sink now keeps each element as parsed values and formats it

@@ -10,7 +10,7 @@
 //! at all. Two code paths answering the same question differently is the
 //! recurring defect in this codebase; the answer is one machine.
 //!
-//! [`drive_osc`] owns the *framing*: gzip sniffing, the element hierarchy
+//! [`drive_osc`] owns the *structure*: gzip sniffing, the element hierarchy
 //! (root, sections, objects, their children; anything misplaced is
 //! refused), self-closing elements, child routing, and the end-of-document
 //! completeness check. Text, comments and processing instructions carry
@@ -21,7 +21,12 @@
 //! checked: the XML declaration's own pseudo-attribute grammar, and
 //! element names that matched a literal OSC name. An
 //! [`OscSink`] owns the *data*:
-//! what an element turns into once the framing has identified it.
+//! what an element turns into once the driver has identified it.
+//!
+//! The driver reads a whole document, or one piece of it that a framing
+//! reader cut out ([`framer`], [`Continuation`]); a piece is held to every
+//! rule above that can still apply at its position, and must end exactly
+//! where the next piece begins.
 
 use std::cell::Cell;
 use std::io::{self, BufReader, Read};
@@ -795,7 +800,13 @@ type Sniffed = io::Chain<io::Take<io::Cursor<[u8; 3]>>, std::fs::File>;
 /// How an opened OSC input is read.
 enum OscInput {
     /// Plain XML, or gzip from a stream: read on the tokenizer's thread.
-    Inline(Box<dyn io::Read>),
+    /// `regular` is true for plain XML in a regular file, which a framing
+    /// reader may read ahead of the parse (no read of it can block on a
+    /// writer).
+    Inline {
+        read: Box<dyn io::Read>,
+        regular: bool,
+    },
     /// Gzip from a regular file: inflated ahead on a thread of its own.
     InflateAhead(Sniffed),
 }
@@ -839,10 +850,10 @@ fn open_osc_input(
         }
     }
     let gzip = got >= 2 && prefix[..2] == [0x1f, 0x8b];
-    let regular = gzip && file.metadata().map_err(read_error)?.is_file();
+    let regular = file.metadata().map_err(read_error)?.is_file();
     let file = io::Cursor::new(prefix).take(got as u64).chain(file);
 
-    if regular {
+    if gzip && regular {
         return Ok(OscInput::InflateAhead(file));
     }
     let inner: Box<dyn io::Read> = if gzip {
@@ -858,7 +869,10 @@ fn open_osc_input(
             cancel: cancel.handle().clone(),
         })
     };
-    Ok(OscInput::Inline(inner))
+    Ok(OscInput::Inline {
+        read: inner,
+        regular: regular && !gzip,
+    })
 }
 
 /// The XML reader every OSC parse drives, over either input form.
@@ -1010,6 +1024,21 @@ fn drive_inflated<S: OscSink>(
     path: &Path,
     cancel: &crate::host::Recorder,
 ) -> (ParseResult<()>, u64) {
+    with_inflated(file, path, cancel, |source| {
+        let mut reader = xml_reader(source);
+        drive_osc(&mut reader, sink, path)
+    })
+}
+
+/// Run `body` over a regular-file gzip input's inflated bytes, its inflate
+/// on a scoped thread ([`inflate_ahead`]). Returns `body`'s result and the
+/// inflate thread's decoder time.
+fn with_inflated(
+    file: Sniffed,
+    path: &Path,
+    cancel: &crate::host::Recorder,
+    body: impl FnOnce(&mut ChunkReader<'_>) -> ParseResult<()>,
+) -> (ParseResult<()>, u64) {
     let invocation = cancel.handle();
     crate::threads::scope(invocation, |threads| {
         let (tx, rx) = std::sync::mpsc::sync_channel(crate::tunables::OSC_INFLATE_AHEAD_CHUNKS);
@@ -1027,17 +1056,14 @@ fn drive_inflated<S: OscSink>(
                 return (Err(err), 0);
             }
         };
-        let result = {
-            let mut reader = xml_reader(ChunkReader {
-                rx: &rx,
-                free: &free_tx,
-                chunk: Vec::new(),
-                pos: 0,
-                done: false,
-                cancel: invocation,
-            });
-            drive_osc(&mut reader, sink, path)
-        };
+        let result = body(&mut ChunkReader {
+            rx: &rx,
+            free: &free_tx,
+            chunk: Vec::new(),
+            pos: 0,
+            done: false,
+            cancel: invocation,
+        });
         // Hanging up releases an inflater blocked on a full channel.
         drop(rx);
         drop(free_tx);
@@ -1095,6 +1121,18 @@ struct DriveState {
     open: ElementKind,
     /// A DOCTYPE has been read; a second one is refused.
     doctype_seen: bool,
+}
+
+impl DriveState {
+    /// Before the first byte of a document.
+    fn document() -> Self {
+        Self {
+            level: Level::Doc,
+            section: OscAction::Create,
+            open: ElementKind::Node,
+            doctype_seen: false,
+        }
+    }
 }
 
 /// The root element name, whose close proves the document is whole.
@@ -1673,12 +1711,96 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
     sink: &mut S,
     path: &Path,
 ) -> ParseResult<()> {
-    let mut state = DriveState {
-        level: Level::Doc,
-        section: OscAction::Create,
-        open: ElementKind::Node,
-        doctype_seen: false,
+    drive_osc_from(reader, sink, path, DriveState::document(), Part::WHOLE)
+}
+
+/// The point between two pieces of an OSC document at which a framing
+/// reader cut it ([`framer`]): directly inside the root, or directly inside
+/// one action section, with no markup open. Nothing else of the document's
+/// state reaches past such a point: the root's attributes are checked, a
+/// DOCTYPE can no longer appear, and the open names quick-xml checks end
+/// tags against are exactly the root and the section, which a continuation
+/// reader is primed with ([`Continuation::prefix`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Continuation {
+    Root,
+    Section(OscAction),
+}
+
+impl Continuation {
+    /// The start tags a continuation reader reads before the piece, so that
+    /// its open-name stack is the document's at the cut.
+    fn prefix(self) -> &'static [u8] {
+        match self {
+            Self::Root => b"<osmChange>",
+            Self::Section(OscAction::Create) => b"<osmChange><create>",
+            Self::Section(OscAction::Modify) => b"<osmChange><modify>",
+            Self::Section(OscAction::Delete) => b"<osmChange><delete>",
+        }
+    }
+
+    /// The driver's state once the prefix has been read.
+    fn state(self) -> DriveState {
+        let (level, section) = match self {
+            Self::Root => (Level::Root, OscAction::Create),
+            Self::Section(action) => (Level::Section, action),
+        };
+        DriveState {
+            level,
+            section,
+            open: ElementKind::Node,
+            doctype_seen: true,
+        }
+    }
+
+    /// Where `state` stands, if at a point a cut can be.
+    fn of(state: &DriveState) -> Option<Self> {
+        match state.level {
+            Level::Root => Some(Self::Root),
+            Level::Section => Some(Self::Section(state.section)),
+            _ => None,
+        }
+    }
+}
+
+/// Which piece of its document a drive reads.
+#[derive(Clone, Copy)]
+struct Part {
+    /// The piece starts at the document's first byte, so an XML declaration
+    /// may stand at its start. In any later piece a declaration is refused,
+    /// as it is past the start of the document.
+    first: bool,
+    /// `None`: the piece ends where the document does, and the root must
+    /// have closed. `Some(c)`: the piece ends at a cut, where the drive must
+    /// stand at `c` with nothing open.
+    exit: Option<Continuation>,
+}
+
+impl Part {
+    const WHOLE: Self = Self {
+        first: true,
+        exit: None,
     };
+}
+
+/// A piece of a document that does not continue where the next piece was
+/// cut to begin. Only malformed markup can do this: a framer and quick-xml
+/// agree on every boundary of a well-formed document.
+#[cold]
+fn misframed() -> Error {
+    Error::invalid_data(
+        "malformed OSC XML: the document's markup does not close where the reader \
+         divided it, so its structure cannot be read",
+    )
+}
+
+fn drive_osc_from<R: io::BufRead, S: OscSink>(
+    reader: &mut Reader<R>,
+    sink: &mut S,
+    path: &Path,
+    mut state: DriveState,
+    part: Part,
+) -> ParseResult<()> {
     let mut buf = Vec::new();
 
     loop {
@@ -1721,8 +1843,9 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
         let raw_ok = match raw {
             RawCheck::None => true,
             // First means nothing consumed before it: the reader's position
-            // counts skipped whitespace but not a UTF-8 BOM.
-            RawCheck::Decl => buf.len() as u64 == reader.buffer_position(),
+            // counts skipped whitespace but not a UTF-8 BOM. A later piece
+            // of the document is past its start whatever its reader read.
+            RawCheck::Decl => part.first && buf.len() as u64 == reader.buffer_position(),
             RawCheck::DocType => {
                 buf.starts_with(b"<!DOCTYPE") && buf.get(9).is_some_and(|&b| is_xml_space(b))
             }
@@ -1750,6 +1873,12 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
     // the partial document as the whole change stream - apply-changes
     // wrote a partially-applied PBF and reported success. Only the
     // closing tag proves the document is whole.
+    if let Some(exit) = part.exit {
+        if Continuation::of(&state) != Some(exit) {
+            return Err(input_fault(path, misframed()));
+        }
+        return Ok(());
+    }
     if state.level != Level::Done {
         return Err(input_fault(
             path,
@@ -1775,7 +1904,7 @@ pub(crate) fn parse_osc_path<S: OscSink>(
 ) -> ParseResult<()> {
     let total = Rc::new(Cell::new(0_u64));
     let (result, decompress_total) = match open_osc_input(path, &total, cancel)? {
-        OscInput::Inline(inner) => {
+        OscInput::Inline { read: inner, .. } => {
             let mut reader = xml_reader(BufReader::new(inner));
             (drive_osc(&mut reader, sink, path), total.get())
         }
@@ -1790,15 +1919,22 @@ pub(crate) fn parse_osc_path<S: OscSink>(
 }
 
 // ---------------------------------------------------------------------------
-// Lexical batches: the driver's callbacks, recorded for replay elsewhere
+// Batches: pieces of a document read on one thread and parsed on another
 //
-// A reader thread drives the document (tokenizing, framing, every structural
-// check above) and records each callback's raw tag content instead of
-// interpreting it. A worker then replays a batch into a real sink. No XML is
-// parsed out of its document context: the replayed tags are exactly the ones
-// the driver framed, and attribute decoding needs nothing from the document
-// beyond the tag itself (predefined entities and character references only).
+// A batch is one of two things. For a regular file, a span: contiguous
+// document bytes between two cut points a framing reader found ([`framer`]),
+// which a worker parses with the full driver from the continuation at its
+// start, every check above included. For a stream, or a regular file the
+// framer could not cut, a transcript: the reader thread drives the document
+// itself (tokenizing, framing, every structural check above) and records
+// each callback's raw tag content; a worker replays it into a real sink. A
+// transcript's tags are exactly the ones the driver framed, and attribute
+// decoding needs nothing from the document beyond the tag itself
+// (predefined entities and character references only).
 // ---------------------------------------------------------------------------
+
+mod framer;
+pub(crate) use framer::{Framing, frame_osc_path};
 
 #[derive(Clone, Copy)]
 enum LexOp {
@@ -1816,20 +1952,109 @@ struct LexEvent {
     name_len: usize,
 }
 
+/// One batch of a document, whole elements only: a span or a transcript.
+pub(crate) struct LexBatch {
+    body: Body,
+}
+
+enum Body {
+    Transcript(Transcript),
+    Span(Span),
+}
+
+/// Contiguous bytes of a document between two cut points. `entry` is
+/// `None` for the span that starts at the document's first byte; `exit` is
+/// `None` for the span that ends at its end (after a clean end of input).
+struct Span {
+    bytes: Vec<u8>,
+    entry: Option<Continuation>,
+    exit: Option<Continuation>,
+}
+
+impl Default for LexBatch {
+    fn default() -> Self {
+        Self {
+            body: Body::Transcript(Transcript::default()),
+        }
+    }
+}
+
+impl LexBatch {
+    /// The batch's bytes (document bytes of a span, recorded tag bytes of a
+    /// transcript), the unit batches are cut and budgeted by.
+    pub(crate) fn bytes(&self) -> usize {
+        match &self.body {
+            Body::Transcript(t) => t.text.len(),
+            Body::Span(s) => s.bytes.len(),
+        }
+    }
+
+    fn span(bytes: Vec<u8>, entry: Option<Continuation>, exit: Option<Continuation>) -> Self {
+        Self {
+            body: Body::Span(Span { bytes, entry, exit }),
+        }
+    }
+
+    /// Feed the batch to `sink`, locating failures exactly as [`drive_osc`]
+    /// does: interpreting the input is the input's fault, an emitting
+    /// `end_element` is the output's. A delete's children are routed by
+    /// `S`'s [`OscSink::DELETE_CHILDREN`], as the driver routes them.
+    pub(crate) fn replay<S: OscSink>(&self, sink: &mut S, path: &Path) -> ParseResult<()> {
+        match &self.body {
+            Body::Transcript(t) => t.replay(sink, path),
+            Body::Span(s) => s.parse(sink, path),
+        }
+    }
+}
+
+impl Span {
+    /// Parse the span with the full driver, its reader primed with the
+    /// continuation's open elements so that end tags are checked against
+    /// the document's, not the span's, open names.
+    fn parse<S: OscSink>(&self, sink: &mut S, path: &Path) -> ParseResult<()> {
+        let prefix = self.entry.map_or(&b""[..], Continuation::prefix);
+        let mut reader = xml_reader(io::Read::chain(prefix, &self.bytes[..]));
+        let state = continue_at(&mut reader, self.entry)?;
+        let part = Part {
+            first: self.entry.is_none(),
+            exit: self.exit,
+        };
+        drive_osc_from(&mut reader, sink, path, state, part)
+    }
+}
+
+/// The driver state to start a reader at whose input begins with
+/// `entry`'s [`Continuation::prefix`] (none for `None`, the document's
+/// start): the prefix is read and not dispatched.
+fn continue_at<R: io::BufRead>(
+    reader: &mut Reader<R>,
+    entry: Option<Continuation>,
+) -> ParseResult<DriveState> {
+    let Some(entry) = entry else {
+        return Ok(DriveState::document());
+    };
+    let mut buf = Vec::new();
+    let opened = if entry == Continuation::Root { 1 } else { 2 };
+    for _ in 0..opened {
+        if !matches!(reader.read_event_into(&mut buf), Ok(Event::Start(_))) {
+            return Err(Error::internal(
+                "an OSC continuation prefix did not read as start tags",
+            ));
+        }
+        buf.clear();
+    }
+    Ok(entry.state())
+}
+
 /// A run of recorded driver callbacks, whole elements only.
 #[derive(Default)]
-pub(crate) struct LexBatch {
+struct Transcript {
     text: String,
     events: Vec<LexEvent>,
 }
 
-impl LexBatch {
-    /// Recorded tag bytes, the unit batches are cut and budgeted by.
-    pub(crate) fn bytes(&self) -> usize {
-        self.text.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
+impl Transcript {
+    fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
@@ -1847,12 +2072,7 @@ impl LexBatch {
         });
     }
 
-    /// Replay the recorded callbacks into `sink`, locating failures exactly
-    /// as [`drive_osc`] does: interpreting the input is the input's fault,
-    /// an emitting `end_element` is the output's.
-    /// A delete's children are routed by `S`'s [`OscSink::DELETE_CHILDREN`],
-    /// as the driver routes them.
-    pub(crate) fn replay<S: OscSink>(&self, sink: &mut S, path: &Path) -> ParseResult<()> {
+    fn replay<S: OscSink>(&self, sink: &mut S, path: &Path) -> ParseResult<()> {
         let mut section = OscAction::Create;
         for ev in &self.events {
             let e = quick_xml::events::BytesStart::from_content(
@@ -1885,7 +2105,7 @@ impl LexBatch {
 /// refuses, so a reader stops recording promptly when its consumer has
 /// given up, even inside one huge element.
 pub(crate) struct LexSink<F, H> {
-    batch: LexBatch,
+    batch: Transcript,
     target: usize,
     seal: F,
     halted: H,
@@ -1894,11 +2114,18 @@ pub(crate) struct LexSink<F, H> {
 impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> LexSink<F, H> {
     pub(crate) fn new(target: usize, seal: F, halted: H) -> Self {
         Self {
-            batch: LexBatch::default(),
+            batch: Transcript::default(),
             target,
             seal,
             halted,
         }
+    }
+
+    fn seal_batch(&mut self) -> ParseResult<()> {
+        let batch = LexBatch {
+            body: Body::Transcript(std::mem::take(&mut self.batch)),
+        };
+        (self.seal)(batch)
     }
 
     fn record(
@@ -1919,7 +2146,23 @@ impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> LexSink<F, H> {
         if self.batch.is_empty() {
             return Ok(());
         }
-        (self.seal)(std::mem::take(&mut self.batch))
+        self.seal_batch()
+    }
+
+    /// End a drive that returned `result`. On success, [`finish`](Self::finish).
+    /// On failure the callbacks recorded since the last seal are still sealed,
+    /// so a fault a worker finds in them, which a serial parse meets before
+    /// the driver's, is reported ahead of it (the reader's failure stands past
+    /// every batch it sealed). A seal that fails then (the run stopping)
+    /// changes nothing: the driver's failure is returned either way.
+    pub(crate) fn finish_after(self, result: ParseResult<()>) -> ParseResult<()> {
+        match result {
+            Ok(()) => self.finish(),
+            Err(e) => {
+                drop(self.finish());
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1953,8 +2196,8 @@ impl<F: FnMut(LexBatch) -> ParseResult<()>, H: Fn() -> bool> OscSink for LexSink
 
     fn end_element(&mut self) -> ParseResult<()> {
         self.record(LexOp::End, None)?;
-        if self.batch.bytes() >= self.target {
-            (self.seal)(std::mem::take(&mut self.batch))?;
+        if self.batch.text.len() >= self.target {
+            self.seal_batch()?;
         }
         Ok(())
     }

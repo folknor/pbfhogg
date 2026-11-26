@@ -520,3 +520,16 @@ with a per-kind blob skip (shipped in CHANGELOG), and the complete-ways and
 smart unsorted sweeps gained the same kind skip. Reword the bullet so it
 records the audit's scope at retirement without asserting a standing non-goal.
 
+## DOC-077 - verify.md's check table says OSC tags-filter keeps grouped input order
+
+Reported by: the spar accounting of the OSC tags-filter rendering item, from
+a scout lateral (2026-11-26); read from the documents.
+
+The `reference/verify.md` check table row for `tags-filter --input-kind osc`
+lists "grouped input order" among the claims, while the same file's OSC
+tags-filter case text says the output keeps the kept changes in input order,
+each under its input action, and CORRECTNESS.md says the same (only
+`merge-changes --simplify` regroups). Since the streamed tags-filter landed,
+output is not grouped. Reword the row to "input order" after confirming the
+verifier's check claims no grouping.
+

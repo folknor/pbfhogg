@@ -70,6 +70,8 @@ hashbrown = { version = "0.17.1", default-features = false }
 zstd = "0.14.0"
 hotpath = "0.33.0"
 quick-xml = "0.42.0"
+# The OSC framing reader's byte scans; already quick-xml's.
+memchr = "2.8.3"
 # XXH3-128 for `digest`; pure Rust, xxh3 only.
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 serde_json = { workspace = true, optional = true }

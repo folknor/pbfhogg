@@ -715,20 +715,44 @@ Outputs one binary file per table named in `format.rs`. Self-contained module in
 OSC-only: merges multiple OSC XML files into one. No PBF I/O.
 
 Both modes read through the same stage (`merge_changes/stream.rs`): one
-reader thread per input (capped by the worker count) drives the OSC driver
-and cuts the document into lexical batches of whole elements under a byte
-credit ledger; pool workers replay each batch into a byte sink that checks
-every element with the shared parsers and writes the owned writers' XML
-bytes, without building owned elements.
+reader thread per input (capped by the worker count) cuts the document into
+batches of whole elements under a byte credit ledger, and pool workers feed
+each batch into a byte sink that checks every element with the shared
+parsers and writes the owned writers' XML bytes, without building owned
+elements.
+
+For a regular file the reader only frames (`osc/xml_parse/framer.rs`): it
+finds where markup begins and ends, with quick-xml's own quote-aware tag and
+PI scanners, and seals a span of document bytes at the first `<` past the
+batch target that stands directly inside the root or an action section. A
+worker parses the span with the full OSC driver, every check included, from
+a quick-xml reader primed with the open root and section, and refuses unless
+the span ends exactly at the continuation the next span starts from (the
+last must close the root after a clean end of input). A cut quick-xml would
+not have made therefore ends its span inside markup or at the wrong
+continuation, and is refused, never read differently. Markup the framer does
+not follow (a DOCTYPE, the empty comment `<!---->`), or a span past
+`OSC_SPAN_CEILING_BYTES` with no cut point, finishes the input with the
+tokenizing reader instead, primed at the unsealed span's start. A stream
+(a FIFO, `/dev/stdin`) is always tokenized on its reader thread: the reader
+drives the OSC driver itself and records each element's tags as a
+transcript the worker replays, because a framer waiting on a stream's writer
+could not report an error the tokenizer has already found.
+
+A failure is reported per input at its earliest position: the coordinator
+waits for every earlier batch of the failing input before it returns, so a
+batch that starts where an earlier fault left the framing never decides the
+error, and the report is what a serial parse gives. Across inputs the first
+failing input wins.
 
 Every OSC parse (these readers, apply-changes' serial ingest and the
 library's `parse_osc_file`) inflates a gzip input that is a regular file on
-a scoped thread of its own, a few chunks ahead of the tokenizer
+a scoped thread of its own, a few chunks ahead of the tokenizer or framer
 (`OSC_INFLATE_CHUNK_BYTES`, `OSC_INFLATE_AHEAD_CHUNKS`), so inflate overlaps
-tokenizing instead of adding to it. One gzip member is still inflated
-serially, and every upstream OSC is one member. Plain XML and streams (a
-FIFO, `/dev/stdin`) are read inline: a read-ahead blocked on a stream's
-writer could not be interrupted when the tokenizer has already failed.
+reading instead of adding to it. One gzip member is still inflated
+serially, and every upstream OSC is one member. Plain XML and streams (a FIFO,
+`/dev/stdin`) are read inline: a read-ahead blocked on a stream's writer
+could not be interrupted when the tokenizer has already failed.
 
 - **Default**: each batch becomes its own gzip member; one coordinator
   writes members in input and batch order, spilling a later input's output
@@ -762,7 +786,7 @@ the output as they finish. Input order is required, not incidental: an
 apply lets the later of two equal-version changes win, so regrouping by
 action reverses a delete and a same-version re-create. Memory is the
 readers' in-flight ledger; nothing of the output is retained. Its one
-reader frames the document; the workers run on the host's executor, at
+reader frames the document as above; the workers run on the host's executor, at
 most `n` at once under `Fixed(n)`, unbounded under `Auto`. One input never
 spills, so the run has no scratch.
 

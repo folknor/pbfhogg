@@ -656,6 +656,17 @@
 
 ### Changed
 
+- **`merge-changes` and `tags-filter --input-kind osc` parse an OSC that is
+  a regular file on their workers.** Each input's reader thread now only
+  finds where the document can be divided and hands the pieces out; the
+  workers run the full XML parse and every check on them. Planet:
+  `tags-filter` on one daily OSC 1.33 s to 0.69 s, `merge-changes` of seven
+  2.85 s to 2.6 s (now CPU-bound). The output's changes and their order are
+  unchanged; where gzip members and action sections split moves, as it
+  does with batch size. Stream inputs are read as before. A malformed
+  input now reports the fault earliest in its document, as `apply-changes`
+  does, instead of whichever of several faults was found first.
+
 - **Reading a `.osc.gz` inflates it on a thread of its own, ahead of the
   XML parse.** Every OSC reader (`merge-changes`, `tags-filter
   --input-kind osc`, `apply-changes`, the library's `osc` parsers) now

@@ -632,6 +632,7 @@ mod tests {
         )?;
         let batching = stream::Batching {
             batch_bytes: 1 << 10,
+            span_ceiling: crate::tunables::OSC_SPAN_CEILING_BYTES,
             inflight_bytes: 8 << 10,
         };
         let stats = tags_filter_osc_to(input, &output, exprs, parallelism, batching, &host)?;

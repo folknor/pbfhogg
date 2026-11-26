@@ -1076,21 +1076,6 @@ bounded memory would need scratch, which --simplify refuses).
 
 Kind: memory, unmeasured payoff.
 
-## PERF-038 - Unsimplified OSC merge replays a lexical transcript
-
-Reported by: osc.
-
-Mechanism: `LexBatch` tokenizes every child, copies start-tag content into
-batch text, records a descriptor, and workers replay events into another
-representation.
-
-Redesign: immutable decompressed buffers plus whole-element spans and action
-context; a light framing pass finds legal boundaries; workers fully parse and
-validate.
-
-Risks: framing must understand quoted attributes, comments and XML constructs;
-byte-pattern splitting is insufficient.
-
 ## PERF-041 - Diff decodes crossing frames per unit and builds full elements to compare
 
 Reported by: decode, osc, merge.

@@ -44,8 +44,8 @@
 //! the fault plan's nonzero threshold overrides (diff units, text chunks,
 //! apply-changes create batches) are the same kind of instrument for the
 //! library's integration tests. One narrow exception to "no per-scope tuning
-//! struct": merge-changes' `stream::Batching` carries the batch size and
-//! in-flight budget below as the streaming mechanism's own parameter;
+//! struct": merge-changes' `stream::Batching` carries the batch size, span
+//! ceiling and in-flight budget below as the streaming mechanism's own parameter;
 //! production callers pass `Batching::PRODUCTION` and only that mechanism's
 //! tests pass anything else. It is not a precedent for caller-supplied
 //! tuning. Known and accepted: altw external's small fixtures still open all
@@ -111,14 +111,29 @@ pub(crate) const OSC_INFLATE_CHUNK_BYTES: usize = 1024 * 1024;
 /// gzip input's inflated read-ahead at `OSC_INFLATE_AHEAD_CHUNKS + 2` chunks.
 pub(crate) const OSC_INFLATE_AHEAD_CHUNKS: usize = 4;
 
-/// Raw element bytes (tag content before entity decoding, as the OSC reader
-/// copies it) at which a merge-changes reader seals a batch for encoding.
-/// Every sealed batch becomes its own gzip member (or plain fragment) with
-/// its own action sections, so changing it changes the output bytes but
-/// never the changes or their order; nothing about the host or `-j` does
-/// either. Small enough to spread one input over the pool, large enough
-/// that member and section overhead stays negligible.
+/// Batch bytes at which a merge-changes reader seals a batch for encoding:
+/// document bytes for a regular-file input, whose reader frames the
+/// document into spans, and recorded tag content for a stream, whose reader
+/// tokenizes it. Every sealed batch becomes its own gzip member (or plain
+/// fragment) with its own action sections, so changing it changes the
+/// output bytes but never the changes or their order; nothing about the
+/// host or `-j` does either. Small enough to spread one input over the
+/// pool, large enough that member and section overhead stays negligible.
 pub(crate) const MERGE_CHANGES_BATCH_BYTES: usize = 512 * 1024;
+
+/// Document bytes a framing OSC reader may hold in one span it has not yet
+/// sealed. A span is sealed at the first cut point past
+/// `MERGE_CHANGES_BATCH_BYTES`, so only a stretch with no cut point (one
+/// huge object, or valid markup the framer does not cut inside) reaches
+/// this; past it the input is read to its end by the tokenizing reader
+/// instead, which is exact and bounded but serial. Sized far above any
+/// object in real OSC so production input never falls back.
+pub(crate) const OSC_SPAN_CEILING_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes a framing OSC reader appends to its span per read. A cut copies
+/// the scanned-past tail of the last read into the next span, so this
+/// bounds that copy; small next to a batch, large next to a read call.
+pub(crate) const OSC_FRAME_FEED_BYTES: usize = 64 * 1024;
 
 /// Raw element bytes admitted to merge-changes encoding and not yet written
 /// to the output or a spill file, summed over every input. Credit is taken

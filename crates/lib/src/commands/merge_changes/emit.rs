@@ -12,9 +12,9 @@
 //! would report. Rendering and output happen only at the end of an element
 //! the sink keeps, where the driver attributes a failure to the output, not
 //! the input. A filtering sink therefore formats only its survivors: on a
-//! selective tags-filter run that cut process CPU by about a fifth, though
-//! the one framing reader, not the workers, bounds the wall at the default
-//! worker count.
+//! selective tags-filter run that cut process CPU by about a fifth (measured
+//! when the reader still tokenized and bounded the wall; it now only frames,
+//! and the tokenizing is the workers').
 //!
 //! The byte contract is the owned writers': `id`, then `lat` and `lon` for
 //! a node that has them (`node_coords` then `format_coord`; always a visible

@@ -3,10 +3,33 @@
 ## Merge-changes
 
 `pbfhogg merge-changes` squashes N OSC (gzip + XML) inputs into one OSC
-output. Two production code paths on the same lexical readers:
+output. Two production code paths on the same per-input readers:
 **streaming** (`write_streaming`, the default) and **simplify**
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
+
+### Readers frame spans, workers tokenize (bygg, 2026-11-26, `a1d7434a` + change)
+
+Each reader of a regular file now only frames its document into spans of
+bytes, and the workers run the full OSC driver on them; profile and
+mechanism in tags-filter.md (same change) and `reference/pipeline.md`.
+Planet 7-OSC `4914..4920`, `--iterations 1`, interleaved against `--commit
+a1d7434a`:
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `9ca64033` 2.8 s | `fe817840` 2.6 s |
+| 2 | `762049e4` 2.9 s | `cc48ef19` 2.6 s |
+
+About -9 %, both pairs the same sign. `MERGECHANGES_PARALLEL_EMIT` 2647 to
+2356 ms in pair 2 at 23.4 to 29.9 average cores of bygg's 32, so the merge
+is no longer bound by its readers but by CPU: the workers now tokenize
+every input as well as render and deflate it. The rulings below that rest
+on "the run is bound by its readers" (held members instead of spill,
+streamed simplify drain) were measured before this change; the binding
+resource they name has moved, which is the named change their re-measure
+clause asks for, should one be wanted. Peak RSS in the emit phase 243 to
+215 MB.
 
 ### Gzip inflated ahead of the tokenizer (bygg, 2026-11-26, `1b3dfe61` + change)
 

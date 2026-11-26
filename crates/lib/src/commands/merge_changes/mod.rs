@@ -647,9 +647,12 @@ fn encode_batch(
         let mut sink = emit::ByteSink::new(&mut writer, &mut open_action, &mut count);
         batch.replay(&mut sink, path)?;
     }
-    if let Some(prev) = open_action {
-        writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
-    }
+    // A batch with no change (a span holding only comments or empty
+    // sections) is no member at all, not an empty one.
+    let Some(prev) = open_action else {
+        return Ok((Vec::new(), count));
+    };
+    writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
     let bytes = writer.into_inner()?;
     Ok((bytes, count))
 }
@@ -941,16 +944,21 @@ mod tests {
     fn small(inflight_bytes: usize) -> stream::Batching {
         stream::Batching {
             batch_bytes: 1 << 10,
+            span_ceiling: crate::tunables::OSC_SPAN_CEILING_BYTES,
             inflight_bytes,
         }
     }
 
     /// The small configurations: an in-flight budget below one batch (each
-    /// batch admitted alone, credit recycled one at a time) and one of
-    /// several batches (results finish out of order and wait in the
-    /// coordinator).
-    fn small_batchings() -> [stream::Batching; 2] {
-        [small(256), small(8 << 10)]
+    /// batch admitted alone, credit recycled one at a time), one of several
+    /// batches (results finish out of order and wait in the coordinator),
+    /// and a span ceiling below the batch size, so a regular file is cut
+    /// into spans for as far as one read reaches and then finished by the
+    /// tokenizing fallback.
+    fn small_batchings() -> [stream::Batching; 3] {
+        let mut fallback = small(8 << 10);
+        fallback.span_ceiling = 1 << 9;
+        [small(256), small(8 << 10), fallback]
     }
 
     /// [`merge_changes`] at `batching`, published to `dest`.
@@ -1023,7 +1031,8 @@ mod tests {
         }
         let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
         for is_gz in [false, true] {
-            let mut first: Option<Vec<u8>> = None;
+            let mut first: std::collections::BTreeMap<usize, Vec<u8>> =
+                std::collections::BTreeMap::new();
             for (batching, jobs) in small_batchings()
                 .into_iter()
                 .flat_map(|b| [1, 2, 8].map(|jobs| (b, jobs)))
@@ -1058,9 +1067,15 @@ mod tests {
                 let case = format!("{batching:?}, jobs={jobs}, gzip={is_gz}");
                 assert!(xml.ends_with("</osmChange>"), "{case}");
                 assert_eq!(ids_in(&xml), expected_ids, "{case}");
-                // Both small batchings cut at the same batch bytes.
-                match &first {
-                    None => first = Some(bytes),
+                // Batchings that cut alike (same batch bytes and span
+                // ceiling) write the same bytes at every `-j`. A different
+                // ceiling can move where spans give way to transcripts,
+                // which count different bytes, so only the changes and their
+                // order (checked above) are held across ceilings.
+                match first.get(&batching.span_ceiling) {
+                    None => {
+                        first.insert(batching.span_ceiling, bytes);
+                    }
                     Some(f) => assert_eq!(&bytes, f, "{case}"),
                 }
             }

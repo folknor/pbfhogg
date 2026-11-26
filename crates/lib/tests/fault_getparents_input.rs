@@ -22,7 +22,6 @@
 //! anything and zero after a walker run or a run refused before the scan.
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
@@ -50,6 +49,7 @@ struct Route {
     /// The input carries no indexdata.
     unindexed: bool,
     direct: bool,
+    public_default: bool,
 }
 
 impl Route {
@@ -57,6 +57,7 @@ impl Route {
         arm: Arm::Walker,
         unindexed: false,
         direct: false,
+        public_default: false,
     };
 
     const FULL_SCAN: Self = Self {
@@ -185,6 +186,17 @@ fn run<'a>(
         direct_reads: route.direct,
         ..WriteOptions::default()
     };
+    if route.public_default {
+        return pbfhogg::getparents::getparents(
+            input,
+            crate::common::out(output),
+            &query(),
+            &GetparentsOptions { add_self: true },
+            &write,
+            &pbfhogg::HeaderOverrides::default(),
+            host,
+        );
+    }
     getparents_with_min_blobs(
         input,
         crate::common::out(output),
@@ -328,72 +340,16 @@ fn full_scan_reads_only_the_pinned_input() {
     check_route(Route::FULL_SCAN, 3);
 }
 
-/// A caller's pin is the run's pin: replaced between the caller's pin and
-/// the call, the input is the file the caller pinned (stable reopen name) or the first
-/// open is refused (path reopen). An entry point that pinned the path
-/// afresh would read the replacement instead. Both public entries.
+/// The fixture stays below the public entry's default full-scan threshold.
 #[test]
-fn a_caller_pin_is_used_as_it_is() {
-    // `getparents` takes the default threshold: the walker on a fixture.
-    for (route, public_default) in [
-        (Route::WALKER, false),
-        (Route::FULL_SCAN, false),
-        (Route::WALKER, true),
-    ] {
-        let dir = crate::common::test_scratch();
-        let input = dir.path().join("in.osm.pbf");
-        let replacement = dir.path().join("replacement.osm.pbf");
-        write_input(&input, route);
-        let unreplaced = dir.path().join("unreplaced.osm.pbf");
-        run(route, &input, &unreplaced, &crate::common::test_host())
-            .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {e}"));
-        assert_eq!(elements(&unreplaced), EXPECTED, "{route:?}");
-        let expected = pinned_cell::take(&unreplaced);
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&input, route);
-            write_replacement(&replacement);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                std::fs::rename(&replacement, &input).expect("replace the input");
-                let output = dir.path().join("out.osm.pbf");
-                let result = if public_default {
-                    pbfhogg::getparents::getparents(
-                        pin,
-                        crate::common::out(&output),
-                        &query(),
-                        &GetparentsOptions { add_self: true },
-                        &WriteOptions::default(),
-                        &pbfhogg::HeaderOverrides::default(),
-                        &host,
-                    )
-                } else {
-                    run(route, pin, &output, &host)
-                };
-                let cell = format!("{route:?}, getparents {public_default}, scenario {scenario:?}");
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                        assert_eq!(
-                            std::fs::read(&output).expect("read output"),
-                            expected,
-                            "{cell}: the output must come from the pinned file"
-                        );
-                        std::fs::remove_file(&output).expect("remove output");
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                        assert!(!output.exists(), "{cell}: published an output");
-                    }
-                }
-            });
-        }
-    }
+fn public_entry_reads_only_the_pinned_input() {
+    check_route(
+        Route {
+            public_default: true,
+            ..Route::WALKER
+        },
+        3,
+    );
 }
 
 /// Every route pins, so a FIFO is refused up front rather than opened (a

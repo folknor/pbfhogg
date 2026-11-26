@@ -19,12 +19,11 @@
 //! cover the library side of it for all three checks.
 
 use crate::pinned_cell::{self, Cell, Judged};
-use crate::reopen_cell;
 
 use std::path::Path;
 
 use pbfhogg::check::verify_ids::{VerifyIdsOptions, verify_ids};
-use pbfhogg::read::input::InputSource;
+use pbfhogg::read::input::{InputSource, PinnedInput};
 
 use crate::common::{
     TestWay, generate_nodes, write_multi_block_non_indexed_pbf, write_multi_block_test_pbf,
@@ -198,65 +197,66 @@ fn a_type_filter_reads_only_the_pinned_input() {
     }
 }
 
-/// Each check run through a caller's pin, the input replaced between the
-/// pin and the call: the check reads the file the caller pinned (stable reopen name) or
-/// refuses its first open (path reopen). A check that pinned or opened the
-/// path afresh would read the replacement instead. This is what lets the
-/// CLI compose the three checks on one pin.
-#[test]
-fn every_check_uses_a_caller_pin_as_it_is() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let replacement = dir.path().join("replacement.osm.pbf");
-    let opts = pbfhogg::check::index::CheckIndexOptions {
-        max_errors: 0,
-        direct_io: false,
-    };
-    let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
-        direct_io: false,
-        check_relations: false,
-        show_ids: None,
-    };
-    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-        for check in ["ids", "index", "refs"] {
-            write_input(&input, false);
-            write_replacement(&replacement);
-            let host = crate::common::test_host();
-            scenario.run(&input, &host, |pin, scenario| {
-                std::fs::rename(&replacement, &input).expect("replace the input");
-                // `(node count, data blob count)` where the check reports it.
-                let result: pbfhogg::Result<(u64, Option<u64>)> = match check {
-                    "ids" => run(Route::PLAIN, pin, &host)
-                        .map(|r| (r["counts"]["nodes"].as_u64().expect("node count"), None)),
-                    "index" => pbfhogg::check::index::check_index(pin, &opts, &host)
-                        .map(|r| (0, Some(r.blobs))),
-                    _ => pbfhogg::check::refs::check_refs(pin, &refs_opts, &host)
-                        .map(|r| (r.complete().expect("complete").node_count, None)),
-                };
-                let cell = format!("{check}, scenario {scenario:?}");
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        let (nodes, blobs) = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                        match check {
-                            // Four node blobs and one way blob in the pinned file,
-                            // six and one in the replacement.
-                            "index" => assert_eq!(blobs, Some(5), "{cell}"),
-                            _ => assert_eq!(nodes, 100, "{cell}: must read the pinned file"),
-                        }
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                    }
+/// Exercise the caller-supplied pin on the check entries that the CLI
+/// composes with ID verification. Index opens a direct stream. Refs only
+/// uses positional reads and must record zero direct opens, as specified
+/// by the check row of `crates/cli/src/io_reach.rs`.
+fn check_single_open(
+    name: &str,
+    spec: &str,
+    expected: u64,
+    run: impl Fn(&PinnedInput, bool, &pbfhogg::host::Host) -> pbfhogg::Result<u64>,
+) {
+    for &direct in pinned_cell::modes() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        write_input(&input, false);
+        let cell = Cell::new(name, direct, &input, &replacement, 1, spec).scratch(dir.path());
+        pinned_cell::check(
+            &cell,
+            |host| run(&PinnedInput::pin(&input, host)?, direct, host),
+            |count| assert_eq!(count, expected, "{name}: unreplaced count"),
+            |_, _| {
+                write_input(&input, false);
+                write_replacement(&replacement);
+            },
+            |(), step| run(step.pin, direct, step.host),
+            |(), (), step, judged| {
+                if let Judged::Unaffected(count) = judged {
+                    assert_eq!(count, expected, "{}: count from the pinned file", step.what);
                 }
-            });
-        }
+            },
+        );
     }
+}
+
+#[test]
+fn index_reads_only_the_pinned_input() {
+    use pbfhogg::check::index::{CheckIndexOptions, check_index};
+
+    // Four node blobs and one way blob. The replacement has six and one.
+    check_single_open("check index", "D", 5, |pin, direct_io, host| {
+        let opts = CheckIndexOptions {
+            max_errors: 0,
+            direct_io,
+        };
+        check_index(pin, &opts, host).map(|report| report.blobs)
+    });
+}
+
+#[test]
+fn refs_reads_only_the_pinned_input() {
+    use pbfhogg::check::refs::{CheckRefsOptions, check_refs};
+
+    check_single_open("check refs", "B", 100, |pin, direct_io, host| {
+        let opts = CheckRefsOptions {
+            direct_io,
+            check_relations: false,
+            show_ids: None,
+        };
+        check_refs(pin, &opts, host).map(|report| report.complete().expect("complete").node_count)
+    });
 }
 
 /// The input is pinned, so a FIFO is refused up front rather than opened (a

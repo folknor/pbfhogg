@@ -2360,6 +2360,31 @@ mod tests {
             }
             result
         };
+        // The getid reach row makes the probe and streaming fallback
+        // direct, with the intervening estimate walk buffered.
+        let witness = |report: &crate::test_hooks::InputReplacement,
+                       host: &crate::host::Host,
+                       direct: bool,
+                       cell: &str| {
+            use crate::test_hooks::Transport::{Buffered, Direct};
+            let expected = if direct {
+                [Direct, Buffered, Direct]
+            } else {
+                [Buffered; 3]
+            };
+            assert_eq!(report.transports, expected, "{cell}: transports");
+            let mut direct_opens = None;
+            host.invocation.for_each_counter(|name, value| {
+                if name == "direct_io_read_opens" {
+                    direct_opens = Some(value);
+                }
+            });
+            assert_eq!(
+                direct_opens,
+                Some(if direct { 2 } else { 0 }),
+                "{cell}: O_DIRECT read opens"
+            );
+        };
         let mut directs = vec![false];
         if cfg!(feature = "linux-direct-io") {
             directs.push(true);
@@ -2373,7 +2398,7 @@ mod tests {
                 .faults()
                 .arm_input_replacement(&input, &replacement, OPENS + 1);
             match run(&reference, &host, direct) {
-                Ok((arm, _)) => assert_eq!(arm, Some(ScanArm::FullScan)),
+                Ok((arm, _)) => assert_eq!(arm, Some(ScanArm::FullScan), "direct {direct}"),
                 #[cfg(feature = "linux-direct-io")]
                 Err(e) if direct && crate::test_support::is_direct_io_refusal(&e) => {
                     crate::test_support::skip(format!(
@@ -2389,19 +2414,7 @@ mod tests {
                 (OPENS, OPENS, false),
                 "direct {direct}: {counted:?}"
             );
-            // Which open took which transport, as the command's reach
-            // documents it: the probe and the streaming full scan direct,
-            // the estimate walk buffered. A count of direct opens would
-            // pass with either direct path fallen back.
-            {
-                use crate::test_hooks::Transport::{Buffered, Direct};
-                let expected = if direct {
-                    vec![Direct, Buffered, Direct]
-                } else {
-                    vec![Buffered; 3]
-                };
-                assert_eq!(counted.transports, expected, "direct {direct}: transports");
-            }
+            witness(&counted, &host, direct, "unreplaced run");
             let expected = std::fs::read(&reference).unwrap();
             assert_eq!(read_ids(&reference, &host), vec![1, 10]);
 
@@ -2426,11 +2439,22 @@ mod tests {
                     let output = dir.path().join("out.pbf");
                     let result = run(&output, &host, direct);
                     let cell = format!("direct {direct}, after open {after}, procfs {procfs}");
+                    #[cfg(feature = "linux-direct-io")]
+                    if let Err(e) = &result
+                        && direct
+                        && crate::test_support::is_direct_io_refusal(e)
+                    {
+                        crate::test_support::skip(format!("{cell}: O_DIRECT not supported: {e}"));
+                        continue;
+                    }
                     let report = host.invocation.faults().input_replacement().unwrap();
                     assert!(report.fired, "{cell}: {report:?}");
                     if procfs || after == OPENS {
-                        result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+                        let (arm, _) = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+                        assert_eq!(arm, Some(ScanArm::FullScan), "{cell}");
                         assert_eq!(report.attempts, OPENS, "{cell}: {report:?}");
+                        assert_eq!(report.verified, OPENS, "{cell}: {report:?}");
+                        witness(&report, &host, direct, &cell);
                         assert_eq!(report.refused, 0, "{cell}: {report:?}");
                         assert_eq!(std::fs::read(&output).unwrap(), expected, "{cell}");
                         std::fs::remove_file(&output).unwrap();

@@ -54,6 +54,10 @@ Tests go where they couple least.
   cells owe instead is that a skip inside a loop of backends or targets
   ends that iteration only, never the later ones, and that every
   successful iteration asserts the witness of the backend it ran.
+  The getid full-scan unit cell exercises private dispatch with an injected
+  threshold. It checks the selected arm, ordered input transports and
+  invocation read-open count on the reference and each successful matrix
+  iteration. A typed direct setup refusal ends only the affected iteration.
   Tests that assert a refusal itself inspect the
   error directly and are not affected. What the gate guarantees is
   that a required backend's refusal cannot pass as a skip, so it goes

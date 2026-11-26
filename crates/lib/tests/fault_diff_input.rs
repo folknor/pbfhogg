@@ -367,7 +367,14 @@ fn the_streaming_diff_reads_only_the_pinned_inputs() {
 /// pin as both sides.
 #[test]
 fn a_repeated_input_is_one_pin() {
-    for route in [Route::SEQUENTIAL, Route::PARALLEL] {
+    for route in [
+        Route::SEQUENTIAL,
+        Route::PARALLEL,
+        Route {
+            count: true,
+            ..Route::PARALLEL
+        },
+    ] {
         for &direct in pinned_cell::modes() {
             let route = Route { direct, ..route };
             let inputs = inputs(route);
@@ -405,7 +412,18 @@ fn a_repeated_input_is_one_pin() {
                     write_input(&replacement, route, Side::Old, true);
                 },
                 |(), step| {
-                    let source = if step.scenario == reopen_cell::Scenario::Path && step.after > 0 {
+                    // The caller-pin arm replaced the path before the call.
+                    // Both arguments have the same path, but the path argument
+                    // must open the replacement, through its own pin.
+                    if step.after == 0 {
+                        return run(
+                            route,
+                            InputSource::Pinned(step.pin),
+                            InputSource::Path(input),
+                            step.host,
+                        );
+                    }
+                    let source = if step.scenario == reopen_cell::Scenario::Path {
                         step.host
                             .invocation
                             .faults()
@@ -419,82 +437,22 @@ fn a_repeated_input_is_one_pin() {
                 },
                 |expected, (), step, judged| {
                     if let Judged::Unaffected(out) = judged {
-                        assert_eq!(
-                            &out, expected,
-                            "{}: both sides must read the pinned file",
-                            step.what
-                        );
+                        if step.after == 0 {
+                            assert!(
+                                !out.contains("created: 0, modified: 0, deleted: 0"),
+                                "{}: the path must read the replacement: {out}",
+                                step.what,
+                            );
+                        } else {
+                            assert_eq!(
+                                &out, expected,
+                                "{}: both sides must read the pinned file",
+                                step.what
+                            );
+                        }
                     }
                 },
             );
-        }
-    }
-}
-
-/// A caller's pin is the run's pin, and it is never merged with a path:
-/// with the input replaced between the caller's pin and the call, the
-/// pinned side reads the file the caller pinned (stable reopen name) or is refused at
-/// its first open (path reopen), and a path argument naming the same input
-/// is pinned afresh, so `diff(pin of a, a)` compares the old file with its
-/// replacement.
-#[test]
-fn a_caller_pin_is_used_as_it_is() {
-    for route in [
-        Route::SEQUENTIAL,
-        Route::PARALLEL,
-        Route {
-            count: true,
-            ..Route::PARALLEL
-        },
-    ] {
-        let inputs = inputs(route);
-        let expected = run_paths(route, &inputs, None, &crate::common::test_host())
-            .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {}", e.report()));
-        let replacement = inputs.dir.path().join("replacement.osm.pbf");
-        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
-            write_input(&inputs.old, route, Side::Old, false);
-            write_input(&replacement, route, Side::Old, true);
-            let host = crate::common::test_host();
-            scenario.run(&inputs.old, &host, |pin, scenario| {
-                std::fs::rename(&replacement, &inputs.old).expect("replace the input");
-                let cell = format!("{route:?}, scenario {scenario:?}");
-
-                let result = run(
-                    route,
-                    InputSource::Pinned(pin),
-                    InputSource::Path(&inputs.new),
-                    &host,
-                );
-                match scenario {
-                    reopen_cell::Scenario::Pinned => {
-                        let out = result.unwrap_or_else(|e| panic!("{cell}: {}", e.report()));
-                        assert_eq!(out, expected, "{cell}: the old side is the pinned file");
-
-                        // The path now names the replacement; pinned afresh, it is
-                        // a different file from the caller's pin of the same path.
-                        let against = run(
-                            route,
-                            InputSource::Pinned(pin),
-                            InputSource::Path(&inputs.old),
-                            &host,
-                        )
-                        .unwrap_or_else(|e| panic!("{cell}: pin against path: {}", e.report()));
-                        assert!(
-                            !against.contains("created: 0, modified: 0, deleted: 0"),
-                            "{cell}: a path must not share a caller's pin: {against}"
-                        );
-                    }
-                    reopen_cell::Scenario::Path => {
-                        let err = result
-                            .err()
-                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                        assert!(
-                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                            "{cell}: {err:?}"
-                        );
-                    }
-                }
-            });
         }
     }
 }

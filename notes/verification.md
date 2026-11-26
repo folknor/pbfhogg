@@ -20,22 +20,6 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-018 - Four hand-rolled caller-pin cells run buffered only
-
-`pinned_cell::check` runs a caller-pin arm on every driver cell in both read modes,
-so the remaining hand-rolled caller-pin cells are the ones it cannot express, and
-they run buffered with no transport list: `diff` and `derive` with a caller pin
-against the same path (`a_caller_pin_is_used_as_it_is` in `fault_diff_input.rs` and
-`fault_derive_input.rs`, whose second call owes four verified opens over two inodes),
-`every_check_uses_a_caller_pin_as_it_is` (the `check` index and refs entries, which
-no driver cell runs; refs owes one buffered open even on a direct run) and the
-public `getparents` entry (`fault_getparents_input.rs`, where the driver runs
-`getparents_with_min_blobs`). Closing it means either driver cells for the check
-index and refs routes and the public getparents entry, or a direct leg with an exact
-list in each hand-rolled cell. The getid full-scan unit cell in
-`crates/lib/src/commands/getid/mod.rs` is a reference-and-matrix cell outside the
-driver with its list asserted by hand; it has no caller-pin arm.
-
 ## VER-162 - The reader's exact half-turn tie rule is not certified
 
 `pbfhogg-verify geocode` models a street or interpolation segment spanning exactly half a turn

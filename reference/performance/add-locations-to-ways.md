@@ -1,5 +1,33 @@
 # Add Locations To Ways
 
+### External stage 2 coordinate table (bygg, baseline `b25180b3`)
+
+The external join lands a coordinate table populated by the node callback.
+Requests stream through 8-byte coordinate slots, using dense slots for ordinary
+ranges and a compact rank index for sparse ranges. The 512 MiB per-worker
+`ALTW_STAGE2_TABLE_BYTES` budget sizes partitions by table footprint.
+Stage 3 still receives the same 12-byte records. `--inject-prepass` keeps
+the sort path for pin counting.
+
+On bygg, A is HEAD `b25180b3` and B is the working tree on
+`b25180b3`. The planet cells ran interleaved with `--iterations 1`, with
+one `fstrim` at the head of the planet suite. The workload was `embed-locations --dataset planet --index-type external`.
+
+| Cell | Run | Wall | `EXTJOIN_STAGE2` span |
+|---|---|---|---|
+| A | `8f9787ce` | 5m07s | |
+| B | `2c04b936` | 4m42s | |
+| A | `e1e3614f` | 5m33s | 155.2 s |
+| B | `a23591d0` | 5m16s | 134.4 s |
+
+Lands at about 13 % less stage 2 time in the second pair and 5-8 % less
+wall time across the pairs. Stage 1 and streaming times stayed level in
+the second pair.
+
+On bygg with all three trial changes in the working tree on `b25180b3`,
+Denmark `verify all` passed 25 of 25 checks. Germany verification passed
+`add-locations-to-ways --mode external` and `renumber`.
+
 ### Sparse all-node store skips reference collection when it fits (bygg)
 
 Germany `embed-locations --index-type sparse` on bygg, interleaved

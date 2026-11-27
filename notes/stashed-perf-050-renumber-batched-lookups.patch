@@ -1,0 +1,1453 @@
+diff --git a/crates/lib/src/commands/renumber/mod.rs b/crates/lib/src/commands/renumber/mod.rs
+index 875c0383..6365d257 100644
+--- a/crates/lib/src/commands/renumber/mod.rs
++++ b/crates/lib/src/commands/renumber/mod.rs
+@@ -55,6 +55,7 @@ use crate::counters::Stopwatch;
+ 
+ use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
+ use crate::error::Error;
++use crate::idset::{IdSet, RankedIdSet};
+ use crate::read::input::{InputSource, PinnedInput};
+ use crate::write::WriteOptions;
+ 
+@@ -130,7 +131,15 @@ use schedule::{BlobTask, build_all_blob_schedules};
+ use stage2::stage2d_parallel_way_assembly;
+ use wire_rewrite::IdSpace;
+ 
+-use crate::tunables::RENUMBER_PREALLOC_IDS_PER_BYTE;
++use crate::tunables::{RENUMBER_INTERLEAVED_RANKS, RENUMBER_PREALLOC_IDS_PER_BYTE};
++
++fn rank_id_set(set: IdSet) -> RankedIdSet {
++    if RENUMBER_INTERLEAVED_RANKS {
++        set.into_ranked_interleaved()
++    } else {
++        set.into_ranked()
++    }
++}
+ 
+ // ---------------------------------------------------------------------------
+ // Shared instrumentation counters
+@@ -574,14 +583,13 @@ pub(crate) fn renumber_external_to<'a>(
+ 
+     // ---- Build rank index ----
+     // Stage boundaries are checkpoints: the rank builds between the parallel
+-    // stages have none of their own. The build is serial on purpose: on
+-    // planet it takes tens of milliseconds for nodes and single digits for
+-    // ways (the `renumber_ext_*_rank_ms` counters), so parallel rank
+-    // construction or worker-owned map pages would buy nothing here; see
+-    // reference/performance/renumber.md "Word-batched ID set insertion".
++    // stages have none of their own. Separate-prefix ranking stays serial:
++    // on planet it takes tens of milliseconds for nodes and single digits
++    // for ways (the `renumber_ext_*_rank_ms` counters). The interleaved
++    // option also rebuilds the bitmap chunks in this timed phase.
+     host.invocation.check()?;
+     let t_rank = Stopwatch::start();
+-    let node_id_set = node_id_set.into_ranked();
++    let node_id_set = rank_id_set(node_id_set);
+     host.invocation
+         .counter("renumber_ext_node_rank_ms", t_rank.elapsed_ms());
+     host.invocation
+@@ -630,7 +638,7 @@ pub(crate) fn renumber_external_to<'a>(
+     // ---- R1: collect relation IDs into IdSet ----
+     host.invocation.marker("RENUMBER_EXT_R1_START");
+     let t_way_rank = Stopwatch::start();
+-    let way_id_set = way_id_set.into_ranked();
++    let way_id_set = rank_id_set(way_id_set);
+     host.invocation
+         .counter("renumber_ext_way_rank_ms", t_way_rank.elapsed_ms());
+     host.invocation
+@@ -646,7 +654,7 @@ pub(crate) fn renumber_external_to<'a>(
+         &host.invocation,
+     )?;
+     let t_rel_rank = Stopwatch::start();
+-    let relation_id_set = relation_id_set.into_ranked();
++    let relation_id_set = rank_id_set(relation_id_set);
+     host.invocation
+         .counter("renumber_ext_rel_rank_ms", t_rel_rank.elapsed_ms());
+     let relation_count = relation_id_set.total_count();
+diff --git a/crates/lib/src/commands/renumber/stage2.rs b/crates/lib/src/commands/renumber/stage2.rs
+index f3fd70f2..225fc8c8 100644
+--- a/crates/lib/src/commands/renumber/stage2.rs
++++ b/crates/lib/src/commands/renumber/stage2.rs
+@@ -7,23 +7,46 @@
+ //! pre-allocation is collected per worker and returned for the caller to
+ //! insert after the stage. The set's dense storage therefore does not grow
+ //! with the worker count: per-worker shards each materialised a bit array
+-//! for every chunk the work-stealing order sent them into, which at planet
+-//! width cost a 4 MiB chunk per worker per way chunk. The price is the one
+-//! pass 1 already pays: a reserved chunk any way touches becomes a 4 MiB bit
+-//! array, where a shard could keep a sparsely covered chunk as an array.
++//! for every chunk the work-stealing order sent them into. A reserved chunk
++//! now materialises bitmap pages on first write, as in pass 1.
++
++use std::sync::atomic::Ordering::Relaxed;
+ 
+ use super::super::Result;
+ use super::pool::{Rewritten, run_rewrite_stage};
+ use super::schedule::BlobTask;
+-use super::wire_rewrite::{IdSpace, Scratch, reframe_ways_with_new_ids};
++use super::wire_rewrite::{IdSpace, Outcome, Scratch, reframe_ways_with_new_ids};
+ use super::{BlobBuffers, Phase, StageCounters, blob_index, positional_bases};
+ use crate::idset::IdSet;
++use crate::tunables::RENUMBER_LOOKUP_SAMPLE_STRIDE;
+ 
++#[derive(Default)]
+ struct Stage2dWorker {
+     buffers: BlobBuffers,
+     scratch: Scratch,
+     reframe_buf: Vec<u8>,
+     overflow: Vec<i64>,
++    sampled_reframe_ns: u64,
++    sampled_blobs: u64,
++}
++
++impl Stage2dWorker {
++    fn reframe<const TIMED: bool>(
++        &mut self,
++        base: i64,
++        nodes: &IdSpace<'_>,
++        way_id_set: &IdSet,
++    ) -> Result<Outcome> {
++        reframe_ways_with_new_ids::<TIMED>(
++            &self.buffers.decompressed,
++            base,
++            nodes,
++            way_id_set,
++            &mut self.overflow,
++            &mut self.reframe_buf,
++            &mut self.scratch,
++        )
++    }
+ }
+ 
+ impl super::RewriteWorker for Stage2dWorker {
+@@ -55,14 +78,7 @@ pub(super) fn stage2d_parallel_way_assembly(
+ ) -> Result<Stage2dResult> {
+     let bases = positional_bases(start_way_id, way_schedule, "way")?;
+     let counters = StageCounters::new();
+-    let mut workers: Vec<Stage2dWorker> = (0..width)
+-        .map(|_| Stage2dWorker {
+-            buffers: BlobBuffers::default(),
+-            scratch: Scratch::default(),
+-            reframe_buf: Vec::new(),
+-            overflow: Vec::new(),
+-        })
+-        .collect();
++    let mut workers: Vec<Stage2dWorker> = (0..width).map(|_| Stage2dWorker::default()).collect();
+ 
+     let totals = run_rewrite_stage(
+         "way",
+@@ -80,17 +96,19 @@ pub(super) fn stage2d_parallel_way_assembly(
+                 // header key lists would change output and add per-blob rewrite work.
+                 w.buffers.load(shared_file, task, &counters)?;
+ 
++                let sample = idx.is_multiple_of(RENUMBER_LOOKUP_SAMPLE_STRIDE);
+                 let t = crate::counters::Stopwatch::start();
+-                let outcome = reframe_ways_with_new_ids(
+-                    &w.buffers.decompressed,
+-                    base,
+-                    nodes,
+-                    way_id_set,
+-                    &mut w.overflow,
+-                    &mut w.reframe_buf,
+-                    &mut w.scratch,
+-                )?;
+-                t.record_ns(&counters.reframe_ns);
++                let outcome = if sample {
++                    w.reframe::<true>(base, nodes, way_id_set)
++                } else {
++                    w.reframe::<false>(base, nodes, way_id_set)
++                }?;
++                let elapsed = t.elapsed_ns();
++                counters.reframe_ns.fetch_add(elapsed, Relaxed);
++                if sample {
++                    w.sampled_blobs = w.sampled_blobs.saturating_add(1);
++                    w.sampled_reframe_ns = w.sampled_reframe_ns.saturating_add(elapsed);
++                }
+ 
+                 if outcome.count != task.element_count {
+                     return Err(crate::Error::invalid_data(format!(
+@@ -121,6 +139,19 @@ pub(super) fn stage2d_parallel_way_assembly(
+         },
+     )?;
+ 
++    let mut lookup_ns = 0_u64;
++    let mut reframe_ns = 0_u64;
++    let mut blobs = 0_u64;
++    for worker in &workers {
++        lookup_ns = lookup_ns.saturating_add(worker.scratch.way_lookup_ns());
++        reframe_ns = reframe_ns.saturating_add(worker.sampled_reframe_ns);
++        blobs = blobs.saturating_add(worker.sampled_blobs);
++    }
++    let recorder = writer.cancel_token().permit();
++    recorder.counter("stage2d_sampled_lookup_ns", lookup_ns);
++    recorder.counter("stage2d_sampled_reframe_ns", reframe_ns);
++    recorder.counter("stage2d_sampled_blobs", blobs);
++
+     Ok(Stage2dResult {
+         ways_written: totals.written,
+         orphan_refs: totals.orphans,
+diff --git a/crates/lib/src/commands/renumber/wire_rewrite.rs b/crates/lib/src/commands/renumber/wire_rewrite.rs
+index 92814f9e..af74f9a4 100644
+--- a/crates/lib/src/commands/renumber/wire_rewrite.rs
++++ b/crates/lib/src/commands/renumber/wire_rewrite.rs
+@@ -39,8 +39,12 @@
+ 
+ use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+ 
++use crate::counters::Stopwatch;
+ use crate::error::Error;
+ use crate::idset::{AtomicWordBatch, IdSet, RankedIdSet};
++use crate::tunables::RENUMBER_REF_BATCH;
++
++const _: () = assert!(RENUMBER_REF_BATCH != 0);
+ 
+ /// Error text for a packed field this rewriter cannot splice.
+ ///
+@@ -243,7 +247,7 @@ impl<'a> IdSpace<'a> {
+ 
+     /// `(new_id, is_orphan)` for a reference, with a single chunk lookup
+     /// for a member.
+-    #[inline]
++    #[cfg(test)]
+     fn resolve(&self, old_id: i64) -> crate::Result<(i64, bool)> {
+         if let Some(new_id) = self.live(old_id)? {
+             return Ok((new_id, false));
+@@ -251,6 +255,14 @@ impl<'a> IdSpace<'a> {
+         self.orphan(old_id).map(|id| (id, true))
+     }
+ 
++    #[inline]
++    fn resolve_rank(&self, old_id: i64, rank: Option<u64>) -> crate::Result<(i64, bool)> {
++        match rank {
++            Some(rank) => offset_id(self.start, rank).map(|id| (id, false)),
++            None => self.orphan(old_id).map(|id| (id, true)),
++        }
++    }
++
+     /// The new ID of an absent `old_id` (see the type docs). Out of line:
+     /// orphans are rare, and inlined this would swell every ref lookup.
+     #[cold]
+@@ -319,10 +331,33 @@ pub(super) struct Scratch {
+     scalars: Vec<u8>,
+     other_fields: Vec<u8>,
+     packed: Vec<u8>,
++    way_refs: WayRefs,
+     element: Vec<u8>,
+     group: Vec<u8>,
+ }
+ 
++impl Scratch {
++    pub(super) fn way_lookup_ns(&self) -> u64 {
++        self.way_refs.lookup_ns
++    }
++}
++
++struct WayRefs {
++    old: [i64; RENUMBER_REF_BATCH],
++    ranks: [Option<u64>; RENUMBER_REF_BATCH],
++    lookup_ns: u64,
++}
++
++impl Default for WayRefs {
++    fn default() -> Self {
++        Self {
++            old: [0; RENUMBER_REF_BATCH],
++            ranks: [None; RENUMBER_REF_BATCH],
++            lookup_ns: 0,
++        }
++    }
++}
++
+ // Deliberately copy key string indices without bounds checks or key lists.
+ // Corrupt indices pass through as on the read side; per-key validation adds work
+ // to this measured rewrite loop and changes which inputs it accepts.
+@@ -727,12 +762,12 @@ pub(super) fn reframe_dense_with_new_ids(
+ /// and node refs while copying everything else verbatim.
+ ///
+ /// For each way: decode old way id, assign new sequential way id,
+-/// resolve each ref's new node id through `nodes`, delta-encode the new
+-/// refs, and copy keys/vals/info raw bytes verbatim. Each old way ID goes
++/// resolve and delta-encode refs in batches, and copy keys/vals/info raw
++/// bytes verbatim. Each old way ID goes
+ /// into `way_id_set` through an [`AtomicWordBatch`] (one atomic OR per
+ /// 64-ID word, published by the time this returns); one the set has no
+ /// pre-allocated chunk for is appended to `overflow` instead.
+-pub(super) fn reframe_ways_with_new_ids(
++pub(super) fn reframe_ways_with_new_ids<const TIMED: bool>(
+     decompressed: &[u8],
+     base_new_way_id: i64,
+     nodes: &IdSpace<'_>,
+@@ -757,13 +792,14 @@ pub(super) fn reframe_ways_with_new_ids(
+                 (3, WIRE_LEN) => {
+                     let way_bytes = gr_cursor.read_len_delimited().map_err(wire_err)?;
+                     let new_way_id = offset_id(base_new_way_id, total)?;
+-                    let way_orphans = reframe_way(
++                    let way_orphans = reframe_way::<TIMED>(
+                         way_bytes,
+                         new_way_id,
+                         nodes,
+                         &mut way_ids,
+                         overflow,
+                         &mut span,
++                        &mut s.way_refs,
+                         &mut s.packed,
+                         &mut s.element,
+                     )?;
+@@ -797,13 +833,14 @@ pub(super) fn reframe_ways_with_new_ids(
+ /// Rewrite one Way into `out` with its id and refs replaced. Returns the
+ /// number of orphan refs.
+ #[allow(clippy::too_many_arguments)]
+-fn reframe_way(
++fn reframe_way<const TIMED: bool>(
+     way_bytes: &[u8],
+     new_way_id: i64,
+     nodes: &IdSpace<'_>,
+     way_ids: &mut AtomicWordBatch<'_>,
+     overflow: &mut Vec<i64>,
+     span: &mut Span,
++    batch: &mut WayRefs,
+     refs_out: &mut Vec<u8>,
+     out: &mut Vec<u8>,
+ ) -> crate::Result<u64> {
+@@ -854,26 +891,7 @@ fn reframe_way(
+         overflow.push(old_way_id);
+     }
+ 
+-    // Decode old ref deltas, resolve via rank, delta-encode new refs.
+-    refs_out.clear();
+-    let mut orphans: u64 = 0;
+-    let mut prev_old_ref: i64 = 0;
+-    let mut prev_new_ref: i64 = 0;
+-    let mut refs_cursor = Cursor::new(old_refs_data);
+-    while !refs_cursor.is_empty() {
+-        let delta = refs_cursor.read_sint64().map_err(wire_err)?;
+-        prev_old_ref = prev_old_ref.wrapping_add(delta);
+-        let old_node_id = prev_old_ref;
+-        let (new_ref, is_orphan) = nodes
+-            .resolve(old_node_id)
+-            .map_err(|e| e.context(format!("in way {old_way_id}")))?;
+-        if is_orphan {
+-            orphans = inc(orphans)?;
+-        }
+-        let new_delta = new_ref.wrapping_sub(prev_new_ref);
+-        protohoggr::encode_varint(refs_out, protohoggr::zigzag_encode_64(new_delta));
+-        prev_new_ref = new_ref;
+-    }
++    let orphans = reframe_way_refs::<TIMED>(old_refs_data, old_way_id, nodes, batch, refs_out)?;
+ 
+     // An empty present segment is replaced by nothing, the encoders' form,
+     // so renumber output renumbers again; an absent one is an empty list.
+@@ -893,6 +911,69 @@ fn reframe_way(
+     Ok(orphans)
+ }
+ 
++fn reframe_way_refs<const TIMED: bool>(
++    data: &[u8],
++    way_id: i64,
++    nodes: &IdSpace<'_>,
++    batch: &mut WayRefs,
++    out: &mut Vec<u8>,
++) -> crate::Result<u64> {
++    out.clear();
++    let mut orphans = 0;
++    let mut prev_old = 0_i64;
++    let mut prev_new = 0_i64;
++    let mut cursor = Cursor::new(data);
++    while !cursor.is_empty() {
++        let mut used = 0_usize;
++        let mut decode_error = None;
++        for id in &mut batch.old {
++            if cursor.is_empty() {
++                break;
++            }
++            match cursor.read_sint64() {
++                Ok(delta) => {
++                    prev_old = prev_old.wrapping_add(delta);
++                    *id = prev_old;
++                    // Bounded by the batch's length.
++                    used = used.wrapping_add(1);
++                }
++                Err(err) => {
++                    decode_error = Some(err);
++                    break;
++                }
++            }
++        }
++
++        let old = &batch.old[..used];
++        let ranks = &mut batch.ranks[..used];
++        let timer = TIMED.then(Stopwatch::start);
++        for (&id, rank) in old.iter().zip(ranks.iter_mut()) {
++            *rank = nodes.set.canonical_rank_if_set(id);
++        }
++        if let Some(timer) = timer {
++            batch.lookup_ns = batch.lookup_ns.saturating_add(timer.elapsed_ns());
++        }
++
++        for (&id, &rank) in old.iter().zip(ranks.iter()) {
++            let (new, is_orphan) = nodes
++                .resolve_rank(id, rank)
++                .map_err(|err| err.context(format!("in way {way_id}")))?;
++            if is_orphan {
++                orphans = inc(orphans)?;
++            }
++            let delta = new.wrapping_sub(prev_new);
++            protohoggr::encode_varint(out, protohoggr::zigzag_encode_64(delta));
++            prev_new = new;
++        }
++        // An already decoded ref takes precedence over a later wire error,
++        // as it did in the per-ref rewrite.
++        if let Some(err) = decode_error {
++            return Err(wire_err(err));
++        }
++    }
++    Ok(orphans)
++}
++
+ /// The splice range of a way with no refs: its one empty packed segment,
+ /// or with none the empty range just past its id. Either way the empty
+ /// `refs_out` writes nothing there, the encoders' form for an empty list,
+@@ -1137,68 +1218,100 @@ fn reframe_relation(
+             )));
+         }
+ 
+-        let mut memids_cursor = Cursor::new(old_memids_data);
+-        let mut types_cursor = Cursor::new(types_data);
+-        let mut prev_old_id: i64 = 0;
+-        let mut prev_new_id: i64 = 0;
+-        for _ in 0..memids_count {
++        orphans = reframe_relation_members(
++            old_memids_data,
++            types_data,
++            memids_count,
++            old_rel_id,
++            ids,
++            memids_out,
++        )?;
++    }
++
++    if let Some(memids_r) = memids_range {
++        splice_two(
++            rel_bytes,
++            id_r,
++            |o| protohoggr::encode_int64_field(o, 1, new_rel_id),
++            memids_r,
++            |o| protohoggr::encode_bytes_field(o, 9, memids_out),
++            out,
++        );
++    } else {
++        // No memids field (zero-member relation) - only patch id.
++        out.clear();
++        out.extend_from_slice(&rel_bytes[..id_r.0]);
++        protohoggr::encode_int64_field(out, 1, new_rel_id);
++        out.extend_from_slice(&rel_bytes[id_r.1..]);
++    }
++    Ok((new_rel_id, orphans))
++}
++
++fn reframe_relation_members(
++    memids: &[u8],
++    types: &[u8],
++    count: usize,
++    relation_id: i64,
++    ids: &RelationIdSpaces<'_>,
++    out: &mut Vec<u8>,
++) -> crate::Result<u64> {
++    let mut memids_cursor = Cursor::new(memids);
++    let mut types_cursor = Cursor::new(types);
++    let mut members = [(0, None); RENUMBER_REF_BATCH];
++    let mut ranks = [None; RENUMBER_REF_BATCH];
++    let mut prev_old = 0_i64;
++    let mut prev_new = 0_i64;
++    let mut orphans = 0;
++
++    // The caller has strictly validated both varint streams and their
++    // lengths, so a later decode here cannot preempt an earlier ref error.
++    for start in (0..count).step_by(RENUMBER_REF_BATCH) {
++        let len = count.saturating_sub(start).min(RENUMBER_REF_BATCH);
++        let members = &mut members[..len];
++        for (old_id, space) in &mut *members {
+             let member_type = types_cursor
+                 .read_varint()
+                 .map_err(|e| Error::from(e).context("types varint"))?;
+             let delta = memids_cursor
+                 .read_sint64()
+                 .map_err(|e| Error::from(e).context("memids varint"))?;
+-            prev_old_id = prev_old_id.wrapping_add(delta);
+-            let old_abs_id = prev_old_id;
+-
+-            // `types` is `repeated int32`: dispatch on the varint truncated
+-            // to 32 bits, as protobuf and pbfhogg's own reader decode it.
+-            // Matching the raw u64 instead treated 2^32 as an unknown type
+-            // and kept its ID, which every reader then took as a node ref -
+-            // to whichever renumbered node now holds that number. The type
+-            // bytes themselves are copied through unchanged.
++            prev_old = prev_old.wrapping_add(delta);
++            *old_id = prev_old;
++
++            // `types` is repeated int32, so dispatch on the low 32 bits.
++            // The type bytes themselves are copied through unchanged.
+             #[allow(clippy::cast_possible_truncation)]
+             let member_type = member_type as u32;
+-            let space = match member_type {
++            *space = match member_type {
+                 0 => Some(&ids.nodes),
+                 1 => Some(&ids.ways),
+                 2 => Some(&ids.relations),
+                 _ => None,
+             };
+-            // An unknown type names no ID space renumber reassigns, so its
+-            // ID cannot alias a renumbered element: preserved, uncounted.
+-            let (new_abs_id, is_orphan) = match space {
++        }
++
++        for (&(id, space), rank) in members.iter().zip(&mut ranks) {
++            *rank = space.and_then(|space| space.set.canonical_rank_if_set(id));
++        }
++
++        for (&(id, space), &rank) in members.iter().zip(&ranks) {
++            // Unknown types name no remapped ID space. Preserve their ID
++            // without counting it as an orphan.
++            let (new, is_orphan) = match space {
+                 Some(space) => space
+-                    .resolve(old_abs_id)
+-                    .map_err(|e| e.context(format!("in relation {old_rel_id}")))?,
+-                None => (old_abs_id, false),
++                    .resolve_rank(id, rank)
++                    .map_err(|e| e.context(format!("in relation {relation_id}")))?,
++                None => (id, false),
+             };
+             if is_orphan {
+                 orphans = inc(orphans)?;
+             }
+-            let new_delta = new_abs_id.wrapping_sub(prev_new_id);
+-            protohoggr::encode_varint(memids_out, protohoggr::zigzag_encode_64(new_delta));
+-            prev_new_id = new_abs_id;
++            let delta = new.wrapping_sub(prev_new);
++            protohoggr::encode_varint(out, protohoggr::zigzag_encode_64(delta));
++            prev_new = new;
+         }
+     }
+-
+-    if let Some(memids_r) = memids_range {
+-        splice_two(
+-            rel_bytes,
+-            id_r,
+-            |o| protohoggr::encode_int64_field(o, 1, new_rel_id),
+-            memids_r,
+-            |o| protohoggr::encode_bytes_field(o, 9, memids_out),
+-            out,
+-        );
+-    } else {
+-        // No memids field (zero-member relation) - only patch id.
+-        out.clear();
+-        out.extend_from_slice(&rel_bytes[..id_r.0]);
+-        protohoggr::encode_int64_field(out, 1, new_rel_id);
+-        out.extend_from_slice(&rel_bytes[id_r.1..]);
+-    }
+-    Ok((new_rel_id, orphans))
++    Ok(orphans)
+ }
+ 
+ #[cfg(test)]
+@@ -1391,7 +1504,7 @@ mod tests {
+         let node_ids = node_ids.into_ranked();
+         let way_ids = IdSet::new();
+         let mut out = Vec::new();
+-        reframe_ways_with_new_ids(
++        reframe_ways_with_new_ids::<false>(
+             block,
+             1_000,
+             &IdSpace::new(&node_ids, 100),
+@@ -1971,15 +2084,15 @@ mod tests {
+         }
+     }
+ 
+-    /// PrimitiveBlock with relation 5 whose members are `(raw type, id)`.
+-    fn relation_block_typed(members: &[(u64, i64)]) -> Vec<u8> {
+-        let mut rel = vec![0x08];
+-        varint(5, &mut rel);
++    /// PrimitiveBlock with one relation whose members are `(raw type, id)`.
++    fn relation_block_typed(rel_id: i64, members: &[(u64, i64)]) -> Vec<u8> {
++        let mut rel = Vec::new();
++        protohoggr::encode_int64_field(&mut rel, 1, rel_id);
+         let mut memids = Vec::new();
+         let mut types = Vec::new();
+         let mut prev = 0_i64;
+         for &(t, id) in members {
+-            varint(zz(id - prev), &mut memids);
++            varint(zz(id.wrapping_sub(prev)), &mut memids);
+             prev = id;
+             varint(t, &mut types);
+         }
+@@ -1997,24 +2110,148 @@ mod tests {
+     #[test]
+     fn member_types_are_dispatched_as_int32() {
+         // Node 7 is live (-> 100), node 9 is an orphan.
+-        let outcome = run(&relation_block_typed(&[(1 << 32, 7), (1 << 32, 9)])).unwrap();
++        let outcome = run(&relation_block_typed(5, &[(1 << 32, 7), (1 << 32, 9)])).unwrap();
+         assert_eq!(
+             outcome.orphans, 1,
+             "2^32 is a node type, so node 9 is an orphan"
+         );
+         // 2^32 + 2 is a relation: relation 5 is live, relation 6 is not.
+-        let outcome = run(&relation_block_typed(&[
+-            ((1 << 32) | 2, 5),
+-            ((1 << 32) | 2, 6),
+-        ]))
++        let outcome = run(&relation_block_typed(
++            5,
++            &[((1 << 32) | 2, 5), ((1 << 32) | 2, 6)],
++        ))
+         .unwrap();
+         assert_eq!(outcome.orphans, 1);
+         // Genuinely unknown types (3, and u32::MAX, which is int32 -1) are
+         // preserved and not counted.
+-        let outcome = run(&relation_block_typed(&[(3, 9), (u64::from(u32::MAX), 11)])).unwrap();
++        let outcome = run(&relation_block_typed(
++            5,
++            &[(3, 9), (u64::from(u32::MAX), 11)],
++        ))
++        .unwrap();
+         assert_eq!(outcome.orphans, 0);
+     }
+ 
++    #[test]
++    fn batched_way_refs_match_scalar_rewrite_bytes() {
++        let node_ids = ranked(&[i64::MIN, -1, 0, 7, 40]);
++        let nodes = IdSpace::new(&node_ids, -10);
++        let refs = [7, 8, i64::MIN, i64::MAX, -1, 0, 40, -5, 7];
++        for len in [
++            RENUMBER_REF_BATCH - 1,
++            RENUMBER_REF_BATCH,
++            RENUMBER_REF_BATCH + 1,
++            2 * RENUMBER_REF_BATCH + 3,
++        ] {
++            let old: Vec<_> = refs.into_iter().cycle().take(len).collect();
++            let mut orphans = 0;
++            let new: Vec<_> = old
++                .iter()
++                .map(|&id| {
++                    let (new, orphan) = nodes.resolve(id).unwrap();
++                    orphans += u64::from(orphan);
++                    new
++                })
++                .collect();
++            let mut output = Vec::new();
++            let outcome = reframe_ways_with_new_ids::<false>(
++                &way_block_segmented(3, &old, 1),
++                100,
++                &nodes,
++                &IdSet::new(),
++                &mut Vec::new(),
++                &mut output,
++                &mut Scratch::default(),
++            )
++            .unwrap();
++            assert_eq!(outcome.orphans, orphans);
++            assert_eq!(output, way_block_segmented(100, &new, 1), "{len} refs");
++        }
++    }
++
++    #[test]
++    fn batched_way_refs_keep_scalar_error_order() {
++        let nodes = ranked(&[7, 8]);
++        let data = [14, 2, 0x80]; // refs 7 and 8, then a truncated varint
++        let mut out = Vec::new();
++        let err = reframe_way_refs::<false>(
++            &data,
++            3,
++            &IdSpace::new(&nodes, i64::MAX),
++            &mut WayRefs::default(),
++            &mut out,
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("leaves the 64-bit id range"));
++        assert!(err.to_string().contains("in way 3"));
++        let mut first_ref = Vec::new();
++        varint(zz(i64::MAX), &mut first_ref);
++        assert_eq!(out, first_ref);
++
++        let err = reframe_way_refs::<false>(
++            &data,
++            3,
++            &IdSpace::new(&nodes, 100),
++            &mut WayRefs::default(),
++            &mut out,
++        )
++        .unwrap_err();
++        let expected = wire_err(Cursor::new(&[0x80]).read_sint64().unwrap_err());
++        assert_eq!(err.to_string(), expected.to_string());
++    }
++
++    #[test]
++    fn batched_relation_members_match_scalar_rewrite_bytes() {
++        let node_ids = ranked(&[i64::MIN, -1, 7]);
++        let way_ids = ranked(&[-5, 15, 16]);
++        let relation_ids = ranked(&[5, i64::MAX]);
++        let ids = RelationIdSpaces {
++            nodes: IdSpace::new(&node_ids, 100),
++            ways: IdSpace::new(&way_ids, -500),
++            relations: IdSpace::new(&relation_ids, 1_000),
++        };
++        let members = [
++            (0, i64::MIN),
++            (1, -5),
++            (2, i64::MAX),
++            (1 << 32, 7),
++            (1, 15),
++            (2, 4),
++            (0, 0),
++            (3, i64::MAX),
++            (u64::from(u32::MAX), i64::MIN),
++        ];
++        let old: Vec<_> = members
++            .into_iter()
++            .cycle()
++            .take(2 * RENUMBER_REF_BATCH + 3)
++            .collect();
++        let mut orphans = 0;
++        let new: Vec<_> = old
++            .iter()
++            .map(|&(kind, id)| {
++                let (new, orphan) = match kind & u64::from(u32::MAX) {
++                    0 => ids.nodes.resolve(id).unwrap(),
++                    1 => ids.ways.resolve(id).unwrap(),
++                    2 => ids.relations.resolve(id).unwrap(),
++                    _ => (id, false),
++                };
++                orphans += u64::from(orphan);
++                (kind, new)
++            })
++            .collect();
++        let mut out = Vec::new();
++        let outcome = reframe_relations_with_new_ids(
++            &relation_block_typed(5, &old),
++            &ids,
++            &mut out,
++            &mut Scratch::default(),
++        )
++        .unwrap();
++        assert_eq!(outcome.orphans, orphans);
++        assert_eq!(out, relation_block_typed(1_000, &new));
++    }
++
+     #[test]
+     fn unpacked_relation_memids_are_rejected_not_silently_passed_through() {
+         // This is the silent-corruption case. With `memids` unpacked, the
+@@ -2199,7 +2436,7 @@ mod tests {
+         let mut node_ids = IdSet::new();
+         node_ids.insert(7);
+         let node_ids = node_ids.into_ranked();
+-        reframe_ways_with_new_ids(
++        reframe_ways_with_new_ids::<false>(
+             block,
+             1_000,
+             &IdSpace::new(&node_ids, 100),
+diff --git a/crates/lib/src/idset.rs b/crates/lib/src/idset.rs
+index c64a1d53..4e1c4d01 100644
+--- a/crates/lib/src/idset.rs
++++ b/crates/lib/src/idset.rs
+@@ -43,6 +43,7 @@ const WORDS_PER_CHUNK: usize = CHUNK_BYTES / std::mem::size_of::<u64>();
+ const WORDS_PER_PAGE: usize =
+     crate::tunables::RENUMBER_ATOMIC_ID_PAGE_BYTES / std::mem::size_of::<u64>();
+ const PAGES_PER_CHUNK: usize = WORDS_PER_CHUNK / WORDS_PER_PAGE;
++const PAGE_BITS: u32 = WORDS_PER_PAGE as u32 * 64;
+ const _: () = assert!(WORDS_PER_PAGE.is_power_of_two() && WORDS_PER_PAGE <= WORDS_PER_CHUNK);
+ 
+ /// Keys per chunk = bits per bit-array chunk = 2^25.
+@@ -295,6 +296,111 @@ fn block_rank(blocks: Option<&[u32]>, off: u32) -> u64 {
+     })
+ }
+ 
++/// The rank is relative to the chunk, whose member count fits in a u32.
++/// Align each pair so it cannot straddle a cache line.
++#[repr(C, align(16))]
++struct RankedWord {
++    bits: u64,
++    before: u32,
++}
++
++impl RankedWord {
++    #[inline]
++    fn rank(&self, bit: u64) -> u32 {
++        self.before + (self.bits & (bit - 1)).count_ones()
++    }
++}
++
++enum RankedPage {
++    Empty(u32),
++    Full(u32),
++    Words(Box<[RankedWord]>),
++}
++
++impl RankedPage {
++    fn new(words: &[AtomicU64], before: &mut u32) -> Self {
++        let first = words[0].load(Relaxed);
++        if matches!(first, 0 | u64::MAX)
++            && words[1..].iter().all(|word| word.load(Relaxed) == first)
++        {
++            let rank = *before;
++            if first == 0 {
++                return Self::Empty(rank);
++            }
++            *before += PAGE_BITS;
++            return Self::Full(rank);
++        }
++        Self::Words(
++            words
++                .iter()
++                .map(|word| {
++                    let bits = word.load(Relaxed);
++                    let pair = RankedWord {
++                        bits,
++                        before: *before,
++                    };
++                    *before += bits.count_ones();
++                    pair
++                })
++                .collect(),
++        )
++    }
++}
++
++/// Frozen bit chunk with rank stored next to each membership word. The page
++/// directory carries the rank for gaps and full pages without allocating
++/// words for them. Small array chunks keep their sorted offsets.
++struct InterleavedChunk {
++    pages: Box<[RankedPage]>,
++}
++
++impl InterleavedChunk {
++    fn new<'a>(pages: impl Iterator<Item = (usize, &'a [AtomicU64])>) -> (Self, u64) {
++        let mut directory = Vec::with_capacity(PAGES_PER_CHUNK);
++        let mut before = 0;
++        for (index, words) in pages {
++            directory.resize_with(index, || RankedPage::Empty(before));
++            directory.push(RankedPage::new(words, &mut before));
++        }
++        directory.resize_with(PAGES_PER_CHUNK, || RankedPage::Empty(before));
++        (
++            Self {
++                pages: directory.into_boxed_slice(),
++            },
++            u64::from(before),
++        )
++    }
++
++    #[inline]
++    fn rank(&self, off: u32) -> u64 {
++        let (page, local) = split_page_offset(off);
++        let before = match &self.pages[page] {
++            RankedPage::Empty(before) => *before,
++            RankedPage::Full(before) => *before + local,
++            RankedPage::Words(words) => words[(local >> 6) as usize].rank(1u64 << (local & 63)),
++        };
++        u64::from(before)
++    }
++
++    #[inline]
++    fn rank_if_set(&self, off: u32) -> Option<u64> {
++        let (page, local) = split_page_offset(off);
++        let before = match &self.pages[page] {
++            RankedPage::Empty(_) => return None,
++            RankedPage::Full(before) => *before + local,
++            RankedPage::Words(words) => {
++                let word = &words[(local >> 6) as usize];
++                let bit = 1u64 << (local & 63);
++                if word.bits & bit == 0 {
++                    return None;
++                }
++                word.rank(bit)
++            }
++        };
++        Some(u64::from(before))
++    }
++}
++
+ /// One 2^25-key chunk.
+ enum Chunk {
+     /// Contiguous 4 MiB bit array.
+@@ -303,6 +409,8 @@ enum Chunk {
+     Paged(PagedChunk),
+     /// Sorted, deduplicated in-chunk offsets; at most `SPARSE_MAX` of them.
+     Sparse(Vec<u32>),
++    /// Produced only by freezing, after all writers have returned.
++    Interleaved(InterleavedChunk),
+ }
+ 
+ fn atomic_chunk(paged: bool) -> Chunk {
+@@ -315,7 +423,7 @@ fn atomic_chunk(paged: bool) -> Chunk {
+ 
+ impl Chunk {
+     fn is_atomic(&self) -> bool {
+-        !matches!(self, Chunk::Sparse(_))
++        matches!(self, Chunk::Dense(_) | Chunk::Paged(_))
+     }
+ 
+     fn new_sparse() -> Self {
+@@ -335,6 +443,9 @@ impl Chunk {
+                 })
+             }
+             Chunk::Sparse(offsets) => offsets.binary_search(&off).is_ok(),
++            Chunk::Interleaved(chunk) => chunk
++                .word((off >> 6) as usize)
++                .is_some_and(|word| word & (1u64 << (off & 63)) != 0),
+         }
+     }
+ 
+@@ -370,6 +481,7 @@ impl Chunk {
+                 *self = Chunk::Dense(words);
+                 true
+             }
++            Chunk::Interleaved(_) => unreachable!("a frozen chunk cannot be inserted into"),
+         }
+     }
+ 
+@@ -391,6 +503,7 @@ impl Chunk {
+             ),
+             Chunk::Paged(pages) => Chunk::Paged(pages.clone_chunk()),
+             Chunk::Sparse(offsets) => Chunk::Sparse(offsets.clone()),
++            Chunk::Interleaved(_) => unreachable!("a frozen chunk cannot be cloned for mutation"),
+         }
+     }
+ 
+@@ -423,6 +536,7 @@ impl Chunk {
+                 }
+             }
+             (dst @ Chunk::Sparse(_), src) => dst.union_into_sparse(src),
++            _ => unreachable!("a frozen chunk cannot be merged"),
+         }
+     }
+ 
+@@ -451,6 +565,7 @@ impl Chunk {
+                     Chunk::Sparse(merged)
+                 }
+             }
++            Chunk::Interleaved(_) => unreachable!("a frozen chunk cannot be merged"),
+         };
+     }
+ 
+@@ -482,7 +597,37 @@ impl Chunk {
+                 .map(|w| u64::from(w.load(Relaxed).count_ones()))
+                 .sum(),
+             Chunk::Sparse(offsets) => offsets.len() as u64,
++            Chunk::Interleaved(_) => unreachable!("a frozen chunk has its count in the rank index"),
++        }
++    }
++
++    /// Build the rank data, replacing bitmap storage one chunk at a time
++    /// when the caller selected interleaving.
++    fn freeze(&mut self, interleaved: bool) -> (Option<Vec<u32>>, u64) {
++        if !interleaved {
++            return self.rank_blocks();
+         }
++        let (chunk, count) = match self {
++            Chunk::Dense(words) => InterleavedChunk::new(
++                words
++                    .as_chunks::<WORDS_PER_PAGE>()
++                    .0
++                    .iter()
++                    .enumerate()
++                    .map(|(i, page)| (i, &page[..])),
++            ),
++            Chunk::Paged(pages) => {
++                // A reserved overflow chunk can still have no pages at all.
++                if pages.0.get().is_none() {
++                    return (None, 0);
++                }
++                InterleavedChunk::new(pages.pages())
++            }
++            Chunk::Sparse(offsets) => return (None, offsets.len() as u64),
++            Chunk::Interleaved(_) => unreachable!("a chunk can only be frozen once"),
++        };
++        *self = Chunk::Interleaved(chunk);
++        (None, count)
+     }
+ 
+     /// Per-block prefix counts for a bit array (`None` for an array chunk,
+@@ -498,6 +643,7 @@ impl Chunk {
+             }
+             Chunk::Paged(pages) => pages.rank_blocks(),
+             Chunk::Sparse(offsets) => (None, offsets.len() as u64),
++            Chunk::Interleaved(_) => unreachable!("a chunk can only be frozen once"),
+         }
+     }
+ 
+@@ -517,18 +663,20 @@ impl Chunk {
+                     })
+             }
+             Chunk::Sparse(offsets) => offsets.partition_point(|&x| x < off) as u64,
++            Chunk::Interleaved(chunk) => chunk.rank(off),
+         }
+     }
+ 
+     #[inline]
+-    fn rank_member(&self, off: u32, blocks: Option<&[u32]>) -> Option<u64> {
++    fn rank_member<'a>(&self, off: u32, blocks: impl FnOnce() -> Option<&'a [u32]>) -> Option<u64> {
+         match self {
+             Chunk::Sparse(offsets) => offsets.binary_search(&off).ok().map(|i| i as u64),
+-            Chunk::Dense(words) => member_rank_in_words(words, off, off, blocks),
++            Chunk::Dense(words) => member_rank_in_words(words, off, off, blocks()),
+             Chunk::Paged(pages) => {
+                 let (page, local) = split_page_offset(off);
+-                member_rank_in_words(pages.page(page)?, local, off, blocks)
++                member_rank_in_words(pages.page(page)?, local, off, blocks())
+             }
++            Chunk::Interleaved(chunk) => chunk.rank_if_set(off),
+         }
+     }
+ 
+@@ -553,7 +701,9 @@ impl Chunk {
+                 }
+                 false
+             }
+-            Chunk::Paged(_) => self.offsets_from(lo).next().is_some_and(|off| off <= hi),
++            Chunk::Paged(_) | Chunk::Interleaved(_) => {
++                self.offsets_from(lo).next().is_some_and(|off| off <= hi)
++            }
+             Chunk::Sparse(offsets) => {
+                 let i = offsets.partition_point(|&x| x < lo);
+                 i < offsets.len() && offsets[i] <= hi
+@@ -579,6 +729,7 @@ impl Chunk {
+                 }
+             }
+             Chunk::Paged(pages) => ChunkOffsets::Paged(PagedOffsets::new(pages, from)),
++            Chunk::Interleaved(chunk) => ChunkOffsets::Interleaved(PagedOffsets::new(chunk, from)),
+             Chunk::Sparse(offsets) => {
+                 let i = offsets.partition_point(|&x| x < from);
+                 ChunkOffsets::Sparse(offsets[i..].iter())
+@@ -606,6 +757,7 @@ impl Chunk {
+                 }
+             }
+             Chunk::Paged(pages) => ChunkOffsetsRev::Paged(PagedOffsets::new(pages, to)),
++            Chunk::Interleaved(chunk) => ChunkOffsetsRev::Interleaved(PagedOffsets::new(chunk, to)),
+             Chunk::Sparse(offsets) => {
+                 let i = offsets.partition_point(|&x| x <= to);
+                 ChunkOffsetsRev::Sparse(offsets[..i].iter().rev())
+@@ -616,8 +768,7 @@ impl Chunk {
+ 
+ #[inline]
+ fn split_page_offset(off: u32) -> (usize, u32) {
+-    let page_bits = WORDS_PER_PAGE * 64;
+-    (off as usize / page_bits, off % page_bits as u32)
++    ((off / PAGE_BITS) as usize, off % PAGE_BITS)
+ }
+ 
+ #[inline]
+@@ -641,15 +792,38 @@ fn member_rank_in_words(
+         .then(|| block_rank(blocks, off) + rank_in_words(words, local, target))
+ }
+ 
++trait PageWords {
++    /// Membership word, or `None` for an absent or empty page.
++    fn word(&self, word: usize) -> Option<u64>;
++}
++
++impl PageWords for PagedChunk {
++    #[inline]
++    fn word(&self, word: usize) -> Option<u64> {
++        Some(self.page(word / WORDS_PER_PAGE)?[word % WORDS_PER_PAGE].load(Relaxed))
++    }
++}
++
++impl PageWords for InterleavedChunk {
++    #[inline]
++    fn word(&self, word: usize) -> Option<u64> {
++        match &self.pages[word / WORDS_PER_PAGE] {
++            RankedPage::Empty(_) => None,
++            RankedPage::Full(_) => Some(u64::MAX),
++            RankedPage::Words(words) => Some(words[word % WORDS_PER_PAGE].bits),
++        }
++    }
++}
++
+ /// The same word-at-a-time walk as a dense iterator, skipping absent pages.
+-struct PagedOffsets<'a, const REVERSE: bool> {
+-    pages: &'a PagedChunk,
++struct PagedOffsets<'a, P, const REVERSE: bool> {
++    pages: &'a P,
+     word: usize,
+     remaining: u64,
+ }
+ 
+-impl<'a, const REVERSE: bool> PagedOffsets<'a, REVERSE> {
+-    fn new(pages: &'a PagedChunk, off: u32) -> Self {
++impl<'a, P: PageWords, const REVERSE: bool> PagedOffsets<'a, P, REVERSE> {
++    fn new(pages: &'a P, off: u32) -> Self {
+         let word = (off >> 6) as usize;
+         let bit = off & 63;
+         let mask = if REVERSE {
+@@ -657,9 +831,7 @@ impl<'a, const REVERSE: bool> PagedOffsets<'a, REVERSE> {
+         } else {
+             u64::MAX << bit
+         };
+-        let remaining = pages
+-            .page(word / WORDS_PER_PAGE)
+-            .map_or(0, |page| page[word % WORDS_PER_PAGE].load(Relaxed) & mask);
++        let remaining = pages.word(word).unwrap_or(0) & mask;
+         Self {
+             pages,
+             word,
+@@ -675,11 +847,11 @@ impl<'a, const REVERSE: bool> PagedOffsets<'a, REVERSE> {
+         };
+         // loop-ends: each absent page advances to the next page boundary.
+         while self.word < WORDS_PER_CHUNK {
+-            let page = self.word / WORDS_PER_PAGE;
+-            if let Some(words) = self.pages.page(page) {
+-                self.remaining = words[self.word % WORDS_PER_PAGE].load(Relaxed);
++            if let Some(bits) = self.pages.word(self.word) {
++                self.remaining = bits;
+                 return;
+             }
++            let page = self.word / WORDS_PER_PAGE;
+             self.word = if REVERSE {
+                 (page * WORDS_PER_PAGE).wrapping_sub(1)
+             } else {
+@@ -725,7 +897,8 @@ enum ChunkOffsets<'a> {
+         cur_base: u32,
+     },
+     Sparse(std::slice::Iter<'a, u32>),
+-    Paged(PagedOffsets<'a, false>),
++    Paged(PagedOffsets<'a, PagedChunk, false>),
++    Interleaved(PagedOffsets<'a, InterleavedChunk, false>),
+ }
+ 
+ impl Iterator for ChunkOffsets<'_> {
+@@ -756,6 +929,7 @@ impl Iterator for ChunkOffsets<'_> {
+             },
+             ChunkOffsets::Sparse(it) => it.next().copied(),
+             ChunkOffsets::Paged(it) => it.next(),
++            ChunkOffsets::Interleaved(it) => it.next(),
+         }
+     }
+ }
+@@ -772,7 +946,8 @@ enum ChunkOffsetsRev<'a> {
+         cur_base: u32,
+     },
+     Sparse(std::iter::Rev<std::slice::Iter<'a, u32>>),
+-    Paged(PagedOffsets<'a, true>),
++    Paged(PagedOffsets<'a, PagedChunk, true>),
++    Interleaved(PagedOffsets<'a, InterleavedChunk, true>),
+ }
+ 
+ impl Iterator for ChunkOffsetsRev<'_> {
+@@ -803,6 +978,7 @@ impl Iterator for ChunkOffsetsRev<'_> {
+             },
+             ChunkOffsetsRev::Sparse(it) => it.next().copied(),
+             ChunkOffsetsRev::Paged(it) => it.next(),
++            ChunkOffsetsRev::Interleaved(it) => it.next(),
+         }
+     }
+ }
+@@ -840,25 +1016,6 @@ enum Slot {
+     Overflow,
+ }
+ 
+-/// Rank of member offset `off` in the present chunk `chunk` (chunk id `cid`,
+-/// found at `slot`): keys strictly below it.
+-#[inline]
+-fn rank_in_chunk(idx: &RankIndex, slot: Slot, cid: u64, chunk: &Chunk, off: u32) -> u64 {
+-    let (prefix, blocks) = chunk_rank_index(idx, slot, cid);
+-    prefix + chunk.rank_within(off, blocks)
+-}
+-
+-#[inline]
+-fn chunk_rank_index(idx: &RankIndex, slot: Slot, cid: u64) -> (u64, Option<&[u32]>) {
+-    match slot {
+-        Slot::Direct(i) => (idx.chunk_prefix[i], idx.block_prefix[i].as_deref()),
+-        Slot::Overflow => {
+-            let i = idx.ov_keys.partition_point(|&k| k < cid);
+-            (idx.ov_prefix[i], idx.ov_block[i].as_deref())
+-        }
+-    }
+-}
+-
+ // ---------------------------------------------------------------------------
+ // The unsigned backend
+ // ---------------------------------------------------------------------------
+@@ -1080,7 +1237,7 @@ impl Bitmap {
+                 let (page, local) = split_page_offset(off);
+                 Some((pages.page_for_atomic(page), local))
+             }
+-            Chunk::Sparse(_) => None,
++            Chunk::Sparse(_) | Chunk::Interleaved(_) => None,
+         }
+     }
+ 
+@@ -1281,6 +1438,7 @@ impl Bitmap {
+                 }
+                 Chunk::Paged(pages) => pages.footprint_bytes(ranked) as u64,
+                 Chunk::Sparse(offsets) => (offsets.capacity() * size_of::<u32>()) as u64,
++                Chunk::Interleaved(_) => unreachable!("footprint estimates precede freezing"),
+             }
+         };
+         let directory = self.chunks.capacity() as u64 * size_of::<Cell>() as u64
+@@ -1353,15 +1511,15 @@ impl Bitmap {
+     }
+ 
+     /// The prefix-sum index of this bitmap's current members.
+-    fn rank_index(&self) -> RankIndex {
++    fn rank_index(&mut self, interleaved: bool) -> RankIndex {
+         let mut chunk_prefix = Vec::with_capacity(self.chunks.len() + 1);
+         let mut block_prefix = Vec::with_capacity(self.chunks.len());
+         let mut cumulative: u64 = 0;
+-        for chunk in &self.chunks {
++        for chunk in &mut self.chunks {
+             chunk_prefix.push(cumulative);
+-            match chunk.as_ref() {
++            match chunk.as_mut() {
+                 Some(chunk) => {
+-                    let (blocks, count) = chunk.rank_blocks();
++                    let (blocks, count) = chunk.freeze(interleaved);
+                     block_prefix.push(blocks);
+                     cumulative += count;
+                 }
+@@ -1373,10 +1531,10 @@ impl Bitmap {
+         let mut ov_keys = Vec::with_capacity(self.overflow.len());
+         let mut ov_prefix = Vec::with_capacity(self.overflow.len() + 1);
+         let mut ov_block = Vec::with_capacity(self.overflow.len());
+-        for (&cid, chunk) in &self.overflow {
++        for (&cid, chunk) in &mut self.overflow {
+             ov_keys.push(cid);
+             ov_prefix.push(cumulative);
+-            let (blocks, count) = chunk.rank_blocks();
++            let (blocks, count) = chunk.freeze(interleaved);
+             ov_block.push(blocks);
+             cumulative += count;
+         }
+@@ -1400,10 +1558,10 @@ impl Bitmap {
+                 // Past every direct chunk; every overflow key is larger.
+                 return idx.chunk_prefix[self.chunks.len()];
+             }
+-            match self.chunks[i].as_ref() {
+-                Some(chunk) => rank_in_chunk(idx, Slot::Direct(i), cid, chunk, off),
+-                None => idx.chunk_prefix[i],
+-            }
++            idx.chunk_prefix[i]
++                + self.chunks[i].as_ref().map_or(0, |chunk| {
++                    chunk.rank_within(off, idx.block_prefix[i].as_deref())
++                })
+         } else {
+             let i = idx.ov_keys.partition_point(|&k| k < cid);
+             let mut r = idx.ov_prefix[i];
+@@ -1421,8 +1579,17 @@ impl Bitmap {
+     fn rank_if_set(&self, idx: &RankIndex, key: NonNegId) -> Option<u64> {
+         let (cid, off) = key.split();
+         let (slot, chunk) = self.chunk(cid)?;
+-        let (prefix, blocks) = chunk_rank_index(idx, slot, cid);
+-        chunk.rank_member(off, blocks).map(|rank| prefix + rank)
++        let (i, prefixes, blocks) = match slot {
++            Slot::Direct(i) => (i, &idx.chunk_prefix, &idx.block_prefix),
++            Slot::Overflow => (
++                idx.ov_keys.partition_point(|&k| k < cid),
++                &idx.ov_prefix,
++                &idx.ov_block,
++            ),
++        };
++        chunk
++            .rank_member(off, || blocks[i].as_deref())
++            .map(|rank| prefixes[i] + rank)
+     }
+ 
+     fn len(&self) -> u64 {
+@@ -1871,8 +2038,21 @@ impl IdSet {
+     /// proves too slow, chunk the build and check per chunk, with a matched
+     /// A/B showing the untripped check costs nothing.
+     pub fn into_ranked(self) -> RankedIdSet {
+-        let nonneg_rank = self.nonneg.rank_index();
+-        let neg_rank = self.neg.has_any().then(|| self.neg.rank_index());
++        self.freeze(false)
++    }
++
++    /// Freeze with a per-word rank beside each membership word in bitmap
++    /// chunks. Partial pages use twice the word storage of the separate
++    /// layout. Full and empty pages keep only a rank, and sparse array
++    /// chunks keep their offsets. Conversion replaces each bitmap chunk
++    /// before starting the next, bounding temporary overlap to one chunk.
++    pub fn into_ranked_interleaved(self) -> RankedIdSet {
++        self.freeze(true)
++    }
++
++    fn freeze(mut self, interleaved: bool) -> RankedIdSet {
++        let nonneg_rank = self.nonneg.rank_index(interleaved);
++        let neg_rank = self.neg.has_any().then(|| self.neg.rank_index(interleaved));
+         let neg_total = neg_rank.as_ref().map_or(0, RankIndex::total);
+         let zero = u64::from(self.nonneg.get(NonNegId(0)));
+         RankedIdSet {
+@@ -1906,7 +2086,7 @@ impl IdSet {
+ /// canonical order. Both are bijections from the members onto
+ /// `0..total_count()`, and they agree on every positive ID.
+ ///
+-/// Both fields are private and no accessor hands out the inner set, not even
++/// The fields are private and no accessor hands out the inner set, not even
+ /// as `&IdSet`: the atomic setters write through a shared reference, so any
+ /// path to `&IdSet` would let members change under a built index and leave
+ /// its prefixes stale. Membership is forwarded explicitly via [`Self::get`].
+@@ -2012,10 +2192,20 @@ impl RankedIdSet {
+         self.set.iter_numeric_from(start)
+     }
+ 
+-    /// Discard the rank index and hand the set back for further mutation.
++    /// Discard the separate rank index and hand the set back for mutation.
+     /// Consuming, so no ranked view of the set can outlive the change.
+     #[cfg(test)]
+     fn into_inner(self) -> IdSet {
++        for bitmap in [&self.set.nonneg, &self.set.neg] {
++            assert!(
++                !bitmap
++                    .chunks
++                    .iter()
++                    .filter_map(Cell::as_ref)
++                    .chain(bitmap.overflow.values())
++                    .any(|chunk| matches!(chunk, Chunk::Interleaved(_)))
++            );
++        }
+         self.set
+     }
+ }
+@@ -2531,6 +2721,143 @@ mod tests {
+         assert_eq!(ranked.numeric_rank_if_set(high + 2 * chunk), None);
+     }
+ 
++    fn assert_rank_layouts_match(a: &RankedIdSet, b: &RankedIdSet, probes: &[i64]) {
++        assert_eq!(a.total_count(), b.total_count());
++        for &id in probes {
++            assert_eq!(a.get(id), b.get(id), "membership of {id}");
++            assert_eq!(
++                a.numeric_rank(id),
++                b.numeric_rank(id),
++                "numeric rank of {id}"
++            );
++            assert_eq!(
++                a.numeric_rank_if_set(id),
++                b.numeric_rank_if_set(id),
++                "numeric member rank of {id}"
++            );
++            assert_eq!(
++                a.canonical_rank(id),
++                b.canonical_rank(id),
++                "canonical rank of {id}"
++            );
++            assert_eq!(
++                a.canonical_rank_if_set(id),
++                b.canonical_rank_if_set(id),
++                "canonical member rank of {id}"
++            );
++            assert!(
++                a.iter_numeric_from(id)
++                    .take(8)
++                    .eq(b.iter_numeric_from(id).take(8)),
++                "numeric iteration from {id}"
++            );
++        }
++    }
++
++    #[test]
++    fn interleaved_ranks_match_array_dense_and_paged_chunks() {
++        let page = i64::from(PAGE_BITS);
++        let chunk = 1_i64 << ID_SHIFT;
++        let members = [0, 1, 63, 66, page - 1, 3 * page, 3 * page + 7, 2 * chunk];
++        let probes = [
++            -1,
++            0,
++            1,
++            2,
++            63,
++            64,
++            65,
++            66,
++            page - 1,
++            page,
++            page + 17,
++            2 * page - 1,
++            2 * page,
++            3 * page - 1,
++            3 * page,
++            3 * page + 7,
++            3 * page + 8,
++            4 * page,
++            chunk - 1,
++            chunk,
++            2 * chunk,
++            i64::MAX,
++        ];
++        for make in [IdSet::new, IdSet::new_paged_atomic] {
++            let populate = || {
++                let mut set = make();
++                set.pre_allocate(chunk);
++                for id in (page..2 * page).chain(members[..7].iter().copied()) {
++                    assert!(set.try_insert_atomic(id));
++                }
++                set.insert(members[7]); // outside the reservation: array chunk
++                set
++            };
++            let separate = populate().into_ranked();
++            let interleaved = populate().into_ranked_interleaved();
++            let Some(Chunk::Interleaved(bits)) = interleaved.set.nonneg.chunks[0].as_ref() else {
++                panic!("the bitmap must convert to interleaved words");
++            };
++            assert!(matches!(&bits.pages[0], RankedPage::Words(_)));
++            assert!(matches!(&bits.pages[1], RankedPage::Full(5)));
++            assert!(matches!(&bits.pages[2], RankedPage::Empty(rank) if *rank == PAGE_BITS + 5));
++            assert!(matches!(
++                interleaved.set.nonneg.chunks[2].as_ref(),
++                Some(Chunk::Sparse(_))
++            ));
++            assert_rank_layouts_match(&separate, &interleaved, &probes);
++        }
++    }
++
++    #[test]
++    fn interleaved_ranks_match_for_both_signs_and_overflow_chunks() {
++        let high = (DIRECT_CHUNKS as i64) << ID_SHIFT;
++        let boundary = high + i64::from(PAGE_BITS);
++        let populate = || {
++            let mut set = IdSet::new();
++            for key in boundary - SPARSE_MAX as i64..=boundary {
++                // Promote an overflow chunk to a bitmap in each family.
++                set.insert(key);
++                set.insert(!key);
++            }
++            for id in [i64::MIN, -1, 0, 7, i64::MAX] {
++                set.insert(id);
++            }
++            set
++        };
++        let separate = populate().into_ranked();
++        let interleaved = populate().into_ranked_interleaved();
++        assert!(matches!(
++            interleaved.set.neg.overflow.get(&DIRECT_CHUNKS),
++            Some(Chunk::Interleaved(_))
++        ));
++        let probes = [
++            i64::MIN,
++            i64::MIN + 1,
++            !(boundary + 1),
++            !boundary,
++            !(boundary - 1),
++            !high,
++            -2,
++            -1,
++            0,
++            1,
++            7,
++            high,
++            boundary - 1,
++            boundary,
++            boundary + 1,
++            i64::MAX - 1,
++            i64::MAX,
++        ];
++        assert_rank_layouts_match(&separate, &interleaved, &probes);
++        assert_rank_layouts_match(
++            &IdSet::new().into_ranked(),
++            &IdSet::new().into_ranked_interleaved(),
++            &probes,
++        );
++    }
++
+     #[test]
+     #[should_panic(expected = "negative id -7")]
+     fn insert_atomic_names_a_negative_id_instead_of_blaming_pre_allocate() {

@@ -7,18 +7,18 @@
 //! 1. **Way pass**: stream ways, emit `(node key, slot_pos)` COO pairs into
 //!    256 node buckets partitioned by node key (signed node IDs fall into two
 //!    key families sharing the buckets; see `keys.rs`).
-//! 2. **Node join**: per bucket, sort pairs by node key in memory, merge-join
-//!    with matching node stream, emit `(slot_pos, lat, lon)` into
-//!    256 slot buckets partitioned by high bits of slot_pos.
+//! 2. **Node join**: build a bounded coordinate table per node-key
+//!    partition, stream matching requests and emit `(slot_pos, lat, lon)`
+//!    into 256 slot buckets partitioned by high bits of slot_pos.
 //! 3. **Slot reorder**: per bucket, sort by slot_pos, emit final blob-ordered
 //!    delta-varint `coord_payloads` (see `coord_payloads.rs`). The flat
 //!    `coord_slots` array is a historical intermediate, retired in 2026-04.
 //! 4. **Assembly**: stream original PBF + per-blob coord_payloads preads,
 //!    emit enriched ways.
 //!
-//! All I/O is sequential. Temporary-disk demand and peak memory depend on the
-//! input; see `reference/performance/add-locations-to-ways.md` for measurements. This path does not
-//! build a random-access node index.
+//! Temporary-disk demand and peak memory depend on the input. The node
+//! table covers one partition at a time. See
+//! `reference/performance/add-locations-to-ways.md` for measurements.
 
 use super::Stats;
 use crate::commands::HeaderOverrides;
@@ -344,8 +344,23 @@ pub(super) trait ShardCodec: Copy + Send + Sync + 'static {
         slot: u32,
         out: &mut [u8; 2 * ID_WORD_SIZE],
     ) -> Result<usize>;
-    /// Decode one shard file's bytes, appending its records to `out`.
-    fn decode_into(self, bytes: &[u8], out: &mut Vec<Self::Record>) -> Result<()>;
+    /// Visit complete records in order and return the consumed byte count.
+    /// A non-final batch can end with the first word of a two-word record.
+    fn visit_records(
+        self,
+        bytes: &[u8],
+        final_batch: bool,
+        visit: impl FnMut(Self::Record) -> Result<()>,
+    ) -> Result<usize>;
+
+    /// Decode one complete shard, appending its records to `out`.
+    fn decode_into(self, bytes: &[u8], out: &mut Vec<Self::Record>) -> Result<()> {
+        self.visit_records(bytes, true, |record| {
+            out.push(record);
+            Ok(())
+        })?;
+        Ok(())
+    }
 }
 
 /// The run's id-shard format, chosen once from the key layout.
@@ -488,7 +503,13 @@ impl ShardCodec for IdCodec {
     /// cannot borrow the next shard's first word: the length must be whole
     /// words and the last record must not be a dangling escape. An
     /// extension word wider than `u32` is refused, never truncated.
-    fn decode_into(self, bytes: &[u8], out: &mut Vec<IdRecord>) -> Result<()> {
+    #[inline]
+    fn visit_records(
+        self,
+        bytes: &[u8],
+        final_batch: bool,
+        mut visit: impl FnMut(IdRecord) -> Result<()>,
+    ) -> Result<usize> {
         let (words, rem) = bytes.as_chunks::<ID_WORD_SIZE>();
         if !rem.is_empty() {
             return Err(crate::Error::internal(format!(
@@ -505,6 +526,9 @@ impl ShardCodec for IdCodec {
             let slot_field = (word >> 1) & escape;
             let slot = if slot_field == escape {
                 let Some(ext) = words.next() else {
+                    if !final_batch {
+                        return Ok(bytes.len() - ID_WORD_SIZE);
+                    }
                     return Err(crate::Error::internal(
                         "id shard ends inside an escaped record",
                     ));
@@ -524,13 +548,13 @@ impl ShardCodec for IdCodec {
             let local = (word >> local_shift) as u32;
             #[allow(clippy::cast_possible_truncation)]
             let blob_idx = ((word >> (self.slot_bits + 1)) & blob_mask) as u32;
-            out.push(IdRecord {
+            visit(IdRecord {
                 local_node_id: local | if word & 1 == 1 { CLOSURE_FLAG } else { 0 },
                 blob_idx,
                 blob_local_slot: slot,
-            });
+            })?;
         }
-        Ok(())
+        Ok(bytes.len())
     }
 }
 
@@ -567,29 +591,35 @@ impl ShardCodec for WideCodec {
         Ok(2 * ID_WORD_SIZE)
     }
 
-    fn decode_into(self, bytes: &[u8], out: &mut Vec<WideIdRecord>) -> Result<()> {
+    #[inline]
+    fn visit_records(
+        self,
+        bytes: &[u8],
+        final_batch: bool,
+        mut visit: impl FnMut(WideIdRecord) -> Result<()>,
+    ) -> Result<usize> {
         let (records, rem) = bytes.as_chunks::<{ 2 * ID_WORD_SIZE }>();
-        if !rem.is_empty() {
+        if final_batch && !rem.is_empty() {
             return Err(crate::Error::internal(format!(
                 "wide id shard length {} is not a multiple of {}",
                 bytes.len(),
                 2 * ID_WORD_SIZE
             )));
         }
-        out.extend(records.iter().map(|r| {
+        for r in records {
             let mut local = [0u8; ID_WORD_SIZE];
             local.copy_from_slice(&r[..ID_WORD_SIZE]);
             let mut tail = [0u8; ID_WORD_SIZE];
             tail.copy_from_slice(&r[ID_WORD_SIZE..]);
             let tail = u64::from_le_bytes(tail);
             #[allow(clippy::cast_possible_truncation)]
-            WideIdRecord {
+            visit(WideIdRecord {
                 local: u64::from_le_bytes(local),
                 blob_idx: (tail >> 32) as u32,
                 slot: tail as u32,
-            }
-        }));
-        Ok(())
+            })?;
+        }
+        Ok(bytes.len() - rem.len())
     }
 }
 

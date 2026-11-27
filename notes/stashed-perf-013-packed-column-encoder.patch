@@ -1,0 +1,2423 @@
+diff --git a/crates/lib/src/write/block_builder.rs b/crates/lib/src/write/block_builder.rs
+index 99284b28..53105c6a 100644
+--- a/crates/lib/src/write/block_builder.rs
++++ b/crates/lib/src/write/block_builder.rs
+@@ -45,15 +45,10 @@ pub(crate) struct EncodedBlock<'a> {
+ }
+ 
+ use crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY;
+-use protohoggr::{
+-    encode_bytes_field, encode_packed_bool, encode_packed_int32, encode_packed_sint32,
+-    encode_packed_sint64,
+-};
++use protohoggr::{encode_bytes_field, encode_varint, zigzag_encode_32};
+ 
+ use super::encode::{
+-    KeySet, collect_checked_keys, encode_relation, encode_relation_prefix,
+-    encode_relation_raw_bytes, encode_way, encode_way_raw_bytes,
+-    encode_way_raw_bytes_with_locations, encode_way_with_locations,
++    ElementGroup, KeySet, collect_checked_keys, len_field_size, push_delta, write_len_prefix,
+ };
+ use super::string_table::StringTable;
+ 
+@@ -376,7 +371,7 @@ impl DenseMetadata<'_> {
+ /// Map a MemberType to its protobuf enum integer value.
+ ///
+ /// MemberType enum: NODE=0, WAY=1, RELATION=2.
+-pub(super) fn member_type_value(mt: MemberType) -> i32 {
++pub(super) fn member_type_value(mt: MemberType) -> u8 {
+     match mt {
+         MemberType::Node => 0,
+         MemberType::Way => 1,
+@@ -389,6 +384,224 @@ pub(super) fn member_type_value(mt: MemberType) -> i32 {
+     }
+ }
+ 
++/// The packed bodies of a single dense run, with deltas accumulated as
++/// nodes are added. `count` is independent of the byte lengths and lets the
++/// first tagged node pad the omitted tag column for earlier tagless nodes.
++#[derive(Clone)]
++struct PackedDenseNodes {
++    ids: Vec<u8>,
++    lats: Vec<u8>,
++    lons: Vec<u8>,
++    keys_vals: Vec<u8>,
++    versions: Vec<u8>,
++    timestamps: Vec<u8>,
++    changesets: Vec<u8>,
++    uids: Vec<u8>,
++    user_sids: Vec<u8>,
++    visibles: Vec<u8>,
++    count: usize,
++    last_id: i64,
++    last_lat: i64,
++    last_lon: i64,
++    last_timestamp: i64,
++    last_changeset: i64,
++    last_uid: i32,
++    last_user_sid: i32,
++}
++
++struct DenseGroupLengths {
++    info: usize,
++    dense: usize,
++    group: usize,
++    total: usize,
++}
++
++impl PackedDenseNodes {
++    fn with_capacity(prealloc: usize) -> Self {
++        Self {
++            ids: Vec::with_capacity(prealloc),
++            lats: Vec::with_capacity(prealloc),
++            lons: Vec::with_capacity(prealloc),
++            // Preserve the historical reservation for mixed tag runs.
++            keys_vals: Vec::with_capacity(prealloc.saturating_mul(2)),
++            versions: Vec::with_capacity(prealloc),
++            timestamps: Vec::with_capacity(prealloc),
++            changesets: Vec::with_capacity(prealloc),
++            uids: Vec::with_capacity(prealloc),
++            user_sids: Vec::with_capacity(prealloc),
++            visibles: Vec::with_capacity(prealloc),
++            count: 0,
++            last_id: 0,
++            last_lat: 0,
++            last_lon: 0,
++            last_timestamp: 0,
++            last_changeset: 0,
++            last_uid: 0,
++            last_user_sid: 0,
++        }
++    }
++
++    #[inline]
++    fn push_position(&mut self, id: i64, lat: i32, lon: i32) {
++        push_delta(&mut self.ids, id, &mut self.last_id);
++        push_delta(&mut self.lats, i64::from(lat), &mut self.last_lat);
++        push_delta(&mut self.lons, i64::from(lon), &mut self.last_lon);
++        self.count += 1;
++    }
++
++    #[inline]
++    fn push_tag(&mut self, preceding: usize, key: u32, value: u32) {
++        if self.keys_vals.is_empty() {
++            self.keys_vals.resize(preceding, 0);
++        }
++        encode_varint(
++            &mut self.keys_vals,
++            i64::from(key.cast_signed()).cast_unsigned(),
++        );
++        encode_varint(
++            &mut self.keys_vals,
++            i64::from(value.cast_signed()).cast_unsigned(),
++        );
++    }
++
++    #[inline]
++    fn finish_tags(&mut self) {
++        if !self.keys_vals.is_empty() {
++            self.keys_vals.push(0);
++        }
++    }
++
++    fn push_metadata(&mut self, meta: &RawMetadata) {
++        // Keep the full-metadata add path branch-free. The run's column
++        // set controls which packed columns are used when it is sealed.
++        encode_varint(&mut self.versions, i64::from(meta.version).cast_unsigned());
++        push_delta(
++            &mut self.timestamps,
++            meta.timestamp,
++            &mut self.last_timestamp,
++        );
++        push_delta(
++            &mut self.changesets,
++            meta.changeset,
++            &mut self.last_changeset,
++        );
++        encode_varint(
++            &mut self.uids,
++            u64::from(zigzag_encode_32(meta.uid.wrapping_sub(self.last_uid))),
++        );
++        self.last_uid = meta.uid;
++        encode_varint(
++            &mut self.user_sids,
++            u64::from(zigzag_encode_32(
++                meta.user_sid.wrapping_sub(self.last_user_sid),
++            )),
++        );
++        self.last_user_sid = meta.user_sid;
++        self.visibles.push(u8::from(meta.visible));
++    }
++
++    fn info_fields(&self, columns: DenseColumns) -> impl Iterator<Item = (u32, &[u8])> {
++        [
++            (columns.version(), 1, self.versions.as_slice()),
++            (columns.timestamp(), 2, self.timestamps.as_slice()),
++            (columns.changeset(), 3, self.changesets.as_slice()),
++            (columns.uid(), 4, self.uids.as_slice()),
++            (columns.user(), 5, self.user_sids.as_slice()),
++            (columns.visible(), 6, self.visibles.as_slice()),
++        ]
++        .into_iter()
++        .filter_map(|(present, field, bytes)| present.then_some((field, bytes)))
++    }
++
++    fn tail_fields(&self) -> [(u32, &[u8]); 3] {
++        [(8, &self.lats), (9, &self.lons), (10, &self.keys_vals)]
++    }
++
++    fn lengths(&self, columns: DenseColumns) -> Result<DenseGroupLengths> {
++        let overflow = || crate::error::Error::internal("dense node group length overflows usize");
++        let info = nonempty_fields_len(self.info_fields(columns).map(|(_, bytes)| bytes.len()))
++            .ok_or_else(overflow)?;
++        let dense = nonempty_fields_len(
++            [self.ids.len(), info]
++                .into_iter()
++                .chain(self.tail_fields().map(|(_, bytes)| bytes.len())),
++        )
++        .ok_or_else(overflow)?;
++        let group = len_field_size(dense).ok_or_else(overflow)?;
++        let total = len_field_size(group).ok_or_else(overflow)?;
++        Ok(DenseGroupLengths {
++            info,
++            dense,
++            group,
++            total,
++        })
++    }
++
++    fn encode_to(
++        &self,
++        buf: &mut Vec<u8>,
++        columns: DenseColumns,
++        lengths: &DenseGroupLengths,
++    ) -> Result<()> {
++        buf.reserve(lengths.total);
++        let start = buf.len();
++        write_len_prefix(buf, 2, lengths.group);
++        write_len_prefix(buf, 2, lengths.dense);
++        encode_bytes_field(buf, 1, &self.ids);
++        if lengths.info != 0 {
++            write_len_prefix(buf, 5, lengths.info);
++            for (field, bytes) in self.info_fields(columns) {
++                encode_bytes_field(buf, field, bytes);
++            }
++        }
++        for (field, bytes) in self.tail_fields() {
++            encode_bytes_field(buf, field, bytes);
++        }
++        if buf.len() - start != lengths.total {
++            return Err(crate::error::Error::internal(
++                "dense node group lengths do not match packed columns",
++            ));
++        }
++        Ok(())
++    }
++
++    fn buffers(&mut self) -> [&mut Vec<u8>; 10] {
++        [
++            &mut self.ids,
++            &mut self.lats,
++            &mut self.lons,
++            &mut self.keys_vals,
++            &mut self.versions,
++            &mut self.timestamps,
++            &mut self.changesets,
++            &mut self.uids,
++            &mut self.user_sids,
++            &mut self.visibles,
++        ]
++    }
++
++    fn clear(&mut self) {
++        for buf in self.buffers() {
++            buf.clear();
++        }
++        self.count = 0;
++        self.last_id = 0;
++        self.last_lat = 0;
++        self.last_lon = 0;
++        self.last_timestamp = 0;
++        self.last_changeset = 0;
++        self.last_uid = 0;
++        self.last_user_sid = 0;
++    }
++}
++
++fn nonempty_fields_len(lengths: impl IntoIterator<Item = usize>) -> Option<usize> {
++    lengths
++        .into_iter()
++        .filter(|&len| len != 0)
++        .try_fold(0usize, |sum, len| sum.checked_add(len_field_size(len)?))
++}
++
+ // ---------------------------------------------------------------------------
+ // BlockBuilder
+ // ---------------------------------------------------------------------------
+@@ -439,19 +652,7 @@ pub struct BlockBuilder {
+     // Pre-serialized tagdata from the last encode_block() call.
+     last_tagdata: Option<Vec<u8>>,
+ 
+-    // Dense node accumulators
+-    dense_ids: Vec<i64>,
+-    dense_lats: Vec<i64>,
+-    dense_lons: Vec<i64>,
+-    dense_keys_vals: Vec<i32>,
+-
+-    // Dense node metadata accumulators
+-    dense_versions: Vec<i32>,
+-    dense_timestamps: Vec<i64>,
+-    dense_changesets: Vec<i64>,
+-    dense_uids: Vec<i32>,
+-    dense_user_sids: Vec<i32>,
+-    dense_visibles: Vec<bool>,
++    dense: PackedDenseNodes,
+     /// The pending dense run's `DenseInfo` columns; empty when its nodes
+     /// carry no metadata.
+     dense_columns: DenseColumns,
+@@ -462,26 +663,10 @@ pub struct BlockBuilder {
+     /// nodes that must be dense, even with the same columns.
+     dense_optional: bool,
+     shadow_plain: Vec<u8>,
+-    // The dense candidate of an optional run, encoded to be measured.
+-    dense_candidate: Vec<u8>,
+     // A raw plain-source node's checked tags, staged so its route can be
+     // chosen after every index is checked.
+     raw_tags_scratch: Vec<(u32, u32)>,
+ 
+-    // Dense node delta state
+-    last_dense_id: i64,
+-    last_dense_lat: i64,
+-    last_dense_lon: i64,
+-    last_dense_timestamp: i64,
+-    last_dense_changeset: i64,
+-    last_dense_uid: i32,
+-    last_dense_user_sid: i32,
+-
+-    // Wire-format accumulators. Ways and relations: `group_buf` holds the
+-    // block's serialized messages, `elem_scratch` one element's body. Dense
+-    // nodes: `group_buf` stages the DenseNodes body, `elem_scratch` one
+-    // packed field or the DenseInfo body, `packed_scratch` one DenseInfo
+-    // packed field (see `encode_dense_nodes_group` for why they stay).
+     // Node groups already closed, in insertion order (dense runs sealed by a
+     // metadata-presence change or a plain node, and plain groups), and the
+     // body of the pending plain node group. At most one of `plain_group` and
+@@ -490,13 +675,11 @@ pub struct BlockBuilder {
+     // join when it resolves plain.
+     node_groups: Vec<u8>,
+     plain_group: Vec<u8>,
+-    group_buf: Vec<u8>,
++    element_group: ElementGroup,
+     elem_scratch: Vec<u8>,
+-    packed_scratch: Vec<u8>, // per-field packed content (refs in location path, DenseInfo)
++    packed_scratch: Vec<u8>,      // plain node tag keys
+     packed_vals_scratch: Vec<u8>, // tag values packed encoding (dual-buffer single-pass)
+-    packed_lat_scratch: Vec<u8>, // way latitudes or streamed relation member IDs
+-    packed_lon_scratch: Vec<u8>, // way longitudes or streamed relation member types
+-    info_scratch: Vec<u8>,   // Info sub-message body
++    info_scratch: Vec<u8>,        // Info sub-message body
+ 
+     // The block encode buffer. `take` and `lend_encoded` lend it and keep it
+     // for the next block; `take_owned` moves it out, and the next block then
+@@ -554,7 +737,7 @@ impl BlockBuilder {
+     /// Create a new, empty block builder with the default element cap.
+     ///
+     /// Equivalent to `BlockBuilder::with_element_cap_prealloc(
+-    /// DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP)`.
++    /// DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP.get())`.
+     pub fn new() -> Self {
+         Self::with_element_cap_prealloc(DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP.get())
+     }
+@@ -571,7 +754,7 @@ impl BlockBuilder {
+     /// unbounded allocations requested by a single integer, before a byte of
+     /// input had been read.
+     ///
+-    /// `prealloc_bound` limits the initial capacity of each element vector.
++    /// `prealloc_bound` limits the initial reservation for packed node columns.
+     /// `repack` derives this budget from the input file size, so a tiny input
+     /// with a huge requested cap cannot demand unbounded initial allocations.
+     /// Compressed input may contain more elements than bytes; the vectors can
+@@ -583,9 +766,6 @@ impl BlockBuilder {
+     pub fn with_element_cap_prealloc(cap: std::num::NonZeroUsize, prealloc_bound: usize) -> Self {
+         let cap = cap.get();
+         let prealloc = cap.min(prealloc_bound.max(1));
+-        // Preserve the historical reservation for mixed tag runs.
+-        // saturating_mul guards against pathological caps near usize::MAX.
+-        let kv_cap = prealloc.saturating_mul(2);
+         BlockBuilder {
+             string_table: StringTable::new(),
+             block_type: None,
+@@ -602,39 +782,18 @@ impl BlockBuilder {
+             tag_key_scratch: Vec::new(),
+             last_tagdata: None,
+ 
+-            dense_ids: Vec::with_capacity(prealloc),
+-            dense_lats: Vec::with_capacity(prealloc),
+-            dense_lons: Vec::with_capacity(prealloc),
+-            dense_keys_vals: Vec::with_capacity(kv_cap),
+-
+-            dense_versions: Vec::with_capacity(prealloc),
+-            dense_timestamps: Vec::with_capacity(prealloc),
+-            dense_changesets: Vec::with_capacity(prealloc),
+-            dense_uids: Vec::with_capacity(prealloc),
+-            dense_user_sids: Vec::with_capacity(prealloc),
+-            dense_visibles: Vec::with_capacity(prealloc),
++            dense: PackedDenseNodes::with_capacity(prealloc),
+             dense_columns: DenseColumns::default(),
+             dense_optional: false,
+             shadow_plain: Vec::new(),
+-            dense_candidate: Vec::new(),
+             raw_tags_scratch: Vec::new(),
+ 
+-            last_dense_id: 0,
+-            last_dense_lat: 0,
+-            last_dense_lon: 0,
+-            last_dense_timestamp: 0,
+-            last_dense_changeset: 0,
+-            last_dense_uid: 0,
+-            last_dense_user_sid: 0,
+-
+             node_groups: Vec::new(),
+             plain_group: Vec::new(),
+-            group_buf: Vec::new(),
++            element_group: ElementGroup::default(),
+             elem_scratch: Vec::new(),
+             packed_scratch: Vec::new(),
+             packed_vals_scratch: Vec::new(),
+-            packed_lat_scratch: Vec::new(),
+-            packed_lon_scratch: Vec::new(),
+             info_scratch: Vec::new(),
+ 
+             encode_buf: Vec::new(),
+@@ -775,7 +934,7 @@ impl BlockBuilder {
+     pub(crate) fn content_len(&self) -> usize {
+         self.string_table
+             .content_len()
+-            .saturating_add(self.group_buf.len())
++            .saturating_add(self.element_group.len())
+             .saturating_add(self.node_groups.len())
+             .saturating_add(self.plain_group.len())
+     }
+@@ -908,19 +1067,8 @@ impl BlockBuilder {
+             DenseColumns::default()
+         });
+ 
+-        let preceding = self.dense_ids.len();
+-        let lat = i64::from(decimicro_lat);
+-        let lon = i64::from(decimicro_lon);
+-
+-        // Dense fields store signed deltas. Preserve their two's-complement
+-        // wire values explicitly so debug and release builds encode alike.
+-        self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
+-        self.dense_lats.push(lat.wrapping_sub(self.last_dense_lat));
+-        self.dense_lons.push(lon.wrapping_sub(self.last_dense_lon));
+-
+-        self.last_dense_id = id;
+-        self.last_dense_lat = lat;
+-        self.last_dense_lon = lon;
++        let preceding = self.dense.count;
++        self.dense.push_position(id, decimicro_lat, decimicro_lon);
+         self.track_coords(decimicro_lat, decimicro_lon);
+ 
+         // Tags: interleaved [key_sid, val_sid, ...] terminated by 0
+@@ -928,9 +1076,9 @@ impl BlockBuilder {
+             let key_idx = self.string_table.add(key);
+             self.tag_key_indices.insert(key_idx);
+             let val_idx = self.string_table.add(val);
+-            self.push_dense_tag(preceding, key_idx, val_idx);
++            self.dense.push_tag(preceding, key_idx, val_idx);
+         }
+-        self.finish_dense_tags();
++        self.dense.finish_tags();
+ 
+         // Metadata: `begin_dense_node` keeps every dense run homogeneous in
+         // metadata presence, so a node without metadata never needs
+@@ -954,8 +1102,8 @@ impl BlockBuilder {
+     /// group can hold only as a column set shared by the whole group. Where
+     /// a dense slot with exactly the node's columns claims what its plain
+     /// `Info` would (`partial_columns`), consecutive nodes with the same
+-    /// field set form a candidate dense run, also encoded plain, and the run
+-    /// is written in whichever form is smaller when it closes. Otherwise the
++    /// field set accumulate packed columns and plain messages. Their lengths
++    /// choose the form to write when the run closes. Otherwise the
+     /// node is written as a plain `Node` message with an `Info` carrying only
+     /// the present fields. Consecutive plain nodes share one group, and plain
+     /// and dense nodes never share a group, so the block's groups keep
+@@ -1026,11 +1174,11 @@ impl BlockBuilder {
+             let key_idx = self.string_table.add(key);
+             let val_idx = self.string_table.add(val);
+             self.tag_key_indices.insert(key_idx);
+-            self.push_dense_tag(self.dense_ids.len(), key_idx, val_idx);
++            self.dense.push_tag(self.dense.count, key_idx, val_idx);
+             protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_idx));
+             protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_idx));
+         }
+-        self.finish_dense_tags();
++        self.dense.finish_tags();
+         let raw = RawPartialMetadata {
+             version: meta.version,
+             timestamp: meta.timestamp,
+@@ -1043,30 +1191,12 @@ impl BlockBuilder {
+         self.push_optional_node(id, decimicro_lat, decimicro_lon, &raw);
+     }
+ 
+-    /// A dense group can omit its tag column until its first tag. At that
+-    /// point the earlier tagless slots need one delimiter each.
+-    #[inline]
+-    fn push_dense_tag(&mut self, preceding: usize, key: u32, value: u32) {
+-        if self.dense_keys_vals.is_empty() {
+-            self.dense_keys_vals.resize(preceding, 0);
+-        }
+-        self.dense_keys_vals.push(key.cast_signed());
+-        self.dense_keys_vals.push(value.cast_signed());
+-    }
+-
+-    #[inline]
+-    fn finish_dense_tags(&mut self) {
+-        if !self.dense_keys_vals.is_empty() {
+-            self.dense_keys_vals.push(0);
+-        }
+-    }
+-
+     /// Start or continue an optional run with `columns`. A mandatory run, or
+     /// an optional one with other columns, is sealed first; a pending plain
+     /// group is left open.
+     #[inline]
+     fn begin_optional_node(&mut self, columns: DenseColumns) {
+-        if !self.dense_ids.is_empty() && (!self.dense_optional || columns != self.dense_columns) {
++        if self.dense.count != 0 && (!self.dense_optional || columns != self.dense_columns) {
+             self.seal_dense_run();
+         }
+         self.dense_columns = columns;
+@@ -1074,7 +1204,7 @@ impl BlockBuilder {
+     }
+ 
+     /// The common tail of an optional node, whose tags are already in
+-    /// `dense_keys_vals` and, packed for a plain `Node`, in `packed_scratch`
++    /// the dense tag column and, packed for a plain `Node`, in `packed_scratch`
+     /// and `packed_vals_scratch`: its dense slot (absent fields as
+     /// placeholders the run's columns leave unwritten) and its plain `Node`
+     /// in `shadow_plain`, byte for byte what `add_plain_node` writes.
+@@ -1085,15 +1215,8 @@ impl BlockBuilder {
+         decimicro_lon: i32,
+         meta: &RawPartialMetadata,
+     ) {
+-        let lat = i64::from(decimicro_lat);
+-        let lon = i64::from(decimicro_lon);
+-        self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
+-        self.dense_lats.push(lat.wrapping_sub(self.last_dense_lat));
+-        self.dense_lons.push(lon.wrapping_sub(self.last_dense_lon));
+-        self.last_dense_id = id;
+-        self.last_dense_lat = lat;
+-        self.last_dense_lon = lon;
+-        self.add_dense_metadata_raw(&RawMetadata {
++        self.dense.push_position(id, decimicro_lat, decimicro_lon);
++        self.dense.push_metadata(&RawMetadata {
+             version: meta.version.unwrap_or(0),
+             timestamp: meta.timestamp.unwrap_or(0),
+             changeset: meta.changeset.unwrap_or(0),
+@@ -1153,7 +1276,8 @@ impl BlockBuilder {
+             tags,
+         );
+         if let Some(meta) = metadata {
+-            super::encode::EncodeMetadata::encode_info(
++            self.info_scratch.clear();
++            super::encode::EncodeMetadata::append_info(
+                 meta,
+                 &mut self.info_scratch,
+                 &mut self.string_table,
+@@ -1173,36 +1297,17 @@ impl BlockBuilder {
+         self.count += 1;
+     }
+ 
+-    #[allow(clippy::cast_possible_wrap)]
+     fn add_dense_metadata(&mut self, meta: &Metadata<'_>) {
+-        // Every column is accumulated whatever the run's column set (no
+-        // per-node branch); `encode_dense_nodes_group` writes only the set.
+-        // Version is NOT delta-encoded
+-        self.dense_versions.push(meta.version);
+-
+-        // Timestamp - delta-encoded
+-        self.dense_timestamps
+-            .push(meta.timestamp.wrapping_sub(self.last_dense_timestamp));
+-        self.last_dense_timestamp = meta.timestamp;
+-
+-        // Changeset - delta-encoded
+-        self.dense_changesets
+-            .push(meta.changeset.wrapping_sub(self.last_dense_changeset));
+-        self.last_dense_changeset = meta.changeset;
+-
+-        // UID - delta-encoded
+-        self.dense_uids
+-            .push(meta.uid.wrapping_sub(self.last_dense_uid));
+-        self.last_dense_uid = meta.uid;
+-
+-        // User SID - delta-encoded
+-        let user_sid = self.string_table.add(meta.user) as i32;
+-        self.dense_user_sids
+-            .push(user_sid.wrapping_sub(self.last_dense_user_sid));
+-        self.last_dense_user_sid = user_sid;
+-
+-        // Visible (only meaningful for history files, but we preserve it)
+-        self.dense_visibles.push(meta.visible);
++        self.dense.push_metadata(&RawMetadata {
++            version: meta.version,
++            timestamp: meta.timestamp,
++            changeset: meta.changeset,
++            uid: meta.uid,
++            user_sid: self.string_table.add(meta.user).cast_signed(),
++            visible: meta.visible,
++            columns: self.dense_columns,
++            zero_timestamp_claim: false,
++        });
+     }
+ 
+     /// Prepare for one more dense node whose metadata carries `columns`
+@@ -1223,7 +1328,7 @@ impl BlockBuilder {
+         if !self.plain_group.is_empty() {
+             self.flush_plain_group();
+         }
+-        if columns != self.dense_columns && !self.dense_ids.is_empty() {
++        if columns != self.dense_columns && self.dense.count != 0 {
+             self.seal_dense_run();
+         }
+         // Set after the seal, which clears the run's state.
+@@ -1252,17 +1357,13 @@ impl BlockBuilder {
+             return;
+         }
+         self.block_type = Some(BlockType::Ways);
+-        encode_way(
++        self.element_group.add_way(
+             &mut self.string_table,
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
+             refs,
++            None,
+             metadata,
+         );
+         self.track_id(id);
+@@ -1283,17 +1384,13 @@ impl BlockBuilder {
+             return;
+         }
+         self.block_type = Some(BlockType::Ways);
+-        encode_way(
++        self.element_group.add_way(
+             &mut self.string_table,
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
+             refs,
++            None,
+             metadata,
+         );
+         self.track_id(id);
+@@ -1332,20 +1429,13 @@ impl BlockBuilder {
+             return;
+         }
+         self.block_type = Some(BlockType::Ways);
+-        encode_way_with_locations(
++        self.element_group.add_way(
+             &mut self.string_table,
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.packed_lat_scratch,
+-            &mut self.packed_lon_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
+             refs,
+-            locations,
++            Some(locations),
+             metadata,
+         );
+         self.track_id(id);
+@@ -1376,20 +1466,13 @@ impl BlockBuilder {
+             return;
+         }
+         self.block_type = Some(BlockType::Ways);
+-        encode_way_with_locations(
++        self.element_group.add_way(
+             &mut self.string_table,
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.packed_lat_scratch,
+-            &mut self.packed_lon_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
+             refs,
+-            locations,
++            Some(locations),
+             metadata,
+         );
+         self.track_id(id);
+@@ -1430,13 +1513,8 @@ impl BlockBuilder {
+             return;
+         }
+         self.block_type = Some(BlockType::Relations);
+-        encode_relation(
++        self.element_group.add_relation(
+             &mut self.string_table,
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
+@@ -1471,13 +1549,8 @@ impl BlockBuilder {
+             return;
+         }
+         self.block_type = Some(BlockType::Relations);
+-        encode_relation(
++        self.element_group.add_relation(
+             &mut self.string_table,
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
+@@ -1500,77 +1573,23 @@ impl BlockBuilder {
+         if !self.can_add_relation() {
+             return Err(self.raw_refusal(BlockType::Relations, id));
+         }
+-        encode_relation_prefix(
++        if let Err(err) = self.element_group.add_relation_iter(
+             &mut self.string_table,
+-            &mut self.elem_scratch,
+-            &mut self.packed_scratch,
+-            &mut self.packed_vals_scratch,
+-            &mut self.info_scratch,
+             &mut self.tag_key_indices,
+             id,
+             tags,
++            members,
+             metadata,
+-        );
+-        if let Err(err) = self.pack_relation_members(id, members) {
++        ) {
+             self.poison(err.to_string());
+             return Err(err);
+         }
+-        for (field, data) in [
+-            (8, &self.packed_scratch),
+-            (9, &self.packed_lat_scratch),
+-            (10, &self.packed_lon_scratch),
+-        ] {
+-            encode_bytes_field(&mut self.elem_scratch, field, data);
+-        }
+-        protohoggr::encode_bytes_field_always(&mut self.group_buf, 4, &self.elem_scratch);
+         self.block_type = Some(BlockType::Relations);
+         self.track_id(id);
+         self.count += 1;
+         Ok(())
+     }
+ 
+-    fn pack_relation_members<'m>(
+-        &mut self,
+-        id: i64,
+-        members: impl IntoIterator<Item = Result<MemberData<'m>>>,
+-    ) -> Result<()> {
+-        use protohoggr::{encode_varint, zigzag_encode_64};
+-
+-        self.packed_scratch.clear();
+-        self.packed_lat_scratch.clear();
+-        self.packed_lon_scratch.clear();
+-        let mut last_id = 0;
+-        let mut unknown = None;
+-        for member in members {
+-            let member = member?;
+-            let kind = member.id.member_type();
+-            if let MemberType::Unknown(raw) = kind {
+-                unknown.get_or_insert(raw);
+-                continue;
+-            }
+-            let role = self.string_table.add(member.role).cast_signed();
+-            encode_varint(&mut self.packed_scratch, i64::from(role).cast_unsigned());
+-            let member_id = member.id.id();
+-            // PBF member deltas wrap at the signed boundary.
+-            encode_varint(
+-                &mut self.packed_lat_scratch,
+-                zigzag_encode_64(member_id.wrapping_sub(last_id)),
+-            );
+-            last_id = member_id;
+-            encode_varint(
+-                &mut self.packed_lon_scratch,
+-                u64::from(member_type_value(kind).cast_unsigned()),
+-            );
+-        }
+-        if let Some(raw) = unknown {
+-            return Err(crate::error::Error::invalid_data(format!(
+-                "relation {id}: member type {raw} has no Relation.MemberType enum \
+-                 value; encoding it would rewrite the member as a node",
+-            )));
+-        }
+-        Ok(())
+-    }
+-
+     // -----------------------------------------------------------------------
+     // Raw string indices, copied from a pre-seeded source block (apply-changes)
+     // -----------------------------------------------------------------------
+@@ -1943,15 +1962,8 @@ impl BlockBuilder {
+         self.block_type = Some(BlockType::DenseNodes);
+         self.begin_dense_node(metadata.map_or_else(DenseColumns::default, |m| m.columns));
+ 
+-        let preceding = self.dense_ids.len();
+-        let lat = i64::from(decimicro_lat);
+-        let lon = i64::from(decimicro_lon);
+-        self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
+-        self.dense_lats.push(lat.wrapping_sub(self.last_dense_lat));
+-        self.dense_lons.push(lon.wrapping_sub(self.last_dense_lon));
+-        self.last_dense_id = id;
+-        self.last_dense_lat = lat;
+-        self.last_dense_lon = lon;
++        let preceding = self.dense.count;
++        self.dense.push_position(id, decimicro_lat, decimicro_lon);
+         self.track_coords(decimicro_lat, decimicro_lon);
+ 
+         for (key_sid, val_sid) in raw_tags {
+@@ -1971,12 +1983,12 @@ impl BlockBuilder {
+             self.tag_key_indices.insert(key_sid);
+             // Both are below a table length, which a block's byte limit
+             // keeps far below `i32::MAX`.
+-            self.push_dense_tag(preceding, key_sid, val_sid);
++            self.dense.push_tag(preceding, key_sid, val_sid);
+         }
+-        self.finish_dense_tags();
++        self.dense.finish_tags();
+ 
+         if let Some(meta) = metadata {
+-            self.add_dense_metadata_raw(meta);
++            self.dense.push_metadata(meta);
+         }
+ 
+         self.track_id(id);
+@@ -2226,11 +2238,11 @@ impl BlockBuilder {
+             self.tag_key_indices.insert(key_sid);
+             // Below a table length, which a block's byte limit keeps far
+             // below `i32::MAX`.
+-            self.push_dense_tag(self.dense_ids.len(), key_sid, val_sid);
++            self.dense.push_tag(self.dense.count, key_sid, val_sid);
+             protohoggr::encode_varint(&mut self.packed_scratch, u64::from(key_sid));
+             protohoggr::encode_varint(&mut self.packed_vals_scratch, u64::from(val_sid));
+         }
+-        self.finish_dense_tags();
++        self.dense.finish_tags();
+         self.push_optional_node(id, decimicro_lat, decimicro_lon, meta);
+     }
+ 
+@@ -2292,14 +2304,16 @@ impl BlockBuilder {
+     ) -> Result<()> {
+         self.check_raw_strings("way", id, keys_data, vals_data, &[], info_data)?;
+         self.block_type = Some(BlockType::Ways);
+-        encode_way_raw_bytes(
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
++        self.element_group.add_raw(
+             id,
+-            keys_data,
+-            vals_data,
+-            refs_data,
+-            info_data,
++            [
++                keys_data,
++                vals_data,
++                info_data.unwrap_or_default(),
++                refs_data,
++                &[],
++                &[],
++            ],
+         );
+         self.track_id(id);
+         self.count += 1;
+@@ -2352,16 +2366,16 @@ impl BlockBuilder {
+     ) -> Result<()> {
+         self.check_raw_strings("way", id, keys_data, vals_data, &[], info_data)?;
+         self.block_type = Some(BlockType::Ways);
+-        encode_way_raw_bytes_with_locations(
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
++        self.element_group.add_raw(
+             id,
+-            keys_data,
+-            vals_data,
+-            refs_data,
+-            lat_data,
+-            lon_data,
+-            info_data,
++            [
++                keys_data,
++                vals_data,
++                info_data.unwrap_or_default(),
++                refs_data,
++                lat_data,
++                lon_data,
++            ],
+         );
+         self.track_id(id);
+         self.count += 1;
+@@ -2442,42 +2456,22 @@ impl BlockBuilder {
+             info_data,
+         )?;
+         self.block_type = Some(BlockType::Relations);
+-        encode_relation_raw_bytes(
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
++        self.element_group.add_raw(
+             id,
+-            keys_data,
+-            vals_data,
+-            roles_sid_data,
+-            memids_data,
+-            types_data,
+-            info_data,
++            [
++                keys_data,
++                vals_data,
++                info_data.unwrap_or_default(),
++                roles_sid_data,
++                memids_data,
++                types_data,
++            ],
+         );
+         self.track_id(id);
+         self.count += 1;
+         Ok(())
+     }
+ 
+-    #[allow(clippy::cast_possible_wrap)]
+-    fn add_dense_metadata_raw(&mut self, meta: &RawMetadata) {
+-        self.dense_versions.push(meta.version);
+-        // Raw signed metadata uses the same wrapping wire-delta convention as
+-        // values decoded and re-encoded through `add_dense_metadata`.
+-        self.dense_timestamps
+-            .push(meta.timestamp.wrapping_sub(self.last_dense_timestamp));
+-        self.last_dense_timestamp = meta.timestamp;
+-        self.dense_changesets
+-            .push(meta.changeset.wrapping_sub(self.last_dense_changeset));
+-        self.last_dense_changeset = meta.changeset;
+-        self.dense_uids
+-            .push(meta.uid.wrapping_sub(self.last_dense_uid));
+-        self.last_dense_uid = meta.uid;
+-        self.dense_user_sids
+-            .push(meta.user_sid.wrapping_sub(self.last_dense_user_sid));
+-        self.last_dense_user_sid = meta.user_sid;
+-        self.dense_visibles.push(meta.visible);
+-    }
+-
+     /// Encode the current block into `encode_buf` and reset block state.
+     ///
+     /// Returns `None` if the block is empty (nothing to encode).
+@@ -2499,17 +2493,6 @@ impl BlockBuilder {
+             return Ok(None);
+         };
+ 
+-        // An optional run chooses its form before the groups are copied
+-        // below, which write a pending dense run directly.
+-        if self.dense_optional {
+-            self.seal_dense_run();
+-            if let Some(reason) = self.poison.as_deref() {
+-                return Err(crate::error::Error::invalid_data(format!(
+-                    "BlockBuilder refused to encode a block: {reason}"
+-                )));
+-            }
+-        }
+-
+         // Every tracked key is in the table: `add` returns slots it has, and
+         // the raw adds refuse a key at or past the seeded source table, which
+         // the table only grows from. The tagdata build below indexes them.
+@@ -2560,19 +2543,29 @@ impl BlockBuilder {
+                 // (granularity=100, offsets=0, date_gran=1000).
+                 // Closed groups first, then whichever one group is pending.
+                 self.encode_buf.extend_from_slice(&self.node_groups);
+-                if !self.plain_group.is_empty() {
+-                    encode_bytes_field(&mut self.encode_buf, 2, &self.plain_group);
+-                }
+-                if !self.dense_ids.is_empty() {
+-                    self.encode_dense_nodes_group()?;
++                let dense = if self.dense_optional {
++                    match self.resolve_optional_run() {
++                        Ok(lengths) => lengths,
++                        Err(err) => {
++                            self.poison(err.to_string());
++                            return Err(crate::error::Error::invalid_data(format!(
++                                "BlockBuilder refused to encode a block: {err}"
++                            )));
++                        }
++                    }
++                } else if self.dense.count != 0 {
++                    Some(self.dense.lengths(self.dense_columns)?)
++                } else {
++                    None
++                };
++                encode_bytes_field(&mut self.encode_buf, 2, &self.plain_group);
++                if let Some(lengths) = dense {
++                    self.dense
++                        .encode_to(&mut self.encode_buf, self.dense_columns, &lengths)?;
+                 }
+             }
+-            BlockType::Ways | BlockType::Relations => {
+-                // PrimitiveBlock field 2: PrimitiveGroup submessage
+-                // group_buf already contains the Way/Relation field entries
+-                // that form the body of the PrimitiveGroup.
+-                encode_bytes_field(&mut self.encode_buf, 2, &self.group_buf);
+-            }
++            BlockType::Ways => self.element_group.encode_to(&mut self.encode_buf, 3)?,
++            BlockType::Relations => self.element_group.encode_to(&mut self.encode_buf, 4)?,
+         }
+ 
+         // Build tagdata from tracked tag key indices. Sorting indices by their
+@@ -2694,152 +2687,6 @@ impl BlockBuilder {
+         Ok(Some(used))
+     }
+ 
+-    /// Encode DenseNodes to wire format and append it to `encode_buf`.
+-    ///
+-    /// Encodes PrimitiveGroup (field 2 of PrimitiveBlock) containing
+-    /// DenseNodes (field 2 of PrimitiveGroup) with all packed fields. Each
+-    /// packed field is staged in a scratch buffer to learn its length, the
+-    /// DenseInfo submessage in `elem_scratch`, and the DenseNodes body in
+-    /// `group_buf`, which is copied once into `encode_buf` behind both
+-    /// prefixes.
+-    ///
+-    /// The staging is deliberate. Writing everything straight into
+-    /// `encode_buf` behind lengths measured first (a varint-width pass over
+-    /// every dense vector, then one direct write) was built on 2026-11-05,
+-    /// verified byte-identical, and measured slower: on planet `cat --clean`
+-    /// (host plantasjen, against `9ebcfa97`) the node phase took 5-6 %
+-    /// longer in both interleaved pairs while peak RSS fell only 25-40 MB.
+-    /// Computing a width per value costs more than bulk-copying the
+-    /// already-encoded bytes. Shapes not tried: accumulating packed lengths
+-    /// as values are added, and reserving prefix space then compacting. See
+-    /// reference/performance/write-pipeline.md "Dense-node direct encoding, refused".
+-    ///
+-    /// DenseNodes fields:
+-    ///   id (sint64 packed, field 1), denseinfo (submessage, field 5),
+-    ///   lat (sint64 packed, field 8), lon (sint64 packed, field 9),
+-    ///   keys_vals (int32 packed, field 10).
+-    ///
+-    /// DenseInfo fields:
+-    ///   version (int32 packed, field 1), timestamp (sint64 packed, field 2),
+-    ///   changeset (sint64 packed, field 3), uid (sint32 packed, field 4),
+-    ///   user_sid (sint32 packed, field 5), visible (bool packed, field 6).
+-    fn encode_dense_nodes_group(&mut self) -> Result<()> {
+-        // Build the DenseNodes body into group_buf (reused scratch)
+-        self.group_buf.clear();
+-
+-        // DenseNodes field 1: id (packed sint64)
+-        encode_packed_sint64(
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            1,
+-            &self.dense_ids,
+-        );
+-
+-        // DenseNodes field 5: denseinfo (submessage)
+-        let columns = self.dense_columns;
+-        if !columns.is_empty() {
+-            // Build DenseInfo into elem_scratch, the run's columns only.
+-            self.elem_scratch.clear();
+-            self.packed_scratch.clear();
+-
+-            // DenseInfo field 1: version (packed int32)
+-            if columns.version() {
+-                encode_packed_int32(
+-                    &mut self.elem_scratch,
+-                    &mut self.packed_scratch,
+-                    1,
+-                    &self.dense_versions,
+-                );
+-            }
+-            // DenseInfo field 2: timestamp (packed sint64)
+-            if columns.timestamp() {
+-                encode_packed_sint64(
+-                    &mut self.elem_scratch,
+-                    &mut self.packed_scratch,
+-                    2,
+-                    &self.dense_timestamps,
+-                );
+-            }
+-            // DenseInfo field 3: changeset (packed sint64)
+-            if columns.changeset() {
+-                encode_packed_sint64(
+-                    &mut self.elem_scratch,
+-                    &mut self.packed_scratch,
+-                    3,
+-                    &self.dense_changesets,
+-                );
+-            }
+-            // DenseInfo field 4: uid (packed sint32)
+-            if columns.uid() {
+-                encode_packed_sint32(
+-                    &mut self.elem_scratch,
+-                    &mut self.packed_scratch,
+-                    4,
+-                    &self.dense_uids,
+-                );
+-            }
+-            // DenseInfo field 5: user_sid (packed sint32)
+-            if columns.user() {
+-                encode_packed_sint32(
+-                    &mut self.elem_scratch,
+-                    &mut self.packed_scratch,
+-                    5,
+-                    &self.dense_user_sids,
+-                );
+-            }
+-            // DenseInfo field 6: visible (packed bool)
+-            if columns.visible() {
+-                encode_packed_bool(&mut self.elem_scratch, 6, &self.dense_visibles);
+-            }
+-
+-            encode_bytes_field(&mut self.group_buf, 5, &self.elem_scratch);
+-        }
+-
+-        // DenseNodes field 8: lat (packed sint64)
+-        encode_packed_sint64(
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            8,
+-            &self.dense_lats,
+-        );
+-        // DenseNodes field 9: lon (packed sint64)
+-        encode_packed_sint64(
+-            &mut self.group_buf,
+-            &mut self.elem_scratch,
+-            9,
+-            &self.dense_lons,
+-        );
+-        // DenseNodes field 10: keys_vals (packed int32). The same encoding
+-        // supplies the optional run's size comparison, including wrappers.
+-        if !self.dense_keys_vals.is_empty() {
+-            encode_packed_int32(
+-                &mut self.group_buf,
+-                &mut self.elem_scratch,
+-                10,
+-                &self.dense_keys_vals,
+-            );
+-        }
+-
+-        // Write PrimitiveBlock field 2 (PrimitiveGroup) holding PrimitiveGroup
+-        // field 2 (DenseNodes, the body in group_buf). Both lengths follow
+-        // from the body's, so the body is copied once, straight behind the
+-        // two prefixes, instead of being wrapped in a scratch buffer first.
+-        // Both fields are written whatever the body's length; a dense block
+-        // holds at least one node, so the body is never empty and the output
+-        // is what the skip-if-empty wrapper this replaced wrote too.
+-        let overflow = || crate::error::Error::internal("dense node group length overflows usize");
+-        let dense_len = self.group_buf.len();
+-        let group_len = super::encode::len_field_size(dense_len).ok_or_else(overflow)?;
+-        self.encode_buf
+-            .reserve(super::encode::len_field_size(group_len).ok_or_else(overflow)?);
+-        for len in [group_len, dense_len] {
+-            protohoggr::encode_tag(&mut self.encode_buf, 2, protohoggr::WIRE_LEN);
+-            protohoggr::encode_varint(&mut self.encode_buf, len as u64);
+-        }
+-        self.encode_buf.extend_from_slice(&self.group_buf);
+-        Ok(())
+-    }
+-
+     fn reset(&mut self) {
+         self.block_type = None;
+         self.count = 0;
+@@ -2850,20 +2697,8 @@ impl BlockBuilder {
+         self.min_lon = i32::MAX;
+         self.max_lon = i32::MIN;
+         self.tag_key_indices.clear();
+-        self.dense_columns = DenseColumns::default();
+         self.seeded = None;
+-
+-        self.last_dense_id = 0;
+-        self.last_dense_lat = 0;
+-        self.last_dense_lon = 0;
+-        self.last_dense_timestamp = 0;
+-        self.last_dense_changeset = 0;
+-        self.last_dense_uid = 0;
+-        self.last_dense_user_sid = 0;
+-
+-        // Clear wire-format accumulators for ways/relations.
+-        self.group_buf.clear();
+-
++        self.element_group.clear(MAX_RETAINED_SCRATCH_CAPACITY);
+         self.clear_dense_run();
+         self.node_groups.clear();
+         self.plain_group.clear();
+@@ -2877,24 +2712,7 @@ impl BlockBuilder {
+         self.dense_columns = DenseColumns::default();
+         self.dense_optional = false;
+         self.shadow_plain.clear();
+-        self.last_dense_id = 0;
+-        self.last_dense_lat = 0;
+-        self.last_dense_lon = 0;
+-        self.last_dense_timestamp = 0;
+-        self.last_dense_changeset = 0;
+-        self.last_dense_uid = 0;
+-        self.last_dense_user_sid = 0;
+-        // Clear dense Vecs (encode_dense_nodes_group reads without consuming).
+-        self.dense_ids.clear();
+-        self.dense_lats.clear();
+-        self.dense_lons.clear();
+-        self.dense_keys_vals.clear();
+-        self.dense_versions.clear();
+-        self.dense_timestamps.clear();
+-        self.dense_changesets.clear();
+-        self.dense_uids.clear();
+-        self.dense_user_sids.clear();
+-        self.dense_visibles.clear();
++        self.dense.clear();
+     }
+ 
+     // Close the pending dense run into `node_groups` and reset its delta
+@@ -2902,22 +2720,30 @@ impl BlockBuilder {
+     // node and on a metadata-presence change (`begin_dense_node`).
+     #[cold]
+     fn seal_dense_run(&mut self) {
+-        if self.dense_ids.is_empty() {
++        if self.dense.count == 0 {
+             return;
+         }
+-        if self.dense_optional {
+-            self.resolve_optional_run();
+-        } else {
+-            std::mem::swap(&mut self.encode_buf, &mut self.node_groups);
+-            let result = self.encode_dense_nodes_group();
+-            std::mem::swap(&mut self.encode_buf, &mut self.node_groups);
+-            if let Err(err) = result {
+-                self.poison(err.to_string());
+-            }
++        let result = self.seal_dense_group();
++        if let Err(err) = result {
++            self.poison(err.to_string());
+         }
+         self.clear_dense_run();
+     }
+ 
++    fn seal_dense_group(&mut self) -> Result<()> {
++        let lengths = if self.dense_optional {
++            self.resolve_optional_run()?
++        } else {
++            Some(self.dense.lengths(self.dense_columns)?)
++        };
++        if let Some(lengths) = lengths {
++            self.flush_plain_group();
++            self.dense
++                .encode_to(&mut self.node_groups, self.dense_columns, &lengths)?;
++        }
++        Ok(())
++    }
++
+     /// Close an optional run in the smaller of its two forms: the dense
+     /// group (after the pending plain group, closed into its own group), or
+     /// its plain `Node` messages appended to the pending plain group, which
+@@ -2927,40 +2753,29 @@ impl BlockBuilder {
+     /// that would have joined the plain form opens a new group after a
+     /// dense one, which this does not foresee.
+     #[cold]
+-    fn resolve_optional_run(&mut self) {
+-        let mut candidate = std::mem::take(&mut self.dense_candidate);
+-        candidate.clear();
+-        std::mem::swap(&mut self.encode_buf, &mut candidate);
+-        let result = self.encode_dense_nodes_group();
+-        std::mem::swap(&mut self.encode_buf, &mut candidate);
+-        if let Err(err) = result {
+-            self.poison(err.to_string());
+-            self.dense_candidate = candidate;
+-            return;
+-        }
+-        let len = super::encode::len_field_size;
++    fn resolve_optional_run(&mut self) -> Result<Option<DenseGroupLengths>> {
++        let lengths = self.dense.lengths(self.dense_columns)?;
+         let pending = if self.plain_group.is_empty() {
+             Some(0)
+         } else {
+-            len(self.plain_group.len())
++            len_field_size(self.plain_group.len())
+         };
+-        let dense = pending.and_then(|p| p.checked_add(candidate.len()));
++        let dense = pending.and_then(|p| p.checked_add(lengths.total));
+         let plain = self
+             .plain_group
+             .len()
+             .checked_add(self.shadow_plain.len())
+-            .and_then(len);
++            .and_then(len_field_size);
+         match (dense, plain) {
+-            (Some(dense), Some(plain)) if dense < plain => {
+-                if !self.plain_group.is_empty() {
+-                    self.flush_plain_group();
+-                }
+-                self.node_groups.extend_from_slice(&candidate);
++            (Some(dense), Some(plain)) if dense < plain => Ok(Some(lengths)),
++            (_, Some(_)) => {
++                self.plain_group.extend_from_slice(&self.shadow_plain);
++                Ok(None)
+             }
+-            (_, Some(_)) => self.plain_group.extend_from_slice(&self.shadow_plain),
+-            (_, None) => self.poison("plain node group length overflows usize".to_owned()),
++            (_, None) => Err(crate::error::Error::internal(
++                "plain node group length overflows usize",
++            )),
+         }
+-        self.dense_candidate = candidate;
+     }
+ 
+     /// Drop every retained buffer that one block grew past the retention
+@@ -2969,7 +2784,7 @@ impl BlockBuilder {
+     /// for a whole run - holds a fixed bound per buffer rather than the
+     /// union of every outlier it ever met. A released buffer regrows only if
+     /// a later block needs it. Normal blocks never trip it: at the default
+-    /// cap the dense vectors are 8 to 64 KB each.
++    /// cap the packed dense columns are typically much smaller than the limit.
+     ///
+     /// Runs inside [`reset`](Self::reset), so it excludes the two buffers
+     /// that still hold the block just encoded: `encode_buf` (released at the
+@@ -2981,27 +2796,16 @@ impl BlockBuilder {
+                 drop(std::mem::take(v));
+             }
+         }
+-        release(&mut self.dense_ids);
+-        release(&mut self.dense_lats);
+-        release(&mut self.dense_lons);
+-        release(&mut self.dense_keys_vals);
+-        release(&mut self.dense_versions);
+-        release(&mut self.dense_timestamps);
+-        release(&mut self.dense_changesets);
+-        release(&mut self.dense_uids);
+-        release(&mut self.dense_user_sids);
+-        release(&mut self.dense_visibles);
++        for buf in self.dense.buffers() {
++            release(buf);
++        }
+         release(&mut self.node_groups);
+         release(&mut self.plain_group);
+         release(&mut self.shadow_plain);
+-        release(&mut self.dense_candidate);
+         release(&mut self.raw_tags_scratch);
+-        release(&mut self.group_buf);
+         release(&mut self.elem_scratch);
+         release(&mut self.packed_scratch);
+         release(&mut self.packed_vals_scratch);
+-        release(&mut self.packed_lat_scratch);
+-        release(&mut self.packed_lon_scratch);
+         release(&mut self.info_scratch);
+         release(&mut self.tag_key_scratch);
+         // Both the bitset (grown by the highest key index) and the member
+@@ -3197,6 +3001,494 @@ mod tests {
+     use crate::{MemberId, MemberType, PrimitiveBlock};
+     use protohoggr::encode_bytes_field;
+ 
++    /// The old dense encoder staged signed deltas and packed each field at
++    /// flush before building DenseInfo, DenseNodes and PrimitiveGroup.
++    #[derive(Default)]
++    struct StagedDenseNodes {
++        ids: Vec<i64>,
++        lats: Vec<i64>,
++        lons: Vec<i64>,
++        keys_vals: Vec<i32>,
++        versions: Vec<i32>,
++        timestamps: Vec<i64>,
++        changesets: Vec<i64>,
++        uids: Vec<i32>,
++        users: Vec<i32>,
++        visibles: Vec<bool>,
++        previous_position: [i64; 3],
++        previous_meta: Option<RawMetadata>,
++    }
++
++    impl StagedDenseNodes {
++        fn push(
++            &mut self,
++            id: i64,
++            lat: i32,
++            lon: i32,
++            tags: &[(u32, u32)],
++            meta: Option<RawMetadata>,
++        ) {
++            if !tags.is_empty() && self.keys_vals.is_empty() {
++                self.keys_vals.resize(self.ids.len(), 0);
++            }
++            for &(key, value) in tags {
++                self.keys_vals
++                    .extend([key.cast_signed(), value.cast_signed()]);
++            }
++            if !self.keys_vals.is_empty() {
++                self.keys_vals.push(0);
++            }
++            let position = [id, i64::from(lat), i64::from(lon)];
++            let [id, lat, lon] =
++                std::array::from_fn(|i| position[i].wrapping_sub(self.previous_position[i]));
++            self.ids.push(id);
++            self.lats.push(lat);
++            self.lons.push(lon);
++            self.previous_position = position;
++            if let Some(meta) = meta {
++                self.versions.push(meta.version);
++                self.timestamps.push(
++                    meta.timestamp
++                        .wrapping_sub(self.previous_meta.map_or(0, |m| m.timestamp)),
++                );
++                self.changesets.push(
++                    meta.changeset
++                        .wrapping_sub(self.previous_meta.map_or(0, |m| m.changeset)),
++                );
++                self.uids.push(
++                    meta.uid
++                        .wrapping_sub(self.previous_meta.map_or(0, |m| m.uid)),
++                );
++                self.users.push(
++                    meta.user_sid
++                        .wrapping_sub(self.previous_meta.map_or(0, |m| m.user_sid)),
++                );
++                self.visibles.push(meta.visible);
++                self.previous_meta = Some(meta);
++            }
++        }
++
++        fn append_group(&self, groups: &mut Vec<u8>, columns: crate::DenseColumns) {
++            use protohoggr::{
++                encode_packed_bool, encode_packed_int32, encode_packed_sint32, encode_packed_sint64,
++            };
++
++            let (mut packed, mut info, mut dense, mut group) =
++                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
++            encode_packed_sint64(&mut dense, &mut packed, 1, &self.ids);
++            if columns.version() {
++                encode_packed_int32(&mut info, &mut packed, 1, &self.versions);
++            }
++            if columns.timestamp() {
++                encode_packed_sint64(&mut info, &mut packed, 2, &self.timestamps);
++            }
++            if columns.changeset() {
++                encode_packed_sint64(&mut info, &mut packed, 3, &self.changesets);
++            }
++            if columns.uid() {
++                encode_packed_sint32(&mut info, &mut packed, 4, &self.uids);
++            }
++            if columns.user() {
++                encode_packed_sint32(&mut info, &mut packed, 5, &self.users);
++            }
++            if columns.visible() {
++                encode_packed_bool(&mut info, 6, &self.visibles);
++            }
++            encode_bytes_field(&mut dense, 5, &info);
++            encode_packed_sint64(&mut dense, &mut packed, 8, &self.lats);
++            encode_packed_sint64(&mut dense, &mut packed, 9, &self.lons);
++            encode_packed_int32(&mut dense, &mut packed, 10, &self.keys_vals);
++            encode_bytes_field(&mut group, 2, &dense);
++            encode_bytes_field(groups, 2, &group);
++        }
++    }
++
++    fn generated_id(i: usize) -> i64 {
++        match i % 9 {
++            0 => 0,
++            1 => i64::MAX,
++            2 => -1,
++            3 => i64::MIN,
++            _ => i64::try_from(i).unwrap(),
++        }
++    }
++
++    fn generated_metadata(i: usize) -> Metadata<'static> {
++        Metadata {
++            version: [0, 1, -1, i32::MIN][i % 4],
++            timestamp: generated_id(i),
++            changeset: generated_id(i + 1),
++            uid: [i32::MAX, -1, i32::MIN, 0][i % 4],
++            user: ["first", "", "second"][i % 3],
++            visible: i.is_multiple_of(2),
++        }
++    }
++
++    #[test]
++    fn dense_block_at_default_cap_matches_staged_encoding() -> crate::Result<()> {
++        use crate::DenseColumns;
++        use crate::write::string_table::StringTable;
++
++        let mut builder = BlockBuilder::new();
++        let mut strings = StringTable::new();
++        let mut groups = Vec::new();
++        let mut cursor = 0;
++        for (end, columns) in [
++            (97, DenseColumns::default()),
++            (539, DenseColumns::ALL),
++            (
++                super::DEFAULT_ELEMENT_CAP.get(),
++                DenseColumns::from_presence([true, true, false, false, true, false]),
++            ),
++        ] {
++            let mut staged = StagedDenseNodes::default();
++            for i in cursor..end {
++                let id = generated_id(i);
++                let lat = [i32::MIN, i32::MAX, -65, 64, 0][i % 5];
++                let lon = [i32::MAX, i32::MIN, 65, -64, 0][i % 5];
++                let key = format!("key-{i}");
++                let pair = [("", "empty key"), (key.as_str(), "")];
++                let tags = if i % 11 == 7 { &pair[..] } else { &[] };
++                let meta = (!columns.is_empty()).then(|| generated_metadata(i));
++                builder.add_node_columns(
++                    id,
++                    lat,
++                    lon,
++                    tags.iter().copied(),
++                    meta.as_ref(),
++                    columns,
++                );
++                let tags: Vec<_> = tags
++                    .iter()
++                    .map(|(k, v)| (strings.add(k), strings.add(v)))
++                    .collect();
++                let raw = meta.map(|m| RawMetadata {
++                    version: m.version,
++                    timestamp: m.timestamp,
++                    changeset: m.changeset,
++                    uid: m.uid,
++                    user_sid: strings.add(m.user).cast_signed(),
++                    visible: m.visible,
++                    columns,
++                    zero_timestamp_claim: false,
++                });
++                staged.push(id, lat, lon, &tags, raw);
++            }
++            staged.append_group(&mut groups, columns);
++            cursor = end;
++        }
++        assert!(builder.should_flush());
++        let mut expected = Vec::new();
++        strings.encode_to(&mut expected)?;
++        expected.extend_from_slice(&groups);
++        assert_eq!(builder.take()?.expect("dense block"), expected);
++        Ok(())
++    }
++
++    fn staged_plain_node(group: &mut Vec<u8>, id: i64, lat: i32, info: &[u8]) {
++        use protohoggr::{WIRE_VARINT, encode_tag, encode_varint, zigzag_encode_64};
++        let mut node = Vec::new();
++        encode_tag(&mut node, 1, WIRE_VARINT);
++        encode_varint(&mut node, zigzag_encode_64(id));
++        encode_bytes_field(&mut node, 4, info);
++        for (field, value) in [(8, i64::from(lat)), (9, 0)] {
++            encode_tag(&mut node, field, WIRE_VARINT);
++            encode_varint(&mut node, zigzag_encode_64(value));
++        }
++        encode_bytes_field(group, 1, &node);
++    }
++
++    #[test]
++    fn optional_node_runs_match_staged_representation_selection() -> crate::Result<()> {
++        use crate::write::string_table::StringTable;
++        let meta = PartialMetadata {
++            version: Some(1),
++            visible: Some(true),
++            ..PartialMetadata::default()
++        };
++        let NodeRoute::Partial(columns) = meta.route() else {
++            panic!("optional dense fixture")
++        };
++        for (count, tie) in [(1, false), (2, false), (2, true), (17, false)] {
++            for seal_before_flush in [false, true] {
++                let mut builder = BlockBuilder::new();
++                let mut staged = StagedDenseNodes::default();
++                let mut pending = Vec::new();
++                let mut shadow = Vec::new();
++                builder.add_node_bare_plain(-1, 0, 0, []);
++                staged_plain_node(&mut pending, -1, 0, &[]);
++                for i in 1..=count {
++                    // In the tie case the second id and latitude delta each
++                    // take one more byte than the plain absolute value.
++                    let (id, lat) = if tie {
++                        let pos = if i == 1 { -64 } else { 63 };
++                        (i64::from(pos), pos)
++                    } else {
++                        (i64::from(i), 0)
++                    };
++                    builder.add_node_partial(id, lat, 0, [], Some(&meta));
++                    staged.push(
++                        id,
++                        lat,
++                        0,
++                        &[],
++                        Some(RawMetadata {
++                            version: 1,
++                            timestamp: 0,
++                            changeset: 0,
++                            uid: 0,
++                            user_sid: 0,
++                            visible: true,
++                            columns,
++                            zero_timestamp_claim: false,
++                        }),
++                    );
++                    staged_plain_node(&mut shadow, id, lat, &[0x08, 1, 0x30, 1]);
++                }
++                let mut dense = Vec::new();
++                encode_bytes_field(&mut dense, 2, &pending);
++                staged.append_group(&mut dense, columns);
++                pending.extend_from_slice(&shadow);
++                let mut plain = Vec::new();
++                encode_bytes_field(&mut plain, 2, &pending);
++                assert_eq!(dense.len() == plain.len(), tie);
++                assert_eq!(dense.len() < plain.len(), count > 1 && !tie);
++                let mut groups = if dense.len() < plain.len() {
++                    dense
++                } else {
++                    plain
++                };
++                if seal_before_flush {
++                    builder.add_node(99, 0, 0, [], None);
++                    let mut trailing = StagedDenseNodes::default();
++                    trailing.push(99, 0, 0, &[], None);
++                    trailing.append_group(&mut groups, crate::DenseColumns::default());
++                }
++                let mut expected = Vec::new();
++                StringTable::new().encode_to(&mut expected)?;
++                expected.extend_from_slice(&groups);
++                assert_eq!(builder.take()?.expect("node block"), expected);
++            }
++        }
++        Ok(())
++    }
++
++    struct StagedElements {
++        strings: crate::write::string_table::StringTable,
++        keys: crate::write::encode::KeySet,
++        group: Vec<u8>,
++        elem: Vec<u8>,
++        packed: Vec<u8>,
++        values: Vec<u8>,
++        lats: Vec<u8>,
++        lons: Vec<u8>,
++        info: Vec<u8>,
++    }
++
++    impl StagedElements {
++        fn new() -> Self {
++            Self {
++                strings: crate::write::string_table::StringTable::new(),
++                keys: crate::write::encode::KeySet::default(),
++                group: Vec::new(),
++                elem: Vec::new(),
++                packed: Vec::new(),
++                values: Vec::new(),
++                lats: Vec::new(),
++                lons: Vec::new(),
++                info: Vec::new(),
++            }
++        }
++
++        fn way<'t, M: crate::write::encode::EncodeMetadata>(
++            &mut self,
++            id: i64,
++            tags: &[(&'t str, &'t str)],
++            refs: &[i64],
++            locations: Option<&[(i32, i32)]>,
++            metadata: Option<&M>,
++        ) {
++            use crate::write::encode::{encode_way, encode_way_with_locations};
++            if let Some(locations) = locations {
++                encode_way_with_locations(
++                    &mut self.strings,
++                    &mut self.group,
++                    &mut self.elem,
++                    &mut self.packed,
++                    &mut self.values,
++                    &mut self.lats,
++                    &mut self.lons,
++                    &mut self.info,
++                    &mut self.keys,
++                    id,
++                    tags.iter().copied(),
++                    refs,
++                    locations,
++                    metadata,
++                );
++            } else {
++                encode_way(
++                    &mut self.strings,
++                    &mut self.group,
++                    &mut self.elem,
++                    &mut self.packed,
++                    &mut self.values,
++                    &mut self.info,
++                    &mut self.keys,
++                    id,
++                    tags.iter().copied(),
++                    refs,
++                    metadata,
++                );
++            }
++        }
++
++        fn relation<'t, M: crate::write::encode::EncodeMetadata>(
++            &mut self,
++            id: i64,
++            tags: &[(&'t str, &'t str)],
++            members: &[MemberData<'_>],
++            metadata: Option<&M>,
++        ) {
++            crate::write::encode::encode_relation(
++                &mut self.strings,
++                &mut self.group,
++                &mut self.elem,
++                &mut self.packed,
++                &mut self.values,
++                &mut self.info,
++                &mut self.keys,
++                id,
++                tags.iter().copied(),
++                members,
++                metadata,
++            );
++        }
++
++        fn compare(&self, builder: &mut BlockBuilder, count: usize) -> crate::Result<()> {
++            assert!(builder.should_flush());
++            assert_eq!(
++                builder.content_len(),
++                self.strings.content_len() + self.group.len()
++            );
++            let mut expected = Vec::new();
++            self.strings.encode_to(&mut expected)?;
++            encode_bytes_field(&mut expected, 2, &self.group);
++            let block = builder.take_owned()?.expect("element block");
++            assert_eq!(block.index.count, count as u64);
++            assert_eq!(block.bytes, expected);
++            Ok(())
++        }
++    }
++
++    fn generated_partial_metadata(i: usize) -> PartialMetadata<'static> {
++        PartialMetadata {
++            version: Some(0),
++            timestamp: Some(generated_id(i)),
++            user: Some(""),
++            visible: Some(i.is_multiple_of(2)),
++            ..PartialMetadata::default()
++        }
++    }
++
++    #[test]
++    fn way_blocks_at_cap_match_staged_encoding() -> crate::Result<()> {
++        let count = 257;
++        let mut builder = BlockBuilder::with_element_cap_prealloc(cap(count), count);
++        let refs: Vec<_> = (0..count).map(generated_id).collect();
++        let locations: Vec<_> = (0..count)
++            .map(|i| {
++                let coordinates = [i32::MIN, i32::MAX, -64, 65];
++                (coordinates[i % 4], coordinates[(i + 1) % 4])
++            })
++            .collect();
++        for with_locations in [false, true] {
++            let mut staged = StagedElements::new();
++            for i in 0..count {
++                let id = generated_id(i);
++                let val = format!("value-{i}");
++                let pair = [("", val.as_str())];
++                let tags = if i % 3 == 1 { &pair[..] } else { &[] };
++                let len = if i % 13 == 12 { count } else { i % 13 };
++                let refs = &refs[..len];
++                let locations = with_locations.then_some(&locations[..len]);
++                let full = (i % 3 == 1).then(|| generated_metadata(i));
++                let partial = if i % 6 == 2 {
++                    generated_partial_metadata(i)
++                } else {
++                    PartialMetadata::default()
++                };
++                match (locations, i % 3 == 2) {
++                    (Some(locs), true) => builder.add_way_with_locations_partial(
++                        id,
++                        tags.iter().copied(),
++                        refs,
++                        locs,
++                        Some(&partial),
++                    ),
++                    (Some(locs), false) => builder.add_way_with_locations(
++                        id,
++                        tags.iter().copied(),
++                        refs,
++                        locs,
++                        full.as_ref(),
++                    ),
++                    (None, true) => {
++                        builder.add_way_partial(id, tags.iter().copied(), refs, Some(&partial));
++                    }
++                    (None, false) => builder.add_way(id, tags.iter().copied(), refs, full.as_ref()),
++                }
++                if i % 3 == 2 {
++                    staged.way(id, tags, refs, locations, Some(&partial));
++                } else {
++                    staged.way(id, tags, refs, locations, full.as_ref());
++                }
++            }
++            staged.compare(&mut builder, count)?;
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn relation_block_at_cap_matches_staged_encoding() -> crate::Result<()> {
++        let count = 257;
++        let mut builder = BlockBuilder::with_element_cap_prealloc(cap(count), count);
++        let roles: Vec<_> = (0..count).map(|i| format!("role-{i}")).collect();
++        let members: Vec<_> = roles
++            .iter()
++            .enumerate()
++            .map(|(i, role)| {
++                let id = generated_id(i);
++                MemberData {
++                    id: match i % 3 {
++                        0 => MemberId::Node(id),
++                        1 => MemberId::Way(id),
++                        _ => MemberId::Relation(id),
++                    },
++                    role: if i.is_multiple_of(13) { "" } else { role },
++                }
++            })
++            .collect();
++        let mut staged = StagedElements::new();
++        for i in 0..count {
++            let id = generated_id(i);
++            let pair = [("", "relation")];
++            let tags = if i % 3 == 1 { &pair[..] } else { &[] };
++            let len = if i % 13 == 12 { count } else { i % 13 };
++            let members = &members[..len];
++            if i % 3 == 2 {
++                let meta = generated_partial_metadata(i);
++                builder.add_relation_partial(id, tags.iter().copied(), members, Some(&meta));
++                staged.relation(id, tags, members, Some(&meta));
++            } else {
++                let meta = (i % 3 == 1).then(|| generated_metadata(i));
++                builder.add_relation(id, tags.iter().copied(), members, meta.as_ref());
++                staged.relation(id, tags, members, meta.as_ref());
++            }
++        }
++        staged.compare(&mut builder, count)
++    }
++
+     #[test]
+     fn dense_tag_column_round_trips() -> crate::Result<()> {
+         use crate::read::wire::{Cursor, WireGroup};
+@@ -4543,7 +4835,7 @@ mod tests {
+ 
+     /// A ref/location length mismatch must not reach the encoder.
+     ///
+-    /// `encode_way_with_locations` zips the two slices, so the shorter one
++    /// The encoder zips the two slices, so the shorter one
+     /// decides the way's node count: a way silently written with fewer refs
+     /// than it has. Only a `debug_assert_eq!` stood between that and a
+     /// release build. The assertion here is on the refusal to produce the
+@@ -4708,10 +5000,6 @@ mod tests {
+             kept.encode_buf.capacity() <= LIMIT,
+             "outlier encode buffer released"
+         );
+-        assert!(
+-            kept.group_buf.capacity() <= LIMIT,
+-            "outlier group buffer released"
+-        );
+         assert!(
+             kept.elem_scratch.capacity() <= LIMIT,
+             "outlier scratch released"
+@@ -4877,13 +5165,21 @@ mod tests {
+         );
+     }
+ 
++    fn packed_sint64(bytes: &[u8]) -> Vec<i64> {
++        crate::read::wire::PackedSint64Iter::new(bytes).collect()
++    }
++
++    fn packed_sint32(bytes: &[u8]) -> Vec<i32> {
++        crate::read::wire::PackedSint32Iter::new(bytes).collect()
++    }
++
+     #[test]
+     fn dense_node_id_deltas_wrap_at_signed_boundaries() {
+         let mut bb = BlockBuilder::new();
+         bb.add_node(-1, 0, 0, [], None);
+         bb.add_node(i64::MAX, 0, 0, [], None);
+ 
+-        assert_eq!(bb.dense_ids, [-1, i64::MIN]);
++        assert_eq!(packed_sint64(&bb.dense.ids), [-1, i64::MIN]);
+         assert!(bb.take().unwrap().is_some());
+     }
+ 
+@@ -4909,9 +5205,9 @@ mod tests {
+         bb.add_node(1, 0, 0, [], Some(&first));
+         bb.add_node(2, 0, 0, [], Some(&next));
+ 
+-        assert_eq!(bb.dense_timestamps, [i64::MAX, i64::MIN]);
+-        assert_eq!(bb.dense_changesets, [i64::MAX, i64::MIN]);
+-        assert_eq!(bb.dense_uids, [i32::MAX, i32::MIN]);
++        assert_eq!(packed_sint64(&bb.dense.timestamps), [i64::MAX, i64::MIN]);
++        assert_eq!(packed_sint64(&bb.dense.changesets), [i64::MAX, i64::MIN]);
++        assert_eq!(packed_sint32(&bb.dense.uids), [i32::MAX, i32::MIN]);
+         assert!(bb.take().unwrap().is_some());
+     }
+ 
+@@ -4938,13 +5234,13 @@ mod tests {
+             columns: crate::DenseColumns::ALL,
+             zero_timestamp_claim: false,
+         };
+-        bb.add_dense_metadata_raw(&first);
+-        bb.add_dense_metadata_raw(&next);
++        bb.dense.push_metadata(&first);
++        bb.dense.push_metadata(&next);
+ 
+-        assert_eq!(bb.dense_timestamps, [i64::MAX, i64::MIN]);
+-        assert_eq!(bb.dense_changesets, [i64::MAX, i64::MIN]);
+-        assert_eq!(bb.dense_uids, [i32::MAX, i32::MIN]);
+-        assert_eq!(bb.dense_user_sids, [i32::MAX, i32::MIN]);
++        assert_eq!(packed_sint64(&bb.dense.timestamps), [i64::MAX, i64::MIN]);
++        assert_eq!(packed_sint64(&bb.dense.changesets), [i64::MAX, i64::MIN]);
++        assert_eq!(packed_sint32(&bb.dense.uids), [i32::MAX, i32::MIN]);
++        assert_eq!(packed_sint32(&bb.dense.user_sids), [i32::MAX, i32::MIN]);
+     }
+ 
+     /// A metadata-less node after signed-minimum metadata seals the run, so
+@@ -4964,7 +5260,7 @@ mod tests {
+         bb.add_node(2, 0, 0, [], None);
+ 
+         assert!(
+-            bb.dense_timestamps.is_empty(),
++            bb.dense.timestamps.is_empty(),
+             "the second run has no DenseInfo"
+         );
+         let block = PrimitiveBlock::from_vec(bb.take().unwrap().unwrap().to_vec()).unwrap();
+diff --git a/crates/lib/src/write/encode.rs b/crates/lib/src/write/encode.rs
+index 18ed671d..dac80a82 100644
+--- a/crates/lib/src/write/encode.rs
++++ b/crates/lib/src/write/encode.rs
+@@ -1,13 +1,4 @@
+-//! Wire-format encoders for `PrimitiveGroup` elements. These are called from
+-//! `BlockBuilder`'s `add_*` methods to append serialized bytes into the
+-//! current group buffer.
+-//!
+-//! Every element encoder writes the `id` field even when it is 0 (OSMPBF
+-//! declares `Way.id` and `Relation.id` required, and libosmium writes them
+-//! unconditionally) and wraps the element body with the `_always` field
+-//! writer. A skip-if-empty wrapper drops an element whose every field is
+-//! default - an untagged id-0 way or relation with no refs, members or
+-//! Info - while the block index still counts it.
++//! Wire-format encoders for `PrimitiveGroup` elements.
+ 
+ use protohoggr::{
+     encode_bytes_field, encode_bytes_field_always, encode_int64_field_always, encode_varint,
+@@ -94,6 +85,12 @@ pub(super) fn len_field_size(body_len: usize) -> Option<usize> {
+     (1 + varint_len(body_len as u64)).checked_add(body_len)
+ }
+ 
++#[inline]
++pub(super) fn write_len_prefix(buf: &mut Vec<u8>, field: u32, len: usize) {
++    protohoggr::encode_tag(buf, field, protohoggr::WIRE_LEN);
++    encode_varint(buf, len as u64);
++}
++
+ /// The one-byte varint-field tag of field `FIELD`. A field number outside
+ /// `1..=15` (zero is not a protobuf field; above 15 the tag takes two bytes)
+ /// fails to compile.
+@@ -139,12 +136,7 @@ fn encode_optional_uint32<const FIELD: u32>(buf: &mut Vec<u8>, value: u32) {
+ ///
+ /// Uses unconditional field writers to always emit all metadata fields,
+ /// even when their value is zero (matching the OSMPBF convention).
+-pub(super) fn encode_info_to(
+-    info: &mut Vec<u8>,
+-    string_table: &mut StringTable,
+-    meta: &Metadata<'_>,
+-) {
+-    info.clear();
++fn append_info(info: &mut Vec<u8>, string_table: &mut StringTable, meta: &Metadata<'_>) {
+     // Field 1: version (optional int32) - always present
+     encode_optional_int32::<1>(info, meta.version);
+     // Field 2: timestamp (optional int64) - always present
+@@ -165,17 +157,17 @@ pub(super) fn encode_info_to(
+ }
+ 
+ pub(super) trait EncodeMetadata {
+-    fn encode_info(&self, info: &mut Vec<u8>, strings: &mut StringTable);
++    fn append_info(&self, info: &mut Vec<u8>, strings: &mut StringTable);
+ }
+ 
+ impl EncodeMetadata for Metadata<'_> {
+-    fn encode_info(&self, info: &mut Vec<u8>, strings: &mut StringTable) {
+-        encode_info_to(info, strings, self);
++    fn append_info(&self, info: &mut Vec<u8>, strings: &mut StringTable) {
++        append_info(info, strings, self);
+     }
+ }
+ 
+ impl EncodeMetadata for super::block_builder::PartialMetadata<'_> {
+-    fn encode_info(&self, info: &mut Vec<u8>, strings: &mut StringTable) {
++    fn append_info(&self, info: &mut Vec<u8>, strings: &mut StringTable) {
+         let raw = super::block_builder::RawPartialMetadata {
+             version: self.version,
+             timestamp: self.timestamp,
+@@ -185,7 +177,7 @@ impl EncodeMetadata for super::block_builder::PartialMetadata<'_> {
+             user_sid: self.user.map(|user| strings.add(user).cast_signed()),
+             visible: self.visible,
+         };
+-        encode_raw_partial_info(info, &raw);
++        append_raw_partial_info(info, &raw);
+     }
+ }
+ 
+@@ -196,6 +188,10 @@ pub(super) fn encode_raw_partial_info(
+     meta: &super::block_builder::RawPartialMetadata,
+ ) {
+     info.clear();
++    append_raw_partial_info(info, meta);
++}
++
++fn append_raw_partial_info(info: &mut Vec<u8>, meta: &super::block_builder::RawPartialMetadata) {
+     if let Some(value) = meta.version {
+         encode_optional_int32::<1>(info, value);
+     }
+@@ -244,8 +240,269 @@ pub(super) fn encode_tags<'t>(
+     }
+ }
+ 
++/// One span per length-delimited element field, in wire order. Fields 8-10
++/// are refs/lat/lon for ways and roles/member IDs/types for relations.
++const ELEMENT_FIELDS: [u32; 6] = [2, 3, 4, 8, 9, 10];
++
++#[derive(Clone)]
++struct ElementSpans {
++    id_len: usize,
++    lengths: [usize; ELEMENT_FIELDS.len()],
++    body_len: usize,
++}
++
++/// Store each element's packed spans in reusable, contiguous field buffers.
++/// At flush, the spans are read in element order into the final block. Each
++/// span is copied once, with its length already known. An arena per field
++/// avoids both an allocation per element and moving bytes to backpatch prefixes.
++#[derive(Clone, Default)]
++pub(super) struct ElementGroup {
++    // Complete int64 ID fields, including their tags.
++    ids: Vec<u8>,
++    columns: [Vec<u8>; ELEMENT_FIELDS.len()],
++    elements: Vec<ElementSpans>,
++    body_len: usize,
++}
++
++impl ElementGroup {
++    pub(super) fn len(&self) -> usize {
++        self.body_len
++    }
++
++    pub(super) fn clear(&mut self, retention_limit: usize) {
++        self.body_len = 0;
++        clear_or_release(&mut self.elements, retention_limit);
++        clear_or_release(&mut self.ids, retention_limit);
++        for column in &mut self.columns {
++            clear_or_release(column, retention_limit);
++        }
++    }
++
++    fn starts(&self) -> [usize; ELEMENT_FIELDS.len()] {
++        self.columns.each_ref().map(Vec::len)
++    }
++
++    fn start_element<'t, M: EncodeMetadata>(
++        &mut self,
++        strings: &mut StringTable,
++        tag_keys: &mut KeySet,
++        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
++        metadata: Option<&M>,
++    ) -> [usize; ELEMENT_FIELDS.len()] {
++        let starts = self.starts();
++        let [keys, values, info, ..] = &mut self.columns;
++        for (key, value) in tags {
++            let key = strings.add(key);
++            tag_keys.insert(key);
++            encode_varint(keys, u64::from(key));
++            encode_varint(values, u64::from(strings.add(value)));
++        }
++        if let Some(meta) = metadata {
++            meta.append_info(info, strings);
++        }
++        starts
++    }
++
++    fn finish_element(&mut self, id: i64, starts: [usize; ELEMENT_FIELDS.len()]) {
++        let lengths = std::array::from_fn(|i| self.columns[i].len() - starts[i]);
++        let id_start = self.ids.len();
++        encode_int64_field_always(&mut self.ids, 1, id);
++        let id_len = self.ids.len() - id_start;
++        let mut body_len = id_len;
++        for len in lengths {
++            if len != 0 {
++                body_len += 1 + varint_len(len as u64) + len;
++            }
++        }
++        self.body_len += 1 + varint_len(body_len as u64) + body_len;
++        self.elements.push(ElementSpans {
++            id_len,
++            lengths,
++            body_len,
++        });
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn add_way<'t, M: EncodeMetadata>(
++        &mut self,
++        strings: &mut StringTable,
++        tag_keys: &mut KeySet,
++        id: i64,
++        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
++        refs: &[i64],
++        locations: Option<&[(i32, i32)]>,
++        metadata: Option<&M>,
++    ) {
++        let starts = self.start_element(strings, tag_keys, tags, metadata);
++        let [.., ref_bytes, lat_bytes, lon_bytes] = &mut self.columns;
++        let mut last_ref = 0;
++        if let Some(locations) = locations {
++            let (mut last_lat, mut last_lon) = (0, 0);
++            for (&node, &(lat, lon)) in refs.iter().zip(locations) {
++                push_delta(ref_bytes, node, &mut last_ref);
++                push_delta(lat_bytes, i64::from(lat), &mut last_lat);
++                push_delta(lon_bytes, i64::from(lon), &mut last_lon);
++            }
++        } else {
++            for &node in refs {
++                push_delta(ref_bytes, node, &mut last_ref);
++            }
++        }
++        self.finish_element(id, starts);
++    }
++
++    pub(super) fn add_relation<'t, M: EncodeMetadata>(
++        &mut self,
++        strings: &mut StringTable,
++        tag_keys: &mut KeySet,
++        id: i64,
++        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
++        members: &[MemberData<'_>],
++        metadata: Option<&M>,
++    ) {
++        let starts = self.start_element(strings, tag_keys, tags, metadata);
++        let mut last_id = 0;
++        for &member in members {
++            self.push_member(strings, member, member.id.member_type(), &mut last_id);
++        }
++        self.finish_element(id, starts);
++    }
++
++    pub(super) fn add_relation_iter<'t, 'm, M: EncodeMetadata>(
++        &mut self,
++        strings: &mut StringTable,
++        tag_keys: &mut KeySet,
++        id: i64,
++        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
++        members: impl IntoIterator<Item = crate::error::Result<MemberData<'m>>>,
++        metadata: Option<&M>,
++    ) -> crate::error::Result<()> {
++        let starts = self.start_element(strings, tag_keys, tags, metadata);
++        if let Err(err) = self.pack_members(strings, id, members) {
++            for (column, start) in self.columns.iter_mut().zip(starts) {
++                column.truncate(start);
++            }
++            return Err(err);
++        }
++        self.finish_element(id, starts);
++        Ok(())
++    }
++
++    fn pack_members<'m>(
++        &mut self,
++        strings: &mut StringTable,
++        id: i64,
++        members: impl IntoIterator<Item = crate::error::Result<MemberData<'m>>>,
++    ) -> crate::error::Result<()> {
++        let mut last_id = 0;
++        let mut unknown = None;
++        for member in members {
++            let member = member?;
++            let kind = member.id.member_type();
++            if let crate::MemberType::Unknown(raw) = kind {
++                unknown.get_or_insert(raw);
++                continue;
++            }
++            self.push_member(strings, member, kind, &mut last_id);
++        }
++        if let Some(raw) = unknown {
++            return Err(crate::error::Error::invalid_data(format!(
++                "relation {id}: member type {raw} has no Relation.MemberType enum \
++                 value; encoding it would rewrite the member as a node",
++            )));
++        }
++        Ok(())
++    }
++
++    #[inline]
++    fn push_member(
++        &mut self,
++        strings: &mut StringTable,
++        member: MemberData<'_>,
++        kind: crate::MemberType,
++        last_id: &mut i64,
++    ) {
++        let [.., roles, ids, types] = &mut self.columns;
++        let role = strings.add(member.role).cast_signed();
++        encode_varint(roles, i64::from(role).cast_unsigned());
++        push_delta(ids, member.id.id(), last_id);
++        types.push(member_type_value(kind));
++    }
++
++    pub(super) fn add_raw(&mut self, id: i64, fields: [&[u8]; ELEMENT_FIELDS.len()]) {
++        let starts = self.starts();
++        for (column, bytes) in self.columns.iter_mut().zip(fields) {
++            column.extend_from_slice(bytes);
++        }
++        self.finish_element(id, starts);
++    }
++
++    pub(super) fn encode_to(&self, buf: &mut Vec<u8>, field: u32) -> crate::error::Result<()> {
++        if self.elements.is_empty() {
++            return Ok(());
++        }
++        let total = len_field_size(self.body_len)
++            .ok_or_else(|| crate::error::Error::internal("element group length overflows usize"))?;
++        buf.reserve(total);
++        let start = buf.len();
++        write_len_prefix(buf, 2, self.body_len);
++        let mut ids = self.ids.as_slice();
++        let mut remaining = self.columns.each_ref().map(Vec::as_slice);
++        for element in &self.elements {
++            write_len_prefix(buf, field, element.body_len);
++            buf.extend_from_slice(take_span(&mut ids, element.id_len)?);
++            for ((field, len), remaining) in ELEMENT_FIELDS
++                .into_iter()
++                .zip(element.lengths)
++                .zip(&mut remaining)
++            {
++                if len == 0 {
++                    continue;
++                }
++                encode_bytes_field_always(buf, field, take_span(remaining, len)?);
++            }
++        }
++        if buf.len() - start != total
++            || !ids.is_empty()
++            || remaining.iter().any(|span| !span.is_empty())
++        {
++            return Err(crate::error::Error::internal(
++                "element group lengths do not match packed spans",
++            ));
++        }
++        Ok(())
++    }
++}
++
++#[inline]
++fn take_span<'a>(remaining: &mut &'a [u8], len: usize) -> crate::error::Result<&'a [u8]> {
++    let (span, rest) = remaining
++        .split_at_checked(len)
++        .ok_or_else(|| crate::error::Error::internal("element span exceeds its packed column"))?;
++    *remaining = rest;
++    Ok(span)
++}
++
++fn clear_or_release<T>(buf: &mut Vec<T>, limit: usize) {
++    if buf.capacity().saturating_mul(std::mem::size_of::<T>()) > limit {
++        // Release the oversized allocation, not just its contents.
++        drop(std::mem::take(buf));
++    } else {
++        buf.clear();
++    }
++}
++
++#[inline]
++pub(super) fn push_delta(buf: &mut Vec<u8>, value: i64, last: &mut i64) {
++    encode_varint(buf, zigzag_encode_64(value.wrapping_sub(*last)));
++    *last = value;
++}
++
++// The staged way and relation encoders are retained below as a byte-for-byte oracle.
++
+ /// Encode a Way and append it as `PrimitiveGroup.ways` (field 3) to `group_buf`.
+ #[allow(clippy::too_many_arguments)]
++#[cfg(test)]
+ pub(super) fn encode_way<'t, M: EncodeMetadata>(
+     string_table: &mut StringTable,
+     group_buf: &mut Vec<u8>,
+@@ -276,7 +533,8 @@ pub(super) fn encode_way<'t, M: EncodeMetadata>(
+ 
+     // Field 4: info (submessage)
+     if let Some(meta) = metadata {
+-        meta.encode_info(info_buf, string_table);
++        info_buf.clear();
++        meta.append_info(info_buf, string_table);
+         encode_bytes_field(elem, 4, info_buf);
+     }
+ 
+@@ -302,6 +560,7 @@ pub(super) fn encode_way<'t, M: EncodeMetadata>(
+ /// Uses three packed buffers in a single zip loop for refs/lat/lon to avoid
+ /// iterating the data three separate times.
+ #[allow(clippy::too_many_arguments)]
++#[cfg(test)]
+ pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
+     string_table: &mut StringTable,
+     group_buf: &mut Vec<u8>,
+@@ -332,7 +591,8 @@ pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
+     );
+ 
+     if let Some(meta) = metadata {
+-        meta.encode_info(info_buf, string_table);
++        info_buf.clear();
++        meta.append_info(info_buf, string_table);
+         encode_bytes_field(elem, 4, info_buf);
+     }
+ 
+@@ -373,6 +633,7 @@ pub(super) fn encode_way_with_locations<'t, M: EncodeMetadata>(
+ /// written directly with field tag + length prefix. That the keys and vals
+ /// arrays pair up is the source block's: construction refuses arrays of
+ /// different lengths (`validate_tag_arrays`), as for every raw encoder here.
++#[cfg(test)]
+ pub(super) fn encode_way_raw_bytes(
+     group_buf: &mut Vec<u8>,
+     elem: &mut Vec<u8>,
+@@ -397,6 +658,7 @@ pub(super) fn encode_way_raw_bytes(
+ ///
+ /// Same as `encode_way_raw_bytes` but also writes fields 9 (lat) and 10 (lon).
+ #[allow(clippy::too_many_arguments)]
++#[cfg(test)]
+ pub(super) fn encode_way_raw_bytes_with_locations(
+     group_buf: &mut Vec<u8>,
+     elem: &mut Vec<u8>,
+@@ -427,6 +689,7 @@ pub(super) fn encode_way_raw_bytes_with_locations(
+ 
+ /// Encode a Relation and append it as `PrimitiveGroup.relations` (field 4) to `group_buf`.
+ #[allow(clippy::too_many_arguments)]
++#[cfg(test)]
+ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
+     string_table: &mut StringTable,
+     group_buf: &mut Vec<u8>,
+@@ -477,11 +740,9 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
+         // Field 10: types (packed int32)
+         packed.clear();
+         for m in members {
+-            // Protobuf int32 wire encoding: sign-extend i32 → i64 → u64.
+-            // MemberType enum values are 0/1/2 so no actual sign extension occurs.
++            // MemberType enum values are 0/1/2 on the wire.
+             let mt = member_type_value(m.id.member_type());
+-            #[allow(clippy::cast_sign_loss)]
+-            encode_varint(packed, mt as u64);
++            encode_varint(packed, u64::from(mt));
+         }
+         encode_bytes_field(elem, 10, packed);
+     }
+@@ -492,6 +753,7 @@ pub(super) fn encode_relation<'t, M: EncodeMetadata>(
+ 
+ /// Write the fields that precede the three packed member columns.
+ #[allow(clippy::too_many_arguments)]
++#[cfg(test)]
+ pub(super) fn encode_relation_prefix<'t, M: EncodeMetadata>(
+     string_table: &mut StringTable,
+     elem: &mut Vec<u8>,
+@@ -517,7 +779,8 @@ pub(super) fn encode_relation_prefix<'t, M: EncodeMetadata>(
+     );
+ 
+     if let Some(meta) = metadata {
+-        meta.encode_info(info_buf, string_table);
++        info_buf.clear();
++        meta.append_info(info_buf, string_table);
+         encode_bytes_field(elem, 4, info_buf);
+     }
+ }
+@@ -527,6 +790,7 @@ pub(super) fn encode_relation_prefix<'t, M: EncodeMetadata>(
+ /// All byte slices are raw protobuf packed field content from `WireRelation`,
+ /// written directly with field tag + length prefix.
+ #[allow(clippy::too_many_arguments)]
++#[cfg(test)]
+ pub(super) fn encode_relation_raw_bytes(
+     group_buf: &mut Vec<u8>,
+     elem: &mut Vec<u8>,
+@@ -807,6 +1071,67 @@ mod tests {
+         assert_eq!(group, relation, "encode_relation_raw_bytes");
+     }
+ 
++    #[test]
++    fn raw_element_spans_match_staged_bytes_across_group_reuse() -> crate::error::Result<()> {
++        const LIMIT: usize = 128;
++        let mut packed = super::ElementGroup::default();
++        let mut staged = Vec::new();
++        let mut elem = Vec::new();
++        let mut expected = Vec::new();
++        let mut output = Vec::new();
++        let long = [0; 129];
++        let refs = [0x82, 0]; // A non-minimal varint must still be copied verbatim.
++        let info = [0x08, 0];
++        packed.add_raw(1, [&[1], &[2], &info, &refs, &[], &[]]);
++        super::encode_way_raw_bytes(&mut staged, &mut elem, 1, &[1], &[2], &refs, Some(&info));
++        packed.add_raw(0, [&[], &[], &[], &[], &[], &[]]);
++        super::encode_way_raw_bytes(&mut staged, &mut elem, 0, &[], &[], &[], None);
++        packed.add_raw(3, [&[], &[], &[], &long, &long, &long]);
++        super::encode_way_raw_bytes_with_locations(
++            &mut staged,
++            &mut elem,
++            3,
++            &[],
++            &[],
++            &long,
++            &long,
++            &long,
++            Some(&[]),
++        );
++        protohoggr::encode_bytes_field(&mut expected, 2, &staged);
++        packed.encode_to(&mut output, 3)?;
++        assert_eq!(output, expected);
++
++        packed.clear(LIMIT);
++        assert_eq!(packed.len(), 0);
++        assert!(
++            packed
++                .columns
++                .iter()
++                .all(|column| column.capacity() <= LIMIT)
++        );
++        assert!(packed.elements.capacity() * std::mem::size_of::<super::ElementSpans>() <= LIMIT);
++        staged.clear();
++        expected.clear();
++        output.clear();
++        packed.add_raw(-1, [&[3], &[4], &[], &[0], &refs, &[2]]);
++        super::encode_relation_raw_bytes(
++            &mut staged,
++            &mut elem,
++            -1,
++            &[3],
++            &[4],
++            &[0],
++            &refs,
++            &[2],
++            None,
++        );
++        protohoggr::encode_bytes_field(&mut expected, 2, &staged);
++        packed.encode_to(&mut output, 4)?;
++        assert_eq!(output, expected);
++        Ok(())
++    }
++
+     /// The key set keeps each index once in first-seen order, covers any
+     /// index (zero, word edges, far past what it held), and a clear leaves
+     /// no stale bit behind for the next block.

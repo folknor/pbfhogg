@@ -1,27 +1,13 @@
-//! Stage 2: Node join - parallel id-bucket merge join.
+//! Stage 2: resolve node-key partitions into slot bucket records.
 //!
-//! Each worker claims an id-bucket via atomic dispatch, loads the
-//! IdRecords pass A wrote into that bucket's shard files, sorts them
-//! by `local_node_id`, finds the contiguous run of node blobs whose
-//! `[min_id, max_id]` intersects the bucket's id range, decodes those
-//! blobs, and walks records and node tuples in lockstep (both
-//! ID-sorted) to resolve coordinates. Each resolved record is written
-//! to a shared slot bucket file as a `ResolvedEntry`.
-//!
-//! Replaces the rank-index path (counting-sort by `local_rank`,
-//! `coord_slice` keyed by `(rank - bucket_rank_start)`,
-//! `next_rank` per-blob counter, drift canary on
-//! `next_rank == ref_rank_end`) with a streaming merge-walk that
-//! computes `linear_slot_pos = blob_start_slot[record.blob_idx] +
-//! record.blob_local_slot` per record. The `coord_slice` allocation
-//! goes away entirely (would have ballooned to ~440 MB per worker
-//! if sized to `bucket_width` rather than `rank_range_size`).
-//!
-//! Records whose global id has no matching node tuple in any blob
-//! within the bucket's range are *orphans* - left unemitted. Stage 4
-//! fills zero coordinates for any slot_pos not covered by a
-//! `ResolvedEntry`, so orphan records produce the same end behaviour
-//! as way refs to absent nodes.
+//! Ordinary joins populate a bounded coordinate table from the node scanner
+//! and stream the request shards in their written order. With inject-prepass
+//! the sorted occurrence walk counts non-closure occurrences before assigning
+//! pins. Both paths leave absent refs unemitted and give stage 3 the same
+//! slot records.
+
+#[path = "stage2_table.rs"]
+mod table;
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -42,7 +28,7 @@ use crate::tunables::{
 };
 
 // ---------------------------------------------------------------------------
-// Stage 2: Parallel node join - id-bucket merge walk
+// Stage 2: Parallel node join
 // ---------------------------------------------------------------------------
 
 struct LoaderScratch<R> {
@@ -85,6 +71,13 @@ crate::counters::counter_set! {
         resolve_ms => "s2_resolve_ms",
         bucket_load_ms => "s2_bucket_load_ms",
         bucket_loads => "s2_bucket_loads",
+        dense_partitions => "s2_dense_partitions",
+        ranked_partitions => "s2_ranked_partitions",
+        /// One request scan per lookup partition, even for an empty table.
+        request_scans => "s2_request_scans",
+        /// Includes decoding, lookup and emitting the resolved records.
+        request_scan_ms => "s2_request_scan_ms",
+        table_join_ms => "s2_table_join_ms",
         prepare_parse_ms => "s2_prepare_parse_ms",
         prepare_sort_ms => "s2_prepare_sort_ms",
         orphan_records => "s2_orphan_records",
@@ -365,16 +358,9 @@ pub(super) struct SlotBucketManifest {
     pub(super) buckets: Vec<(crate::scratch::ScratchPath, u64)>,
 }
 
-/// Parallel stage 2: N workers each claim id buckets via atomic
-/// dispatch, load + sort the bucket's records, find the contiguous run
-/// of node blobs whose key span in the bucket's family intersects the
-/// bucket's key range, decode those blobs, walk records and the family's
-/// node tuples in lockstep, and emit `ResolvedEntry` to per-bucket slot
-/// writers (256 files total, per-bucket mutex). Returns the count of
-/// records that found their node in the key-sorted tuple stream -
-/// presence, not non-zero-ness; see the counting site in [`walk_blob`] -
-/// and the manifest of what was written to each slot bucket, whose counts
-/// sum to it.
+/// Parallel stage 2: workers claim id buckets and emit matching coordinates
+/// to shared slot bucket writers. Returns the number of resolved refs
+/// (including coordinates at (0, 0)) and the committed slot manifest.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stage2_node_join(
     scratch: &RunScratch,
@@ -452,6 +438,7 @@ struct WorkerBufs<R> {
     node_read_buf: crate::read::read_buf::ReadBuf,
     node_decompress_buf: Vec<u8>,
     node_tuples: Vec<NodeTuple>,
+    table: table::NodeTable,
     node_group_starts: Vec<(usize, usize)>,
     entry_buf: [u8; RESOLVED_ENTRY_SIZE],
     local_resolved: u64,
@@ -459,6 +446,23 @@ struct WorkerBufs<R> {
     /// STAGE2_FLUSH_THRESHOLD, and at the end of each id bucket.
     slot_bufs: Vec<Vec<u8>>,
     slot_counts: Vec<u64>,
+}
+
+impl<R> WorkerBufs<R> {
+    fn new(slot_bucket_count: usize) -> Self {
+        Self {
+            loader: LoaderScratch::new(),
+            node_read_buf: crate::read::read_buf::ReadBuf::default(),
+            node_decompress_buf: Vec::new(),
+            node_tuples: Vec::new(),
+            table: table::NodeTable::default(),
+            node_group_starts: Vec::new(),
+            entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
+            local_resolved: 0,
+            slot_bufs: (0..slot_bucket_count).map(|_| Vec::new()).collect(),
+            slot_counts: vec![0; slot_bucket_count],
+        }
+    }
 }
 
 #[hotpath::measure]
@@ -498,17 +502,7 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
             let spawned = scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
 
-                let mut w = WorkerBufs {
-                    loader: LoaderScratch::new(),
-                    node_read_buf: crate::read::read_buf::ReadBuf::default(),
-                    node_decompress_buf: Vec::new(),
-                    node_tuples: Vec::new(),
-                    node_group_starts: Vec::new(),
-                    entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
-                    local_resolved: 0,
-                    slot_bufs: (0..job.slot_bucket_count).map(|_| Vec::new()).collect(),
-                    slot_counts: vec![0; job.slot_bucket_count],
-                };
+                let mut w = WorkerBufs::new(job.slot_bucket_count);
 
                 loop {
                     // The first-error mutex is locked once per bucket claim.
@@ -571,9 +565,32 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
     Ok(resolved_count)
 }
 
-/// Join one non-empty id bucket.
-#[allow(clippy::too_many_lines)]
 fn join_bucket<C: ShardCodec>(
+    codec: C,
+    job: &Stage2Job<'_, '_>,
+    c: &Stage2Counters,
+    pbf_file: &std::fs::File,
+    bucket_idx: usize,
+    w: &mut WorkerBufs<C::Record>,
+) -> Result<()> {
+    if job.inject_prepass {
+        join_bucket_sorted(codec, job, c, pbf_file, bucket_idx, w)
+    } else {
+        table::join_bucket(
+            codec,
+            job,
+            c,
+            pbf_file,
+            bucket_idx,
+            w,
+            crate::tunables::ALTW_STAGE2_TABLE_BYTES,
+        )
+    }
+}
+
+/// Join one non-empty id bucket with the sorted pin-counting walk.
+#[allow(clippy::too_many_lines)]
+fn join_bucket_sorted<C: ShardCodec>(
     codec: C,
     job: &Stage2Job<'_, '_>,
     c: &Stage2Counters,
@@ -641,7 +658,6 @@ fn join_bucket<C: ShardCodec>(
     let threshold = job.layout.threshold();
 
     for span in &spans[lo_span..hi_span] {
-        host.invocation.check()?;
         let blob = job
             .node_blob_mapping
             .get(span.blob as usize)
@@ -652,25 +668,15 @@ fn join_bucket<C: ShardCodec>(
             bucket_straddlers += 1;
         }
 
-        // pread + decompress + extract.
-        let t_pr = crate::counters::Stopwatch::start();
-        // Input failures are located with the input and the blob's payload
-        // offset (cold).
+        read_node_blob(
+            job,
+            c,
+            pbf_file,
+            blob,
+            &mut w.node_read_buf,
+            &mut w.node_decompress_buf,
+        )?;
         let in_input = |e: Error| job.input_pbf.locate_at(blob.data_offset, e);
-        let raw = w
-            .node_read_buf
-            .read_exact_at(pbf_file, blob.data_offset, blob.data_size)
-            .map_err(|e| in_input(Error::from(e).context("stage2 node pread")))?;
-        t_pr.record_ms(&c.node_pread_ms);
-        t_pr.record_ns(&c.node_pread_ns);
-        c.node_bytes_read.fetch_add(blob.data_size as u64, Relaxed);
-
-        let t_dc = crate::counters::Stopwatch::start();
-        crate::blob::decompress_blob_raw(raw, &mut w.node_decompress_buf)
-            .map_err(|e| in_input(e.context("stage2 node decompress")))?;
-        t_dc.record_ms(&c.node_decompress_ms);
-        t_dc.record_ns(&c.node_decompress_ns);
-
         let t_ex = crate::counters::Stopwatch::start();
         w.node_tuples.clear();
         // Every tuple goes through the blob's claim check: the partition
@@ -785,21 +791,52 @@ fn join_bucket<C: ShardCodec>(
         record_max(&c.max_worker_buf_bytes, worker_bytes);
     }
 
-    // Flush non-empty local buffers to shared writers.
-    let mut nonempty_count: u64 = 0;
-    for sb in 0..job.slot_bucket_count {
-        if w.slot_bufs[sb].is_empty() {
-            continue;
-        }
-        nonempty_count += 1;
-        flush_slot_buffer(job, c, sb, &mut w.slot_bufs[sb], &mut w.slot_counts[sb])?;
-    }
-    c.nonempty_slot_buckets_total
-        .fetch_add(nonempty_count, Relaxed);
-
-    // Recycle the records buffer for the next bucket.
     w.loader.records = bkt.records;
     w.loader.records.clear();
+    flush_bucket(job, c, w)
+}
+
+fn read_node_blob(
+    job: &Stage2Job<'_, '_>,
+    c: &Stage2Counters,
+    pbf_file: &std::fs::File,
+    blob: &NodeBlobInfo,
+    read_buf: &mut crate::read::read_buf::ReadBuf,
+    decompress_buf: &mut Vec<u8>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    job.host.invocation.check()?;
+    let in_input = |e: Error| job.input_pbf.locate_at(blob.data_offset, e);
+    let t_pr = crate::counters::Stopwatch::start();
+    let raw = read_buf
+        .read_exact_at(pbf_file, blob.data_offset, blob.data_size)
+        .map_err(|e| in_input(Error::from(e).context("stage2 node pread")))?;
+    t_pr.record_ms(&c.node_pread_ms);
+    t_pr.record_ns(&c.node_pread_ns);
+    c.node_bytes_read.fetch_add(blob.data_size as u64, Relaxed);
+
+    let t_dc = crate::counters::Stopwatch::start();
+    crate::blob::decompress_blob_raw(raw, decompress_buf)
+        .map_err(|e| in_input(e.context("stage2 node decompress")))?;
+    t_dc.record_ms(&c.node_decompress_ms);
+    t_dc.record_ns(&c.node_decompress_ns);
+    Ok(())
+}
+
+fn flush_bucket<R>(
+    job: &Stage2Job<'_, '_>,
+    c: &Stage2Counters,
+    w: &mut WorkerBufs<R>,
+) -> Result<()> {
+    let mut nonempty_count: u64 = 0;
+    for (sb, (buf, count)) in w.slot_bufs.iter_mut().zip(&mut w.slot_counts).enumerate() {
+        if !buf.is_empty() {
+            nonempty_count += 1;
+            flush_slot_buffer(job, c, sb, buf, count)?;
+        }
+    }
+    c.nonempty_slot_buckets_total
+        .fetch_add(nonempty_count, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -963,18 +1000,6 @@ fn walk_blob<R: ShardRecord>(
                 }
                 last = Some(this);
             }
-            let blob_start = job
-                .way_slot_starts
-                .get(record.blob_idx() as usize)
-                .copied()
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "stage2: record blob_idx {} out of range (way_slot_starts.len()={})",
-                        record.blob_idx(),
-                        job.way_slot_starts.len(),
-                    ))
-                })?;
-            let linear_slot_pos = blob_start + u64::from(record.blob_local_slot());
             // Pin = the node is shared: it occurs in at least two
             // non-closure ref positions. All occurrences of an id form one
             // run, so the whole run is counted once (from its start) and
@@ -996,45 +1021,57 @@ fn walk_blob<R: ShardRecord>(
             // Private scratch codec documented on ResolvedEntry: domain
             // validation above makes the shift lossless; the run-wide flag
             // also governs payload decoding.
-            let entry = ResolvedEntry {
-                slot_pos: linear_slot_pos,
-                lat: if job.inject_prepass {
-                    (tuple.lat << 1) | i32::from(pin)
-                } else {
-                    tuple.lat
-                },
-                lon: tuple.lon,
+            let lat = if job.inject_prepass {
+                (tuple.lat << 1) | i32::from(pin)
+            } else {
+                tuple.lat
             };
-            let bucket = entry.slot_bucket(job.total_slots, job.slot_bucket_count);
-            // The bucket-local slot fits u32: the layout's widest bucket
-            // was checked once, before stage 2.
-            let (bucket_start, _) =
-                slot_bucket_bounds(job.total_slots, job.slot_bucket_count, bucket);
-            entry.write_to(bucket_start, out.entry_buf);
-            out.slot_bufs[bucket].extend_from_slice(&out.entry_buf[..]);
-            out.slot_counts[bucket] += 1;
-            // Count on presence, not on truthiness. `resolved` already
-            // means the id was found in the node stream; gating the
-            // increment on a non-zero coordinate additionally reported every
-            // genuine node at Null Island as missing, so the external
-            // backend disagreed with the sparse one about the same input.
-            // Absent is not zero.
-            *out.local_resolved += 1;
-            if out.slot_bufs[bucket].len() >= STAGE2_FLUSH_THRESHOLD {
-                // Track max buffer size before flush.
-                record_max(&c.max_slot_buffer_bytes, out.slot_bufs[bucket].len() as u64);
-                flush_slot_buffer(
-                    job,
-                    c,
-                    bucket,
-                    &mut out.slot_bufs[bucket],
-                    &mut out.slot_counts[bucket],
-                )?;
-            }
+            emit_resolved(job, c, record, (lat, tuple.lon), out)?;
         }
         *record_ptr += 1;
     }
     *carry = last.filter(|r| r.0 == upper);
     Ok(())
 }
+#[inline]
+fn emit_resolved<R: ShardRecord>(
+    job: &Stage2Job<'_, '_>,
+    c: &Stage2Counters,
+    record: &R,
+    (lat, lon): (i32, i32),
+    out: &mut WalkOut<'_>,
+) -> Result<()> {
+    let blob_start = job
+        .way_slot_starts
+        .get(record.blob_idx() as usize)
+        .copied()
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "stage2: record blob_idx {} out of range (way_slot_starts.len()={})",
+                record.blob_idx(),
+                job.way_slot_starts.len(),
+            ))
+        })?;
+    let linear_slot_pos = blob_start + u64::from(record.blob_local_slot());
+    let entry = ResolvedEntry {
+        slot_pos: linear_slot_pos,
+        lat,
+        lon,
+    };
+    let bucket = entry.slot_bucket(job.total_slots, job.slot_bucket_count);
+    let (bucket_start, _) = slot_bucket_bounds(job.total_slots, job.slot_bucket_count, bucket);
+    entry.write_to(bucket_start, out.entry_buf);
+    let buf = &mut out.slot_bufs[bucket];
+    let count = &mut out.slot_counts[bucket];
+    buf.extend_from_slice(out.entry_buf);
+    *count += 1;
+    // A real node at (0, 0) counts as resolved, too.
+    *out.local_resolved += 1;
+    if buf.len() >= STAGE2_FLUSH_THRESHOLD {
+        record_max(&c.max_slot_buffer_bytes, buf.len() as u64);
+        flush_slot_buffer(job, c, bucket, buf, count)?;
+    }
+    Ok(())
+}
+
 pub(super) type SlotBuckets = SharedSlotBuckets;

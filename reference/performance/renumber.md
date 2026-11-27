@@ -38,6 +38,36 @@ width" below.
 
 ## History
 
+### Batched lookups and interleaved ranks, neutral (bygg, baseline `b25180b3`)
+
+The prototype rewrites references in batches of 32 and offers an opt-in
+interleaved membership and rank word layout in `idset.rs`.
+
+On bygg, A is HEAD `b25180b3` and B is the working tree on
+`b25180b3`. The planet cells ran interleaved with `--iterations 1`, with
+one `fstrim` at the head of the planet suite. The workload was `id-remap --dataset planet`.
+
+| Cell | Run | Wall | Layout |
+|---|---|---|---|
+| A | `fd3e7a69` | 1m05s | Existing |
+| B | `21925bb3` | 1m05s | Existing |
+| A | `ed2c7c2f` | 1m05s | Existing |
+| B | `c9509d73` | 1m06s | Existing |
+| B | `742a7121` | 1m03s | Interleaved |
+| A | `0411977c` | 1m06s | Existing |
+| B | `b66f0d48` | 1m05s | Interleaved |
+
+On `c9509d73`, `stage2d_sampled_lookup_ns` totaled 196.6 ms out of
+397.6 ms in `stage2d_sampled_reframe_ns` across 18 sampled blobs. The
+stage 2d span was 23.6 s. Lookup accounted for about half of sampled
+rewrite time. Batching was neutral and the interleaved layout's roughly
+2-3 % difference was within noise. Stage 2d may be bound by work these
+lookup changes do not touch.
+
+The prototype did not land. The sparse add-locations-to-ways consumer of
+the interleaved layout was never measured. Germany `renumber` verification
+passed on bygg with all three trial changes in the working tree on `b25180b3`.
+
 ### Renumber
 
 #### Pass 1 at host width (planet, baseline `e8fd4597`, bygg, 2026-11-26)

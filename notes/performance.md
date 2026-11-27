@@ -494,9 +494,7 @@ compressor copy to remove. Once the representation is packed bytes, a bulk
 varint writer with one capacity reservation (instead of protohoggr's scalar
 pushes) becomes worth trying; not before. Iterator or column inputs for way
 refs and relation members belong here too (OSC-way temporaries in
-`add_osc_way` alone were refused as too rare to show). Note the recorded
-refusal of the eager width-prepass shape: `write-pipeline.md` "Dense-node
-direct encoding, refused" (`3f8ed0ec`); the shapes above are its untried ones.
+`add_osc_way` alone were refused as too rare to show).
 
 Payoff: removes work on every genuinely rebuilt node.
 
@@ -505,6 +503,18 @@ backpatching can cost as much as the copies; size accounting for outliers;
 partial metadata semantics.
 
 Kind: high-conviction encoder rewrite.
+
+Measurement on bygg, HEAD `b25180b3` against the working tree on
+`b25180b3`: planet `copy-pbf --clean yes` was about 3 % faster with packed
+columns, at the noise floor. Re-encoding is likely compression-bound.
+The prototype did not land. The earlier eager width-prepass was also
+refused. A third encoder shape needs a profile showing encode time first.
+See the [encoder measurements](../reference/performance/write-pipeline.md#packed-column-encoder-neutral-bygg-baseline-b25180b3).
+
+To resurface: the code is in
+`notes/stashed-perf-013-packed-column-encoder.patch` (made against
+`b25180b3` on bygg). It edits `write/block_builder.rs` and
+`write/encode.rs` and needs no tunables.
 
 ## PERF-014 - Degrade unsort still funnels elements through one central encoder
 
@@ -728,39 +738,27 @@ versus bounded correctly is higher confidence.
 
 Kind: high conviction (routing); medium (hybrid).
 
-## PERF-030 - External ALTW sorts every occurrence by node ID
+## PERF-030 - External ALTW request deduplication and fragment formats
 
 Reported by: altw-external.
 
-Mechanism: stage 2 reads each request shard, expands packed words into
-12-byte `IdRecord`s, comparison-sorts the bucket, decodes node blobs into
-`NodeTuple` vectors and merge-walks. Equal-width ID buckets do not bound request
-population, so a heavily referenced node can put most references in one bucket
-that `prepare_bucket` reserves and sorts at once. Logical scratch traffic is
-about 40R + 2P bytes (requests I, 12-byte resolved records, encoded payloads
-P); two external permutations are the practical floor for this operating point.
+Landed: the bounded stage 2 coordinate table streams requests in way order.
+`--inject-prepass` retains the sorted pin-counting path. On bygg, planet
+external `embed-locations` improved about 5-8 % wall and 13 % in stage 2,
+comparing HEAD `b25180b3` with the working tree on `b25180b3`. See the
+[external stage 2 measurements](../reference/performance/add-locations-to-ways.md#external-stage-2-coordinate-table-bygg-baseline-b25180b3).
 
-Redesign: decode a partition's nodes into a bounded RAM table (dense for
-ordinary ranges, compact rank for sparse; about 438 MB for a 54.7 M-ID range at
-8 bytes) and stream requests through it in original way order; no sort, no
-whole-bucket vector; populate via the node callback. Preserved order enables
-fragment formats: blob identity and count once per fragment, local node IDs as
-a column, delta or run encoded destinations, closure flags separate; replies in
-fragment order without a 4-byte slot beside every coordinate; framed delta or
-bit-packed coordinate blocks. Coordinates with presence and pin fit 8 bytes
-(biased latitude plus one in 31 bits, zero for absent). Lower confidence:
-dedupe requests by node ID and output group with per-group coordinate
-dictionaries.
+Remaining: dedupe requests by node ID and output group with per-group
+coordinate dictionaries. Explore fragment formats with blob identity and
+count once per fragment, a local node ID column, delta- or run-encoded
+destinations, and separate closure flags. Reply order within a fragment
+could make per-coordinate slot fields redundant and allow framed delta
+or bit-packed coordinates.
 
-Payoff: removes the occurrence sort, struct expansion and memory traffic; bounds
-memory independent of occurrence count; enables smaller scratch both ways.
-
-Risks: random DRAM gathers replace sorted access; partition sizing by an
-explicit budget; domain errors only for referenced coordinates; under
-`--inject-prepass` pins need all non-closure occurrence counts first (a counting
-pass or extra request read). A radix sort alone captures less.
-
-Kind: coherent join rewrite.
+A split bucket rereads its request shards for each lookup partition.
+`s2_request_scans` counts those scans, including the initial scan for
+each bucket. Check it against the bucket count when evaluating whether
+rescans matter for a workload.
 
 ## PERF-031 - External ALTW materializes a third scratch stream between stage 3 and 4
 
@@ -1065,13 +1063,8 @@ Kind: scaling payoff (check).
 
 Reported by: sort.
 
-Narrowed 2026-11-26: the stage 2d wall was not bound by lookup cost but by
-its fixed 6 workers (pass 1 likewise at 4); both stages now run at host
-width with a shared way set, planet 126-131 s to 68-80 s
-(reference/performance/renumber.md, "Host-sized rewrite stages"). What
-remains is per-ref CPU, which matters again now that stage 2d keeps about
-28 cores busy; no cell yet attributes lookup time within
-`stage2d_reframe_ns` at this width, so the first step is that attribution.
+Pass 1 and stage 2d already run at host width with a shared way set.
+See the [host-width measurements](../reference/performance/renumber.md#host-sized-rewrite-stages-planet-baseline-c73f2a73-bygg-2026-11-26).
 
 Mechanism: lookup reads a bitmap, separately allocated prefix arrays and
 popcounts up to seven words (`rank_if_set` already combines membership and
@@ -1095,13 +1088,26 @@ Second consumer: sparse add-locations-to-ways pass 2 (`SparseArrayIndex::get`,
 the layout for it too: resident-store CPU (rank sits on the dependency chain
 of every coordinate load while the store is cached, e.g. japan) separately
 from near-residency page traffic (a larger index can evict store pages; past
-residency pass 2 is fault-bound). The two local baselines are in (array
-chunks rank from the found index, bit chunks reuse the membership word;
-planet renumber neutral, reference/performance/renumber.md "Paged ID
-sets"), so interleaving is measured against them. Sparse pass 1 is decode-bound and was measured indifferent to rank cost
-(reference/performance/add-locations-to-ways.md, rank cursor).
+residency pass 2 is fault-bound). This consumer was never measured with the
+interleaved layout.
 
 Kind: strong hypothesis.
+
+Measurement on bygg, HEAD `b25180b3` against the working tree on
+`b25180b3`: on planet `id-remap`, batching 32 lookups was neutral and
+enabling the interleaved layout moved wall time by roughly 2-3 %, within
+noise. In `c9509d73`, lookups took 196.6 ms of 397.6 ms sampled rewrite
+time over 18 blobs, with a 23.6 s stage 2d span. Lookup accounts for about
+half of sampled rewrite time, but stage 2d may be bound by work neither
+change touches. The prototype did not land. See the
+[renumber measurements](../reference/performance/renumber.md#batched-lookups-and-interleaved-ranks-neutral-bygg-baseline-b25180b3).
+
+To resurface: the code is in
+`notes/stashed-perf-050-renumber-batched-lookups.patch` (made against
+`b25180b3` on bygg). It edits `renumber/` and `idset.rs`. Restore the
+omitted tunables `RENUMBER_REF_BATCH = 32`,
+`RENUMBER_INTERLEAVED_RANKS = false` (the bool switch), and
+`RENUMBER_LOOKUP_SAMPLE_STRIDE = 1024`.
 
 ## PERF-053 - Geocode admin lookup reconstructs polygons per query
 

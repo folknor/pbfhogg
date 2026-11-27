@@ -779,6 +779,15 @@ pub(crate) const STAGE2_FLUSH_THRESHOLD: usize = 256 * 1024;
 /// sizing).
 pub(crate) const ALTW_STAGE2_WORKERS_CAP: usize = 6;
 
+/// Stage 2 coordinate table budget per worker, including any sparse rank
+/// keys. A typical planet ID bucket (about 55 million keys) fits as one
+/// dense partition. Wider populated ranges are split before decoding.
+pub(crate) const ALTW_STAGE2_TABLE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Stage 2 reads request shards in bounded batches. One extra shard word
+/// can be held across reads when a packed slot escapes.
+pub(crate) const ALTW_STAGE2_SHARD_READ_BYTES: usize = 1024 * 1024;
+
 /// Cap on the external join's stage 3 worker count (applied on top of the
 /// decode-worker sizing). Backed off from the pre-streaming cap of 6 because
 /// stage 3 and stage 4 worker buffers are now both resident at the same time

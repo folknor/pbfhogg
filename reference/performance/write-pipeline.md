@@ -114,8 +114,9 @@ The node phase, the only one the change touches, is 5-6 % slower in both
 pairs; the way phase is flat. Node-phase peak RSS fell 25-40 MB, inside the
 noise floor. About 180 us per 8000-node block across the workers: computing
 a width per value costs more than bulk-copying bytes that are already
-encoded. Not adopted; the staging stays. Untried shapes: accumulating packed
-lengths as values are added, and reserving prefix space then compacting.
+encoded. Not adopted. The later
+[packed-column trial](#packed-column-encoder-neutral-bygg-baseline-b25180b3)
+measured accumulating packed bytes as values are added.
 
 ## Pipelined writer delivery window (bygg, 2026-10-31)
 
@@ -301,6 +302,31 @@ files exceeding available RAM). Sequential reads and memory-bound workloads
 are better served by buffered I/O with kernel readahead.
 
 ## History
+
+### Packed-column encoder, neutral (bygg, baseline `b25180b3`)
+
+The prototype appends dense deltas as varints as nodes are added. It encodes
+way and relation fields into reusable buffers, records their spans, and
+copies each span once at flush.
+
+On bygg, A is HEAD `b25180b3` and B is the working tree on
+`b25180b3`. The planet cells ran interleaved with `--iterations 1`, with
+one `fstrim` at the head of the planet suite. The workload was `copy-pbf --dataset planet --clean yes`.
+
+| Cell | Run | Wall |
+|---|---|---|
+| A | `9ce027f6` | 2m24s |
+| B | `4c380a20` | 2m17s |
+| A | `850e6afe` | 2m18s |
+| B | `6095327d` | 2m17s |
+
+The roughly 3 % wall difference is at the noise floor. Re-encoding is
+likely compression-bound. The prototype did not land. The packed-column
+trial and the earlier refused eager width-prepass trial have now tested
+two encoder shapes at planet scale without a repeatable wall gain. The
+[width-prepass trial](#dense-node-direct-encoding-refused-plantasjen-2026-11-05-against-9ebcfa97)
+ran on plantasjen against `9ebcfa97` and slowed the node phase. A third
+shape needs a profile showing encode time first.
 
 #### Write throughput (commit `d387301`)
 

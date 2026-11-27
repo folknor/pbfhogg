@@ -752,46 +752,6 @@ impl PrimitiveBlock {
         })
     }
 
-    /// Batch-decode all dense nodes into columnar arrays (IDs, lats, lons).
-    ///
-    /// Reuses the provided `DenseNodeColumns` scratch buffer. Coordinates
-    /// are converted to decimicrodegrees. Returns the number of nodes decoded.
-    ///
-    /// Handles blocks with multiple dense groups (appends across groups).
-    /// Non-dense Node messages are NOT included - use element-by-element
-    /// iteration for blocks that may contain plain Node groups.
-    ///
-    /// This is the columnar alternative to iterating `elements()` / `elements_skip_metadata()`
-    /// for classification passes that only need ID + coordinates.
-    /// A malformed dense group cannot reach here: [`validate_block`]
-    /// rejects a block whose dense `id`/`lat`/`lon` arrays disagree in length
-    /// or fail to parse, so a re-parse failure is a broken invariant and
-    /// panics (see `validated`) rather than dropping the group's nodes.
-    ///
-    /// Unlike the element accessors, the coordinates are checked: a dense
-    /// coordinate whose exact decimicrodegree value does not fit `i32` is
-    /// refused with the node scanner's wire error, as
-    /// [`DenseNodeColumns::decode_append`](super::columnar::DenseNodeColumns::decode_append)
-    /// describes. Every caller decides membership from these columns, so
-    /// a wrapped coordinate must not reach it.
-    pub(crate) fn decode_dense_columns(
-        &self,
-        columns: &mut super::columnar::DenseNodeColumns,
-    ) -> Result<usize> {
-        columns.clear();
-        for group in self.groups() {
-            if let Some(dense) = validated_dense(&group.group) {
-                columns.decode_append(
-                    &dense,
-                    self.data.wire.granularity,
-                    self.data.wire.lat_offset,
-                    self.data.wire.lon_offset,
-                )?;
-            }
-        }
-        Ok(columns.len())
-    }
-
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
     pub fn groups(&self) -> GroupIter<'_> {
         GroupIter::new(&self.data.wire)
@@ -1069,10 +1029,11 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// Paths that decode coordinates without the accessors do the same exact
 /// scaling and checked `i32` narrowing during the decode they already
 /// perform: the node scanner in `scan/node.rs` (altw, apply-changes
-/// `--locations-on-ways`, sorted extract simple), the apply-changes way
-/// refresh in `refresh.rs` and the checked columnar decode
-/// (`decode_dense_columns`). `inspect --nodes` alone keeps the wrapping
-/// conversion, as a report of what the old walk read. They read granularity as this decoder does
+/// `--locations-on-ways`, and fused simple extract's raw-copy verification),
+/// the apply-changes way refresh in `refresh.rs` and
+/// [`ClassificationBlock::decode_dense_columns`]. `inspect --nodes` alone
+/// keeps the wrapping conversion, as a report of what the old walk read.
+/// They read granularity as this decoder does
 /// (any `int32`). The geographic domain is judged where a node coordinate is
 /// joined into an output way (the altw stores and the apply-changes
 /// kept-node sink), on the joined nodes, and by the geocode builder on every
@@ -1119,7 +1080,7 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// [`GroupProjection`] through [`BlockBuffer::project`], or through
 /// [`validate_in_place`] when it holds the bytes borrowed. Both use the
 /// full scan and refuse the same blocks as construction. The dependency
-/// pass of tags-filter uses the same scan in its selective mode.
+/// passes of tags-filter and extract share the selective group scan.
 ///
 /// `make` builds the projection once the top level is framed, from the
 /// block's scalar fields and its string table entries (buffer-relative
@@ -1209,7 +1170,7 @@ pub(crate) struct BlockScan {
 /// same error, and the kind-claim refusal follows validation in both. The
 /// check itself is [`validate_in_place`], which a caller holding borrowed
 /// bytes it will not build a block from calls directly. The tags-filter
-/// projections expose only the fields they validate for their particular pass.
+/// and extract projections expose only the fields validated for their pass.
 pub(crate) struct BlockBuffer<'w> {
     buffer: Vec<u8>,
     pool: Option<&'w std::sync::Arc<crate::blob::DecompressPool>>,
@@ -1314,8 +1275,8 @@ impl<'w> BlockBuffer<'w> {
         Ok(validated.into_block())
     }
 
-    /// Frame a block for a selective element walk. The returned view exposes
-    /// only the fallible walk, which validates before yielding elements.
+    /// Frame a block for classification or a selective write. The returned
+    /// view validates the required fields before exposing them.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn for_selection(self) -> Result<SelectionBlock> {
         let BlockBuffer {
@@ -1397,6 +1358,63 @@ pub(crate) struct SelectionBlock {
 }
 
 impl SelectionBlock {
+    /// Run the selective validator used by projected dependency scans and
+    /// expose the accepted fields in element order.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn classify(&self) -> Result<ClassificationBlock<'_>> {
+        let kinds = self.validate_scope::<false>()?;
+        Ok(ClassificationBlock {
+            wire: &self.data.wire,
+            kinds,
+        })
+    }
+
+    /// Raw copying retains every field, so it needs the full validation.
+    pub(crate) fn validate_passthrough(&self) -> Result<()> {
+        self.validate_scope::<true>().map(drop)
+    }
+
+    fn validate_scope<const FULL: bool>(&self) -> Result<crate::element_kind::ElementKindSet> {
+        let wire = &self.data.wire;
+        let (kinds, _) = validate_groups::<FULL, _>(
+            wire.group_count(),
+            |i| wire.group(i),
+            wire.stringtable.len(),
+            [false; 3],
+            &mut NoProjection,
+        )?;
+        self.utf8.as_ref().map_err(Clone::clone)?;
+        kinds.refuse_under(self.claim)?;
+        Ok(kinds)
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.data.bytes[..self.data.wire.proto_len as usize]
+    }
+
+    /// Validate and visit the records extract will re-encode. Selection
+    /// may probe the same ID repeatedly. Each visitor call immediately
+    /// follows selection of that occurrence, so they can share mask scratch.
+    /// Selection must return the same answer for an ID throughout the walk,
+    /// and the caller must keep the visitor's work provisional until success.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn visit_retained<'a>(
+        &'a self,
+        select: impl Fn(crate::ElementKind, i64) -> bool,
+        mut visit: impl FnMut(Element<'a>) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_selected::<true>(
+            |kind, id| {
+                if select(kind, id) {
+                    Selection::KeepTags
+                } else {
+                    Selection::Discard
+                }
+            },
+            |element, _| visit(element),
+        )
+    }
+
     /// Walk records selected for re-encoding, in element order. Structural
     /// checks cover the whole block. Metadata and tag values are checked
     /// before a retained record reaches `visit`. A dense column is shared by
@@ -1405,6 +1423,14 @@ impl SelectionBlock {
     /// same answer for an ID throughout the walk.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn visit<'a>(
+        &'a self,
+        select: impl Fn(crate::ElementKind, i64) -> Selection,
+        visit: impl FnMut(Element<'a>, bool) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_selected::<false>(select, visit)
+    }
+
+    fn visit_selected<'a, const RETAINED_DENSE_FIELDS: bool>(
         &'a self,
         select: impl Fn(crate::ElementKind, i64) -> Selection,
         mut visit: impl FnMut(Element<'a>, bool) -> Result<()>,
@@ -1420,11 +1446,154 @@ impl SelectionBlock {
         };
         let mut kinds = crate::element_kind::ElementKindSet::default();
         for i in 0..wire.group_count() {
-            kinds = kinds.union(visit_selected_group(wire, i, &select, &mut offer)?);
+            kinds = kinds.union(visit_selected_group::<RETAINED_DENSE_FIELDS>(
+                wire, i, &select, &mut offer,
+            )?);
         }
         self.utf8.as_ref().map_err(Clone::clone)?;
         kinds.refuse_under(self.claim)?;
         output
+    }
+}
+
+/// A selective projection of the fields used for spatial selection and
+/// dependency matching. Full element iteration is reserved for the write walk.
+pub(crate) struct ClassificationBlock<'a> {
+    wire: &'a WireBlock<'static>,
+    kinds: crate::element_kind::ElementKindSet,
+}
+
+impl<'a> ClassificationBlock<'a> {
+    pub(crate) fn has_kind(&self, kind: crate::ElementKind) -> bool {
+        self.kinds.has(kind)
+    }
+
+    /// Iterate dense and plain nodes in element order. Use their checked
+    /// `decimicro_lat` and `decimicro_lon` accessors before testing membership.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = Element<'a>> {
+        let wire = self.wire;
+        (0..wire.group_count()).flat_map(move |i| {
+            let group = WireGroup::new(wire.group(i));
+            let dense = validated_dense(&group)
+                .map(|mut dense| {
+                    dense.keys_vals_data = &[];
+                    DenseNodeIter::new_skip_metadata(wire, dense)
+                })
+                .into_iter()
+                .flatten()
+                .map(Element::DenseNode);
+            dense.chain(
+                group
+                    .nodes()
+                    .map(move |bytes| Element::Node(classification_node(wire, bytes))),
+            )
+        })
+    }
+
+    pub(crate) fn plain_nodes(&self) -> impl Iterator<Item = Node<'a>> {
+        let wire = self.wire;
+        (0..wire.group_count()).flat_map(move |i| {
+            WireGroup::new(wire.group(i))
+                .nodes()
+                .map(move |bytes| classification_node(wire, bytes))
+        })
+    }
+
+    pub(crate) fn ways(&self) -> impl Iterator<Item = Way<'a>> {
+        let wire = self.wire;
+        (0..wire.group_count()).flat_map(move |i| {
+            WireGroup::new(wire.group(i)).ways().map(move |bytes| {
+                let mut way = validated(WireWay::parse(bytes), "Way");
+                way.info_data = None;
+                way.keys_data = &[];
+                way.vals_data = &[];
+                Way::new(wire, way)
+            })
+        })
+    }
+
+    pub(crate) fn relations(&self) -> impl Iterator<Item = ClassificationRelation<'a>> {
+        let wire = self.wire;
+        (0..wire.group_count()).flat_map(move |i| {
+            WireGroup::new(wire.group(i))
+                .relations()
+                .map(move |bytes| ClassificationRelation {
+                    wire,
+                    relation: validated(WireRelation::parse(bytes), "Relation"),
+                })
+        })
+    }
+
+    /// Fill the scratch columns from all dense groups. Plain nodes are
+    /// available separately through [`Self::plain_nodes`].
+    ///
+    /// [`DenseNodeColumns::decode_append`](super::columnar::DenseNodeColumns::decode_append)
+    /// checks both axes against the exact scaling rule. If any coordinate
+    /// does not fit in an `i32` decimicrodegree, return the node scanner's
+    /// wire error. Callers must use the columns for membership only on success.
+    pub(crate) fn decode_dense_columns(
+        &self,
+        columns: &mut super::columnar::DenseNodeColumns,
+    ) -> Result<usize> {
+        let wire = self.wire;
+        columns.clear();
+        for group in GroupIter::new(wire) {
+            if let Some(dense) = validated_dense(&group.group) {
+                columns.decode_append(
+                    &dense,
+                    wire.granularity,
+                    wire.lat_offset,
+                    wire.lon_offset,
+                )?;
+            }
+        }
+        Ok(columns.len())
+    }
+}
+
+fn classification_node<'a>(wire: &'a WireBlock<'static>, bytes: &'a [u8]) -> Node<'a> {
+    let mut node = validated(WireNode::parse(bytes), "Node");
+    node.info_data = None;
+    node.keys_data = &[];
+    node.vals_data = &[];
+    Node::new(wire, node)
+}
+
+/// Relation member IDs and a checked lookup of the first tag with a given key.
+pub(crate) struct ClassificationRelation<'a> {
+    wire: &'a WireBlock<'static>,
+    relation: WireRelation<'a>,
+}
+
+impl<'a> ClassificationRelation<'a> {
+    pub(crate) fn id(&self) -> i64 {
+        self.relation.id
+    }
+
+    pub(crate) fn members(&self) -> super::elements::MemberIdIter<'a> {
+        super::elements::MemberIdIter::new(self.relation.memids_data, self.relation.types_data)
+    }
+
+    /// The arrays' framing and cardinality have already been checked.
+    /// Resolve keys only until a match and resolve only its value.
+    pub(crate) fn tag_value(&self, key: &str) -> Result<Option<&'a str>> {
+        use super::wire::{Cursor, WIRE_VARINT};
+
+        let mut keys = Cursor::new(self.relation.keys_data);
+        let mut vals = Cursor::new(self.relation.vals_data);
+        while !keys.is_empty() {
+            if self.tag_string(keys.read_varint()?)? == key {
+                return self.tag_string(vals.read_varint()?).map(Some);
+            }
+            vals.skip_field(WIRE_VARINT)?;
+        }
+        Ok(None)
+    }
+
+    fn tag_string(&self, sid: u64) -> Result<&'a str> {
+        let sid =
+            u32::try_from(sid).map_err(|_| new_wire_error("tag string index exceeds uint32"))?;
+        str_from_stringtable(self.wire, sid as usize)
     }
 }
 
@@ -1446,7 +1615,7 @@ impl Selection {
     }
 }
 
-fn visit_selected_group<'a>(
+fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
     wire: &'a WireBlock<'static>,
     index: usize,
     select: &impl Fn(crate::ElementKind, i64) -> Selection,
@@ -1461,7 +1630,7 @@ fn visit_selected_group<'a>(
     let mut kinds = crate::element_kind::ElementKindSet::default();
     // Output is dense-first. Defer any dense validation failure until
     // after the ordinary records, matching the full validator's order.
-    let dense = visit_selected_dense(wire, &group, select, visit);
+    let dense = visit_selected_dense::<RETAINED_DENSE_FIELDS>(wire, &group, select, visit);
     for bytes in group.nodes() {
         kinds.add(NodeKind);
         let mut node = WireNode::parse(bytes)?;
@@ -1527,7 +1696,7 @@ fn visit_selected_group<'a>(
     Ok(kinds)
 }
 
-fn visit_selected_dense<'a>(
+fn visit_selected_dense<'a, const RETAINED_DENSE_FIELDS: bool>(
     wire: &'a WireBlock<'static>,
     group: &WireGroup<'a>,
     select: &impl Fn(crate::ElementKind, i64) -> Selection,
@@ -1563,15 +1732,20 @@ fn visit_selected_dense<'a>(
             }
         }
     }
-    project_dense_tags(
-        &mut dense,
-        selection == Selection::KeepTags,
-        count,
-        wire.stringtable.len(),
-    )?;
+    let retained_through = if RETAINED_DENSE_FIELDS && selection == Selection::KeepTags {
+        validate_retained_dense_tags(&dense, count, wire.stringtable.len(), select)?
+    } else {
+        project_dense_tags(
+            &mut dense,
+            selection == Selection::KeepTags,
+            count,
+            wire.stringtable.len(),
+        )?;
+        count
+    };
     if selection != Selection::Discard {
         validate_dense_info(&dense, count)?;
-        for node in DenseNodeIter::new(wire, dense) {
+        for node in DenseNodeIter::new(wire, dense).take(retained_through) {
             let selection = select(Node, node.id());
             if selection != Selection::Discard {
                 visit(Element::DenseNode(node), selection == Selection::KeepTags);
@@ -2024,7 +2198,47 @@ fn validate_dense_keys_vals(
     node_count: usize,
     strings: usize,
 ) -> Result<()> {
-    use super::wire::Cursor;
+    validate_dense_tag_runs(keys_vals_data, node_count, strings, || true)
+}
+
+/// Check tag runs and find the last node the writer will read, so dense
+/// iteration only decodes metadata deltas through that node.
+fn validate_retained_dense_tags(
+    dense: &WireDenseNodes<'_>,
+    count: usize,
+    strings: usize,
+    select: &impl Fn(crate::ElementKind, i64) -> Selection,
+) -> Result<usize> {
+    let mut ids = super::elements::WayRefIter::delta_decoded(dense.id_data).enumerate();
+    let mut retained_through = 0;
+    let mut keep_next = || {
+        let Some((position, id)) = ids.next() else {
+            return false;
+        };
+        let keep = select(crate::ElementKind::Node, id) == Selection::KeepTags;
+        if keep {
+            retained_through = position + 1;
+        }
+        keep
+    };
+    if dense.keys_vals_data.is_empty() {
+        for _ in 0..count {
+            keep_next();
+        }
+    } else {
+        validate_dense_tag_runs(dense.keys_vals_data, count, strings, keep_next)?;
+    }
+    Ok(retained_through)
+}
+
+/// Check run boundaries for the decoder, and indices for runs it will write.
+fn validate_dense_tag_runs(
+    keys_vals_data: &[u8],
+    node_count: usize,
+    strings: usize,
+    mut keep_next: impl FnMut() -> bool,
+) -> Result<()> {
+    use super::wire::{Cursor, WIRE_VARINT};
 
     if keys_vals_data.is_empty() {
         return Ok(());
@@ -2033,33 +2247,27 @@ fn validate_dense_keys_vals(
     let mut cursor = Cursor::new(keys_vals_data);
     let mut runs = 0usize;
     let mut in_run = false;
-    // Dense tag iterators narrow to i32. Require nonnegative int32 string
-    // indices here, including values, so high bits cannot alias a valid sid;
-    // then require each fitting index to resolve in the table.
+    let mut keep = keep_next();
     while !cursor.is_empty() {
         let key = cursor.read_varint()?;
-        if key > 0x7fff_ffff {
-            return Err(new_wire_error("dense tag string index exceeds int32"));
-        }
         if key == 0 {
             runs += 1;
             in_run = false;
+            keep = keep_next();
             continue;
         }
-        if key >= strings as u64 {
-            return Err(sid_past_the_table(key));
+        if keep {
+            validate_dense_tag_sid(key, strings)?;
         }
         if cursor.is_empty() {
             return Err(new_wire_error(
                 "dense keys_vals ends with a key that has no value",
             ));
         }
-        let value = cursor.read_varint()?;
-        if value > 0x7fff_ffff {
-            return Err(new_wire_error("dense tag string index exceeds int32"));
-        }
-        if value >= strings as u64 {
-            return Err(sid_past_the_table(value));
+        if keep {
+            validate_dense_tag_sid(cursor.read_varint()?, strings)?;
+        } else {
+            cursor.skip_field(WIRE_VARINT)?;
         }
         in_run = true;
     }
@@ -2072,6 +2280,18 @@ fn validate_dense_keys_vals(
         return Err(new_wire_error(
             "dense keys_vals describes a different number of nodes than the id array",
         ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_dense_tag_sid(sid: u64, strings: usize) -> Result<()> {
+    // Dense tag iterators narrow to i32. Check the width before lookup.
+    if sid > 0x7fff_ffff {
+        return Err(new_wire_error("dense tag string index exceeds int32"));
+    }
+    if sid >= strings as u64 {
+        return Err(sid_past_the_table(sid));
     }
     Ok(())
 }
@@ -2731,7 +2951,7 @@ mod strict_validation_tests {
 
     /// A block holding one dense node with the given raw lat (lon 0) under
     /// the given granularity and lat_offset.
-    fn scaled_dense_block(granularity: i32, lat_offset: i64, raw_lat: i64) -> PrimitiveBlock {
+    fn scaled_dense_block(granularity: i32, lat_offset: i64, raw_lat: i64) -> Vec<u8> {
         let zz = |v: i64| ((v << 1) ^ (v >> 63)).cast_unsigned();
         let mut lat = Vec::new();
         varint(zz(raw_lat), &mut lat);
@@ -2743,7 +2963,7 @@ mod strict_validation_tests {
         varint(i64::from(granularity).cast_unsigned(), &mut buffer);
         varint(19 << 3, &mut buffer);
         varint(lat_offset.cast_unsigned(), &mut buffer);
-        PrimitiveBlock::from_vec(buffer).unwrap()
+        buffer
     }
 
     /// The checked readers - the columnar decode (extract smart, complete,
@@ -2770,14 +2990,24 @@ mod strict_validation_tests {
         ];
         for (granularity, lat_offset, raw_lat) in cases {
             let case = format!("case {granularity} {lat_offset} {raw_lat}");
-            let block = scaled_dense_block(granularity, lat_offset, raw_lat);
+            let (mut st, mut groups) = (Vec::new(), Vec::new());
+            let block = BlockBuffer::new(
+                scaled_dense_block(granularity, lat_offset, raw_lat),
+                None,
+                &mut st,
+                &mut groups,
+                None,
+            )
+            .for_selection()
+            .unwrap();
+            let block = block.classify().unwrap();
             let mut columns = crate::read::columnar::DenseNodeColumns::new();
             let columnar = block
                 .decode_dense_columns(&mut columns)
                 .ok()
                 .map(|_| columns.lats);
             let (checked, permissive): (Vec<Option<i32>>, Vec<i32>) = block
-                .elements()
+                .nodes()
                 .filter_map(|e| match e {
                     Element::DenseNode(n) => {
                         Some((n.decimicro_lat().ok(), n.decimicro_lat_wrapping()))
@@ -3094,6 +3324,140 @@ mod strict_validation_tests {
             .visit(|_, _| Selection::KeepTags, |_, _| Ok(()))
     }
 
+    fn assert_extract_refusal<T>(result: crate::Result<T>, full: &crate::Error) {
+        let actual = result.map(drop).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(actual.kind()),
+            std::mem::discriminant(full.kind())
+        );
+        assert_eq!(actual.to_string(), full.to_string());
+    }
+
+    #[test]
+    fn extract_projection_checks_the_smart_tag_lookup_on_demand() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes, packed, relation};
+
+        let fixture = |values| {
+            let mut record = relation(10, &[(0, 1, 0)]);
+            field_bytes(&mut record, 2, &packed([1, 2, 2]));
+            field_bytes(&mut record, 3, &packed(values));
+            block(
+                &["", "name", "type", "boundary"],
+                &[Group {
+                    relations: vec![record],
+                    ..Group::default()
+                }],
+            )
+        };
+        for (values, expected) in [([4, 3, 4], Some("boundary")), ([3, 4, 3], None)] {
+            let bytes = fixture(values);
+            let full = crate::test_support::assert_err_kind!(
+                PrimitiveBlock::from_vec(bytes.clone()),
+                crate::ErrorKind::StringtableIndexOutOfBounds { index: 4 },
+            );
+            let (mut st, mut groups) = (Vec::new(), Vec::new());
+            let block = BlockBuffer::new(bytes, None, &mut st, &mut groups, None)
+                .for_selection()
+                .unwrap();
+            let classified = block.classify().unwrap();
+            let relation = classified.relations().next().unwrap();
+            assert!(matches!(
+                relation.members().next(),
+                Some(crate::MemberId::Node(1))
+            ));
+            match expected {
+                Some(value) => assert_eq!(relation.tag_value("type").unwrap(), Some(value)),
+                None => assert_extract_refusal(relation.tag_value("type"), &full),
+            }
+            assert_extract_refusal(block.visit_retained(|_, _| true, |_| Ok(())), &full);
+            block.visit_retained(|_, _| false, |_| Ok(())).unwrap();
+            assert_extract_refusal(block.validate_passthrough(), &full);
+        }
+    }
+
+    #[test]
+    fn extract_validates_dense_metadata_when_a_retained_node_needs_it() {
+        use crate::read::wire_fixtures::{Group, block, dense, field_bytes, packed};
+
+        let mut nodes = dense(&[(1, 0, 0), (2, 1, 1)], &[0, 0]);
+        let mut info = Vec::new();
+        field_bytes(&mut info, 1, &packed([3]));
+        field_bytes(&mut nodes, 5, &info);
+        let bytes = block(
+            &[""],
+            &[Group {
+                dense: Some(nodes),
+                ..Group::default()
+            }],
+        );
+        let full = crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(bytes.clone()),
+            crate::ErrorKind::WireFormat {
+                msg: "dense denseinfo array length does not match the id array"
+            },
+        );
+        let (mut st, mut groups) = (Vec::new(), Vec::new());
+        let block = BlockBuffer::new(bytes, None, &mut st, &mut groups, None)
+            .for_selection()
+            .unwrap();
+        assert_eq!(block.classify().unwrap().nodes().count(), 2);
+        block.visit_retained(|_, _| false, |_| Ok(())).unwrap();
+        assert_extract_refusal(block.visit_retained(|_, id| id == 2, |_| Ok(())), &full);
+    }
+
+    fn assert_extract_structural_refusal(bytes: Vec<u8>, claim: Option<crate::ElementKind>) {
+        let (mut st, mut groups) = (Vec::new(), Vec::new());
+        let full = BlockBuffer::new(bytes.clone(), None, &mut st, &mut groups, claim)
+            .block()
+            .unwrap_err();
+        let block = BlockBuffer::new(bytes, None, &mut st, &mut groups, claim)
+            .for_selection()
+            .unwrap();
+        assert_extract_refusal(block.classify(), &full);
+        assert_extract_refusal(block.visit_retained(|_, _| false, |_| Ok(())), &full);
+    }
+
+    #[test]
+    fn extract_projection_retains_structure_and_kind_checks() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes, packed, relation, way};
+
+        let mut broken_way = way(10, &[1], (0, 0));
+        field_bytes(&mut broken_way, 9, &packed([0]));
+        let broken_members = {
+            let mut rel = Vec::new();
+            field_bytes(&mut rel, 8, &packed([0]));
+            rel
+        };
+        let malformed = [
+            (
+                Group {
+                    ways: vec![broken_way],
+                    ..Group::default()
+                },
+                None,
+            ),
+            (
+                Group {
+                    relations: vec![broken_members],
+                    ..Group::default()
+                },
+                None,
+            ),
+            (
+                Group {
+                    relations: vec![relation(10, &[])],
+                    ..Group::default()
+                },
+                Some(crate::ElementKind::Way),
+            ),
+        ];
+        for (group, claim) in malformed {
+            assert_extract_structural_refusal(block(&[""], &[group]), claim);
+        }
+        let bad_strings = len_field(1, &len_field(1, &[0xff]));
+        assert_extract_structural_refusal(bad_strings, None);
+    }
+
     #[test]
     fn selecting_every_record_matches_full_validation_on_mutated_blocks() {
         use crate::read::wire_fixtures::{mutations, projection_fixtures};
@@ -3344,6 +3708,10 @@ mod strict_validation_tests {
 
                 let block = unvalidated_block(buffer);
                 let msg = panic_message(|| {
+                    let block = super::ClassificationBlock {
+                        wire: &block.data.wire,
+                        kinds: Default::default(),
+                    };
                     let mut columns = crate::read::columnar::DenseNodeColumns::new();
                     let _decoded = block.decode_dense_columns(&mut columns);
                 });

@@ -4,8 +4,9 @@
 //! planner refuses classifies, then writes.
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::read::block::{BlockBuffer, ClassificationBlock, SelectionBlock};
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementKind, PrimitiveBlock};
+use crate::{Element, ElementKind};
 
 use super::super::{
     HeaderOverrides, Result, clean_metadata, clean_partial_metadata, ensure_node_capacity_local,
@@ -317,7 +318,7 @@ pub(super) fn try_extract_multi_single_pass(
             // verification can never change which nodes are selected.
             // Fills `scratch` with each region's matching node ids, occurrences
             // kept (passthrough verification counts them).
-            let classify_columns = |block: &PrimitiveBlock,
+            let classify_columns = |block: &ClassificationBlock<'_>,
                                     columns: &mut crate::read::columnar::DenseNodeColumns,
                                     scratch: &mut Vec<Vec<i64>>|
              -> crate::error::Result<()> {
@@ -328,11 +329,9 @@ pub(super) fn try_extract_multi_single_pass(
                 classifier.collect_bbox_columns(columns, &bboxes, scratch);
                 // Dense columns deliberately exclude plain Node messages. Visit
                 // only those messages here; keep dense classification batched.
-                for group in block.groups() {
-                    for node in group.nodes() {
-                        let (lat, lon) = super::common::plain_coords(&node)?;
-                        classifier.visit(lat, lon, None, |region| scratch[region].push(node.id()));
-                    }
+                for node in block.plain_nodes() {
+                    let (lat, lon) = super::common::plain_coords(&node)?;
+                    classifier.visit(lat, lon, None, |region| scratch[region].push(node.id()));
                 }
                 Ok(())
             };
@@ -344,17 +343,8 @@ pub(super) fn try_extract_multi_single_pass(
                 )
             };
 
-            // One pass over every node blob. Each is validated as block
-            // construction validates it, refusing a contradicted kind claim
-            // (a candidate is scheduled as nodes, and the classifier reads only
-            // nodes), then built and classified. A passthrough candidate's
-            // validated bytes are also read for the structural check in
-            // `dense_only_payload` before the block is built: a block the decode
-            // path rejects is never copied raw, and the check sees the payload,
-            // not the offset tables a build appends. This one pass replaced a
-            // block pool for the rest and a raw pool that copied each candidate
-            // into a block; it is a simplification, measured neutral at planet
-            // (reference/performance/check.md, "Payloads validated where they lie").
+            // Classify every node blob, including contradicted kind checks.
+            // A candidate also needs full validation before a raw copy.
             let node_blobs_ref = &node_blobs;
             crate::scan::classify::parallel_project_phase(
                 &shared_file,
@@ -362,14 +352,10 @@ pub(super) fn try_extract_multi_single_pass(
                 None,
                 worker_init,
                 |position, buffer, (columns, scratch, builder)| {
-                    let (crate::read::block::NoProjection, validated) =
-                        buffer.project(|_, _| crate::read::block::NoProjection)?;
+                    let buffer = buffer.for_selection()?;
+                    let block = buffer.classify()?;
                     let candidates = node_blobs_ref[position].candidates.as_deref();
-                    let eligible = match candidates {
-                        Some(_) => dense_only_payload(validated.bytes())?,
-                        None => false,
-                    };
-                    let block = validated.into_block();
+                    let eligible = candidates.is_some() && dense_only_payload(buffer.payload())?;
                     classify_columns(&block, columns, scratch)?;
                     let admit = node_blobs_ref[position].admit.as_deref();
                     for (region, ids) in scratch.iter_mut().enumerate() {
@@ -383,6 +369,9 @@ pub(super) fn try_extract_multi_single_pass(
                     let verified = candidates
                         .filter(|_| eligible)
                         .and_then(|c| verified_regions(c, |r| scratch[r].len(), observed));
+                    if verified.is_some() {
+                        buffer.validate_passthrough()?;
+                    }
                     for (region, ids) in scratch.iter().enumerate() {
                         for &id in ids {
                             builder.push(id, region);
@@ -406,18 +395,14 @@ pub(super) fn try_extract_multi_single_pass(
                 None,
                 || (BatchBuilder::new(n), vec![0usize; n]),
                 |position, buffer, (builder, hits): &mut (BatchBuilder, Vec<usize>)| {
-                    let (crate::read::block::NoProjection, validated) =
-                        buffer.project(|_, _| crate::read::block::NoProjection)?;
+                    let buffer = buffer.for_selection()?;
+                    let block = buffer.classify()?;
                     let candidates = node_blobs_ref[position].candidates.as_deref();
-                    let eligible = match candidates {
-                        Some(_) => dense_only_payload(validated.bytes())?,
-                        None => false,
-                    };
-                    let block = validated.into_block();
+                    let eligible = candidates.is_some() && dense_only_payload(buffer.payload())?;
                     hits.fill(0);
                     let mut observed = 0usize;
                     let admit = node_blobs_ref[position].admit.as_deref();
-                    for element in block.elements_skip_metadata() {
+                    for element in block.nodes() {
                         let (id, lat, lon) = match &element {
                             Element::DenseNode(node) => (
                                 node.id(),
@@ -441,6 +426,9 @@ pub(super) fn try_extract_multi_single_pass(
                     let verified = candidates
                         .filter(|_| eligible)
                         .and_then(|c| verified_regions(c, |r| hits[r], observed));
+                    if verified.is_some() {
+                        buffer.validate_passthrough()?;
+                    }
                     Ok((builder.finish(), verified))
                 },
                 |pos, (batch, verified): (PageBatch, Option<Verified>)| {
@@ -482,42 +470,45 @@ pub(super) fn try_extract_multi_single_pass(
             n,
             |block, admit, bbs, output, _scratch| {
                 let mut counts = vec![0u64; n];
-                let mut mask = vec![0u64; mw];
+                let mask = std::cell::RefCell::new(vec![0; mw]);
                 // An occurrence goes only to the regions its blob is read
                 // for (`node_blob_regions`), as in each single extract.
                 let member = |id: i64, mask: &mut [u64]| {
                     node_members.mask_into(id, mask) && restrict(mask, admit)
                 };
-                for element in block.elements() {
-                    match &element {
-                        // A non-member skips metadata decode: the overwhelmingly
-                        // common no-region-matches node.
-                        Element::DenseNode(dn) if member(dn.id(), &mut mask) => {
-                            let id = dn.id();
-                            let (lat, lon) = super::common::dense_coords(dn)?;
-                            let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                            for i in regions_of(&mask) {
-                                ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                                bbs[i].add_node_dense(id, lat, lon, dn.tags(), meta.as_ref());
-                                counts[i] += 1;
+                block.visit_retained(
+                    |kind, id| kind == ElementKind::Node && member(id, &mut mask.borrow_mut()),
+                    |element| {
+                        let mask = mask.borrow();
+                        match &element {
+                            Element::DenseNode(dn) => {
+                                let id = dn.id();
+                                let (lat, lon) = super::common::dense_coords(dn)?;
+                                let meta = clean_metadata(dense_node_metadata(dn)?, clean);
+                                for i in regions_of(&mask) {
+                                    ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
+                                    bbs[i].add_node_dense(id, lat, lon, dn.tags(), meta.as_ref());
+                                    counts[i] += 1;
+                                }
                             }
-                        }
-                        Element::Node(nd) if member(nd.id(), &mut mask) => {
-                            let id = nd.id();
-                            let (lat, lon) = super::common::plain_coords(nd)?;
-                            let meta = clean_partial_metadata(
-                                element_metadata(ElementKind::Node, id, &nd.info())?,
-                                clean,
-                            );
-                            for i in regions_of(&mask) {
-                                ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                                bbs[i].add_node_partial(id, lat, lon, nd.tags(), meta.as_ref());
-                                counts[i] += 1;
+                            Element::Node(nd) => {
+                                let id = nd.id();
+                                let (lat, lon) = super::common::plain_coords(nd)?;
+                                let meta = clean_partial_metadata(
+                                    element_metadata(ElementKind::Node, id, &nd.info())?,
+                                    clean,
+                                );
+                                for i in regions_of(&mask) {
+                                    ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
+                                    bbs[i].add_node_partial(id, lat, lon, nd.tags(), meta.as_ref());
+                                    counts[i] += 1;
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 Ok(counts)
             },
             &framing,
@@ -538,14 +529,6 @@ pub(super) fn try_extract_multi_single_pass(
     // A way's mask is the OR of its refs' node masks; the walk stops once
     // every region has matched.
     //
-    // Deliberately a block walk, not a projection. Not measured here: the
-    // estimate rests on extract smart's way classify, the same shape (every
-    // way's refs tested against a node set), which stayed at the same
-    // length on `read::project_ids::WaySpans` at planet. This loop adds the
-    // per-region membership tests on top, so the message re-parse a
-    // projection would remove is a smaller share still
-    // (reference/performance/inspect.md, "inspect --nodes reads through a
-    // projection").
     let way_fused = fused_blobs(
         way_blobs
             .iter()
@@ -575,22 +558,22 @@ pub(super) fn try_extract_multi_single_pass(
         host.invocation.marker("MULTI_WAY_FUSED_END");
     } else {
         host.invocation.marker("MULTI_WAY_CLASSIFY_START");
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &way_schedule,
             None,
             || (BatchBuilder::new(n), vec![0u64; mw]),
-            |block, (builder, acc): &mut (BatchBuilder, Vec<u64>)| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(w) = &element {
-                        acc.fill(0);
-                        for node_id in w.refs() {
-                            if node_members.or_into(node_id, acc) && *acc == all_regions {
-                                break;
-                            }
+            |_, buffer, (builder, acc): &mut (BatchBuilder, Vec<u64>)| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
+                for w in block.ways() {
+                    acc.fill(0);
+                    for node_id in w.refs() {
+                        if node_members.or_into(node_id, acc) && *acc == all_regions {
+                            break;
                         }
-                        builder.push_mask(w.id(), acc);
                     }
+                    builder.push_mask(w.id(), acc);
                 }
                 Ok(builder.finish())
             },
@@ -608,25 +591,30 @@ pub(super) fn try_extract_multi_single_pass(
             n,
             |block, bbs, output, way| {
                 let mut counts = vec![0u64; n];
-                let mut mask = vec![0u64; mw];
-                for element in block.elements() {
-                    if let Element::Way(w) = &element {
-                        let wid = w.id();
-                        if !way_members.mask_into(wid, &mut mask) {
-                            continue;
+                let mask = std::cell::RefCell::new(vec![0; mw]);
+                block.visit_retained(
+                    |kind, id| {
+                        kind == ElementKind::Way
+                            && way_members.mask_into(id, &mut mask.borrow_mut())
+                    },
+                    |element| {
+                        let mask = mask.borrow();
+                        if let Element::Way(w) = &element {
+                            let wid = w.id();
+                            way.prepare(w, coords)?;
+                            let meta = clean_partial_metadata(
+                                element_metadata(ElementKind::Way, wid, &w.info())?,
+                                clean,
+                            );
+                            for i in regions_of(&mask) {
+                                ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
+                                way.write(&mut bbs[i], w.tags(), meta.as_ref());
+                                counts[i] += 1;
+                            }
                         }
-                        way.prepare(w, coords)?;
-                        let meta = clean_partial_metadata(
-                            element_metadata(ElementKind::Way, wid, &w.info())?,
-                            clean,
-                        );
-                        for i in regions_of(&mask) {
-                            ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
-                            way.write(&mut bbs[i], w.tags(), meta.as_ref());
-                            counts[i] += 1;
-                        }
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 Ok(counts)
             },
             &framing,
@@ -645,9 +633,6 @@ pub(super) fn try_extract_multi_single_pass(
     // region). Streamed per blob like the other kinds: classification reads
     // only the finished node and way memberships.
     //
-    // A block walk on purpose: the phase is under 1 s at planet, so the
-    // re-parse a projection would remove sits under the command's noise
-    // floor.
     let relation_fused = fused_blobs(
         relation_blobs
             .iter()
@@ -677,26 +662,26 @@ pub(super) fn try_extract_multi_single_pass(
         host.invocation.marker("MULTI_REL_FUSED_END");
     } else {
         host.invocation.marker("MULTI_REL_CLASSIFY_START");
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &relation_schedule,
             None,
             || (BatchBuilder::new(n), vec![0u64; mw]),
-            |block, (builder, acc): &mut (BatchBuilder, Vec<u64>)| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element {
-                        acc.fill(0);
-                        for member in matchable_members(r) {
-                            let hit = match member {
-                                MatchableMember::Node(id) => node_members.or_into(id, acc),
-                                MatchableMember::Way(id) => way_members.or_into(id, acc),
-                            };
-                            if hit && *acc == all_regions {
-                                break;
-                            }
+            |_, buffer, (builder, acc): &mut (BatchBuilder, Vec<u64>)| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
+                for r in block.relations() {
+                    acc.fill(0);
+                    for member in matchable_members(r.members()) {
+                        let hit = match member {
+                            MatchableMember::Node(id) => node_members.or_into(id, acc),
+                            MatchableMember::Way(id) => way_members.or_into(id, acc),
+                        };
+                        if hit && *acc == all_regions {
+                            break;
                         }
-                        builder.push_mask(r.id(), acc);
                     }
+                    builder.push_mask(r.id(), acc);
                 }
                 Ok(builder.finish())
             },
@@ -715,25 +700,35 @@ pub(super) fn try_extract_multi_single_pass(
             |block, bbs, output, _scratch| {
                 let mut counts = vec![0u64; n];
                 let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-                let mut mask = vec![0u64; mw];
-                for element in block.elements() {
-                    if let Element::Relation(r) = &element {
-                        let rid = r.id();
-                        if !relation_members.mask_into(rid, &mut mask) {
-                            continue;
+                let mask = std::cell::RefCell::new(vec![0; mw]);
+                block.visit_retained(
+                    |kind, id| {
+                        kind == ElementKind::Relation
+                            && relation_members.mask_into(id, &mut mask.borrow_mut())
+                    },
+                    |element| {
+                        let mask = mask.borrow();
+                        if let Element::Relation(r) = &element {
+                            let rid = r.id();
+                            r.members_into(&mut members_buf)?;
+                            let meta = clean_partial_metadata(
+                                element_metadata(ElementKind::Relation, rid, &r.info())?,
+                                clean,
+                            );
+                            for i in regions_of(&mask) {
+                                ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;
+                                bbs[i].add_relation_partial(
+                                    rid,
+                                    r.tags(),
+                                    &members_buf,
+                                    meta.as_ref(),
+                                );
+                                counts[i] += 1;
+                            }
                         }
-                        r.members_into(&mut members_buf)?;
-                        let meta = clean_partial_metadata(
-                            element_metadata(ElementKind::Relation, rid, &r.info())?,
-                            clean,
-                        );
-                        for i in regions_of(&mask) {
-                            ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_relation_partial(rid, r.tags(), &members_buf, meta.as_ref());
-                            counts[i] += 1;
-                        }
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 Ok(counts)
             },
             &framing,
@@ -1105,7 +1100,7 @@ fn multi_extract_pread_write_nodes<F>(
 ) -> Result<()>
 where
     F: Fn(
-            &PrimitiveBlock,
+            &SelectionBlock,
             Option<&[u64]>,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
@@ -1207,7 +1202,7 @@ impl MultiLocal {
         input: &InputFile,
         entry: &ScheduledBlob,
         invocation: &crate::host::Recorder,
-    ) -> Result<PrimitiveBlock> {
+    ) -> Result<SelectionBlock> {
         let block = (|| {
             let raw = self.read_buf.read_exact_at(
                 &**input.file(),
@@ -1216,12 +1211,14 @@ impl MultiLocal {
             )?;
             let mut buf = crate::blob::pool_get(Some(&self.pool), 0);
             crate::blob::decompress_blob_raw(raw, &mut buf)?;
-            PrimitiveBlock::from_vec_pooled_with_scratch(
+            BlockBuffer::new(
                 buf,
-                &self.pool,
+                Some(&self.pool),
                 &mut self.st_scratch,
                 &mut self.gr_scratch,
+                None,
             )
+            .for_selection()
         })()
         .map_err(|e| input.locate_blob(entry, e));
         self.read_buf.release_outlier(invocation);
@@ -1231,7 +1228,7 @@ impl MultiLocal {
     /// Classify `block` against the N regions and take each region's blocks.
     fn classify<F>(
         &mut self,
-        block: &PrimitiveBlock,
+        block: &SelectionBlock,
         admit: Option<&[u64]>,
         n: usize,
         block_fn: &F,
@@ -1239,7 +1236,7 @@ impl MultiLocal {
     ) -> crate::Result<RegionFrames>
     where
         F: Fn(
-            &PrimitiveBlock,
+            &SelectionBlock,
             Option<&[u64]>,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
@@ -1451,7 +1448,7 @@ impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_
 
 /// Multi-region pread-from-workers write pass.
 ///
-/// Workers pread blob data, decompress, parse into PrimitiveBlock, then call
+/// Workers pread blob data, decompress, frame a selective block, then call
 /// the provided closure to classify elements against N regions and produce
 /// N × `Vec<OwnedBlock>`, then compress and frame those blocks
 /// (`RegionFraming`). The consumer copies each region's frames to its
@@ -1472,7 +1469,7 @@ fn multi_extract_pread_write<F>(
 ) -> Result<()>
 where
     F: Fn(
-            &PrimitiveBlock,
+            &SelectionBlock,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
             &mut crate::owned::WayScratch,
@@ -1486,18 +1483,20 @@ where
     // Way and relation blobs have no spatial admission: every region reads
     // them.
     let block_fn =
-        |block: &PrimitiveBlock,
+        |block: &SelectionBlock,
          _admit: Option<&[u64]>,
          bbs: &mut Vec<BlockBuilder>,
          output: &mut Vec<Vec<OwnedBlock>>,
          way: &mut crate::owned::WayScratch| block_fn(block, bbs, output, way);
-    crate::scan::classify::parallel_classify_phase_ordered(
+    crate::scan::classify::parallel_project_phase_ordered(
         input,
         schedule,
         None,
         None,
         || MultiLocal::new(n, &host.invocation),
-        |block, local: &mut MultiLocal| local.classify(block, None, n, &block_fn, framing),
+        |buffer, local: &mut MultiLocal| {
+            local.classify(&buffer.for_selection()?, None, n, &block_fn, framing)
+        },
         |_position, item| write_regions(item, writers, stats, stat_field),
         host,
     )

@@ -669,6 +669,15 @@
   The default two-pass filter no longer refuses malformed fields it
   neither reads nor writes. See [DEVIATIONS.md](DEVIATIONS.md#tags-filter-pbf-validation-follows-the-fields-used-by-each-pass).
 
+- **Smart and simple extract take about 28 % and 15 % less time on planet,
+  respectively.** On bygg, the working tree on `ae36d2c9` cut wall time
+  against HEAD `ae36d2c9` for smart with a Berlin bounding box (warm
+  baseline) and simple with the `berlin-concave` polygon. All three extract
+  strategies now scope validation to the fields they use in single- and
+  multi-region runs. Malformed fields that extract neither reads nor writes
+  can now be accepted. Raw passthrough still requires full block validation.
+  See [DEVIATIONS.md](DEVIATIONS.md#extract-pbf-validation-follows-classification-and-retained-output).
+
 - **`apply-changes` writes smaller files and finishes faster.** Rewritten
   blocks no longer repeat the source string table across every output
   block, and eligible indexed blobs reuse wire data for unchanged elements.

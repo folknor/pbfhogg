@@ -1090,6 +1090,272 @@ mod tests {
     use pbfhogg_test_scratch::TestScratch;
     use std::io::Write as _;
 
+    fn scoped_fixture(discarded: bool) -> [Vec<u8>; 3] {
+        use crate::read::wire_fixtures::{
+            Group, block, dense, field_bytes, packed, plain_node, relation, way,
+        };
+
+        let strings = ["", "name", "fixture", "type", "multipolygon"];
+        let bad_sid = strings.len() as u64;
+        let mut plain = plain_node(7, 70_000_000, 70_000_000, &[(1, 2)], None);
+        if discarded {
+            field_bytes(&mut plain, 4, &[0x08]);
+        }
+        let mut nodes = dense(
+            &[
+                (1, 0, 0),
+                (2, 20_000_000, 20_000_000),
+                (4, 40_000_000, 40_000_000),
+                (5, 50_000_000, 50_000_000),
+                (6, 60_000_000, 60_000_000),
+            ],
+            &[1, 2, 0, 0, 0, 0, 1, if discarded { bad_sid } else { 2 }, 0],
+        );
+        let mut info = Vec::new();
+        field_bytes(&mut info, 1, &packed([3; 5]));
+        field_bytes(&mut nodes, 5, &info);
+
+        let mut matched_way = way(10, &[1, 2], (1, 2));
+        field_bytes(&mut matched_way, 4, &[0x08, 0x03]);
+        let mut matched_relation = relation(20, &[(0, 10, 1), (0, 11, 1)]);
+        field_bytes(&mut matched_relation, 2, &packed([3]));
+        field_bytes(&mut matched_relation, 3, &packed([4]));
+        let mut discarded_relation = relation(22, &[(if discarded { bad_sid } else { 0 }, 7, 0)]);
+        field_bytes(&mut discarded_relation, 2, &packed([3]));
+        field_bytes(
+            &mut discarded_relation,
+            3,
+            &packed([if discarded { bad_sid } else { 4 }]),
+        );
+        [
+            block(
+                &strings,
+                // An indexed block may have both encodings, each in its
+                // own group. The index scanner refuses mixed group fields.
+                &[
+                    Group {
+                        dense: Some(nodes),
+                        ..Group::default()
+                    },
+                    Group {
+                        nodes: vec![plain],
+                        ..Group::default()
+                    },
+                ],
+            ),
+            block(
+                &strings,
+                &[Group {
+                    ways: vec![
+                        matched_way,
+                        way(11, &[4, 5], (1, 2)),
+                        way(12, &[7], (1, if discarded { bad_sid } else { 2 })),
+                    ],
+                    ..Group::default()
+                }],
+            ),
+            block(
+                &strings,
+                &[Group {
+                    relations: vec![
+                        matched_relation,
+                        relation(21, &[(0, 20, 2)]),
+                        discarded_relation,
+                    ],
+                    ..Group::default()
+                }],
+            ),
+        ]
+    }
+
+    fn write_scoped_fixture(path: &Path, discarded: bool, indexed: bool, sorted: bool) {
+        use crate::block_builder::{HeaderBuilder, OwnedBlock};
+        use crate::write::compression::Compression;
+        use crate::writer::PbfWriter;
+
+        let mut writer = PbfWriter::new(std::fs::File::create(path).unwrap(), Compression::None);
+        let mut header = HeaderBuilder::new();
+        if sorted {
+            header = header.sorted();
+        }
+        writer.write_header(&header.build().unwrap()).unwrap();
+        for (bytes, good) in scoped_fixture(discarded)
+            .into_iter()
+            .zip(scoped_fixture(false))
+        {
+            if indexed {
+                writer
+                    .write_primitive_block_owned(OwnedBlock {
+                        bytes,
+                        index: crate::blob_meta::scan_block_ids(&good).unwrap_or_else(|| {
+                            panic!("well-formed fixture block must be indexable")
+                        }),
+                        tagdata: None,
+                        way_members: None,
+                    })
+                    .unwrap();
+            } else {
+                writer.write_primitive_block_no_indexdata(&bytes).unwrap();
+            }
+        }
+        writer.flush().unwrap();
+    }
+
+    fn scoped_extract(
+        input: &Path,
+        output: &Path,
+        region: &Region,
+        strategy: ExtractStrategy,
+        force: bool,
+    ) -> Result<ExtractStats> {
+        extract(
+            input,
+            crate::Output::new(
+                output,
+                crate::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            region,
+            strategy,
+            false,
+            &CleanAttrs::default(),
+            &WriteOptions::from_flags(
+                crate::write::compression::Compression::None,
+                false,
+                false,
+                force,
+            ),
+            &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
+        )
+    }
+
+    fn scoped_extract_multi(
+        input: &Path,
+        outputs: &[PathBuf],
+        regions: &[Region],
+        strategy: ExtractStrategy,
+        force: bool,
+    ) -> Result<Vec<ExtractStats>> {
+        extract_multi(
+            input,
+            regions,
+            crate::OutputSet::files(
+                outputs,
+                crate::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            strategy,
+            false,
+            &CleanAttrs::default(),
+            &WriteOptions::from_flags(
+                crate::write::compression::Compression::None,
+                false,
+                false,
+                force,
+            ),
+            &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
+        )
+    }
+
+    const STRATEGIES: [ExtractStrategy; 3] = [
+        ExtractStrategy::Simple,
+        ExtractStrategy::CompleteWays,
+        ExtractStrategy::Smart,
+    ];
+
+    fn assert_scoped_fixture_selection(path: &Path, strategy: ExtractStrategy) {
+        use crate::Element::{DenseNode, Node, Relation, Way};
+
+        let (mut nodes, mut ways, mut relations) = (Vec::new(), Vec::new(), Vec::new());
+        crate::ElementReader::open_with(path, false, &crate::host::Host::for_tests())
+            .unwrap()
+            .for_each(|element| match element {
+                DenseNode(n) => {
+                    assert_eq!(n.info().unwrap().version(), 3);
+                    nodes.push(n.id());
+                }
+                Node(n) => nodes.push(n.id()),
+                Way(w) => {
+                    if w.id() == 10 {
+                        assert_eq!(w.info().version(), Some(3));
+                        assert_eq!(w.tags().next(), Some(("name", "fixture")));
+                    }
+                    ways.push(w.id());
+                }
+                Relation(r) => relations.push(r.id()),
+            })
+            .unwrap();
+        let expected = match strategy {
+            ExtractStrategy::Simple => (&[1][..], &[10][..], &[20][..]),
+            ExtractStrategy::CompleteWays => (&[1, 2][..], &[10][..], &[20, 21][..]),
+            ExtractStrategy::Smart => (&[1, 2, 4, 5][..], &[10, 11][..], &[20, 21][..]),
+        };
+        assert_eq!(
+            (nodes.as_slice(), ways.as_slice(), relations.as_slice()),
+            expected
+        );
+    }
+
+    #[test]
+    fn extract_scoped_validation_preserves_output_bytes() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let regions = [
+            Region::Bbox(parse_bbox("-1,-1,1,1").unwrap()),
+            Region::Bbox(parse_bbox("1.5,1.5,2.5,2.5").unwrap()),
+        ];
+        for (case, (indexed, sorted)) in [(true, true), (false, true), (false, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let input = scratch.path().join(format!("good-{case}.pbf"));
+            let malformed = scratch.path().join(format!("discarded-{case}.pbf"));
+            write_scoped_fixture(&input, false, indexed, sorted);
+            write_scoped_fixture(&malformed, true, indexed, sorted);
+            for strategy in STRATEGIES {
+                let outputs = [0, 1].map(|region| {
+                    scratch
+                        .path()
+                        .join(format!("multi-{case}-{strategy:?}-{region}.pbf"))
+                });
+                scoped_extract_multi(&input, &outputs, &regions, strategy, !indexed).unwrap();
+                for (slot, (region, multi)) in regions.iter().zip(outputs).enumerate() {
+                    let single = scratch
+                        .path()
+                        .join(format!("single-{case}-{strategy:?}-{slot}.pbf"));
+                    scoped_extract(&input, &single, region, strategy, !indexed).unwrap();
+                    if slot == 0 {
+                        assert_scoped_fixture_selection(&single, strategy);
+                    }
+                    let good = std::fs::read(single).unwrap();
+                    assert_eq!(
+                        good,
+                        std::fs::read(multi).unwrap(),
+                        "{case} {strategy:?} region {slot}"
+                    );
+                    if slot == 0 {
+                        let bad = scratch.path().join(format!("bad-{case}-{strategy:?}.pbf"));
+                        scoped_extract(&malformed, &bad, region, strategy, !indexed).unwrap();
+                        assert_eq!(good, std::fs::read(bad).unwrap(), "{case} {strategy:?}");
+                    }
+                }
+                let outputs = [0, 1].map(|region| {
+                    scratch
+                        .path()
+                        .join(format!("multi-bad-{case}-{strategy:?}-{region}.pbf"))
+                });
+                scoped_extract_multi(&malformed, &outputs, &regions, strategy, !indexed).unwrap();
+                for (region, bad) in outputs.into_iter().enumerate() {
+                    let good = scratch
+                        .path()
+                        .join(format!("multi-{case}-{strategy:?}-{region}.pbf"));
+                    assert_eq!(std::fs::read(good).unwrap(), std::fs::read(bad).unwrap());
+                }
+            }
+        }
+    }
+
     #[test]
     fn parse_valid_bbox() {
         let b = parse_bbox("12.4,55.6,12.7,55.8").unwrap();

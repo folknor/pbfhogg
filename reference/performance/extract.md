@@ -1,6 +1,51 @@
 # Extract
 
-## Extract
+## Current baselines
+
+Planet single-region `region-extract` on bygg, with interleaved
+`--iterations 1` cells for each workload. A is HEAD `ae36d2c9` and B is
+the working tree on that commit.
+
+| Strategy and region | Arm | Wall | Run |
+|---|---|---:|---|
+| Smart, Berlin bbox | A | 1m01s | `4b94863c` |
+| Smart, Berlin bbox | B | 40.3 s | `218cde2e` |
+| Smart, Berlin bbox | A | 54.8 s | `1a121b28` |
+| Smart, Berlin bbox | B | 39.5 s | `2ac7655a` |
+| Simple, `--polygon berlin-concave` | A | 46.7 s | `81580047` |
+| Simple, `--polygon berlin-concave` | B | 39.5 s | `a9d23fd5` |
+| Simple, `--polygon berlin-concave` | A | 46.8 s | `fc111ed9` |
+| Simple, `--polygon berlin-concave` | B | 39.6 s | `3402bd46` |
+
+Smart wall time fell about 28 % against the warm A cell. The first A cell
+likely had a colder cache. The Berlin bbox was `13.08,52.33,13.77,52.68`.
+Simple wall time fell about 15 %, with the same direction in both pairs.
+
+### Consumer-scoped validation
+
+The planet smart extract hotpath on bygg at `ae36d2c9` used the same
+Berlin bbox and took 59.1 s (`07f23b96`). `decompress_blob_raw` used
+455 core-s. `validate_block` through `BlockBuffer::project` used 307
+core-s over 76,869 projections. `PrimitiveBlock::from_vec_pooled_with_scratch`
+used 132 core-s in the write pass.
+
+Extract extends the selective projection API in `read/block.rs` to simple,
+complete-ways and smart, for both single- and multi-region runs.
+Classification checks IDs, node coordinates, way refs and relation members.
+`DenseNodeColumns::decode_append`, checked coordinate accessors and the
+node scanner preserve exact refusal for coordinates outside the `i32`
+decimicrodegree range. Smart reads the first `type` tag on demand for
+directly matched relations. Re-encoding validates the retained tags,
+metadata and member roles it writes. Raw passthrough still requires full
+block validation. See [extract refusal rules](../../DEVIATIONS.md#extract-pbf-validation-follows-classification-and-retained-output).
+
+B passed tier 1 and `pbfhogg-verify extract` and `multi-extract` on
+Denmark and Germany, covering their bboxes and the `copenhagen-concave`
+and `berlin-concave` polygons, respectively.
+
+## History
+
+### Earlier dataset baselines
 
 Plantasjen. Best of 3 runs (or single-sample where noted), indexed PBFs.
 
@@ -321,8 +366,6 @@ against the uncommitted change on top of it:
 
 Verdict: no cost on undeclared input. A declared input's coordinate cost
 was not measured: no planet cell of extract on `altw` exists yet.
-
-## History
 
 ### Multi-extract destination queues and tail packing (bygg, `b4e65632`)
 

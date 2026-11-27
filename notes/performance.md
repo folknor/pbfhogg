@@ -209,13 +209,20 @@ dependency scans still use full validation. The planet workload was about
 19 % faster in the warm pair on bygg, comparing HEAD `67510574` with its
 working tree. See [tags-filter measurements](../reference/performance/tags-filter.md).
 
+Extract now scopes validation for simple, complete-ways and smart, in
+single- and multi-region runs. Classification validates selection fields,
+and the write pass validates retained fields for re-encoding. Raw
+passthrough still uses full validation. See [extract measurements](../reference/performance/extract.md).
+
 Remaining work:
 
 - `check --ids` and `KindIds` share the full projection path. They need to
   opt in to scoped validation in `commands/check/verify_ids.rs` and
   `read/project_ids.rs`.
-- Extract classification, geocode and diff still need consumer-specific
-  validation scopes.
+- Geocode, diff, getid, getparents and `check --refs` still need
+  consumer-specific validation scopes.
+- Explore reusing extract's group framing from classification in the
+  write pass.
 - Check whether pass 2 can avoid the extra dense ID probing with
   `--remove-tags`. In a group with a tag column, the probe can continue
   past a retained node whose tags will be stripped to look for a direct
@@ -232,9 +239,8 @@ validation scanned the arrays, so `KindIds`, `WaySpans` and `IdScratch::each`
 re-decode spans. Raw scanners avoid this but materialize: node scans build all
 `(id, lat, lon)` tuples, way scans always build a full reference `Vec`, and
 callbacks cannot return errors. `blob_meta` `Walk::run` does nearly the same
-work for ID-only and tag-only requests. Examples of the second walk: smart
-extract classification (count arrays, build block, rediscover dense, decode
-three columns, classify), ID checks, reference checks, inspect tagged-node
+work for ID-only and tag-only requests. Examples of the second walk include
+ID checks, reference checks, inspect tagged-node
 count, extended inspect metadata, location checking's separate raw scanners,
 geocode pass 2 dense address extraction, diff element
 iteration that decodes dense metadata content equality ignores. Single-pass

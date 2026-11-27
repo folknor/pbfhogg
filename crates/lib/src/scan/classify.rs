@@ -17,15 +17,13 @@
 //!   earliest unmerged blob, which bounds the reorder memory. Use where the
 //!   merge's output must not depend on worker timing.
 //!
-//! - [`parallel_classify_accumulate`]: per-worker accumulator `S` is held
+//! - [`parallel_project_accumulate`]: per-worker accumulator `S` is held
 //!   for the whole scan and merged once at completion. Use for sparse
 //!   paths where the accumulator has a known small bound.
 //!
-//! The first three each have a projection twin
-//! ([`parallel_project_phase`], [`parallel_project_phase_ordered`],
-//! [`parallel_project_accumulate`]) whose worker hands the caller the
-//! decompressed `BlockBuffer` so each projection can validate the fields
-//! it needs before publishing results.
+//! The per-blob modes have projection twins ([`parallel_project_phase`]
+//! and [`parallel_project_phase_ordered`]). Like the accumulator, they
+//! hand the caller a decompressed `BlockBuffer` to validate for its pass.
 //!
 //! - [`parallel_scan_blobs_raw`]: same shape as `parallel_classify_phase`
 //!   but the worker hands the caller `&[u8]` of decompressed blob bytes,
@@ -862,7 +860,7 @@ fn split_walk<'a>(
 /// scratch reuse (DenseNodeColumns, decompress buffers, etc.).
 ///
 /// For sparse paths that want per-worker accumulation, use
-/// [`parallel_classify_accumulate`].
+/// [`parallel_project_accumulate`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     input: &InputFile,
@@ -923,7 +921,7 @@ crate::counters::counter_set! {
     /// Blocking time in this module's two unordered pools,
     /// [`run_unordered_per_blob`] (behind [`parallel_classify_phase`],
     /// [`parallel_classify_phase_abortable`] and [`parallel_scan_blobs_raw`])
-    /// and [`parallel_classify_accumulate`], for `brokkr sidecar --stalls`.
+    /// and [`parallel_project_accumulate`], for `brokkr sidecar --stalls`.
     /// The ordered phase runs on `crate::ordered_pool`, which records into
     /// that engine's own set (`ordered_pool_*_wait_ns`) instead.
     ///
@@ -1719,7 +1717,32 @@ impl Drop for StopOnUnwind<'_> {
 ///
 /// # When to use
 ///
-/// The per-worker `S` is held for the duration of the whole scan and only
+#[cfg(test)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn parallel_classify_accumulate<S: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    worker_init: impl Fn() -> S + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<()> + Send + Sync,
+    merge: impl FnMut(S),
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    run_accumulate_decoded(
+        input,
+        schedule,
+        threads,
+        worker_init,
+        |buffer, state| classify(&buffer.block()?, state),
+        merge,
+        host,
+    )
+}
+
+/// Project each decompressed blob with its enforced kind claim. Fold each
+/// successful projection into its worker's accumulator.
+///
+////// The per-worker `S` is held for the duration of the whole scan and only
 /// merged at the end. The safe usage envelope is determined by the upper
 /// bound on per-worker `S` memory at the largest scale you support,
 /// multiplied by the number of decode threads.
@@ -1777,37 +1800,6 @@ impl Drop for StopOnUnwind<'_> {
 /// state (one that finished before the failure may already have been
 /// merged), and the run returns the failing worker's error.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn parallel_classify_accumulate<S: Send>(
-    input: &InputFile,
-    schedule: &[ScheduledBlob],
-    threads: Option<usize>,
-    worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<()> + Send + Sync,
-    merge: impl FnMut(S),
-    host: &crate::host::Entered<'_>,
-) -> Result<()> {
-    run_accumulate_decoded(
-        input,
-        schedule,
-        threads,
-        worker_init,
-        |buffer, state| classify(&buffer.block()?, state),
-        merge,
-        host,
-    )
-}
-
-/// [`parallel_classify_accumulate`] for a caller that reads each blob
-/// through a projection rather than a block, as [`parallel_project_phase`]
-/// is to [`parallel_classify_phase`]: `project` receives the blob's
-/// decompressed [`BlockBuffer`](crate::read::block::BlockBuffer) carrying
-/// the entry's claim, validates it with its own
-/// [`GroupProjection`](crate::read::block::GroupProjection)
-/// (`BlockBuffer::project`, so the same blobs are refused with the same
-/// errors as by block construction) and folds what it accepted into the
-/// worker's accumulator. Failure, cancellation and location as in
-/// `parallel_classify_accumulate`.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_project_accumulate<S: Send>(
     input: &InputFile,
     schedule: &[ScheduledBlob],
@@ -1820,8 +1812,7 @@ pub(crate) fn parallel_project_accumulate<S: Send>(
     run_accumulate_decoded(input, schedule, threads, worker_init, project, merge, host)
 }
 
-/// The accumulate pool behind [`parallel_classify_accumulate`] and
-/// [`parallel_project_accumulate`]: each worker carries one `S` across all
+/// The pool behind [`parallel_project_accumulate`]: each worker carries one `S` across all
 /// its blobs, hands each blob's decompressed buffer to `work`, and sends
 /// `S` once when the schedule is exhausted.
 fn run_accumulate_decoded<S: Send>(

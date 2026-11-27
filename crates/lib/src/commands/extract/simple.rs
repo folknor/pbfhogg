@@ -6,10 +6,11 @@ use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::cat::CleanAttrs;
+use crate::read::block::{BlockBuffer, ClassificationBlock};
 use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
-use crate::{Element, ElementKind, PrimitiveBlock};
+use crate::{Element, ElementKind};
 
 use super::super::{HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header};
 use crate::idset::IdSet;
@@ -18,8 +19,7 @@ use crate::retention::release_scratch;
 use super::common::{
     BboxInt, BlobDesc, ExtractPass2IdSets, Passthrough, build_blob_schedule_with_passthrough,
     dense_only_payload, extract_block_pass2, merge_extract_stats, pread_execute,
-    refuse_blob_foreign_kind, relation_has_matched_member, spatial_blob_filter,
-    warn_passthrough_demotions,
+    relation_has_matched_member, spatial_blob_filter, warn_passthrough_demotions,
 };
 use super::{ExtractStats, Region};
 
@@ -61,15 +61,14 @@ impl ClassifyPhase {
 /// - Relations: matched node/way member → set `matched_relation_ids`
 ///
 /// Skips whole blocks that hold no element of the phase's kind, read from
-/// the exact kind set block validation recorded
-/// ([`PrimitiveBlock::element_kinds`]), never from `block_type()`: that label
+/// the exact kind set block validation recorded. The coarse block type label
 /// names a group by its first field, so an empty dense message in front of
 /// ways labels a way block as nodes and a ways-first group can carry
 /// relations, and a sweep skipping on the label lost those matches.
 /// A block of several kinds is walked under the same phase rule.
 #[hotpath::measure]
 fn classify_block_simple(
-    block: &PrimitiveBlock,
+    block: &ClassificationBlock<'_>,
     phase: ClassifyPhase,
     region: &Region,
     exact_bbox: &BboxInt,
@@ -78,39 +77,36 @@ fn classify_block_simple(
     matched_relation_ids: &mut IdSet,
 ) -> crate::error::Result<()> {
     let phase_kind = phase.kind();
-    if !block.element_kinds().has(phase_kind) {
+    if !block.has_kind(phase_kind) {
         return Ok(());
     }
 
-    for element in block.elements_skip_metadata() {
-        match (phase, &element) {
-            (ClassifyPhase::Nodes, Element::DenseNode(dn))
-                if region.contains_node(
-                    exact_bbox,
-                    dn.decimicro_lat().ok(),
-                    dn.decimicro_lon().ok(),
-                )? =>
-            {
-                bbox_node_ids.insert(dn.id());
+    match phase {
+        ClassifyPhase::Nodes => {
+            for element in block.nodes() {
+                let (id, lat, lon) = match element {
+                    Element::DenseNode(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                    Element::Node(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                    _ => continue,
+                };
+                if region.contains_decimicro(exact_bbox, lat, lon) {
+                    bbox_node_ids.insert(id);
+                }
             }
-            (ClassifyPhase::Nodes, Element::Node(n))
-                if region.contains_node(
-                    exact_bbox,
-                    n.decimicro_lat().ok(),
-                    n.decimicro_lon().ok(),
-                )? =>
-            {
-                bbox_node_ids.insert(n.id());
+        }
+        ClassifyPhase::Ways => {
+            for way in block.ways() {
+                if way.refs().any(|id| bbox_node_ids.get(id)) {
+                    matched_way_ids.insert(way.id());
+                }
             }
-            (ClassifyPhase::Ways, Element::Way(w)) if w.refs().any(|r| bbox_node_ids.get(r)) => {
-                matched_way_ids.insert(w.id());
+        }
+        ClassifyPhase::Relations => {
+            for relation in block.relations() {
+                if relation_has_matched_member(relation.members(), bbox_node_ids, matched_way_ids) {
+                    matched_relation_ids.insert(relation.id());
+                }
             }
-            (ClassifyPhase::Relations, Element::Relation(r))
-                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) =>
-            {
-                matched_relation_ids.insert(r.id());
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -216,7 +212,7 @@ fn extract_simple_two_pass(
             // blob claimed as nodes is skipped on its indexdata bbox
             // without a decode (reference/indexdata-trust.md).
             // An indexed blob is decoded only in the sweep of its claimed
-            // kind, where `refuse_blob_foreign_kind` checks that claim
+            // kind, where the projection checks that claim
             // against the payload; the other two sweeps would only drop
             // it. Every admitted indexed blob still reaches its own sweep,
             // so the claim is checked once before pass 2 relies on it.
@@ -228,14 +224,17 @@ fn extract_simple_two_pass(
             }
             let mut classify = || -> Result<()> {
                 blob.decompress_into(&mut decompress_buf)?;
-                let block = PrimitiveBlock::from_vec_with_scratch(
+                let buffer = BlockBuffer::new(
                     std::mem::take(&mut decompress_buf),
+                    None,
                     &mut st_scratch,
                     &mut gr_scratch,
-                )?;
+                    blob.index().map(|idx| idx.kind),
+                )
+                .for_selection()?;
                 release_scratch(&mut st_scratch);
                 release_scratch(&mut gr_scratch);
-                refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
+                let block = buffer.classify()?;
                 classify_block_simple(
                     &block,
                     phase,
@@ -581,8 +580,8 @@ fn simple_nodes_two_phase(
     let matched_way_ids = &IdSet::new();
     let empty_relation_ids = IdSet::new();
     let outside_way_node_ids = IdSet::new();
-    // Workers pread node blobs, decompress, scan with node-only scanner,
-    // check bbox (pure function), send matching IDs to consumer.
+    // Workers pread, decompress and project node coordinates, then send
+    // matching IDs to the consumer.
     // Consumer merges into bbox_node_ids. No shared mutable state in workers.
     host.invocation.marker("SIMPLE_NODE_CLASSIFY_START");
     let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
@@ -595,39 +594,37 @@ fn simple_nodes_two_phase(
         // Per blob: the matching node ids, plus - for a passthrough candidate
         // - the observed node count if the blob verified (see `Passthrough`).
         // Positions index `node_schedule`, which `verified_nodes` follows.
-        crate::scan::classify::parallel_scan_blobs_raw(
+        crate::scan::classify::parallel_project_phase(
             &classify_input,
             &classify_schedule,
             None,
-            || {
-                (
-                    Vec::<crate::scan::node::NodeTuple>::new(),
-                    Vec::<(usize, usize)>::new(),
-                    ValidateScratch::default(),
-                )
-            },
-            |position, decompressed, (tuples, group_starts, validate), gate| {
-                tuples.clear();
-                let kinds =
-                    crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
-                // The scanner reads only nodes, so ways or relations under a
-                // node claim are ones it would never see.
-                let admitted = gate.admit(kinds)?;
-                // Classification is the same for every blob, candidate or
-                // not, so verification can never change which nodes are
-                // selected.
-                let matching: Vec<i64> = tuples
-                    .iter()
-                    .filter(|t| region_ref.contains_decimicro(exact_bbox_ref, t.lat, t.lon))
-                    .map(|t| t.id)
-                    .collect();
+            || (),
+            |position, buffer, ()| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
+                let mut matching = Vec::new();
+                let mut scanned = 0;
+                for element in block.nodes() {
+                    let (id, lat, lon) = match element {
+                        Element::DenseNode(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                        Element::Node(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                        _ => continue,
+                    };
+                    scanned += 1;
+                    if region_ref.contains_decimicro(exact_bbox_ref, lat, lon) {
+                        matching.push(id);
+                    }
+                }
                 let verified = if node_schedule_ref[position].passthrough == Passthrough::Candidate
+                    && matching.len() == scanned
+                    && dense_only_payload(buffer.payload())?
                 {
-                    verify_candidate(decompressed, tuples.len(), matching.len(), validate)?
+                    buffer.validate_passthrough()?;
+                    Some(scanned as u64)
                 } else {
                     None
                 };
-                Ok((admitted, (matching, verified)))
+                Ok((matching, verified))
             },
             |position, (matching_ids, verified): (Vec<i64>, Option<u64>)| {
                 for id in matching_ids {
@@ -696,26 +693,21 @@ fn simple_ways_two_phase(
         let classify_schedule = scheduled(way_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
         let bbox_ids_ref = bbox_node_ids;
-        crate::scan::classify::parallel_scan_blobs_raw(
+        crate::scan::classify::parallel_project_phase(
             &classify_input,
             &classify_schedule,
             None,
-            || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-            |_position, decompressed, (refs_buf, group_starts), gate| {
-                let mut matching: Vec<i64> = Vec::new();
-                let kinds = crate::scan::way::scan_way_refs(
-                    decompressed,
-                    refs_buf,
-                    group_starts,
-                    |way_id, refs| {
-                        if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
-                            matching.push(way_id);
-                        }
-                    },
-                )?;
-                // The scanner reads only ways, so nodes or relations under a
-                // way claim are ones it would never see.
-                Ok((gate.admit(kinds)?, matching))
+            || (),
+            |_, buffer, _| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
+                let mut matching = Vec::new();
+                for way in block.ways() {
+                    if way.refs().any(|id| bbox_ids_ref.get(id)) {
+                        matching.push(way.id());
+                    }
+                }
+                Ok(matching)
             },
             |_position, matching_ids: Vec<i64>| {
                 for id in matching_ids {
@@ -791,25 +783,26 @@ fn simple_relations_two_phase(
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let outside_way_node_ids = IdSet::new();
-    // The classify is a block walk on purpose: about 0.3 s at planet, so
-    // the re-parse a projection would remove sits under the command's
-    // noise floor.
     host.invocation.marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
         let rel_classify_schedule = scheduled(relation_schedule)?;
         let rel_classify_file = crate::read::input::InputFile::open(input)?;
-        crate::scan::classify::parallel_classify_accumulate(
+        crate::scan::classify::parallel_project_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
             None,
             IdSet::new,
-            |block, ids| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element
-                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                    {
-                        ids.insert(r.id());
+            |buffer, ids| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
+                for relation in block.relations() {
+                    if relation_has_matched_member(
+                        relation.members(),
+                        bbox_node_ids,
+                        matched_way_ids,
+                    ) {
+                        ids.insert(relation.id());
                     }
                 }
                 Ok(())
@@ -881,39 +874,6 @@ fn scheduled(descs: &[&BlobDesc]) -> Result<Vec<crate::scan::classify::Scheduled
         .collect()
 }
 
-/// String-table and group-range scratch for a candidate's validation.
-type ValidateScratch = (Vec<(u32, u32)>, Vec<(u32, u32)>);
-
-/// Verify one passthrough candidate from its classify-phase decode: the
-/// observed node count when every scanned node landed in the region and the
-/// payload has the dense-only shape that makes the scan complete, else
-/// `None`. Occurrence counts, not set sizes: a duplicate id counts every
-/// time it would be copied. `scratch` is the worker's string-table and
-/// group-range scratch for the validation, reused across blobs.
-fn verify_candidate(
-    decompressed: &[u8],
-    scanned: usize,
-    matching: usize,
-    scratch: &mut ValidateScratch,
-) -> crate::error::Result<Option<u64>> {
-    if matching != scanned || !dense_only_payload(decompressed)? {
-        return Ok(None);
-    }
-    // What the decode path would do with this blob; a block it rejects must
-    // not reach the output through a raw copy instead. The decoder's check,
-    // run on the payload where it lies: only the verdict is needed. No claim:
-    // the node scanner has refused under it, and a dense-only payload holds
-    // nodes alone. It replaced a copy into a dropped block; that copy ran
-    // only for nominated candidates, none on the planet bbox, and the same
-    // copy in check --locations measured within noise at planet
-    // (reference/performance/check.md, "Payloads validated where they lie").
-    let (st, groups) = scratch;
-    crate::read::block::validate_in_place(decompressed, st, groups, None, |_, _| {
-        crate::read::block::NoProjection
-    })?;
-    Ok(Some(scanned as u64))
-}
-
 /// Turn each passthrough candidate into `Verified` (with the node count the
 /// classify phase observed) or back into `No`, by node-schedule position.
 fn settle_passthrough_candidates(
@@ -972,11 +932,14 @@ fn process_extract_pass2_batch(
                     let mut task = || -> BatchResult {
                         let mut decompress_buf: Vec<u8> = Vec::new();
                         blob.decompress_into(&mut decompress_buf)?;
-                        let block = PrimitiveBlock::from_vec_with_scratch(
+                        let block = BlockBuffer::new(
                             decompress_buf,
+                            None,
                             st_scratch,
                             gr_scratch,
-                        )?;
+                            blob.index().map(|idx| idx.kind),
+                        )
+                        .for_selection()?;
                         release_scratch(st_scratch);
                         release_scratch(gr_scratch);
                         let mut output: Vec<OwnedBlock> = Vec::new();

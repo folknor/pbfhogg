@@ -2,9 +2,10 @@
 
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::cat::CleanAttrs;
+use crate::read::block::{BlockBuffer, ClassificationRelation, SelectionBlock};
 use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
-use crate::{Element, MemberId, PrimitiveBlock};
+use crate::{Element, MemberId};
 
 use super::super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -132,8 +133,13 @@ struct Pass1Known<'a> {
 impl Pass1Known<'_> {
     /// Push the members of smart relation `r` that pass 1 does not already
     /// include.
-    fn push_new_members(&self, r: &crate::Relation, ways: &mut Vec<i64>, nodes: &mut Vec<i64>) {
-        for m in completion_members(r) {
+    fn push_new_members(
+        &self,
+        r: &ClassificationRelation<'_>,
+        ways: &mut Vec<i64>,
+        nodes: &mut Vec<i64>,
+    ) -> Result<()> {
+        for m in completion_members(r)? {
             match m {
                 CompletionMember::Way(id) if !self.matched_way_ids.get(id) => ways.push(id),
                 CompletionMember::Node(id)
@@ -144,6 +150,7 @@ impl Pass1Known<'_> {
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 
@@ -166,14 +173,14 @@ pub(super) enum CompletionMember {
 /// matched, so it is not an extra way (in the region where it matched, for
 /// the multi engine) and its nodes come only from the ways' own completion.
 pub(super) fn completion_members<'a>(
-    r: &'a crate::Relation<'a>,
-) -> impl Iterator<Item = CompletionMember> + 'a {
-    let take = if is_smart_relation(r) { usize::MAX } else { 0 };
-    r.members().take(take).filter_map(|m| match m.id {
+    r: &ClassificationRelation<'a>,
+) -> Result<impl Iterator<Item = CompletionMember> + 'a> {
+    let take = if is_smart_relation(r)? { usize::MAX } else { 0 };
+    Ok(r.members().take(take).filter_map(|member| match member {
         MemberId::Node(id) => Some(CompletionMember::Node(id)),
         MemberId::Way(id) => Some(CompletionMember::Way(id)),
         MemberId::Relation(_) | MemberId::Unknown(_, _) => None,
-    })
+    }))
 }
 
 /// Which element kind the unsorted fallback's current file sweep resolves.
@@ -270,62 +277,66 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 {
                     continue;
                 }
-                blob.decompress_into(&mut decompress_buf)?;
-                // The block takes the decode buffer and drops before the
-                // next blob, unpooled by the rule in read/decompress.rs
-                // ("Take loops"); the parse scratch is reused.
-                let block = PrimitiveBlock::from_vec_with_scratch(
-                    std::mem::take(&mut decompress_buf),
-                    &mut st_scratch,
-                    &mut gr_scratch,
-                )?;
+                let mut project = || -> Result<_> {
+                    blob.decompress_into(&mut decompress_buf)?;
+                    BlockBuffer::new(
+                        std::mem::take(&mut decompress_buf),
+                        None,
+                        &mut st_scratch,
+                        &mut gr_scratch,
+                        blob.index().map(|idx| idx.kind),
+                    )
+                    .for_selection()
+                };
+                let buffer = project().map_err(|err| blob.locate_error(source.as_ref(), err))?;
                 crate::retention::release_scratch(&mut st_scratch);
                 crate::retention::release_scratch(&mut gr_scratch);
-                super::common::refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
-                for element in block.elements_skip_metadata() {
-                    match (phase, &element) {
-                        (UnsortedPhase::Nodes, Element::DenseNode(dn))
-                            if region.contains_node(
-                                &exact_bbox,
-                                dn.decimicro_lat().ok(),
-                                dn.decimicro_lon().ok(),
-                            )? =>
-                        {
-                            bbox_node_ids.insert(dn.id());
-                        }
-                        (UnsortedPhase::Nodes, Element::Node(n))
-                            if region.contains_node(
-                                &exact_bbox,
-                                n.decimicro_lat().ok(),
-                                n.decimicro_lon().ok(),
-                            )? =>
-                        {
-                            bbox_node_ids.insert(n.id());
-                        }
-                        (UnsortedPhase::Ways, Element::Way(w))
-                            if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                        {
-                            matched_way_ids.insert(w.id());
-                            for r in w.refs().filter(|&r| !bbox_node_ids.get(r)) {
-                                outside_way_node_ids.insert(r);
+                let block = buffer
+                    .classify()
+                    .map_err(|err| blob.locate_error(source.as_ref(), err))?;
+                if phase == UnsortedPhase::Relations {
+                    let known = Pass1Known {
+                        bbox_node_ids: &bbox_node_ids,
+                        outside_way_node_ids: &outside_way_node_ids,
+                        matched_way_ids: &matched_way_ids,
+                    };
+                    for r in block.relations() {
+                        push_parent_edges(&r, &mut parent_edges);
+                        if relation_has_matched_member(
+                            r.members(),
+                            &bbox_node_ids,
+                            &matched_way_ids,
+                        ) {
+                            matched_relation_ids.insert(r.id());
+                            if H::COLLECT_MEMBER_IDS {
+                                known
+                                    .push_new_members(&r, &mut extras_ways, &mut extras_nodes)
+                                    .map_err(|err| blob.locate_error(source.as_ref(), err))?;
+                                handler.merge_extras(&mut extras_ways, &mut extras_nodes);
                             }
                         }
-                        (UnsortedPhase::Relations, Element::Relation(r)) => {
-                            push_parent_edges(r, &mut parent_edges);
-                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                                matched_relation_ids.insert(r.id());
-                                if H::COLLECT_MEMBER_IDS {
-                                    let known = Pass1Known {
-                                        bbox_node_ids: &bbox_node_ids,
-                                        outside_way_node_ids: &outside_way_node_ids,
-                                        matched_way_ids: &matched_way_ids,
-                                    };
-                                    known.push_new_members(r, &mut extras_ways, &mut extras_nodes);
-                                    handler.merge_extras(&mut extras_ways, &mut extras_nodes);
-                                }
+                    }
+                    continue;
+                }
+                if phase == UnsortedPhase::Ways {
+                    for way in block.ways() {
+                        if way.refs().any(|id| bbox_node_ids.get(id)) {
+                            matched_way_ids.insert(way.id());
+                            for id in way.refs().filter(|&id| !bbox_node_ids.get(id)) {
+                                outside_way_node_ids.insert(id);
                             }
                         }
-                        _ => {}
+                    }
+                    continue;
+                }
+                for element in block.nodes() {
+                    let (id, lat, lon) = match element {
+                        Element::DenseNode(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                        Element::Node(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                        _ => continue,
+                    };
+                    if region.contains_decimicro(&exact_bbox, lat, lon) {
+                        bbox_node_ids.insert(id);
                     }
                 }
             }
@@ -459,31 +470,22 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     host.invocation.marker("PASS1_NODE_CLASSIFY_END");
 
     // Phase 2: Classify ways by ref intersection with bbox nodes.
-    //
-    // Deliberately a block walk, not a projection (shared by smart and
-    // complete). Reading each blob through `read::project_ids::WaySpans`
-    // was built and measured at planet (Europe bbox, smart): this phase
-    // stayed at 16.6-16.9 s, since every way's refs are scanned against the
-    // node set and that, not the message re-parse a projection removes, is
-    // its cost (reference/performance/inspect.md, "inspect --nodes reads through a
-    // projection").
     host.invocation.marker("PASS1_WAY_CLASSIFY_START");
-    crate::scan::classify::parallel_classify_phase(
+    crate::scan::classify::parallel_project_phase(
         &shared_file,
         &way_schedule,
         None,
         || (),
-        |block, _s| {
+        |_, buffer, _| {
+            let buffer = buffer.for_selection()?;
+            let block = buffer.classify()?;
             let mut way_ids = Vec::new();
             let mut node_ids = Vec::new();
             // Every occurrence, matched or not: smart's extra-way pass and
             // the write pass read this blob only if its extent may hold a
             // way they need.
             let mut extent: Extent = None;
-            for element in block.elements_skip_metadata() {
-                let Element::Way(w) = &element else {
-                    continue;
-                };
+            for w in block.ways() {
                 widen(&mut extent, w.id());
                 if w.refs().any(|r| bbox_node_ids.get(r)) {
                     way_ids.push(w.id());
@@ -507,12 +509,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     )?;
     host.invocation.marker("PASS1_WAY_CLASSIFY_END");
 
-    // Phase 3: Classify relations by member intersection.
-    //
-    // A block walk on purpose: the whole phase is about 1 s at planet
-    // (0.9-1.2 s, bygg), so the re-parse a projection would remove sits
-    // under the noise floor of a 130 s run; smart also reads the relation
-    // tags (`is_smart_relation`).
+    // Phase 3: Classify relations by member intersection. Smart also
+    // checks the type of each directly matched relation for completion.
     host.invocation.marker("PASS1_RELATION_CLASSIFY_START");
     // Per-blob send, not per-worker accumulation: a worker-held `IdSet` of
     // smart member IDs promoted its own dense chunks for members dispersed
@@ -527,12 +525,14 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         matched_way_ids: &matched_way_ids,
     };
     let known = &known;
-    crate::scan::classify::parallel_classify_phase(
+    crate::scan::classify::parallel_project_phase(
         &shared_file,
         &relation_schedule,
         None,
         || (),
-        |block, _s| {
+        |_, buffer, _| {
+            let buffer = buffer.for_selection()?;
+            let block = buffer.classify()?;
             let mut rel_ids = Vec::new();
             let mut extra_ways = Vec::new();
             let mut extra_nodes = Vec::new();
@@ -540,16 +540,17 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             // Every occurrence: the parent closure can include a relation
             // no record matched directly.
             let mut extent: Extent = None;
-            for element in block.elements_skip_metadata() {
-                let Element::Relation(r) = &element else {
-                    continue;
-                };
+            for r in block.relations() {
                 widen(&mut extent, r.id());
-                push_parent_edges(r, &mut edges);
-                if relation_has_matched_member(r, known.bbox_node_ids, known.matched_way_ids) {
+                push_parent_edges(&r, &mut edges);
+                if relation_has_matched_member(
+                    r.members(),
+                    known.bbox_node_ids,
+                    known.matched_way_ids,
+                ) {
                     rel_ids.push(r.id());
                     if H::COLLECT_MEMBER_IDS {
-                        known.push_new_members(r, &mut extra_ways, &mut extra_nodes);
+                        known.push_new_members(&r, &mut extra_ways, &mut extra_nodes)?;
                     }
                 }
             }
@@ -719,31 +720,23 @@ pub(super) fn extract_smart(
         // memory peak it was originally framed as fixing turned out to be
         // elsewhere (cold-arena-page residency cascade, addressed by the
         // PASS1 schedule-reuse commits `d4ea760` and `0b085b1`).
-        // Deliberately a block walk. On `WaySpans` restricted to
-        // `extra_way_ids` this phase went from 10.1 s to 8.7 s at planet,
-        // but the command moved by under 1 % (131.9 s against 131.5 s
-        // median), noise for a 130 s run (reference/performance/inspect.md,
-        // "inspect --nodes reads through a projection"); that measurement
-        // read every way blob, before the schedule was cut by extent.
         host.invocation.marker("SMART_PASS2_CLASSIFY_START");
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &way_schedule,
             None,
             Vec::<i64>::new,
-            |block, scratch| {
+            |_, buffer, scratch| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
                 scratch.clear();
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(w) = &element {
-                        let wid = w.id();
-                        // `extra_way_ids` holds no matched way (see
-                        // `SmartRelationHandler`), and refs pass 1 already
-                        // includes stay out of `extra_node_ids`.
-                        if extra_way_ids_ref.get(wid) {
-                            scratch.extend(w.refs().filter(|&r| {
-                                !bbox_node_ids_ref.get(r) && !outside_way_node_ids_ref.get(r)
-                            }));
-                        }
+                for way in block.ways() {
+                    // Extra ways exclude the direct matches, and refs pass 1
+                    // already includes stay out of the extra node IDs.
+                    if extra_way_ids_ref.get(way.id()) {
+                        scratch.extend(way.refs().filter(|&id| {
+                            !bbox_node_ids_ref.get(id) && !outside_way_node_ids_ref.get(id)
+                        }));
                     }
                 }
                 Ok(std::mem::take(scratch))
@@ -858,7 +851,7 @@ use crate::owned::element_metadata;
 /// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.
 #[hotpath::measure]
 fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
-    block: &PrimitiveBlock,
+    block: &SelectionBlock,
     ids: &ExtractPass3IdSets<'_>,
     clean: &CleanAttrs,
     coords: crate::owned::WayCoords,
@@ -877,74 +870,74 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
     let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
-    for element in block.elements() {
+    let selected = |kind, id| match kind {
+        crate::ElementKind::Node => {
+            ids.bbox_node_ids.get(id)
+                || ids.outside_way_node_ids.get(id)
+                || ids.extra_node_ids.get(id)
+        }
+        crate::ElementKind::Way => ids.matched_way_ids.get(id) || ids.extra_way_ids.get(id),
+        crate::ElementKind::Relation => ids.matched_relation_ids.get(id),
+    };
+    block.visit_retained(selected, |element| {
         match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
                 let in_bbox = ids.bbox_node_ids.get(id);
                 let from_way = ids.outside_way_node_ids.get(id);
-                let from_rel = ids.extra_node_ids.get(id);
-                if in_bbox || from_way || from_rel {
-                    ensure_node_capacity_local(bb, output)?;
-                    add_dense_node(bb, dn, clean)?;
-                    if in_bbox {
-                        stats.nodes_in_bbox += 1;
-                    } else if from_way {
-                        stats.nodes_from_ways += 1;
-                    } else {
-                        stats.nodes_from_relations += 1;
-                    }
+                ensure_node_capacity_local(bb, output)?;
+                add_dense_node(bb, dn, clean)?;
+                if in_bbox {
+                    stats.nodes_in_bbox += 1;
+                } else if from_way {
+                    stats.nodes_from_ways += 1;
+                } else {
+                    stats.nodes_from_relations += 1;
                 }
             }
             Element::Node(n) => {
                 let id = n.id();
                 let in_bbox = ids.bbox_node_ids.get(id);
                 let from_way = ids.outside_way_node_ids.get(id);
-                let from_rel = ids.extra_node_ids.get(id);
-                if in_bbox || from_way || from_rel {
-                    ensure_node_capacity_local(bb, output)?;
-                    add_plain_node(bb, n, clean)?;
-                    if in_bbox {
-                        stats.nodes_in_bbox += 1;
-                    } else if from_way {
-                        stats.nodes_from_ways += 1;
-                    } else {
-                        stats.nodes_from_relations += 1;
-                    }
+                ensure_node_capacity_local(bb, output)?;
+                add_plain_node(bb, n, clean)?;
+                if in_bbox {
+                    stats.nodes_in_bbox += 1;
+                } else if from_way {
+                    stats.nodes_from_ways += 1;
+                } else {
+                    stats.nodes_from_relations += 1;
                 }
             }
             Element::Way(w) => {
                 let in_matched = ids.matched_way_ids.get(w.id());
                 let in_extra = ids.extra_way_ids.get(w.id());
-                if in_matched || in_extra {
-                    ensure_way_capacity_local(bb, output)?;
-                    way.prepare(w, coords)?;
-                    let meta = clean_partial_metadata(
-                        element_metadata(crate::ElementKind::Way, w.id(), &w.info())?,
-                        clean,
-                    );
-                    way.write(bb, w.tags(), meta.as_ref());
-                    if in_extra && !in_matched {
-                        stats.ways_from_relations += 1;
-                    } else {
-                        stats.ways_written += 1;
-                    }
+                ensure_way_capacity_local(bb, output)?;
+                way.prepare(w, coords)?;
+                let meta = clean_partial_metadata(
+                    element_metadata(crate::ElementKind::Way, w.id(), &w.info())?,
+                    clean,
+                );
+                way.write(bb, w.tags(), meta.as_ref());
+                if in_extra && !in_matched {
+                    stats.ways_from_relations += 1;
+                } else {
+                    stats.ways_written += 1;
                 }
             }
             Element::Relation(r) => {
-                if ids.matched_relation_ids.get(r.id()) {
-                    ensure_relation_capacity_local(bb, output)?;
-                    r.members_into(&mut members_buf)?;
-                    let meta = clean_partial_metadata(
-                        element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?,
-                        clean,
-                    );
-                    bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
-                    stats.relations_written += 1;
-                }
+                ensure_relation_capacity_local(bb, output)?;
+                r.members_into(&mut members_buf)?;
+                let meta = clean_partial_metadata(
+                    element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?,
+                    clean,
+                );
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
+                stats.relations_written += 1;
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(stats)
 }
 
@@ -965,10 +958,11 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
 /// relations"): an administrative area cut at the extract edge is as broken
 /// a polygon as a multipolygon is, and `build-geocode-index` and `export`
 /// both assemble `type=boundary` relations as areas.
-fn is_smart_relation(r: &crate::Relation) -> bool {
-    r.tags()
-        .find(|&(k, _)| k == "type")
-        .is_some_and(|(_, v)| v == "multipolygon" || v == "boundary")
+fn is_smart_relation(r: &ClassificationRelation<'_>) -> Result<bool> {
+    Ok(matches!(
+        r.tag_value("type")?,
+        Some("multipolygon" | "boundary")
+    ))
 }
 
 /// Record a `(member, parent)` edge for every relation-type member of `r`.
@@ -976,10 +970,10 @@ fn is_smart_relation(r: &crate::Relation) -> bool {
 /// Every relation contributes, matched or not: whether a parent is in the
 /// extract depends on its members' membership, which is only known once
 /// every relation blob has been classified.
-pub(super) fn push_parent_edges(r: &crate::Relation, edges: &mut Vec<(i64, i64)>) {
+pub(super) fn push_parent_edges(r: &ClassificationRelation<'_>, edges: &mut Vec<(i64, i64)>) {
     let parent = r.id();
     for m in r.members() {
-        if let MemberId::Relation(child) = m.id {
+        if let MemberId::Relation(child) = m {
             edges.push((child, parent));
         }
     }

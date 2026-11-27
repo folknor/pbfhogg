@@ -991,6 +991,42 @@ member-way dependency scans can still refuse a block through full validation.
 The one-pass `--omit-referenced` route and public block construction use full
 validation.
 
+## extract PBF: validation follows classification and retained output
+
+Single- and multi-region extract use scoped validation with all three
+strategies. Every decoded blob still checks block, group and element
+framing, string-table UTF-8, packed-varint framing, countable parallel
+arrays and any enforced kind claim. The fused paths still check their
+indexdata ID ranges and counts. Simple's two-phase node and way
+classifiers now apply those structural checks during classification,
+including on blobs whose output is rebuilt later.
+
+Classification uses IDs, node coordinates, way refs and relation member
+IDs and types. It skips the contents of Info and DenseInfo and skips
+tag index validation. Smart looks up the first `type` tag of each directly
+matched relation, checking each key it reads and the matching value.
+Unmatched relations and relations included only by parent closure have
+no tag-based selection. Simple and complete-ways do not use relation tags
+for selection.
+
+Re-encoding checks metadata and tags on every retained record. On a
+dense group with retained nodes, it checks the shared metadata framing and
+array lengths, since earlier deltas can affect retained nodes. Re-encoding
+also resolves retained metadata indices and relation member roles. It checks
+dense tag run boundaries in that group to associate tags with the right
+IDs and string indices only for retained nodes. Empty dense groups keep
+the full output checks. Raw passthrough still validates the full payload
+because every field is copied.
+
+Extract can therefore accept malformed inner Info or DenseInfo in
+discarded records or whole discarded dense groups, including malformed
+packed fields, duplicate fields and inconsistent metadata array lengths
+inside unread messages. It can accept out-of-range or oversized tag
+indices on discarded records, and missing key/value pairs or incorrect
+run counts in a dense tag stream no retained node reads. Malformed tag
+indices used in smart's type lookup still fail there, even before output.
+The newly accepted fields contribute no selection or output value.
+
 ## tags-filter and inspect tags: expression-syntax edge cases
 
 The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`

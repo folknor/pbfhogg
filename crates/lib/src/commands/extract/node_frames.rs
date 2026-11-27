@@ -6,6 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::block_builder::BlockBuilder;
 use crate::cat::CleanAttrs;
+use crate::read::block::{ClassificationBlock, SelectionBlock};
 use crate::read::columnar::DenseNodeColumns;
 use crate::read::input::InputFile;
 use crate::scan::classify::{ScheduledBlob, parallel_project_phase};
@@ -15,7 +16,7 @@ use crate::tunables::{
 };
 use crate::write::compression::Compression;
 use crate::write::metrics::WriterMetrics;
-use crate::{Element, ElementKind, PrimitiveBlock, Result};
+use crate::{Element, ElementKind, Result};
 
 use super::Region;
 use super::common::{
@@ -118,7 +119,8 @@ pub(super) fn classify_nodes(
         None,
         || (DenseNodeColumns::new(), None),
         |seq, buffer, (columns, builder)| {
-            let block = buffer.block()?;
+            let buffer = buffer.for_selection()?;
+            let block = buffer.classify()?;
             let Some((options, budget)) = options.as_ref().zip(budget.as_ref()) else {
                 let (hits, _) = node_hits::<false>(&block, columns, region, bbox)?;
                 return Ok((hits, None, None));
@@ -132,7 +134,7 @@ pub(super) fn classify_nodes(
                 if lo < claim.min_id || hi > claim.max_id {
                     return None;
                 }
-                speculate(&block, &hits, (lo, hi), options, budget, builder, metrics)
+                speculate(&buffer, &hits, (lo, hi), options, budget, builder, metrics)
             });
             Ok((hits, extent, frame))
         },
@@ -161,7 +163,7 @@ pub(super) fn classify_nodes(
 }
 
 fn node_hits<const OBSERVE: bool>(
-    block: &PrimitiveBlock,
+    block: &ClassificationBlock<'_>,
     columns: &mut DenseNodeColumns,
     region: &Region,
     bbox: &BboxInt,
@@ -169,7 +171,7 @@ fn node_hits<const OBSERVE: bool>(
     let mut hits = Vec::new();
     let mut extent = None;
     if !matches!(region, Region::Bbox(_)) {
-        for element in block.elements_skip_metadata() {
+        for element in block.nodes() {
             let (id, lat, lon) = match &element {
                 Element::DenseNode(n) => (n.id(), n.decimicro_lat().ok(), n.decimicro_lon().ok()),
                 Element::Node(n) => (n.id(), n.decimicro_lat().ok(), n.decimicro_lon().ok()),
@@ -201,15 +203,13 @@ fn node_hits<const OBSERVE: bool>(
         });
     }
     // The columns exclude plain Node messages.
-    for group in block.groups() {
-        for node in group.nodes() {
-            let (lat, lon) = plain_coords(&node)?;
-            if OBSERVE {
-                widen(&mut extent, node.id());
-            }
-            if bbox.contains(lat, lon) {
-                hits.push(node.id());
-            }
+    for node in block.plain_nodes() {
+        let (lat, lon) = plain_coords(&node)?;
+        if OBSERVE {
+            widen(&mut extent, node.id());
+        }
+        if bbox.contains(lat, lon) {
+            hits.push(node.id());
         }
     }
     Ok((hits, extent))
@@ -217,7 +217,7 @@ fn node_hits<const OBSERVE: bool>(
 
 #[allow(clippy::too_many_arguments)]
 fn speculate(
-    block: &PrimitiveBlock,
+    block: &SelectionBlock,
     hits: &[i64],
     extent: (i64, i64),
     options: &Options<'_>,
@@ -231,7 +231,8 @@ fn speculate(
     }
     let work = hits.len()
         + block
-            .decompressed_size()
+            .payload()
+            .len()
             .div_ceil(EXTRACT_NODE_FRAME_SCAN_QUANTUM);
     let lock = || {
         budget
@@ -263,7 +264,7 @@ fn speculate(
 }
 
 fn frame_nodes(
-    block: &PrimitiveBlock,
+    block: &SelectionBlock,
     hits: &[i64],
     hit_limit: usize,
     options: &Options<'_>,
@@ -273,37 +274,37 @@ fn frame_nodes(
 ) -> Result<Option<(Vec<u8>, u64)>> {
     let ids: FxHashSet<i64> = hits.iter().copied().collect();
     let mut nodes = 0;
-    for element in block.elements() {
-        let id = match &element {
-            Element::DenseNode(n) => n.id(),
-            Element::Node(n) => n.id(),
-            _ => continue, // the classify decoder has enforced the kind claim
-        };
-        if !ids.contains(&id) {
-            continue;
-        }
-        if nodes == hit_limit || !bb.can_add_node() {
-            return Ok(None);
-        }
-        if nodes >= hits.len() {
-            // A version outside the region can still share a selected ID.
-            let mut budget = budget
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if budget.work == 0 {
-                return Ok(None);
+    let mut fits = true;
+    block.visit_retained(
+        |kind, id| kind == ElementKind::Node && ids.contains(&id),
+        |element| {
+            if !fits || nodes == hit_limit || !bb.can_add_node() {
+                fits = false;
+                return Ok(());
             }
-            budget.work -= 1;
-        }
-        match element {
-            Element::DenseNode(n) => add_dense_node(bb, &n, options.clean)?,
-            Element::Node(n) => add_plain_node(bb, &n, options.clean)?,
-            _ => continue,
-        }
-        nodes += 1;
-        if bb.content_len() > EXTRACT_NODE_FRAME_RESERVATION {
-            return Ok(None);
-        }
+            if nodes >= hits.len() {
+                // A version outside the region can still share a selected ID.
+                let mut budget = budget
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if budget.work == 0 {
+                    fits = false;
+                    return Ok(());
+                }
+                budget.work -= 1;
+            }
+            match element {
+                Element::DenseNode(n) => add_dense_node(bb, &n, options.clean)?,
+                Element::Node(n) => add_plain_node(bb, &n, options.clean)?,
+                _ => return Err(crate::Error::internal("extract: expected a selected node")),
+            }
+            nodes += 1;
+            fits = bb.content_len() <= EXTRACT_NODE_FRAME_RESERVATION;
+            Ok(())
+        },
+    )?;
+    if !fits {
+        return Ok(None);
     }
     let framed = bb.lend_encoded(|block| {
         use crate::read::blob_wire::{MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};

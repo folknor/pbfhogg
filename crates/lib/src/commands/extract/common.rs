@@ -4,10 +4,11 @@ use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::cat::CleanAttrs;
+use crate::read::block::{BlockBuffer, SelectionBlock};
 use crate::read::input::PinnedInput;
 use crate::read::wire::{Cursor, WIRE_LEN};
 use crate::writer::PbfWriter;
-use crate::{BlobFilter, Element, MemberId, PrimitiveBlock};
+use crate::{BlobFilter, Element, MemberId};
 
 use super::super::{
     BlockSink, FramedBlocks, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -300,12 +301,8 @@ impl WriteSlot {
 /// (the decoder refuses a repeated DenseNodes and keeps only the last
 /// DenseInfo, while the raw bytes would carry both).
 ///
-/// This is a structural walk only. Callers must also construct the payload
-/// as a [`PrimitiveBlock`] - what the decode path would do with it - and
-/// propagate a construction error, so a blob the decoder rejects cannot slip
-/// into the output through a raw copy. That is constructor validation only;
-/// decode-time arithmetic on metadata (timestamp deltas and the like) is not
-/// exercised by either.
+/// This is a structural walk only. A raw copy also needs full payload
+/// validation with the same checks as [`crate::PrimitiveBlock`] construction.
 ///
 /// A framing error in the walk itself is returned as an error, distinct
 /// from ineligibility.
@@ -358,20 +355,6 @@ fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
         cursor.skip_field(wire_type)?;
     }
     Ok(true)
-}
-
-/// Refuse a block decoded from `blob` when it holds an element of a kind
-/// other than the blob's indexdata claim, located at the blob. For the
-/// sequential sweeps, which decode with `BlobReader` rather than a classify
-/// pool.
-pub(super) fn refuse_blob_foreign_kind(
-    blob: &crate::blob::Blob,
-    block: &PrimitiveBlock,
-    source: Option<&std::sync::Arc<Path>>,
-) -> crate::error::Result<()> {
-    block
-        .refuse_foreign_kind(blob.index().map(|index| index.kind))
-        .map_err(|err| blob.locate_error(source, err))
 }
 
 /// Report the outcome of passthrough verification: counters always, and a
@@ -513,7 +496,7 @@ pub(super) fn pread_execute<F>(
     host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
+    F: Fn(&SelectionBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -587,19 +570,21 @@ where
         },
         |(), local: &mut PreadLocal, ordinal| {
             let d = &schedule[decode_at.position(ordinal)];
-            // Workers: pread -> decompress -> PrimitiveBlock -> extract -> framed blocks.
+            // Workers: pread -> decompress -> scoped write walk -> extract -> framed blocks.
             let result = (|| -> crate::error::Result<(Vec<Vec<u8>>, ExtractStats)> {
                 let raw = local
                     .read_buf
                     .read_exact_at(&*shared_file, d.offset, d.size)?;
                 let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
                 crate::blob::decompress_blob_raw(raw, &mut buf)?;
-                let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                let block = BlockBuffer::new(
                     buf,
-                    &local.pool,
+                    Some(&local.pool),
                     &mut local.st_scratch,
                     &mut local.gr_scratch,
-                )?;
+                    None,
+                )
+                .for_selection()?;
                 let mut output = FramedBlocks::new(compression, metrics).cutting();
                 let block_stats = block_fn(&block, &mut local.bb, &mut output)?;
                 flush_local(&mut local.bb, &mut output)?;
@@ -749,7 +734,7 @@ pub(super) fn pread_write_pass<F>(
     host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
+    F: Fn(&SelectionBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -781,7 +766,7 @@ pub(super) fn pread_write_pass_with_schedule<F>(
     host: &crate::host::Entered<'_>,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
+    F: Fn(&SelectionBlock, &mut BlockBuilder, &mut FramedBlocks<'_>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -858,7 +843,7 @@ pub(super) fn add_plain_node(
 /// homogeneous by type, pre-routed to its phase).
 #[hotpath::measure]
 pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
-    block: &PrimitiveBlock,
+    block: &SelectionBlock,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
     coords: crate::owned::WayCoords,
@@ -878,39 +863,38 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
     let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
-    let emit_nodes = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Node));
-    let emit_ways = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Way));
-    let emit_rels = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Relation));
+    let selected = |kind, id| {
+        phase_kind.is_none_or(|phase| phase == kind)
+            && match kind {
+                crate::ElementKind::Node => {
+                    ids.bbox_node_ids.get(id) || ids.outside_way_node_ids.get(id)
+                }
+                crate::ElementKind::Way => ids.matched_way_ids.get(id),
+                crate::ElementKind::Relation => ids.matched_relation_ids.get(id),
+            }
+    };
 
-    for element in block.elements() {
+    block.visit_retained(selected, |element| {
         match &element {
-            Element::DenseNode(dn) if emit_nodes => {
-                let in_bbox = ids.bbox_node_ids.get(dn.id());
-                let from_way = ids.outside_way_node_ids.get(dn.id());
-                if in_bbox || from_way {
-                    ensure_node_capacity_local(bb, output)?;
-                    add_dense_node(bb, dn, clean)?;
-                    if in_bbox {
-                        stats.nodes_in_bbox += 1;
-                    } else {
-                        stats.nodes_from_ways += 1;
-                    }
+            Element::DenseNode(dn) => {
+                ensure_node_capacity_local(bb, output)?;
+                add_dense_node(bb, dn, clean)?;
+                if ids.bbox_node_ids.get(dn.id()) {
+                    stats.nodes_in_bbox += 1;
+                } else {
+                    stats.nodes_from_ways += 1;
                 }
             }
-            Element::Node(n) if emit_nodes => {
-                let in_bbox = ids.bbox_node_ids.get(n.id());
-                let from_way = ids.outside_way_node_ids.get(n.id());
-                if in_bbox || from_way {
-                    ensure_node_capacity_local(bb, output)?;
-                    add_plain_node(bb, n, clean)?;
-                    if in_bbox {
-                        stats.nodes_in_bbox += 1;
-                    } else {
-                        stats.nodes_from_ways += 1;
-                    }
+            Element::Node(n) => {
+                ensure_node_capacity_local(bb, output)?;
+                add_plain_node(bb, n, clean)?;
+                if ids.bbox_node_ids.get(n.id()) {
+                    stats.nodes_in_bbox += 1;
+                } else {
+                    stats.nodes_from_ways += 1;
                 }
             }
-            Element::Way(w) if emit_ways && ids.matched_way_ids.get(w.id()) => {
+            Element::Way(w) => {
                 ensure_way_capacity_local(bb, output)?;
                 way.prepare(w, coords)?;
                 let meta = clean_partial_metadata(
@@ -920,7 +904,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 way.write(bb, w.tags(), meta.as_ref());
                 stats.ways_written += 1;
             }
-            Element::Relation(r) if emit_rels && ids.matched_relation_ids.get(r.id()) => {
+            Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
                 r.members_into(&mut members_buf)?;
                 let meta = clean_partial_metadata(
@@ -930,9 +914,9 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
             }
-            _ => {}
         }
-    }
+        Ok(())
+    })?;
     Ok(stats)
 }
 
@@ -951,10 +935,10 @@ pub(super) enum MatchableMember {
 /// The members of `r` that can match it, in member order. The one member
 /// dispatch both [`relation_has_matched_member`] and multi-extract's
 /// per-region mask reduction use.
-pub(super) fn matchable_members<'a>(
-    r: &'a crate::Relation<'a>,
-) -> impl Iterator<Item = MatchableMember> + 'a {
-    r.members().filter_map(|m| match m.id {
+pub(super) fn matchable_members(
+    members: impl Iterator<Item = MemberId>,
+) -> impl Iterator<Item = MatchableMember> {
+    members.filter_map(|member| match member {
         MemberId::Node(id) => Some(MatchableMember::Node(id)),
         MemberId::Way(id) => Some(MatchableMember::Way(id)),
         MemberId::Relation(_) | MemberId::Unknown(_, _) => None,
@@ -963,11 +947,11 @@ pub(super) fn matchable_members<'a>(
 
 /// Check if a relation has any member whose ID is in the matched node or way sets.
 pub(super) fn relation_has_matched_member(
-    r: &crate::Relation,
+    members: impl Iterator<Item = MemberId>,
     node_ids: &IdSet,
     way_ids: &IdSet,
 ) -> bool {
-    matchable_members(r).any(|m| match m {
+    matchable_members(members).any(|m| match m {
         MatchableMember::Node(id) => node_ids.get(id),
         MatchableMember::Way(id) => way_ids.get(id),
     })
@@ -1026,7 +1010,7 @@ mod tests {
     fn a_builder_node_block_is_eligible() {
         let block = node_block();
         assert!(dense_only_payload(&block).unwrap());
-        PrimitiveBlock::from_vec(block).unwrap();
+        crate::PrimitiveBlock::from_vec(block).unwrap();
     }
 
     /// Ways in a blob whose indexdata says nodes are invisible to the dense

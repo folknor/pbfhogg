@@ -27,11 +27,9 @@
 //! occurrences times the mask width. Dense and plain nodes keep separate
 //! occurrence numbering: `elements()` yields a group's dense nodes in the
 //! order `decode_dense_columns` appends them and its plain nodes in
-//! `groups().nodes()` order. When the occurrences' IDs strictly increase in
-//! canonical order (one list only), each occurrence's hits are its ID's
-//! regions and the emission walk consumes them by cursor; otherwise the hits
-//! become a blob-local sorted `(id, region)` table, the OR over every
-//! occurrence of the ID, and emission looks each occurrence's ID up in it.
+//! `plain_nodes()` order. Emission looks up each ID in the sorted
+//! `(id, region)` table, which holds the union of the hits of every
+//! occurrence of that ID.
 //!
 //! A raw-copy candidate (nominated per region on its indexdata bbox, as in
 //! the two-phase form) is read as its whole frame. It is copied raw to each
@@ -156,7 +154,6 @@ struct Local {
     /// A multi-blob component's sorted `(id, region)` union.
     union: Vec<(i64, u32)>,
     acc: Vec<u64>,
-    regs: Vec<u32>,
     way: crate::owned::WayScratch,
     builder: BatchBuilder,
 }
@@ -226,7 +223,6 @@ pub(super) fn multi_fused_pass(
             table: Vec::new(),
             union: Vec::new(),
             acc: vec![0u64; mw],
-            regs: Vec::new(),
             way: crate::owned::WayScratch::default(),
             builder: BatchBuilder::new(n),
         },
@@ -294,12 +290,6 @@ fn spatial_hits(
     classifier.visit(lat, lon, None, |region| hits.push((occ, region as u32)));
 }
 
-/// Whether `ids` strictly increase in canonical OSM order.
-fn strictly_increasing(ids: &[i64]) -> bool {
-    ids.windows(2)
-        .all(|w| crate::osm_id::osm_id_key(w[0]) < crate::osm_id::osm_id_key(w[1]))
-}
-
 /// Read, decompress, decode and select one blob: its selection walk, its
 /// admission, its exact claim check and its raw-copy decision.
 ///
@@ -355,10 +345,9 @@ fn prepare(
         &mut local.gr_scratch,
         entry.claim(),
     );
-    let (crate::read::block::NoProjection, validated) =
-        buffer.project(|_, _| crate::read::block::NoProjection)?;
-    let eligible = candidate && dense_only_payload(validated.bytes())?;
-    let block = validated.into_block();
+    let block = buffer.for_selection()?;
+    let classified = block.classify()?;
+    let eligible = candidate && dense_only_payload(block.payload())?;
 
     // Selection walk.
     local.dense_ids.clear();
@@ -371,7 +360,7 @@ fn prepare(
             columnar,
         } => {
             if *columnar {
-                block.decode_dense_columns(&mut local.columns)?;
+                classified.decode_dense_columns(&mut local.columns)?;
                 let columns = &local.columns;
                 for i in 0..columns.len() {
                     let (lat, lon) = (columns.lats[i], columns.lons[i]);
@@ -380,16 +369,14 @@ fn prepare(
                 local
                     .dense_ids
                     .extend_from_slice(&columns.ids[..columns.len()]);
-                for group in block.groups() {
-                    for node in group.nodes() {
-                        let (lat, lon) = plain_coords(&node)?;
-                        let occ = local.plain_ids.len() as u32;
-                        local.plain_ids.push(node.id());
-                        spatial_hits(classifier, lat, lon, occ, &mut local.plain_hits);
-                    }
+                for node in classified.plain_nodes() {
+                    let (lat, lon) = plain_coords(&node)?;
+                    let occ = local.plain_ids.len() as u32;
+                    local.plain_ids.push(node.id());
+                    spatial_hits(classifier, lat, lon, occ, &mut local.plain_hits);
                 }
             } else {
-                for element in block.elements_skip_metadata() {
+                for element in classified.nodes() {
                     let (id, lat, lon, dense) = match &element {
                         Element::DenseNode(node) => (
                             node.id(),
@@ -418,40 +405,36 @@ fn prepare(
             }
         }
         MultiSelect::Ways { nodes, all, .. } => {
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element {
-                    local.acc.fill(0);
-                    for node_id in w.refs() {
-                        if nodes.or_into(node_id, &mut local.acc) && local.acc == *all {
-                            break;
-                        }
+            for w in classified.ways() {
+                local.acc.fill(0);
+                for node_id in w.refs() {
+                    if nodes.or_into(node_id, &mut local.acc) && local.acc == *all {
+                        break;
                     }
-                    let occ = local.dense_ids.len() as u32;
-                    local.dense_ids.push(w.id());
-                    for region in regions_of(&local.acc) {
-                        local.dense_hits.push((occ, region as u32));
-                    }
+                }
+                let occ = local.dense_ids.len() as u32;
+                local.dense_ids.push(w.id());
+                for region in regions_of(&local.acc) {
+                    local.dense_hits.push((occ, region as u32));
                 }
             }
         }
         MultiSelect::Relations { nodes, ways, all } => {
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element {
-                    local.acc.fill(0);
-                    for member in matchable_members(r) {
-                        let hit = match member {
-                            MatchableMember::Node(id) => nodes.or_into(id, &mut local.acc),
-                            MatchableMember::Way(id) => ways.or_into(id, &mut local.acc),
-                        };
-                        if hit && local.acc == *all {
-                            break;
-                        }
+            for r in classified.relations() {
+                local.acc.fill(0);
+                for member in matchable_members(r.members()) {
+                    let hit = match member {
+                        MatchableMember::Node(id) => nodes.or_into(id, &mut local.acc),
+                        MatchableMember::Way(id) => ways.or_into(id, &mut local.acc),
+                    };
+                    if hit && local.acc == *all {
+                        break;
                     }
-                    let occ = local.dense_ids.len() as u32;
-                    local.dense_ids.push(r.id());
-                    for region in regions_of(&local.acc) {
-                        local.dense_hits.push((occ, region as u32));
-                    }
+                }
+                let occ = local.dense_ids.len() as u32;
+                local.dense_ids.push(r.id());
+                for region in regions_of(&local.acc) {
+                    local.dense_hits.push((occ, region as u32));
                 }
             }
         }
@@ -503,13 +486,16 @@ fn prepare(
         None => true,
     });
     let raw = match raw_mask {
-        Some(mask) => Some(RawPart {
-            frame: frame
-                .take()
-                .ok_or_else(|| crate::error::Error::internal("multi-extract: candidate frame"))?,
-            mask,
-            nodes: occurrences as u64,
-        }),
+        Some(mask) => {
+            block.validate_passthrough()?;
+            Some(RawPart {
+                frame: frame.take().ok_or_else(|| {
+                    crate::error::Error::internal("multi-extract: candidate frame")
+                })?,
+                mask,
+                nodes: occurrences as u64,
+            })
+        }
         None => None,
     };
     Ok(Prepared {
@@ -527,7 +513,7 @@ fn prepare(
 /// block, its occurrence IDs and admitted hits (moved out of the worker's
 /// scratch), and its raw-copy part.
 struct Prepared {
-    block: crate::PrimitiveBlock,
+    block: crate::read::block::SelectionBlock,
     dense_ids: Vec<i64>,
     plain_ids: Vec<i64>,
     dense_hits: Vec<(u32, u32)>,
@@ -551,10 +537,8 @@ impl Prepared {
     }
 }
 
-/// Emit one prepared blob. `union` is `None` for a one-blob component; for
-/// a larger one it is the component's sorted `(id, region)` table in
-/// `local.union`, built only from admitted hits, and emission reads it less
-/// the regions this blob is not read for.
+/// Emit one prepared blob. When using the component union in `local.union`,
+/// emission uses its admitted hits filtered to this blob's regions.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_arguments,
@@ -616,22 +600,18 @@ fn finish(
     }
     let skip = raw.as_ref().map(|part| part.mask.as_slice());
 
-    let unique = !union
-        && ((local.plain_ids.is_empty() && strictly_increasing(&local.dense_ids))
-            || (local.dense_ids.is_empty() && strictly_increasing(&local.plain_ids)));
+    // Resolve the per-region membership of each ID. The component union
+    // includes only admitted hits, and this blob emits only to its own
+    // admitted regions.
+    local.table.clear();
     if union {
-        // The component's union, less the regions this blob is not read
-        // for: its single extract of such a region never reads the blob.
-        local.table.clear();
-        let admit = blob.admit;
         local.table.extend(
             local
                 .union
                 .iter()
-                .filter(|&&(_, region)| admits(admit, region as usize)),
+                .filter(|&&(_, region)| admits(blob.admit, region as usize)),
         );
-    } else if !unique {
-        local.table.clear();
+    } else {
         for &(occ, region) in &local.dense_hits {
             local.table.push((local.dense_ids[occ as usize], region));
         }
@@ -641,25 +621,10 @@ fn finish(
         local.table.sort_unstable();
         local.table.dedup();
     }
-    // A component's table installs once, from its first blob: the union of
-    // admitted hits is what each blob's own batch would install together.
     let batch = (collect && (!union || install)).then(|| {
-        if unique {
-            for &(occ, region) in &local.dense_hits {
-                local
-                    .builder
-                    .push(local.dense_ids[occ as usize], region as usize);
-            }
-            for &(occ, region) in &local.plain_hits {
-                local
-                    .builder
-                    .push(local.plain_ids[occ as usize], region as usize);
-            }
-        } else {
-            let table = if union { &local.union } else { &local.table };
-            for &(id, region) in table {
-                local.builder.push(id, region as usize);
-            }
+        let table = if union { &local.union } else { &local.table };
+        for &(id, region) in table {
+            local.builder.push(id, region as usize);
         }
         local.builder.finish()
     });
@@ -669,88 +634,82 @@ fn finish(
         v.clear();
     }
     let mut counts = vec![0u64; n];
-    let mut cursors = Cursors::default();
     let kind = select.kind();
     let coords = match select {
         MultiSelect::Ways { coords, .. } => *coords,
         MultiSelect::Nodes { .. } | MultiSelect::Relations { .. } => crate::owned::WayCoords::Drop,
     };
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-    for element in block.elements() {
-        match (&element, kind) {
-            (Element::DenseNode(dn), ElementKind::Node) => {
-                cursors.regions(true, dn.id(), unique, skip, local)?;
-                if local.regs.is_empty() {
-                    continue;
+    let regions = |id| {
+        let start = local.table.partition_point(|&(key, _)| key < id);
+        local.table[start..]
+            .iter()
+            .take_while(move |&&(key, _)| key == id)
+            .map(|&(_, region)| region as usize)
+            .filter(|&region| skip.is_none_or(|mask| !admits(Some(mask), region)))
+    };
+    block.visit_retained(
+        |record_kind, id| record_kind == kind && regions(id).next().is_some(),
+        |element| {
+            match &element {
+                Element::DenseNode(dn) => {
+                    let id = dn.id();
+                    let (lat, lon) = dense_coords(dn)?;
+                    let meta = clean_metadata(dense_node_metadata(dn)?, clean);
+                    for i in regions(dn.id()) {
+                        ensure_node_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
+                        local.bbs[i].add_node_dense(id, lat, lon, dn.tags(), meta.as_ref());
+                        counts[i] += 1;
+                    }
                 }
-                let id = dn.id();
-                let (lat, lon) = dense_coords(dn)?;
-                let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                for &i in &local.regs {
-                    let i = i as usize;
-                    ensure_node_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
-                    local.bbs[i].add_node_dense(id, lat, lon, dn.tags(), meta.as_ref());
-                    counts[i] += 1;
+                Element::Node(nd) => {
+                    let id = nd.id();
+                    let (lat, lon) = plain_coords(nd)?;
+                    let meta = clean_partial_metadata(
+                        element_metadata(ElementKind::Node, id, &nd.info())?,
+                        clean,
+                    );
+                    for i in regions(nd.id()) {
+                        ensure_node_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
+                        local.bbs[i].add_node_partial(id, lat, lon, nd.tags(), meta.as_ref());
+                        counts[i] += 1;
+                    }
                 }
-            }
-            (Element::Node(nd), ElementKind::Node) => {
-                cursors.regions(false, nd.id(), unique, skip, local)?;
-                if local.regs.is_empty() {
-                    continue;
+                Element::Way(w) => {
+                    let wid = w.id();
+                    local.way.prepare(w, coords)?;
+                    let meta = clean_partial_metadata(
+                        element_metadata(ElementKind::Way, wid, &w.info())?,
+                        clean,
+                    );
+                    for i in regions(w.id()) {
+                        ensure_way_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
+                        local.way.write(&mut local.bbs[i], w.tags(), meta.as_ref());
+                        counts[i] += 1;
+                    }
                 }
-                let id = nd.id();
-                let (lat, lon) = plain_coords(nd)?;
-                let meta = clean_partial_metadata(
-                    element_metadata(ElementKind::Node, id, &nd.info())?,
-                    clean,
-                );
-                for &i in &local.regs {
-                    let i = i as usize;
-                    ensure_node_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
-                    local.bbs[i].add_node_partial(id, lat, lon, nd.tags(), meta.as_ref());
-                    counts[i] += 1;
-                }
-            }
-            (Element::Way(w), ElementKind::Way) => {
-                cursors.regions(true, w.id(), unique, None, local)?;
-                if local.regs.is_empty() {
-                    continue;
-                }
-                let wid = w.id();
-                local.way.prepare(w, coords)?;
-                let meta = clean_partial_metadata(
-                    element_metadata(ElementKind::Way, wid, &w.info())?,
-                    clean,
-                );
-                for &i in &local.regs {
-                    let i = i as usize;
-                    ensure_way_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
-                    local.way.write(&mut local.bbs[i], w.tags(), meta.as_ref());
-                    counts[i] += 1;
-                }
-            }
-            (Element::Relation(r), ElementKind::Relation) => {
-                cursors.regions(true, r.id(), unique, None, local)?;
-                if local.regs.is_empty() {
-                    continue;
-                }
-                let rid = r.id();
-                r.members_into(&mut members_buf)?;
-                let meta = clean_partial_metadata(
-                    element_metadata(ElementKind::Relation, rid, &r.info())?,
-                    clean,
-                );
-                for &i in &local.regs {
-                    let i = i as usize;
-                    ensure_relation_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
-                    local.bbs[i].add_relation_partial(rid, r.tags(), &members_buf, meta.as_ref());
-                    counts[i] += 1;
+                Element::Relation(r) => {
+                    let rid = r.id();
+                    r.members_into(&mut members_buf)?;
+                    let meta = clean_partial_metadata(
+                        element_metadata(ElementKind::Relation, rid, &r.info())?,
+                        clean,
+                    );
+                    for i in regions(r.id()) {
+                        ensure_relation_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
+                        local.bbs[i].add_relation_partial(
+                            rid,
+                            r.tags(),
+                            &members_buf,
+                            meta.as_ref(),
+                        );
+                        counts[i] += 1;
+                    }
                 }
             }
-            _ => {}
-        }
-    }
-    cursors.finish(local)?;
+            Ok(())
+        },
+    )?;
     for i in 0..n {
         flush_local(&mut local.bbs[i], &mut local.output[i])?;
     }
@@ -764,83 +723,6 @@ fn finish(
         batch,
         demoted,
     })
-}
-
-/// The emission walk's position in each occurrence list and its hits.
-#[derive(Default)]
-struct Cursors {
-    dense_occ: u32,
-    plain_occ: u32,
-    dense_hit: usize,
-    plain_hit: usize,
-}
-
-impl Cursors {
-    /// Fill `local.regs` with the next occurrence's regions (ascending) from
-    /// the dense or plain list: its run of hits when `unique`, else its ID's
-    /// slice of the blob-local (or component) table, less the regions in
-    /// `skip` (those the blob is copied raw to, so nothing of it is rebuilt
-    /// or converted for them).
-    #[inline]
-    fn regions(
-        &mut self,
-        dense: bool,
-        id: i64,
-        unique: bool,
-        skip: Option<&[u64]>,
-        local: &mut Local,
-    ) -> crate::error::Result<()> {
-        local.regs.clear();
-        let (occ, at, hits) = if dense {
-            (&mut self.dense_occ, &mut self.dense_hit, &local.dense_hits)
-        } else {
-            (&mut self.plain_occ, &mut self.plain_hit, &local.plain_hits)
-        };
-        let this = *occ;
-        *occ += 1;
-        if unique {
-            while let Some(&(o, r)) = hits.get(*at) {
-                if o > this {
-                    break;
-                }
-                if o < this {
-                    return Err(crate::error::Error::internal(
-                        "multi-extract: a fused hit fell behind its occurrence",
-                    ));
-                }
-                local.regs.push(r);
-                *at += 1;
-            }
-        } else {
-            let start = local.table.partition_point(|&(t, _)| t < id);
-            for &(t, r) in &local.table[start..] {
-                if t != id {
-                    break;
-                }
-                local.regs.push(r);
-            }
-        }
-        if let Some(skip) = skip {
-            local
-                .regs
-                .retain(|&region| !admits(Some(skip), region as usize));
-        }
-        Ok(())
-    }
-
-    /// Refuse a hit no emission occurrence consumed.
-    fn finish(&self, local: &Local) -> crate::error::Result<()> {
-        let unconsumed =
-            |occ: u32, hits: &[(u32, u32)]| hits.last().is_some_and(|&(o, _)| o >= occ);
-        if unconsumed(self.dense_occ, &local.dense_hits)
-            || unconsumed(self.plain_occ, &local.plain_hits)
-        {
-            return Err(crate::error::Error::internal(
-                "multi-extract: the fused walks disagree on the blob's occurrences",
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// The ordered consumer: membership pages installed and region frames (or a

@@ -53,8 +53,9 @@
 //! pass reads each physical blob once, as the single-region engines do.
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::read::block::{BlockBuffer, SelectionBlock};
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementKind, PrimitiveBlock};
+use crate::{Element, ElementKind};
 
 use super::super::{
     HeaderOverrides, Result, clean_metadata, clean_partial_metadata, ensure_node_capacity_local,
@@ -283,18 +284,17 @@ pub(super) fn try_extract_multi_dependent(
                 )
             },
             |position, buffer, (columns, scratch, builder)| {
-                let block = buffer.block()?;
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
                 block.decode_dense_columns(columns)?;
                 for v in scratch.iter_mut() {
                     v.clear();
                 }
                 classifier.collect_bbox_columns(columns, &bboxes, scratch);
                 // Dense columns deliberately exclude plain Node messages.
-                for group in block.groups() {
-                    for node in group.nodes() {
-                        let (lat, lon) = super::common::plain_coords(&node)?;
-                        classifier.visit(lat, lon, None, |region| scratch[region].push(node.id()));
-                    }
+                for node in block.plain_nodes() {
+                    let (lat, lon) = super::common::plain_coords(&node)?;
+                    classifier.visit(lat, lon, None, |region| scratch[region].push(node.id()));
                 }
                 let admit = node_admit[position].as_deref();
                 for (region, ids) in scratch.iter().enumerate() {
@@ -318,9 +318,10 @@ pub(super) fn try_extract_multi_dependent(
             None,
             || BatchBuilder::new(n),
             |position, buffer, builder: &mut BatchBuilder| {
-                let block = buffer.block()?;
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
                 let admit = node_admit[position].as_deref();
-                for element in block.elements_skip_metadata() {
+                for element in block.nodes() {
                     let (id, lat, lon) = match &element {
                         Element::DenseNode(node) => (
                             node.id(),
@@ -349,16 +350,13 @@ pub(super) fn try_extract_multi_dependent(
 
     // --- Way classify: matched_way by ID, way_nodes per record ---
     //
-    // A block walk, as the single-region way classify is: every way's refs
-    // are tested against the node membership, and that, not the message
-    // parse, is the phase's cost.
     host.invocation.marker("MULTI_DEP_WAY_CLASSIFY_START");
     let mut matched_way = Membership::new(n);
     let mut way_nodes = Membership::new(n);
     {
         let spatial = &spatial;
         let all_regions = &all_regions;
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &way_schedule,
             None,
@@ -371,13 +369,12 @@ pub(super) fn try_extract_multi_dependent(
                     vec![0u64; mw],
                 )
             },
-            |block, (ways, nodes, record, ref_mask, add)| {
+            |_, buffer, (ways, nodes, record, ref_mask, add)| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
                 // Every occurrence, matched or not (see the write pass).
                 let mut extent: Extent = None;
-                for element in block.elements_skip_metadata() {
-                    let Element::Way(w) = &element else {
-                        continue;
-                    };
+                for w in block.ways() {
                     widen(&mut extent, w.id());
                     record.fill(0);
                     for r in w.refs() {
@@ -431,7 +428,7 @@ pub(super) fn try_extract_multi_dependent(
         let matched_way = &matched_way;
         let way_nodes = &way_nodes;
         let all_regions = &all_regions;
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &relation_schedule,
             None,
@@ -444,21 +441,20 @@ pub(super) fn try_extract_multi_dependent(
                     vec![0u64; mw],
                 )
             },
-            |block, (extra_ways, extra_nodes, direct, member_mask, add)| {
+            |_, buffer, (extra_ways, extra_nodes, direct, member_mask, add)| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
                 let mut ids: Vec<i64> = Vec::new();
                 let mut masks: Vec<u64> = Vec::new();
                 let mut edges: Vec<(i64, i64)> = Vec::new();
                 // Every occurrence: the parent closure can include a
                 // relation no record matched directly.
                 let mut extent: Extent = None;
-                for element in block.elements_skip_metadata() {
-                    let Element::Relation(r) = &element else {
-                        continue;
-                    };
+                for r in block.relations() {
                     widen(&mut extent, r.id());
-                    push_parent_edges(r, &mut edges);
+                    push_parent_edges(&r, &mut edges);
                     direct.fill(0);
-                    for member in matchable_members(r) {
+                    for member in matchable_members(r.members()) {
                         let hit = match member {
                             MatchableMember::Node(id) => spatial.or_into(id, direct),
                             MatchableMember::Way(id) => matched_way.or_into(id, direct),
@@ -475,7 +471,7 @@ pub(super) fn try_extract_multi_dependent(
                     if !smart {
                         continue;
                     }
-                    for member in completion_members(r) {
+                    for member in completion_members(&r)? {
                         match member {
                             CompletionMember::Way(id) => {
                                 // The extra-way exclusion, per region: a way
@@ -536,7 +532,7 @@ pub(super) fn try_extract_multi_dependent(
         let spatial = &spatial;
         let way_nodes = &way_nodes;
         let extra_way = &extra_way;
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &sweep,
             None,
@@ -548,11 +544,10 @@ pub(super) fn try_extract_multi_dependent(
                     vec![0u64; mw],
                 )
             },
-            |block, (nodes, way_mask, ref_mask, add)| {
-                for element in block.elements_skip_metadata() {
-                    let Element::Way(w) = &element else {
-                        continue;
-                    };
+            |_, buffer, (nodes, way_mask, ref_mask, add)| {
+                let buffer = buffer.for_selection()?;
+                let block = buffer.classify()?;
+                for w in block.ways() {
                     if !extra_way.mask_into(w.id(), way_mask) {
                         continue;
                     }
@@ -887,12 +882,14 @@ fn write_pass(
                 let raw = local.read_buf.read_exact_at(file, d.offset, d.size)?;
                 let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
                 crate::blob::decompress_blob_raw(raw, &mut buf)?;
-                let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                let block = BlockBuffer::new(
                     buf,
-                    &local.pool,
+                    Some(&local.pool),
                     &mut local.st_scratch,
                     &mut local.gr_scratch,
-                )?;
+                    None,
+                )
+                .for_selection()?;
                 for v in &mut local.output {
                     v.clear();
                 }
@@ -924,7 +921,7 @@ fn write_pass(
 /// returning each region's counts.
 #[allow(clippy::too_many_lines)]
 fn write_block(
-    block: &PrimitiveBlock,
+    block: &SelectionBlock,
     sets: &WriteSets<'_>,
     local: &mut WriteLocal,
 ) -> crate::Result<Vec<ExtractStats>> {
@@ -938,20 +935,9 @@ fn write_block(
         masks,
         ..
     } = local;
-    let [first, second, union] = masks;
+    let masks = std::cell::RefCell::new(masks);
     let clean = sets.clean;
 
-    // A node's regions, with the spatial and way-completion masks kept for
-    // the stats precedence. False when it is in no region.
-    let node_masks = |id: i64, spatial: &mut [u64], from_way: &mut [u64], union: &mut [u64]| {
-        let a = sets.spatial.mask_into(id, spatial);
-        let b = sets.way_nodes.mask_into(id, from_way);
-        let c = sets.relation_nodes.mask_into(id, union);
-        for ((u, &s), &w) in union.iter_mut().zip(spatial.iter()).zip(from_way.iter()) {
-            *u |= s | w;
-        }
-        a || b || c
-    };
     let count_node = |counts: &mut [ExtractStats], i: usize, spatial: &[u64], from_way: &[u64]| {
         if has(spatial, i) {
             counts[i].nodes_in_bbox += 1;
@@ -962,13 +948,36 @@ fn write_block(
         }
     };
 
-    for element in block.elements() {
+    let selected = |kind, id| {
+        let mut masks = masks.borrow_mut();
+        let [first, second, union] = &mut **masks;
+        match kind {
+            ElementKind::Node => {
+                let a = sets.spatial.mask_into(id, first);
+                let b = sets.way_nodes.mask_into(id, second);
+                let c = sets.relation_nodes.mask_into(id, union);
+                for ((u, &s), &w) in union.iter_mut().zip(first.iter()).zip(second.iter()) {
+                    *u |= s | w;
+                }
+                a || b || c
+            }
+            ElementKind::Way => {
+                let matched = sets.matched_way.mask_into(id, first);
+                let extra = sets.extra_way.mask_into(id, second);
+                for ((u, &m), &x) in union.iter_mut().zip(first.iter()).zip(second.iter()) {
+                    *u = m | x;
+                }
+                matched || extra
+            }
+            ElementKind::Relation => sets.relations.mask_into(id, union),
+        }
+    };
+    block.visit_retained(selected, |element| {
+        let masks = masks.borrow();
+        let [first, second, union] = &**masks;
         match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
-                if !node_masks(id, first, second, union) {
-                    continue;
-                }
                 let (lat, lon) = super::common::dense_coords(dn)?;
                 let meta = clean_metadata(dense_node_metadata(dn)?, clean);
                 for i in regions_of(union) {
@@ -979,9 +988,6 @@ fn write_block(
             }
             Element::Node(nd) => {
                 let id = nd.id();
-                if !node_masks(id, first, second, union) {
-                    continue;
-                }
                 let (lat, lon) = super::common::plain_coords(nd)?;
                 let meta = clean_partial_metadata(
                     element_metadata(ElementKind::Node, id, &nd.info())?,
@@ -994,18 +1000,9 @@ fn write_block(
                 }
             }
             Element::Way(w) => {
-                let id = w.id();
-                let matched = sets.matched_way.mask_into(id, first);
-                let extra = sets.extra_way.mask_into(id, second);
-                if !matched && !extra {
-                    continue;
-                }
-                for ((u, &m), &x) in union.iter_mut().zip(first.iter()).zip(second.iter()) {
-                    *u = m | x;
-                }
                 way.prepare(w, sets.coords)?;
                 let meta = clean_partial_metadata(
-                    element_metadata(ElementKind::Way, id, &w.info())?,
+                    element_metadata(ElementKind::Way, w.id(), &w.info())?,
                     clean,
                 );
                 for i in regions_of(union) {
@@ -1020,9 +1017,6 @@ fn write_block(
             }
             Element::Relation(r) => {
                 let id = r.id();
-                if !sets.relations.mask_into(id, union) {
-                    continue;
-                }
                 r.members_into(&mut members_buf)?;
                 let meta = clean_partial_metadata(
                     element_metadata(ElementKind::Relation, id, &r.info())?,
@@ -1035,6 +1029,7 @@ fn write_block(
                 }
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(counts)
 }

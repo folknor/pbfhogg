@@ -65,6 +65,8 @@ mod check;
 #[cfg(feature = "commands")]
 mod check_locations;
 #[cfg(feature = "commands")]
+mod extract_validation;
+#[cfg(feature = "commands")]
 mod geocode_index;
 #[cfg(feature = "geocode-reader")]
 mod geocode_reader;

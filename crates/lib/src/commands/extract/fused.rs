@@ -13,12 +13,9 @@
 //! worker checks every claim it relies on exactly at decode
 //! ([`IdTally::refuse_inexact`]; ADR-0013, a run that relies on a claim
 //! checks it when it decodes), so the plan does not rest on a false range.
-//! Within a one-blob component, a strictly increasing walk (canonical ID
-//! order is injective) proves each ID occurs once and the per-occurrence
-//! decision is the ID's; any equal or descending step switches the blob to
-//! a blob-local ID set built from the selected occurrences, which is the
-//! same OR the kind-wide set computed. A larger component always selects by
-//! the union of its blobs' selected IDs. A kind that fails the plan (an
+//! A one-blob component emits by the blob's selected IDs. A larger
+//! component emits by the union of its blobs' selected IDs, so every
+//! occurrence of a matching ID is written. A kind that fails the plan (an
 //! unindexed blob, a component that is not a contiguous schedule run or is
 //! larger than `EXTRACT_FUSED_COMPONENT_MAX`) runs the classify-then-write
 //! form instead.
@@ -38,9 +35,10 @@ use crate::blob_meta::IdTally;
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::cat::CleanAttrs;
 use crate::idset::IdSet;
+use crate::read::block::{BlockBuffer, ClassificationBlock, SelectionBlock};
 use crate::read::input::PinnedInput;
 use crate::writer::PbfWriter;
-use crate::{Element, ElementKind, PrimitiveBlock};
+use crate::{Element, ElementKind};
 
 use super::super::{
     BlockSink, FramedBlocks, Result, clean_metadata, clean_partial_metadata,
@@ -148,26 +146,42 @@ impl Select<'_> {
         !matches!(self, Select::Relations { .. })
     }
 
-    /// `(id, selected)` for an element of the pass's kind, `None` otherwise.
-    #[inline]
-    fn decide(&self, element: &Element<'_>) -> crate::error::Result<Option<(i64, bool)>> {
-        Ok(match (self, element) {
-            (Select::Nodes { region, exact }, Element::DenseNode(dn)) => Some((
-                dn.id(),
-                region.contains_node(exact, dn.decimicro_lat().ok(), dn.decimicro_lon().ok())?,
-            )),
-            (Select::Nodes { region, exact }, Element::Node(n)) => Some((
-                n.id(),
-                region.contains_node(exact, n.decimicro_lat().ok(), n.decimicro_lon().ok())?,
-            )),
-            (Select::Ways { nodes, .. }, Element::Way(w)) => {
-                Some((w.id(), w.refs().any(|r| nodes.get(r))))
+    fn matching_ids(
+        &self,
+        block: &ClassificationBlock<'_>,
+        tally: &mut IdTally,
+    ) -> crate::Result<Vec<i64>> {
+        let mut ids = Vec::new();
+        let mut record = |id, hit| {
+            tally.add(id);
+            if hit {
+                ids.push(id);
             }
-            (Select::Relations { nodes, ways }, Element::Relation(r)) => {
-                Some((r.id(), relation_has_matched_member(r, nodes, ways)))
+        };
+        match self {
+            Self::Nodes { region, exact } => {
+                for element in block.nodes() {
+                    let (id, lat, lon) = match element {
+                        Element::DenseNode(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                        Element::Node(n) => (n.id(), n.decimicro_lat()?, n.decimicro_lon()?),
+                        _ => continue,
+                    };
+                    record(id, region.contains_decimicro(exact, lat, lon));
+                }
             }
-            _ => None,
-        })
+            Self::Ways { nodes, .. } => {
+                for way in block.ways() {
+                    record(way.id(), way.refs().any(|id| nodes.get(id)));
+                }
+            }
+            Self::Relations { nodes, ways } => {
+                for relation in block.relations() {
+                    let matched = relation_has_matched_member(relation.members(), nodes, ways);
+                    record(relation.id(), matched);
+                }
+            }
+        }
+        Ok(ids)
     }
 }
 
@@ -195,7 +209,6 @@ struct Local {
     pool: std::sync::Arc<crate::blob::DecompressPool>,
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
-    decisions: Vec<bool>,
     tuples: Vec<crate::scan::node::NodeTuple>,
     group_starts: Vec<(usize, usize)>,
     validate: ValidateScratch,
@@ -262,7 +275,6 @@ pub(super) fn fused_pass(
             pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
-            decisions: Vec::new(),
             tuples: Vec::new(),
             group_starts: Vec::new(),
             validate: Default::default(),
@@ -330,13 +342,10 @@ enum Prepared {
         nodes: u64,
         ids: Vec<i64>,
     },
-    /// A decoded block, its per-occurrence decisions, its selected IDs, and
-    /// whether its IDs strictly increase.
+    /// A decoded block, with the IDs of its matching occurrences.
     Block {
-        block: PrimitiveBlock,
-        decisions: Vec<bool>,
+        block: SelectionBlock,
         ids: Vec<i64>,
-        unique: bool,
         demoted: bool,
     },
 }
@@ -349,7 +358,7 @@ impl Prepared {
     }
 }
 
-/// Emit one prepared blob: by its own decisions when `union` is `None`
+/// Emit one prepared blob: by its own selected IDs when `union` is `None`
 /// (a one-blob component), else by the component's sorted ID union.
 fn finish(
     prepared: Prepared,
@@ -360,15 +369,13 @@ fn finish(
     metrics: &crate::write::metrics::WriterMetrics,
     local: &mut Local,
 ) -> crate::error::Result<Fused> {
-    let (block, decisions, mut ids, unique, demoted) = match prepared {
+    let (block, mut ids, demoted) = match prepared {
         Prepared::Raw { frame, nodes, ids } => return Ok(Fused::Raw { frame, nodes, ids }),
         Prepared::Block {
             block,
-            decisions,
             ids,
-            unique,
             demoted,
-        } => (block, decisions, ids, unique, demoted),
+        } => (block, ids, demoted),
     };
     let mut output = FramedBlocks::new(compression, metrics).cutting();
     let kind = select.kind();
@@ -376,47 +383,24 @@ fn finish(
         Select::Ways { coords, .. } => *coords,
         Select::Nodes { .. } | Select::Relations { .. } => crate::owned::WayCoords::Drop,
     };
-    let block_stats = match union {
-        Some(set) => emit(
-            &block,
-            kind,
-            clean,
-            coords,
-            |id| set.binary_search(&id).is_ok(),
-            &mut local.bb,
-            &mut output,
-        )?,
-        None if unique => {
-            let mut next = decisions.iter().copied();
-            emit(
-                &block,
-                kind,
-                clean,
-                coords,
-                |_| next.next().unwrap_or(false),
-                &mut local.bb,
-                &mut output,
-            )?
-        }
+    let selected = match union {
+        Some(ids) => ids,
         None => {
             ids.sort_unstable();
             ids.dedup();
-            let set = &ids;
-            emit(
-                &block,
-                kind,
-                clean,
-                coords,
-                |id| set.binary_search(&id).is_ok(),
-                &mut local.bb,
-                &mut output,
-            )?
+            &ids
         }
     };
+    let block_stats = emit(
+        &block,
+        kind,
+        clean,
+        coords,
+        |id| selected.binary_search(&id).is_ok(),
+        &mut local.bb,
+        &mut output,
+    )?;
     flush_local(&mut local.bb, &mut output)?;
-    if decisions.capacity() > local.decisions.capacity() {
-        local.decisions = decisions;
-    }
     let frames = output.frames.into_iter().map(|(_, frame)| frame).collect();
     if !select.collects() {
         ids.clear();
@@ -495,43 +479,21 @@ fn prepare(
         demoted = true;
     }
 
-    let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+    let block = BlockBuffer::new(
         buf,
-        &local.pool,
+        Some(&local.pool),
         &mut local.st_scratch,
         &mut local.gr_scratch,
-    )?;
-    block.refuse_foreign_kind(d.kind)?;
-
-    // Selection walk: per-occurrence decisions, the exact claim tally, and
-    // the strict-increase proof that each ID occurs once in the blob.
-    let mut decisions = std::mem::take(&mut local.decisions);
-    decisions.clear();
+        d.kind,
+    )
+    .for_selection()?;
+    let classified = block.classify()?;
     let mut tally = IdTally::default();
-    let mut previous: Option<crate::osm_id::OsmIdKey> = None;
-    let mut unique = true;
-    let mut ids: Vec<i64> = Vec::new();
-    for element in block.elements_skip_metadata() {
-        let Some((id, hit)) = select.decide(&element)? else {
-            continue;
-        };
-        tally.add(id);
-        let key = crate::osm_id::osm_id_key(id);
-        if previous.is_some_and(|p| key <= p) {
-            unique = false;
-        }
-        previous = Some(key);
-        decisions.push(hit);
-        if hit {
-            ids.push(id);
-        }
-    }
+    let ids = select.matching_ids(&classified, &mut tally)?;
     tally.refuse_inexact(&claim)?;
     Ok(Prepared::Block {
         block,
-        decisions,
         ids,
-        unique,
         demoted,
     })
 }
@@ -540,11 +502,11 @@ fn prepare(
 /// when `want(id)` holds, through the same builder calls and cleaning as the
 /// classify-then-write form's `extract_block_pass2`.
 fn emit<O: BlockSink + ?Sized>(
-    block: &PrimitiveBlock,
+    block: &SelectionBlock,
     kind: ElementKind,
     clean: &CleanAttrs,
     coords: crate::owned::WayCoords,
-    mut want: impl FnMut(i64) -> bool,
+    want: impl Fn(i64) -> bool,
     bb: &mut BlockBuilder,
     output: &mut O,
 ) -> crate::Result<ExtractStats> {
@@ -559,19 +521,18 @@ fn emit<O: BlockSink + ?Sized>(
     };
     let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-    for element in block.elements() {
-        match (&element, kind) {
-            (Element::DenseNode(dn), ElementKind::Node) => {
-                if want(dn.id()) {
+    block.visit_retained(
+        |record_kind, id| record_kind == kind && want(id),
+        |element| {
+            match &element {
+                Element::DenseNode(dn) => {
                     ensure_node_capacity_local(bb, output)?;
                     let (lat, lon) = dense_coords(dn)?;
                     let meta = clean_metadata(dense_node_metadata(dn)?, clean);
                     bb.add_node_dense(dn.id(), lat, lon, dn.tags(), meta.as_ref());
                     stats.nodes_in_bbox += 1;
                 }
-            }
-            (Element::Node(n), ElementKind::Node) => {
-                if want(n.id()) {
+                Element::Node(n) => {
                     ensure_node_capacity_local(bb, output)?;
                     let (lat, lon) = plain_coords(n)?;
                     let meta = clean_partial_metadata(
@@ -581,9 +542,7 @@ fn emit<O: BlockSink + ?Sized>(
                     bb.add_node_partial(n.id(), lat, lon, n.tags(), meta.as_ref());
                     stats.nodes_in_bbox += 1;
                 }
-            }
-            (Element::Way(w), ElementKind::Way) => {
-                if want(w.id()) {
+                Element::Way(w) => {
                     ensure_way_capacity_local(bb, output)?;
                     way.prepare(w, coords)?;
                     let meta = clean_partial_metadata(
@@ -593,9 +552,7 @@ fn emit<O: BlockSink + ?Sized>(
                     way.write(bb, w.tags(), meta.as_ref());
                     stats.ways_written += 1;
                 }
-            }
-            (Element::Relation(r), ElementKind::Relation) => {
-                if want(r.id()) {
+                Element::Relation(r) => {
                     ensure_relation_capacity_local(bb, output)?;
                     r.members_into(&mut members_buf)?;
                     let meta = clean_partial_metadata(
@@ -606,9 +563,9 @@ fn emit<O: BlockSink + ?Sized>(
                     stats.relations_written += 1;
                 }
             }
-            _ => {}
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(stats)
 }
 

@@ -1,5 +1,25 @@
 # Cat
 
+## Self-dedupe shares pinned inputs (bygg, baseline `d64b3548`)
+
+Repeated pinned files, including hard links, are indexed once. Alias frames
+share a decoded block while retaining multiplicity and argument precedence.
+An isolated raw dense-node frame can pass through when IDs are strictly
+ordered and unique, tags and metadata are absent, and the framing matches
+what the sweep would write. Such frames are rare in real inputs.
+
+Warm-cache `dedupe-self --dataset germany --cache warm`, `--iterations 1`,
+on bygg. A is HEAD `d64b3548` and B is the working tree on `d64b3548`.
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 9.9 s | `787297cc` |
+| B | 8.1 s | `e6dc11c4` |
+| A | 9.9 s | `16d7f81c` |
+| B | 8.1 s | `82765628` |
+
+Wall time fell 18 % in both pairs. Denmark `verify cat-dedupe` passed on B.
+
 ## Dedupe winner relations without a member vector (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 Denmark `copy-pbf --dedupe yes`, `--iterations 1` interleaved: `1361533e`

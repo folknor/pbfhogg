@@ -11,7 +11,10 @@
 //! views of the run's kind, stably sorted by OSM ID. A small heap orders the
 //! cursors by the OSM ID of their next element. No element is copied into an
 //! owned form on the common path: survivors are re-encoded from the borrowed
-//! view, and duplicates are dropped after validation.
+//! view, and duplicates are dropped after validation. Aliases of the same
+//! pinned frame share its decoded block. An isolated frame can use one
+//! cursor for every alias, or copy the original frame when its wire bytes
+//! prove the sweep would emit them unchanged.
 //!
 //! The frontier rule is the one an owned-element heap sweep would use: before
 //! the merge opens entry `j` it emits every element whose ID sorts strictly
@@ -59,6 +62,8 @@
 //! cursor opens, the owned tails demotion leaves, the group being emitted
 //! (whose elements keep their block alive after the cursor has released it)
 //! and one cursor slot per opened entry.
+//! Shared blocks in a multi-frame run are charged per cursor to preserve
+//! the original demotion schedule and its validation.
 //!
 //! The group is held whole, uncharged and unbounded: every copy of one ID
 //! is gathered before any is written, because a cursor delivers an ID's
@@ -122,7 +127,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::rc::Rc;
 
-use super::{BlobEntry, Frame, FrameBuf, RunCounts, Sources, element_id, read_block};
+use super::{BlobEntry, Frame, FrameBuf, RunCounts, Sources, decode_frame, element_id, read_block};
 use crate::blob_meta::IdTally;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Result;
@@ -136,6 +141,8 @@ use crate::read::block::BlockElementsIter;
 use crate::write::metrics::WriterMetrics;
 use crate::writer::{Compression, frame_blob_pipelined_pieces};
 use crate::{Element, ElementKind, PrimitiveBlock};
+
+mod raw_copy;
 
 /// One run's chunk of framed output, written in order: whole frames, or the
 /// pieces of one larger than a chunk. Its buffers are bytes in order, not
@@ -337,6 +344,9 @@ struct Cursor {
     offset: u64,
     /// Ordinal of `head` within this cursor.
     occurrence: u64,
+    /// How many identical inputs this cursor represents. Zero is a later
+    /// alias that stays in the sweep to preserve its demotion schedule.
+    copies: u64,
     /// Elements of the kind pulled so far, and the block's total.
     pulled: u64,
     total: u64,
@@ -734,10 +744,23 @@ struct Merge {
     group: Vec<Member>,
     /// The group's dedupe index, once it is large (see [`Sweep::insert`]).
     versions: HashMap<i32, usize>,
+    /// The first losing argument of a collapsed run. Its validation still
+    /// runs before the survivors are encoded, using the primary's views.
+    alias_validation_source: Option<usize>,
     visits: usize,
     /// What the run reports (see the module docs, "Resource counters").
     pinned_high_water: usize,
     demoted: u64,
+}
+
+/// A decoded block shared by aliased cursors while they are being opened.
+/// All copies have the same first key, so no groups are emitted between
+/// opening the primary and the final alias.
+type SharedBlocks = HashMap<usize, (Rc<PrimitiveBlock>, usize)>;
+
+enum IsolatedFrame {
+    Copied(RunCounts),
+    Decoded(Rc<PrimitiveBlock>),
 }
 
 impl Sweep<'_, '_> {
@@ -777,8 +800,99 @@ impl Sweep<'_, '_> {
     ///
     /// [`SWEEP_CHECKPOINT_REMOVALS`]: crate::tunables::SWEEP_CHECKPOINT_REMOVALS
     pub(super) fn run(&self, frame_buf: &mut FrameBuf) -> Result<RunCounts> {
+        let mut shared = SharedBlocks::new();
+        let mut prepared = None;
+        let mut entries = self.entries;
         let mut counts = RunCounts::default();
-        let mut out = Output {
+        let mut alias_validation_source = None;
+        if self.dedupe
+            && let Some(first) = entries.first()
+            && let Some(alias) = self.frames[first.frame].alias
+            && alias.copies == entries.len()
+            && first.frame == alias.primary
+            && entries.iter().all(|e| {
+                self.frames[e.frame]
+                    .alias
+                    .is_some_and(|a| a.primary == alias.primary)
+            })
+        {
+            self.checkpoint()?;
+            let frame = &self.frames[first.frame];
+            let block = match self.read_isolated(first, frame, alias.copies, frame_buf)? {
+                IsolatedFrame::Copied(counts) => return Ok(counts),
+                IsolatedFrame::Decoded(block) => block,
+            };
+            let mut cursor = self.open(first, frame, Rc::clone(&block))?;
+            // Keep the old demotion schedule whenever its separate cursors
+            // could have reached the budget. Demotion validates owned
+            // elements even if they would later have lost.
+            if cursor.pinned.saturating_mul(alias.copies) <= crate::tunables::SWEEP_PINNED_BYTES {
+                cursor.copies = alias.copies as u64;
+                counts.aliased_decodes_saved = cursor.copies - 1;
+                let secondary = entries.get(1).ok_or_else(|| {
+                    crate::Error::internal("collapsed alias run has no secondary frame")
+                })?;
+                alias_validation_source = Some(self.frames[secondary.frame].source);
+                entries = &entries[..1];
+            } else {
+                shared.insert(alias.primary, (block, alias.copies - 1));
+            }
+            prepared = Some(cursor);
+        }
+        let mut out = self.output();
+        let mut merge = Merge {
+            cursors: Vec::with_capacity(entries.len()),
+            heap: BinaryHeap::new(),
+            pinned: 0,
+            next_scan: crate::tunables::SWEEP_PINNED_BYTES,
+            group: Vec::new(),
+            versions: HashMap::new(),
+            alias_validation_source,
+            visits: 0,
+            pinned_high_water: 0,
+            demoted: 0,
+        };
+        for entry in entries {
+            self.checkpoint()?;
+            self.advance_to(entry, &mut merge, &mut out, &mut counts)?;
+            let cursor = match prepared.take() {
+                Some(cursor) => cursor,
+                None => self.open_shared(entry, frame_buf, &mut shared, &mut counts)?,
+            };
+            let slot = merge.cursors.len();
+            merge.pinned += cursor.pinned;
+            merge.pinned_high_water = merge.pinned_high_water.max(merge.pinned);
+            if let Some(head) = &cursor.head {
+                merge.heap.push(Reverse((osm_id_key(head.id()), slot)));
+                merge.cursors.push(Some(cursor));
+            } else {
+                merge.cursors.push(None);
+            }
+            self.maybe_demote(&mut merge)?;
+        }
+        if !shared.is_empty() {
+            return Err(crate::Error::internal(
+                "overlap run did not open every frame alias",
+            ));
+        }
+        while !merge.heap.is_empty() {
+            self.emit_group(&mut merge, &mut out, &mut counts)?;
+            self.maybe_demote(&mut merge)?;
+        }
+        crate::commands::flush_local(&mut out.bb, &mut out.filled)?;
+        let origin = out.origin;
+        out.ship(self.emitter, &|e| self.locate_origin(origin, e))?;
+        out.send(self.emitter)?;
+        counts.pinned_high_water = merge.pinned_high_water;
+        counts.demoted = merge.demoted;
+        counts.chunks = out.chunks;
+        counts.chunk_high_water = out.chunk_high_water;
+        counts.staged_high_water = out.staged_high_water;
+        Ok(counts)
+    }
+
+    fn output(&self) -> Output<'_> {
+        Output {
             bb: BlockBuilder::new(),
             origin: None,
             filled: Vec::new(),
@@ -797,82 +911,137 @@ impl Sweep<'_, '_> {
             chunks: 0,
             chunk_high_water: 0,
             staged_high_water: 0,
-        };
-        let mut merge = Merge {
-            cursors: Vec::with_capacity(self.entries.len()),
-            heap: BinaryHeap::new(),
-            pinned: 0,
-            next_scan: crate::tunables::SWEEP_PINNED_BYTES,
-            group: Vec::new(),
-            versions: HashMap::new(),
-            visits: 0,
-            pinned_high_water: 0,
-            demoted: 0,
-        };
-        for entry in self.entries {
-            self.checkpoint()?;
-            let below = osm_id_key(crate::osm_id::blob_osm_first_id(
-                entry.index.min_id,
-                entry.index.max_id,
-            ));
-            while merge
-                .heap
-                .peek()
-                .is_some_and(|Reverse((key, _))| *key < below)
-            {
-                self.emit_group(&mut merge, &mut out, &mut counts)?;
-                self.maybe_demote(&mut merge)?;
-            }
-            let frame = &self.frames[entry.frame];
-            let cursor = self
-                .open(entry, frame, frame_buf)
-                .map_err(|e| self.locate(frame.source, frame.file_offset, e))?;
-            let slot = merge.cursors.len();
-            merge.pinned += cursor.pinned;
-            merge.pinned_high_water = merge.pinned_high_water.max(merge.pinned);
-            if let Some(head) = &cursor.head {
-                merge.heap.push(Reverse((osm_id_key(head.id()), slot)));
-                merge.cursors.push(Some(cursor));
-            } else {
-                merge.cursors.push(None);
-            }
-            self.maybe_demote(&mut merge)?;
         }
-        while !merge.heap.is_empty() {
-            self.emit_group(&mut merge, &mut out, &mut counts)?;
-            self.maybe_demote(&mut merge)?;
-        }
-        crate::commands::flush_local(&mut out.bb, &mut out.filled)?;
-        let origin = out.origin;
-        out.ship(self.emitter, &|e| self.locate_origin(origin, e))?;
-        out.send(self.emitter)?;
-        counts.pinned_high_water = merge.pinned_high_water;
-        counts.demoted = merge.demoted;
-        counts.chunks = out.chunks;
-        counts.chunk_high_water = out.chunk_high_water;
-        counts.staged_high_water = out.staged_high_water;
-        Ok(counts)
     }
 
-    /// Read and decode one entry's frame and open a cursor on it.
-    fn open(&self, entry: &BlobEntry, frame: &Frame, frame_buf: &mut FrameBuf) -> Result<Cursor> {
+    fn advance_to(
+        &self,
+        entry: &BlobEntry,
+        merge: &mut Merge,
+        out: &mut Output<'_>,
+        counts: &mut RunCounts,
+    ) -> Result<()> {
+        let below = crate::osm_id::blob_osm_first_key(entry.index.min_id, entry.index.max_id);
+        while merge
+            .heap
+            .peek()
+            .is_some_and(|Reverse((key, _))| *key < below)
+        {
+            self.emit_group(merge, out, counts)?;
+            self.maybe_demote(merge)?;
+        }
+        Ok(())
+    }
+
+    /// An isolated repeated frame can only compete with itself. Try the
+    /// byte proof before building a PrimitiveBlock. On a miss, decode from
+    /// the same read buffer and let the usual sweep do its validation.
+    fn read_isolated(
+        &self,
+        entry: &BlobEntry,
+        frame: &Frame,
+        copies: usize,
+        frame_buf: &mut FrameBuf,
+    ) -> Result<IsolatedFrame> {
         let source = &self.sources[frame.source];
-        let block = read_block(source, frame, frame_buf, self.cancel)?;
+        if *self.compression != Compression::None
+            || entry.index.kind != ElementKind::Node
+            || entry.intra_unsorted
+            || entry.restructured
+        {
+            return read_block(source, frame, frame_buf, self.cancel)
+                .map(|block| IsolatedFrame::Decoded(Rc::new(block)));
+        }
+        let result = frame_buf.read(source, frame).and_then(|bytes| {
+            let Some(count) = raw_copy::prove(bytes, &entry.index) else {
+                return decode_frame(bytes)
+                    .map(|block| IsolatedFrame::Decoded(Rc::new(block)))
+                    .map_err(|e| self.locate(frame.source, frame.file_offset, e));
+            };
+            let mut counts = RunCounts {
+                elements: count,
+                duplicates: count * (copies as u64 - 1),
+                aliased_decodes_saved: copies as u64 - 1,
+                frames_copied: 1,
+                ..RunCounts::default()
+            };
+            for bytes in bytes.chunks(crate::tunables::OVERLAP_RUN_CHUNK_BYTES) {
+                let chunk = bytes.to_vec();
+                counts.chunk_high_water = counts.chunk_high_water.max(chunk.capacity());
+                counts.staged_high_water = counts.chunk_high_water;
+                counts.chunks += 1;
+                self.emitter.send(vec![chunk])?;
+            }
+            Ok(IsolatedFrame::Copied(counts))
+        });
+        frame_buf.release_outlier(self.cancel);
+        result
+    }
+
+    fn open_shared(
+        &self,
+        entry: &BlobEntry,
+        frame_buf: &mut FrameBuf,
+        shared: &mut SharedBlocks,
+        counts: &mut RunCounts,
+    ) -> Result<Cursor> {
+        let frame = &self.frames[entry.frame];
+        let block = if let Some(alias) = frame.alias
+            && alias.primary != entry.frame
+        {
+            let (block, remaining) = shared.get_mut(&alias.primary).ok_or_else(|| {
+                crate::Error::internal("overlap run opened a frame alias before its primary")
+            })?;
+            let block = Rc::clone(block);
+            *remaining -= 1;
+            if *remaining == 0 {
+                shared.remove(&alias.primary);
+            }
+            counts.aliased_decodes_saved += 1;
+            block
+        } else {
+            let block = Rc::new(read_block(
+                &self.sources[frame.source],
+                frame,
+                frame_buf,
+                self.cancel,
+            )?);
+            if let Some(alias) = frame.alias {
+                shared.insert(alias.primary, (Rc::clone(&block), alias.copies - 1));
+            }
+            block
+        };
+        let mut cursor = self.open(entry, frame, block)?;
+        if self.dedupe
+            && frame
+                .alias
+                .is_some_and(|alias| alias.primary != entry.frame)
+        {
+            cursor.copies = 0;
+        }
+        Ok(cursor)
+    }
+
+    /// Open a cursor on a decoded entry.
+    fn open(&self, entry: &BlobEntry, frame: &Frame, block: Rc<PrimitiveBlock>) -> Result<Cursor> {
         // A believed header claim routed this blob to this kind's sweep and
         // placed it in the run, so it is held to the claim (see the module
         // docs). A scanned entry's index came from the payload; a
         // restructured frame is read per kind on purpose.
         let believed = !entry.index_scanned;
-        if believed {
-            block.refuse_foreign_kind(Some(entry.index.kind))?;
-        }
-        Cursor::open(
-            block,
-            self.kind,
-            believed.then_some(entry.index),
-            entry.intra_unsorted || entry.restructured,
-            (frame.source, frame.file_offset),
-        )
+        let result = (|| {
+            if believed {
+                block.refuse_foreign_kind(Some(entry.index.kind))?;
+            }
+            Cursor::open(
+                block,
+                self.kind,
+                believed.then_some(entry.index),
+                entry.intra_unsorted || entry.restructured,
+                (frame.source, frame.file_offset),
+            )
+        })();
+        result.map_err(|e| self.locate(frame.source, frame.file_offset, e))
     }
 }
 
@@ -881,14 +1050,14 @@ impl Cursor {
     /// lazily, or through views sorted by OSM ID when `sorted_views`; held to
     /// `claim` when one is given.
     fn open(
-        block: PrimitiveBlock,
+        block: impl Into<Rc<PrimitiveBlock>>,
         kind: ElementKind,
         claim: Option<crate::blob_meta::BlobIndex>,
         sorted_views: bool,
         (source, offset): (usize, u64),
     ) -> Result<Cursor> {
+        let block = block.into();
         let mut pinned = block.decompressed_size();
-        let block = Rc::new(block);
         let (feed, total) = if sorted_views {
             // Sized up front from the block's own count (every kind, so a
             // restructured block over-reserves by its other kinds), so the
@@ -933,6 +1102,7 @@ impl Cursor {
             source,
             offset,
             occurrence: 0,
+            copies: 1,
             pulled: 0,
             total,
             pinned,
@@ -969,6 +1139,7 @@ impl Sweep<'_, '_> {
                 .ok_or_else(|| crate::Error::internal("sweep heap names an empty cursor"))?;
             let tie = (cursor.source, cursor.offset, cursor.occurrence);
             let (source, offset) = (cursor.source, cursor.offset);
+            let copies = cursor.copies;
             let pinned_before = cursor.pinned;
             cursor
                 .advance()
@@ -984,6 +1155,17 @@ impl Sweep<'_, '_> {
                 merge.visits = 0;
                 self.checkpoint()?;
             }
+            if copies == 0 && merge.demoted == 0 {
+                // The primary has strictly earlier argument precedence.
+                // It supplied this version regardless of which copy won.
+                // After demotion, owned metadata can normalize a version
+                // that a still-borrowed alias would keep, so compare both.
+                validate_loser(&item, self.keep_locations)
+                    .map_err(|e| self.locate(source, offset, e))?;
+                counts.duplicates += 1;
+                continue;
+            }
+            counts.duplicates += copies.saturating_sub(1);
             let member = Member {
                 version: item.version(),
                 tie,
@@ -993,6 +1175,18 @@ impl Sweep<'_, '_> {
         }
         // The index points into the unsorted group; sorting invalidates it.
         merge.versions.clear();
+        if let Some(source) = merge.alias_validation_source {
+            // Internal losers were validated while the primary supplied
+            // them. Each of its surviving versions also occurred in the
+            // first alias, where the old sweep validated it as a loser.
+            for (i, member) in merge.group.iter().enumerate() {
+                validate_loser(&member.item, self.keep_locations)
+                    .map_err(|e| self.locate(source, member.tie.1, e))?;
+                if (i + 1).is_multiple_of(crate::tunables::SWEEP_CHECKPOINT_REMOVALS) {
+                    self.checkpoint()?;
+                }
+            }
+        }
         // A large group's sort and encode get their own checks; an ordinary
         // one is covered by the pull checks around it.
         let large = merge.group.len() >= crate::tunables::SWEEP_CHECKPOINT_REMOVALS;

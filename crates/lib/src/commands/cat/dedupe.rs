@@ -4,14 +4,15 @@
 //!
 //! Two-pass blob-level merge through the engine shared with `sort`
 //! (`commands::blob_merge`):
-//!   Pass 1: Build blob index from all input files
+//!   Pass 1: Build blob index from all pinned sources, in argument order
 //!   Pass 2: Write in sorted order - passthrough for non-overlapping blobs,
-//!           decode + sweep merge with dedup for overlapping blobs.
+//!           sweep merge with dedup for overlapping blobs.
 //!
 //! Exact duplicates (same type, ID, version) across input files are removed.
-//! Common when merging geographic extracts that share border elements. Only
-//! blobs whose ID ranges overlap are ever decoded, so duplicates *within* one
-//! blob that overlaps nothing pass through untouched.
+//! This is common when merging geographic extracts that share border elements.
+//! A normally ordered, single-kind blob with an isolated ID range keeps its
+//! internal duplicates. Repeated pinned inputs still overlap, even when
+//! their frames can share a decode.
 //!
 //! The output header is reconciled across every input's header by the same
 //! owner every command uses (`commands::output_header::build`).
@@ -41,6 +42,8 @@ pub struct MergePbfStats {
     /// a lying indexdata moved N with no way for the reader to tell.
     pub passthrough_claimed: u64,
     pub blobs_passthrough: u64,
+    /// Input blobs assigned to a sweep, including those the sweep proves
+    /// it can copy byte-for-byte.
     pub blobs_rewritten: u64,
     /// Blobs holding no element, left out of the output.
     pub blobs_omitted: u64,
@@ -84,8 +87,9 @@ impl MergePbfStats {
 /// All inputs must be sorted (Sort.Type_then_ID), and each must start with
 /// exactly one OSMHeader blob. Uses blob-level index for fast passthrough of
 /// non-overlapping blobs; overlapping blobs are decoded, merged, and deduped
-/// via a streaming sweep. A blob that overlaps no other is never decoded, so
-/// duplicates inside it survive.
+/// via a streaming sweep, with a byte-equivalence fast path for compatible
+/// repeated-source frames. Isolated, ordered, single-kind blobs are copied
+/// through with their internal duplicates.
 ///
 /// Every input is pinned before any is read, as in [`cat`](super::cat), so
 /// each is read from the file the run started on; a caller's pin is used as
@@ -192,7 +196,7 @@ fn plan_merge(
     // one: each blob without indexdata is scanned, so the plan rests on
     // observed ranges for it (reference/indexdata-trust.md, "Missing and
     // partial indexdata").
-    let (headers, indexed) = blob_merge::index_inputs(
+    let (headers, indexed) = blob_merge::index_merge_inputs(
         &pins,
         &IndexPolicy {
             require_sorted: Some(
@@ -664,6 +668,220 @@ mod tests {
         assert_eq!(stats.duplicates_removed, 2);
         assert_eq!(stats.blobs_rewritten, 2);
         assert_eq!(stats.blobs_passthrough, 2);
+    }
+
+    #[cfg(unix)]
+    mod aliases {
+        use super::*;
+        use crate::block_builder::{HeaderBuilder, Metadata};
+        use crate::writer::Compression;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        #[derive(Default)]
+        struct Counters {
+            saved: AtomicI64,
+            copied: AtomicI64,
+        }
+
+        impl crate::debug::InstrumentSink for Counters {
+            fn marker(&self, _name: &str) {}
+
+            fn counter(&self, name: &str, value: i64) {
+                match name {
+                    "overlap_run_aliased_decodes_saved" => {
+                        self.saved.store(value, Ordering::Relaxed);
+                    }
+                    "overlap_run_frames_copied" => {
+                        self.copied.store(value, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        type NodeBlob<'a> = (&'a [(i64, Option<i32>)], bool);
+
+        fn write_nodes(path: &Path, blobs: &[NodeBlob<'_>], compression: Compression) {
+            let file = std::fs::File::create(path).expect("create fixture");
+            let mut writer = PbfWriter::new(std::io::BufWriter::new(file), compression);
+            writer
+                .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+                .expect("write header");
+            let mut builder = BlockBuilder::new();
+            let mut lat = 0;
+            for &(nodes, indexed) in blobs {
+                for &(id, version) in nodes {
+                    lat += 1; // Also distinguishes conflicting copies of the same ID/version.
+                    let meta = version.map(|version| Metadata {
+                        version,
+                        timestamp: 1_000,
+                        changeset: 1,
+                        uid: 1,
+                        user: "mapper",
+                        visible: true,
+                    });
+                    builder.add_node(id, lat, -lat, [], meta.as_ref());
+                }
+                // Match the sweep's framing. The scanning writer emits an
+                // empty tag index for these untagged blocks, which the sweep
+                // omits and therefore cannot copy byte-for-byte.
+                let block = builder.take_owned().expect("encode").expect("block");
+                if indexed {
+                    writer
+                        .write_primitive_block_owned(block)
+                        .expect("write block");
+                } else {
+                    writer
+                        .write_primitive_block_owned_no_indexdata(block)
+                        .expect("write bare block");
+                }
+            }
+            writer.flush().expect("flush fixture");
+        }
+
+        fn run(
+            inputs: &[&Path],
+            output: &Path,
+            compression: Compression,
+        ) -> (MergePbfStats, Vec<u8>, i64, i64) {
+            let counters = Arc::new(Counters::default());
+            let mut host = crate::host::Host::for_tests();
+            host.invocation = crate::host::Invocation::with_sink(
+                Arc::clone(&counters) as Arc<dyn crate::debug::InstrumentSink>
+            );
+            let bound = crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .expect("output");
+            let stats = merge_pbf(
+                inputs,
+                bound,
+                &WriteOptions {
+                    compression,
+                    ..WriteOptions::default()
+                },
+                &HeaderOverrides::default(),
+                &host,
+            )
+            .expect("merge");
+            (
+                stats,
+                std::fs::read(output).expect("read merged output"),
+                counters.saved.load(Ordering::Relaxed),
+                counters.copied.load(Ordering::Relaxed),
+            )
+        }
+
+        #[test]
+        fn canonical_raw_self_merge_copies_frames_but_other_compression_rewrites() {
+            let dir = crate::path_guard::tests::scratch();
+            let path = |name| dir.path().join(name);
+            let a = path("a.osm.pbf");
+            let b = path("b.osm.pbf");
+            write_nodes(
+                &a,
+                &[
+                    (&[(0, None), (-1, None), (-4, None), (2, None)], true),
+                    (&[(3, None), (8, None)], true),
+                ],
+                Compression::None,
+            );
+            std::fs::copy(&a, &b).expect("copy to distinct inode for the oracle");
+            for (compression, expected_copies) in
+                [(Compression::None, 2), (Compression::default(), 0)]
+            {
+                let (stats, bytes, saved, copied) =
+                    run(&[&a, &a], &path("aliased.osm.pbf"), compression);
+                let (old, expected, _, _) = run(&[&a, &b], &path("oracle.osm.pbf"), compression);
+                assert!(
+                    bytes == expected,
+                    "output bytes changed with {compression:?}"
+                );
+                assert_eq!(
+                    (stats.nodes, stats.duplicates_removed, stats.blobs_total),
+                    (6, 6, 4)
+                );
+                assert_eq!(stats.blobs_rewritten, old.blobs_rewritten);
+                assert_eq!(
+                    (saved, copied),
+                    (2, expected_copies),
+                    "(aliased decodes saved, frames copied) with {compression:?}"
+                );
+                std::fs::remove_file(path("aliased.osm.pbf")).expect("remove iteration output");
+                std::fs::remove_file(path("oracle.osm.pbf")).expect("remove oracle output");
+            }
+        }
+
+        #[test]
+        fn self_merge_keeps_the_sweep_at_repeated_ids_and_blob_boundaries() {
+            let dir = crate::path_guard::tests::scratch();
+            let path = |name| dir.path().join(name);
+            let a = path("a.osm.pbf");
+            let b = path("b.osm.pbf");
+            write_nodes(
+                &a,
+                &[
+                    (&[(1, None), (1, None)], true),
+                    (&[(2, Some(3)), (2, Some(1)), (3, Some(1))], true),
+                    (&[(3, Some(1)), (3, Some(2)), (4, Some(1))], false),
+                    (&[(5, None), (7, None)], true),
+                ],
+                Compression::None,
+            );
+            std::fs::copy(&a, &b).expect("copy to distinct inode for the oracle");
+            let (stats, actual, saved, copied) =
+                run(&[&a, &a], &path("aliased.osm.pbf"), Compression::None);
+            let (old, expected, _, _) = run(&[&a, &b], &path("oracle.osm.pbf"), Compression::None);
+            assert!(actual == expected, "output bytes changed at a repeated ID");
+            assert_eq!((stats.nodes, stats.duplicates_removed), (8, 12));
+            assert_eq!(stats.blobs_rewritten, old.blobs_rewritten);
+            assert_eq!(
+                (saved, copied),
+                (4, 1),
+                "(aliased decodes saved, frames copied)"
+            );
+        }
+
+        #[test]
+        fn hard_link_aliases_keep_argument_precedence_with_other_inputs() {
+            let dir = crate::path_guard::tests::scratch();
+            let path = |name| dir.path().join(name);
+            let a = path("a.osm.pbf");
+            let other = path("other.osm.pbf");
+            let link = path("hard-link.osm.pbf");
+            let b = path("b.osm.pbf");
+            let c = path("c.osm.pbf");
+            let compression = Compression::default();
+            write_nodes(
+                &a,
+                &[(&[(1, None), (3, None), (5, None)], true)],
+                compression,
+            );
+            write_nodes(
+                &other,
+                &[(&[(1, None), (2, None), (3, None)], true)],
+                compression,
+            );
+            std::fs::hard_link(&a, &link).expect("hard link to the first inode");
+            std::fs::copy(&a, &b).expect("distinct inode");
+            std::fs::copy(&a, &c).expect("distinct inode");
+            let (stats, actual, saved, copied) = run(
+                &[&a, &other, &link, &a],
+                &path("aliased.osm.pbf"),
+                compression,
+            );
+            let (_, expected, _, _) =
+                run(&[&a, &other, &b, &c], &path("oracle.osm.pbf"), compression);
+            assert!(actual == expected, "hard link changed argument precedence");
+            assert_eq!(
+                (stats.nodes, stats.duplicates_removed, stats.blobs_total),
+                (4, 8, 4)
+            );
+            assert_eq!((saved, copied), (2, 0));
+        }
     }
 
     // The two failure cases drive pass 2's frame reads (`read_block` for an

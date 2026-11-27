@@ -70,6 +70,15 @@ pub(crate) struct Frame {
     /// clears it on a rewritten frame, so after planning it is exactly "this
     /// passthrough is reframed".
     pub(crate) reindex: Option<Reindex>,
+    alias: Option<FrameAlias>,
+}
+
+/// Logical copies of a frame of a repeated pinned input. Each copy keeps
+/// its original argument position in the plan.
+#[derive(Clone, Copy)]
+struct FrameAlias {
+    primary: usize,
+    copies: usize,
 }
 
 /// The index and tag key set a reframed passthrough carries, both scanned
@@ -100,6 +109,7 @@ pub(crate) struct Reindex {
 /// One element kind's share of a [`Frame`]: what the plan orders and the
 /// sweep merges. An ordinary blob has one; a block no single index describes
 /// has one per kind it holds, all of the same frame and all rewritten.
+#[derive(Clone, Copy)]
 pub(crate) struct BlobEntry {
     /// The frame (an index into [`Plan::frames`]).
     pub(crate) frame: usize,
@@ -136,6 +146,85 @@ pub(crate) struct Indexed {
     /// them, and they hold no OSM content (only whatever unknown fields they
     /// carried, which go with them).
     pub(crate) omitted: u64,
+}
+
+#[derive(Clone, Copy)]
+struct InputAlias {
+    first: usize,
+    copies: usize,
+}
+
+#[cfg(unix)]
+fn input_aliases(inputs: &[PinnedInput]) -> Result<Vec<InputAlias>> {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+
+    if inputs.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let mut first_by_inode = HashMap::new();
+    let mut aliases: Vec<InputAlias> = Vec::with_capacity(inputs.len());
+    for (source, input) in inputs.iter().enumerate() {
+        let meta = input.metadata()?;
+        let first = *first_by_inode
+            .entry((meta.dev(), meta.ino()))
+            .or_insert(source);
+        aliases.push(InputAlias { first, copies: 0 });
+        aliases[first].copies += 1;
+    }
+    if first_by_inode.len() == inputs.len() {
+        aliases.clear();
+    }
+    Ok(aliases)
+}
+
+impl Indexed {
+    /// Restore the argument-ordered entry stream that the planner would
+    /// get from separate walks. In particular, even an isolated repeated
+    /// frame enters an overlap run, where its internal repeats are deduped.
+    fn expand_aliases(&mut self, aliases: &[InputAlias]) {
+        if aliases.is_empty() {
+            return;
+        }
+        let entry_count = self.entries.len();
+        let entries = std::mem::replace(&mut self.entries, Vec::with_capacity(entry_count));
+        let primary_frames = self.frames.len();
+        for (source, alias) in aliases.iter().enumerate() {
+            let frames = &self.frames[..primary_frames];
+            let start = frames.partition_point(|f| f.source < alias.first);
+            let end = frames.partition_point(|f| f.source <= alias.first);
+            let first_entry = entries.partition_point(|e| e.frame < start);
+            let last_entry = entries.partition_point(|e| e.frame < end);
+            let entries = &entries[first_entry..last_entry];
+            if source == alias.first {
+                self.entries.extend_from_slice(entries);
+                continue;
+            }
+
+            let new_start = self.frames.len();
+            for primary in start..end {
+                let alias = FrameAlias {
+                    primary,
+                    copies: aliases[alias.first].copies,
+                };
+                let original = &mut self.frames[primary];
+                original.alias = Some(alias);
+                let frame = Frame {
+                    source,
+                    file_offset: original.file_offset,
+                    frame_len: original.frame_len,
+                    // The original and every copy enter the same rewrite run.
+                    reindex: None,
+                    alias: Some(alias),
+                };
+                self.frames.push(frame);
+            }
+            self.entries.extend(entries.iter().map(|entry| BlobEntry {
+                frame: new_start + (entry.frame - start),
+                ..*entry
+            }));
+        }
+    }
 }
 
 /// What pass 1 accepts and refuses: the part of a command's input contract
@@ -240,17 +329,42 @@ pub(crate) fn index_inputs(
     direct_io: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
+    index_with_aliases(inputs, &[], policy, direct_io, host)
+}
+
+/// Index one physical source per pinned file in a deduplicating merge.
+pub(crate) fn index_merge_inputs(
+    inputs: &[PinnedInput],
+    policy: &IndexPolicy,
+    direct_io: bool,
+    host: &crate::host::Entered<'_>,
+) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
+    #[cfg(unix)]
+    let aliases = input_aliases(inputs)?;
+    // Off Unix these pins identify paths, which can be replaced between opens.
+    #[cfg(not(unix))]
+    let aliases = [];
+    index_with_aliases(inputs, &aliases, policy, direct_io, host)
+}
+
+fn index_with_aliases(
+    inputs: &[PinnedInput],
+    aliases: &[InputAlias],
+    policy: &IndexPolicy,
+    direct_io: bool,
+    host: &crate::host::Entered<'_>,
+) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
     #[cfg(not(feature = "linux-direct-io"))]
     if direct_io {
         return Err(crate::file_reader::direct_reads_unsupported());
     }
     #[cfg(feature = "linux-direct-io")]
     if direct_io {
-        return index_over(inputs, policy, host, |input| {
+        return index_over(inputs, aliases, policy, host, |input| {
             HeaderWalker::open_direct(input, host)
         });
     }
-    index_over(inputs, policy, host, |input| {
+    index_over(inputs, aliases, policy, host, |input| {
         HeaderWalker::open(input, host)
     })
 }
@@ -280,12 +394,14 @@ impl PayloadRead for crate::read::direct_reader::DirectPositional {
 /// fold on the calling thread, the payload scans on a worker pool.
 fn index_over<P: PayloadRead>(
     inputs: &[PinnedInput],
+    aliases: &[InputAlias],
     policy: &IndexPolicy,
     host: &crate::host::Entered<'_>,
     open: impl Fn(&PinnedInput) -> Result<HeaderWalker<P>>,
 ) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
     let mut walk = Walk {
         inputs,
+        aliases,
         policy,
         open,
         input: 0,
@@ -298,6 +414,7 @@ fn index_over<P: PayloadRead>(
     };
     let mut fold = Fold {
         host,
+        aliases,
         indexed: Indexed {
             frames: Vec::new(),
             entries: Vec::new(),
@@ -345,6 +462,7 @@ fn index_over<P: PayloadRead>(
         },
         &mut fold,
     )?;
+    fold.indexed.expand_aliases(aliases);
     Ok((walk.headers, fold.indexed))
 }
 
@@ -354,6 +472,7 @@ fn index_over<P: PayloadRead>(
 /// when one strikes go out as a task of their own before it is returned.
 struct Walk<'a, P, O> {
     inputs: &'a [PinnedInput],
+    aliases: &'a [InputAlias],
     policy: &'a IndexPolicy,
     open: O,
     /// The next input to open.
@@ -458,6 +577,18 @@ impl<P: PayloadRead, O: Fn(&PinnedInput) -> Result<HeaderWalker<P>>> Walk<'_, P,
                 let source = self.input;
                 self.input += 1;
                 let mut walker = (self.open)(input)?;
+                if let Some(alias) = self.aliases.get(source)
+                    && alias.first != source
+                {
+                    // Still reopen through this argument's pin. Path-based
+                    // pin reopening can refuse a replaced name independently.
+                    self.invocation.check()?;
+                    let header = self.headers.get(alias.first).cloned().ok_or_else(|| {
+                        Error::internal("aliased input has no earlier indexed header")
+                    })?;
+                    self.headers.push(header);
+                    continue;
+                }
                 if self.policy.accept_partial_index || self.policy.distrust_metadata {
                     walker = walker.accepting_partial_index();
                 }
@@ -779,6 +910,7 @@ fn decide(
 /// the serial walk pushed them.
 struct Fold<'a, 'h> {
     host: &'a crate::host::Entered<'h>,
+    aliases: &'a [InputAlias],
     indexed: Indexed,
     noted_unclaimed: bool,
 }
@@ -811,6 +943,7 @@ impl crate::ordered_pool::StreamConsumer<Infallible, Done> for Fold<'_, '_> {
                     file_offset: b.file_offset,
                     frame_len: b.frame_len,
                     reindex: None,
+                    alias: None,
                 },
                 [BlobEntry {
                     frame,
@@ -842,6 +975,7 @@ impl crate::ordered_pool::StreamConsumer<Infallible, Done> for Fold<'_, '_> {
             file_offset: scan.file_offset,
             frame_len: scan.frame_len,
             reindex: None,
+            alias: None,
         };
         match scan.outcome? {
             Outcome::Block {
@@ -861,7 +995,9 @@ impl crate::ordered_pool::StreamConsumer<Infallible, Done> for Fold<'_, '_> {
                     }],
                 );
             }
-            Outcome::Kinds(kinds) if kinds.is_empty() => self.indexed.omitted += 1,
+            Outcome::Kinds(kinds) if kinds.is_empty() => {
+                self.indexed.omitted += self.aliases.get(source).map_or(1, |a| a.copies as u64);
+            }
             Outcome::Kinds(kinds) => self.push(
                 new_frame,
                 kinds.into_iter().map(|index| BlobEntry {
@@ -1371,6 +1507,8 @@ pub(crate) struct WriteCounts {
 struct RunCounts {
     elements: u64,
     duplicates: u64,
+    aliased_decodes_saved: u64,
+    frames_copied: u64,
     pinned_high_water: usize,
     demoted: u64,
     chunks: u64,
@@ -1382,6 +1520,8 @@ struct RunCounts {
 /// each: maxima of the high-water marks, sums of the counts.
 #[derive(Default)]
 struct RunResources {
+    aliased_decodes_saved: u64,
+    frames_copied: u64,
     pinned_high_water: usize,
     demoted: u64,
     chunks: u64,
@@ -1391,6 +1531,8 @@ struct RunResources {
 
 impl RunResources {
     fn fold(&mut self, run: &RunCounts) {
+        self.aliased_decodes_saved += run.aliased_decodes_saved;
+        self.frames_copied += run.frames_copied;
         self.pinned_high_water = self.pinned_high_water.max(run.pinned_high_water);
         self.demoted += run.demoted;
         self.chunks += run.chunks;
@@ -1399,6 +1541,15 @@ impl RunResources {
     }
 
     fn emit(&self, invocation: &crate::host::Recorder) {
+        if self.aliased_decodes_saved != 0 {
+            invocation.counter(
+                "overlap_run_aliased_decodes_saved",
+                self.aliased_decodes_saved,
+            );
+        }
+        if self.frames_copied != 0 {
+            invocation.counter("overlap_run_frames_copied", self.frames_copied);
+        }
         invocation.counter(
             "overlap_run_pinned_high_water_bytes",
             self.pinned_high_water,
@@ -1734,13 +1885,16 @@ pub(crate) fn read_block(
     buf: &mut FrameBuf,
     invocation: &crate::host::Recorder,
 ) -> Result<crate::PrimitiveBlock> {
-    let block = buf.read(source, frame).and_then(|bytes| {
-        frame_parts(bytes)
-            .and_then(|(_, blob)| decode_blob_to_primitiveblock(blob))
-            .map_err(|e| source.locate_at(frame.file_offset, e))
-    });
+    let block = buf
+        .read(source, frame)
+        .and_then(|bytes| decode_frame(bytes).map_err(|e| source.locate_at(frame.file_offset, e)));
     buf.release_outlier(invocation);
     block
+}
+
+fn decode_frame(bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
+    let (_, blob) = frame_parts(bytes)?;
+    decode_blob_to_primitiveblock(blob)
 }
 
 /// The BlobHeader and Blob bytes of a complete frame,
@@ -1790,6 +1944,7 @@ mod tests {
             file_offset: 0,
             frame_len: 0,
             reindex: None,
+            alias: None,
         }
     }
 

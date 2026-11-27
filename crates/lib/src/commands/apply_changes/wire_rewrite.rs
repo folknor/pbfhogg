@@ -77,14 +77,13 @@ pub(super) fn try_rewrite(
     result.unwrap_or(None)
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn rewrite<'a>(
     block: &'a ValidatedBlock<'_>,
     inputs: WireInputs<'a>,
     bb: &mut BlockBuilder,
 ) -> Result<Option<WireRewrite>> {
-    let source_table_bytes = (0..block.string_count())
-        .map(|i| block.string(i).map_or(0, |s| string_field_len(s.len())))
-        .sum();
+    let source_table_bytes = source_table_size(block);
     let sure = Limits::new(*inputs.compression).sure();
     if source_table_bytes > sure {
         return Ok(None);
@@ -98,18 +97,12 @@ fn rewrite<'a>(
             cursor.skip_field(wire)?;
             continue;
         }
-        let mut group = Cursor::new(cursor.read_len_delimited()?);
-        while let Some((field, wire)) = group.read_tag()? {
-            match (kind, field, wire) {
-                (ElementKind::Node, 2, WIRE_LEN) => {
-                    output.dense(group.read_len_delimited()?, &mut selection)?;
-                }
-                (ElementKind::Way, 3, WIRE_LEN) | (ElementKind::Relation, 4, WIRE_LEN) => {
-                    output.ordinary(group.read_len_delimited()?, &mut selection)?;
-                }
-                _ => return Err(use_builder()),
-            }
-        }
+        rewrite_group(
+            cursor.read_len_delimited()?,
+            kind,
+            &mut output,
+            &mut selection,
+        )?;
     }
     output.add_edits(selection.inline.clone())?;
     let first = selection.walk.finish()?.ok_or_else(use_builder)?;
@@ -122,6 +115,35 @@ fn rewrite<'a>(
         output: output.finish(),
         forced: !selection.matched,
     }))
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn source_table_size(block: &ValidatedBlock<'_>) -> usize {
+    (0..block.string_count())
+        .map(|i| block.string(i).map_or(0, |s| string_field_len(s.len())))
+        .sum()
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn rewrite_group(
+    data: &[u8],
+    kind: ElementKind,
+    output: &mut WireOutput<'_, '_>,
+    selection: &mut Selection<'_>,
+) -> Result<()> {
+    let mut group = Cursor::new(data);
+    while let Some((field, wire)) = group.read_tag()? {
+        match (kind, field, wire) {
+            (ElementKind::Node, 2, WIRE_LEN) => {
+                output.dense(group.read_len_delimited()?, selection)?;
+            }
+            (ElementKind::Way, 3, WIRE_LEN) | (ElementKind::Relation, 4, WIRE_LEN) => {
+                output.ordinary(group.read_len_delimited()?, selection)?;
+            }
+            _ => return Err(use_builder()),
+        }
+    }
+    Ok(())
 }
 
 fn message_field(kind: ElementKind) -> u32 {
@@ -156,8 +178,7 @@ impl<'a> Selection<'a> {
     fn row(&mut self, id: i64) -> Result<(Range<usize>, DiffHit)> {
         let kind = self.claim.kind;
         if self.walk.first().is_none() {
-            let last = crate::osm_id::blob_osm_last_key(self.claim.min_id, self.claim.max_id);
-            self.inline = self.diff.upsert_range(kind, id, last);
+            self.find_inline_edits(id);
         }
         self.walk.observe(id)?;
         let start = self.inline.start;
@@ -174,6 +195,12 @@ impl<'a> Selection<'a> {
         let hit = self.seeks.find(self.diff, kind, id);
         self.matched |= hit != DiffHit::None;
         Ok((creates, hit))
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn find_inline_edits(&mut self, id: i64) {
+        let last = crate::osm_id::blob_osm_last_key(self.claim.min_id, self.claim.max_id);
+        self.inline = self.diff.upsert_range(self.claim.kind, id, last);
     }
 
     fn check_version(&self, id: i64, hit: DiffHit, version: Option<i32>) -> Result<()> {
@@ -201,6 +228,7 @@ struct Slots<'a> {
 impl<'a> Slots<'a> {
     const UNMAPPED: u32 = u32::MAX;
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn new(source_count: usize) -> Self {
         Self {
             source: vec![Self::UNMAPPED; source_count],
@@ -211,6 +239,7 @@ impl<'a> Slots<'a> {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn clear(&mut self) {
         self.source.fill(Self::UNMAPPED);
         self.values.truncate(1);
@@ -241,6 +270,7 @@ impl<'a> Slots<'a> {
         Ok(slot)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn edit_table(&mut self, data: &[u8]) -> Result<Vec<u32>> {
         let mut table = Cursor::new(data);
         let mut map = Vec::new();
@@ -260,6 +290,7 @@ impl<'a> Slots<'a> {
         Ok(map)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn write_table(&self, out: &mut Vec<u8>) {
         encode_tag(out, 1, WIRE_LEN);
         encode_varint(out, self.table_len as u64);
@@ -268,6 +299,7 @@ impl<'a> Slots<'a> {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn tagdata(&self) -> Option<Vec<u8>> {
         if self.keys.is_empty() {
             return None;
@@ -290,6 +322,7 @@ fn string_field_len(bytes: usize) -> usize {
 /// Refresh a blob that fits the builder's existing element cap in place
 /// on the wire. Its default framing already represents the new locations.
 /// Keep the source table and group layout, and copy every unaffected span.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn refresh_block<'a>(
     block: &'a ValidatedBlock<'_>,
     inputs: WireInputs<'a>,
@@ -322,45 +355,7 @@ fn refresh_block<'a>(
         let group = cursor.read_len_delimited()?;
         let before = output.refresh.ways;
         group_out.clear();
-        let mut ways = Cursor::new(group);
-        while !ways.is_empty() {
-            let start = ways.position();
-            if ways.read_tag()? != Some((3, WIRE_LEN)) {
-                return Err(use_builder());
-            }
-            let data = ways.read_len_delimited()?;
-            let way = WireWay::parse(data)?;
-            if way.pins_data.is_some() {
-                // The normal rewrite removes stale enrichment.
-                return Err(use_builder());
-            }
-            walk.observe(way.id)?;
-            output.add_bytes(ELEMENT_OVERHEAD + VARINT_BYTES * way.refs_data.len())?;
-            output
-                .fields
-                .prepare_locations(&way, output.inputs.probe, &mut output.refresh)?;
-            let changed = output.fields.replace_locations;
-            let mut identity = |sid, key| {
-                let value = block.string(sid as usize).ok_or_else(use_builder)?;
-                if key {
-                    keys.insert(value.as_bytes());
-                }
-                Ok(sid)
-            };
-            let before_way = group_out.len();
-            let refs = output.fields.write_message(
-                data,
-                ElementKind::Way,
-                WayFields::RefreshOnly,
-                &mut identity,
-                &mut group_out,
-            )?;
-            if !changed {
-                group_out.truncate(before_way);
-                group_out.extend_from_slice(&group[start..ways.position()]);
-            }
-            output.add_bytes(refs * VARINT_BYTES)?;
-        }
+        refresh_group(group, &mut output, &mut walk, &mut keys, &mut group_out)?;
         if output.refresh.ways == before {
             output
                 .payload
@@ -373,13 +368,7 @@ fn refresh_block<'a>(
     if output.refresh.ways == 0 {
         return Ok(None);
     }
-    let mut keys: Vec<&[u8]> = keys.into_iter().collect();
-    keys.sort_unstable();
-    let tagdata = if keys.is_empty() {
-        None
-    } else {
-        encode_tag_index(keys.into_iter())
-    };
+    let tagdata = refresh_tagdata(keys);
     let index = BlobIndex {
         bbox: None,
         ..*output.inputs.claim
@@ -391,6 +380,68 @@ fn refresh_block<'a>(
         output: output.finish(),
         forced: false,
     }))
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn refresh_group<'a>(
+    group: &[u8],
+    output: &mut WireOutput<'a, '_>,
+    walk: &mut BlobWalk<'_>,
+    keys: &mut FxHashSet<&'a [u8]>,
+    group_out: &mut Vec<u8>,
+) -> Result<()> {
+    let block = output.source;
+    let mut ways = Cursor::new(group);
+    while !ways.is_empty() {
+        let start = ways.position();
+        if ways.read_tag()? != Some((3, WIRE_LEN)) {
+            return Err(use_builder());
+        }
+        let data = ways.read_len_delimited()?;
+        let way = WireWay::parse(data)?;
+        if way.pins_data.is_some() {
+            // The normal rewrite removes stale enrichment.
+            return Err(use_builder());
+        }
+        walk.observe(way.id)?;
+        output.add_bytes(ELEMENT_OVERHEAD + VARINT_BYTES * way.refs_data.len())?;
+        output
+            .fields
+            .prepare_locations(&way, output.inputs.probe, &mut output.refresh)?;
+        let changed = output.fields.replace_locations;
+        let mut identity = |sid, key| {
+            let value = block.string(sid as usize).ok_or_else(use_builder)?;
+            if key {
+                keys.insert(value.as_bytes());
+            }
+            Ok(sid)
+        };
+        let before_way = group_out.len();
+        let refs = output.fields.write_message(
+            data,
+            ElementKind::Way,
+            WayFields::RefreshOnly,
+            &mut identity,
+            group_out,
+        )?;
+        if !changed {
+            group_out.truncate(before_way);
+            group_out.extend_from_slice(&group[start..ways.position()]);
+        }
+        output.add_bytes(refs * VARINT_BYTES)?;
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn refresh_tagdata(keys: FxHashSet<&[u8]>) -> Option<Vec<u8>> {
+    let mut keys: Vec<&[u8]> = keys.into_iter().collect();
+    keys.sort_unstable();
+    if keys.is_empty() {
+        None
+    } else {
+        encode_tag_index(keys.into_iter())
+    }
 }
 
 struct WireOutput<'a, 'b> {
@@ -596,6 +647,7 @@ impl<'a, 'b> WireOutput<'a, 'b> {
         result
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn encode_edits(&mut self) -> Result<()> {
         let kind = self.inputs.claim.kind;
         let diff = self.inputs.diff;
@@ -644,6 +696,7 @@ impl<'a, 'b> WireOutput<'a, 'b> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn flush_frame(&mut self) -> Result<()> {
         if self.count == 0 {
             return Ok(());
@@ -657,10 +710,7 @@ impl<'a, 'b> WireOutput<'a, 'b> {
             count: self.count as u64,
             bbox: self.bbox.take(),
         };
-        self.payload.clear();
-        self.slots.write_table(&mut self.payload);
-        self.payload.extend_from_slice(&self.groups);
-        encode_bytes_field(&mut self.payload, 2, &self.ordinary_group);
+        self.assemble_payload();
         let tagdata = self.slots.tagdata();
         self.frame(index, tagdata.as_deref())?;
         self.groups.clear();
@@ -674,15 +724,30 @@ impl<'a, 'b> WireOutput<'a, 'b> {
         Ok(())
     }
 
-    fn frame(&mut self, index: BlobIndex, tagdata: Option<&[u8]>) -> Result<()> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn assemble_payload(&mut self) {
+        self.payload.clear();
+        self.slots.write_table(&mut self.payload);
+        self.payload.extend_from_slice(&self.groups);
+        encode_bytes_field(&mut self.payload, 2, &self.ordinary_group);
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn check_payload_size(&self) -> Result<()> {
         if self.payload.len() > self.sure {
             return Err(use_builder());
         }
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn frame(&mut self, index: BlobIndex, tagdata: Option<&[u8]>) -> Result<()> {
+        self.check_payload_size()?;
         let start = crate::counters::Stopwatch::start();
         let frame = crate::writer::frame_blob_pipelined(
             &self.payload,
             self.inputs.compression,
-            Some(&index.serialize()),
+            Some(&serialize_indexdata(&index)),
             tagdata,
             None,
             self.inputs.metrics,
@@ -696,6 +761,7 @@ impl<'a, 'b> WireOutput<'a, 'b> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn finish(self) -> RewriteOutput {
         RewriteOutput {
             frames: Some(self.frames),
@@ -704,6 +770,11 @@ impl<'a, 'b> WireOutput<'a, 'b> {
             refresh: self.refresh,
         }
     }
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn serialize_indexdata(index: &BlobIndex) -> [u8; crate::blob_meta::INDEX_SIZE] {
+    index.serialize()
 }
 
 /// The builder encodes the OSC records once per batch. Each offset is
@@ -743,6 +814,7 @@ impl EditSplice<'_> {
     }
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn write_edits(
     data: &[u8],
     kind: ElementKind,

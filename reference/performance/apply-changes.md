@@ -41,6 +41,35 @@ On B on bygg, tier 1 passed. `pbfhogg-verify apply-changes` passed in
 plain and locations modes on Denmark and Germany (Germany used
 `--osc-seq 4705`). The Germany `diff` verification also passed.
 
+### Hotpath profile after PERF-008 steps 1 and 2
+
+On bygg, the hotpath run at `8d1019fe` (`d7552e29`) used planet
+`altw-keep-untagged`, OSC 4913, and `--locations-on-ways`; wall time under
+the profiler was 3m04s. Behavior-neutral hotpath measure points covered the
+apply-changes wire-rewrite sub-steps and the block validator.
+
+| Function or work | Core-seconds | Detail |
+|---|---:|---|
+| `frame_blob_into` | 3,256 | zlib output compression at the default level; 1,444,501 frames |
+| `decompress_blob_raw` | 452 | |
+| `Dense::write_run` | 362 | Dense run copy |
+| `validate_block` | 195 | Includes `validate_groups` (182) and `validate_stringtable_utf8` (12) |
+| Dense info columns | 186 | |
+| `copy_coords` | 124 | |
+| Dense tags | 45 | |
+| Payload assembly | 14 | |
+| String slot table and tagdata | <30 | Combined |
+
+The rewritten output was 138.8 GB across 1,444,501 frames from 43,834
+rewritten source blobs. With the documented 8,000-element cap, a source
+blob of about 230,000 elements becomes about 30 output frames.
+
+After PERF-008 steps 1 and 2, apply-changes with locations is
+compression-bound: default-level zlib accounts for about 70% of CPU, while
+validation and the remaining decode each take only a few percent of wall
+time. Further editor work has little left to take. The default codec and
+level are a fixed decision, not a tuning knob, so the residue stands.
+
 ## History
 
 ### String-table compaction (bygg, baseline `5caa1101`)

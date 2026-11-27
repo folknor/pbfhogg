@@ -1137,6 +1137,7 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// group with at least one ID), and how many elements it holds, the count
 /// `PrimitiveBlock::elements` yields: one per plain node, way and relation
 /// message and the dense ID count each dense group's validation computes.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn validate_block<P: GroupProjection>(
     buffer: &[u8],
     st: &mut Vec<(u32, u32)>,
@@ -1249,6 +1250,7 @@ impl<'w> BlockBuffer<'w> {
     /// contradicts the claim. On success returns the projection and the
     /// validated block, which still owns the bytes and can become a
     /// [`PrimitiveBlock`] without validating again.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn project<P: GroupProjection>(
         self,
         make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
@@ -1526,6 +1528,7 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
 /// and hand each validated piece to `projection`. Returns the kinds the
 /// block holds and its element count. The group part of [`validate_block`],
 /// whose doc says what is checked and why; reached only through it.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn validate_groups<'a>(
     group_count: usize,
     group: impl Fn(usize) -> &'a [u8],
@@ -1630,6 +1633,7 @@ fn validate_groups<'a>(
 
 /// The string table's UTF-8 check, after every group, as block construction
 /// makes it: the first entry that is not UTF-8 is refused, by index.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn validate_stringtable_utf8<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Result<()> {
     for (index, raw) in entries.enumerate() {
         std::str::from_utf8(raw).map_err(|err| new_stringtable_utf8(err, index))?;

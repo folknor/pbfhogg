@@ -321,6 +321,8 @@ Reported by apply-core and apply-locations.
 
 String-table compaction and wire rewrites for eligible indexed blobs are
 covered in the [apply-changes performance record](../reference/performance/apply-changes.md#wire-rewrites-of-indexed-blobs-bygg-baseline-a01df138).
+The remaining locations-path cost is now compression-bound: the profile in
+that record attributes about 70% of CPU to default-level zlib compression.
 
 - Size output blocks by encoded bytes within PBF limits. This requires
   revisiting the [documented element cap](../docs/cli/commands.md#apply-changes),

@@ -17,6 +17,7 @@ use super::{
 };
 
 impl WireOutput<'_, '_> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn dense(&mut self, data: &[u8], selection: &mut Selection<'_>) -> Result<()> {
         let mut columns = Dense::new(data)?;
         let mut run = Run::default();
@@ -203,6 +204,7 @@ struct Dense<'a> {
 }
 
 impl<'a> Dense<'a> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn new(data: &'a [u8]) -> Result<Self> {
         let dense = WireDenseNodes::parse(data)?;
         let info = dense.info_data.map(WireDenseInfo::parse).transpose()?;
@@ -243,6 +245,7 @@ impl<'a> Dense<'a> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn write_run(
         &mut self,
         run: &Run,
@@ -278,6 +281,7 @@ impl<'a> Dense<'a> {
         Ok(refs + tags.1)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn write_info(
         &mut self,
         run: &Run,
@@ -338,6 +342,7 @@ impl<'a> Dense<'a> {
         Ok(refs)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn write_tags<'b>(
         &'b mut self,
         count: usize,
@@ -384,6 +389,7 @@ impl<'a> Dense<'a> {
     }
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn copy_coords(
     column: &mut Column<'_>,
     count: usize,
@@ -434,6 +440,7 @@ pub(super) struct Buffers {
 
 /// Reuse the same column encoder for dense groups from the OSC builder,
 /// which already carry the output framing and the normalized metadata.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn write_edits(
     data: &[u8],
     map: &mut impl FnMut(u32, bool) -> Result<u32>,

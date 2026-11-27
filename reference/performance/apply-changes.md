@@ -1,6 +1,52 @@
 # Apply Changes
 
-## Selective node-blob decode in location mode (bygg, stashed on `c0ec89ca`)
+## String-table compaction (bygg, baseline `5caa1101`)
+
+Each output batch holding base survivors seeds only the source string slots
+those survivors reference. OSC strings reuse matching entries through the
+existing content interner. An eligible single-block rewrite keeps the source
+table once. Size-sensitive blobs keep the original overflow path.
+
+The hotpath profile at HEAD `5caa1101` on bygg (`d9132114`, planet
+`altw-keep-untagged`, OSC 4913, `--locations-on-ways`) took 4m26s and
+rewrote 43,834 of 50,816 source blobs. It attributed 6,239 core-s to
+`rewrite_block_parallel`, 4,860 core-s to compression in `frame_blob_into`,
+and 445 core-s to decompression.
+
+On bygg, A is HEAD `5caa1101` and B is the working tree on `5caa1101`.
+Planet `apply-diff --osc 4913` cells were interleaved with `--iterations 1`
+and one fstrim at the head of the suite.
+
+| Workload | A | B | A | B | Wall reduction |
+|---|---|---|---|---|---:|
+| `--variant altw-keep-untagged --locations-on-ways yes` | 4m26s `2f65a257` | 3m19s `d2ebb252` | 4m28s `ae92dfa8` | 3m24s `b2acf0b5` | about 24 % |
+| Indexed, plain | 3m23s `753be2fa` | 2m21s `80300ee2` | 3m22s `ee8f09d4` | 2m21s `98364dca` | about 30 % |
+
+Plain mode on bygg, with the same A and B revisions:
+
+| Metric | A | B |
+|---|---:|---:|
+| Output bytes | 173,972,180,901 | 97,663,726,827 |
+| Rewritten output | 160.86 GB | 84.55 GB |
+| Frame size p50 (bytes) | 107,057 | 46,505 |
+| Frame size p95 (bytes) | 325,513 | 207,334 |
+| Frame size p99 (bytes) | 658,607 | 462,173 |
+| Device writes | 165.9 GB | 93.2 GB |
+| Elements written | 11,629,161,585 | 11,629,161,585 |
+| Passthrough blobs | 7,145 | 7,145 |
+| Rewritten source blobs | 43,671 | 43,671 |
+
+Repeating the source string table across output blocks nearly doubled the
+planet file on a daily apply. Compaction reduced the bytes framed and
+written with the same element count and source blob routing.
+
+On B on bygg, tier 1 passed. `pbfhogg-verify apply-changes` passed in plain
+and `--locations-on-ways` modes on Denmark and Germany (Germany used
+`--osc-seq 4705`).
+
+## History
+
+### Selective node-blob decode in location mode (bygg, stashed on `c0ec89ca`)
 
 The experiment decoded a node blob only when its range intersected a node
 change or a coordinate request.
@@ -30,7 +76,7 @@ intersection logic. Requests sort zero first, then negative IDs by
 magnitude, then positive IDs. Blob ranges use numeric order, so range
 intersection must account for the different ordering.
 
-## Grouped rewritten-frame writes and hit-driven refresh (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+### Grouped rewritten-frame writes and hit-driven refresh (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 The drain now submits consecutive rewritten frames in groups (up to
 `APPLY_CHANGES_REWRITE_GROUP_BYTES` or 16 frames) as one vectored write,
@@ -49,7 +95,7 @@ Wall neutral on both. Grouping removes the drain's send stall
 phase is CPU-bound on this host, not writer-bound, so the stall was not on
 the critical path. Kept, since it costs nothing and removes the stall.
 
-## Merge (apply-changes)
+### Merge (apply-changes)
 
 Best results per dataset.
 
@@ -87,7 +133,7 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
-### Deferred blobs streamed, replay budget removed (bygg, 2026-11-25, `67bcd55c` + change)
+#### Deferred blobs streamed, replay budget removed (bygg, 2026-11-25, `67bcd55c` + change)
 
 The first pass's sink gained a byte count per framed block against
 `APPLY_CHANGES_REWRITE_RETAIN_BYTES`, and the held item's frames became
@@ -98,7 +144,7 @@ baseline `--commit HEAD`, variant uncommitted: baseline 3m21s
 (`6ce554e3`) and 3m23s (`e765fb59`), variant 3m21s (`499cb884`) and
 3m23s (`03e72eb0`). Identical per position. Neutral.
 
-### Compact overflow replay: subset-seeded raw adds (bygg, 2026-11-24, `84088fed` + change)
+#### Compact overflow replay: subset-seeded raw adds (bygg, 2026-11-24, `84088fed` + change)
 
 The raw adds gained a subset-seed branch (one match per surviving
 element on the first pass; the translation runs only in the overflow
@@ -109,7 +155,7 @@ baseline `--commit HEAD`, variant uncommitted: baseline 195.9 s
 pair's 2 % gap sits inside the drift between the two baseline cells.
 Neutral.
 
-### `--direct-io` reaching the scanner, pool and splice reads (bygg, 2026-11-23, `fc3b6b79` + change)
+#### `--direct-io` reaching the scanner, pool and splice reads (bygg, 2026-11-23, `fc3b6b79` + change)
 
 Before the change `--direct-io` read only the front read `O_DIRECT`; the
 scanner's walker, the worker pool's preads and the splice source stayed
@@ -123,7 +169,7 @@ buffered reads were device reads too. The default (buffered) path gained
 one transport branch per blob read and was not measured. Renumber's
 equivalent change (its pools and schedule walk) is unmeasured.
 
-### XML 1.0 character check on every OSC input event (bygg, 2026-11-19, `a664c724` + change)
+#### XML 1.0 character check on every OSC input event (bygg, 2026-11-19, `a664c724` + change)
 
 Planet `apply-diff --osc 4913` after `fstrim`, `--iterations 1`:
 `a664c724` 198.29 s (`a8105a31`); variant 200.24 s (`a5760787`). The ingest
@@ -131,7 +177,7 @@ segment the check lands in (before `MERGE_LOOP`) went from 4612 to 4719 ms
 (+107 ms); the rest of the wall delta sits in the drive-bound trailing
 creates drain (684 to 1575 ms), not in parsing. About +1 % of wall, noise.
 
-### Base version check on matched elements (plantasjen, 2026-11-20, `ec250124` + change)
+#### Base version check on matched elements (plantasjen, 2026-11-20, `ec250124` + change)
 
 The rewrite compares each matched base element's version with the highest
 version the changes claimed for it, refusing a change set older than the
@@ -142,7 +188,7 @@ against 258.9 s at 21.8 cores in both, node transition creates 118.3 s
 against 118.0 s. Neutral; one pair, as the difference sits far below the
 noise band.
 
-### Overflow recovery: the rewrite walk as a step iterator (bygg, 2026-11-19, `3bafe5c0` + change)
+#### Overflow recovery: the rewrite walk as a step iterator (bygg, 2026-11-19, `3bafe5c0` + change)
 
 The worker's rewrite loop became a step iterator (so an output block over
 the 32 MiB payload limit can be written again from the same operations) with
@@ -158,7 +204,7 @@ phase (129.3 s to 134.8 s at 29 cores). Not landed. The landed form yields
 an element with no create before it as one step, parking only behind due
 creates: 195, 196 s (`d610315b`, `b0dbda39`). Neutral.
 
-### Drain blocks on its channel, no receive timeout (bygg, 2026-11-12, `ab647536` + change)
+#### Drain blocks on its channel, no receive timeout (bygg, 2026-11-12, `ab647536` + change)
 
 The drain's 25 ms `recv_timeout` became a plain `recv`: a published
 producer failure and a cancellation now send a wake on the drain channel.
@@ -167,7 +213,7 @@ uncommitted, no trim, planet apply-diff of OSC 4913: `ab647536` 195.6,
 196.3 s (`eed56339`, `0ccd390c`); variant 195.5, 197.1 s (`3758db8e`,
 `ae547c61`). Every phase of the first pair within 1 %. Neutral.
 
-### Hardware gzip CRC is neutral (bygg, 2026-11-11, `9b76817b` + change)
+#### Hardware gzip CRC is neutral (bygg, 2026-11-11, `9b76817b` + change)
 
 zlib-rs with `std`, so gzip checksums use carry-less multiply (see
 merge-changes.md, "Hardware gzip CRC"). After a trim, `--iterations 1`, both
@@ -175,7 +221,7 @@ arms `--commit`, A B B A, planet apply-diff of OSC 4913: `9b76817b` 191.6,
 195.2 s (`da7362cb`, `054477fc`); with `std` 194.2, 194.2 s (`a573fdd4`,
 `8bd4c062`). The 0.4 % between the means is noise.
 
-### Descriptor-first streaming pipeline
+#### Descriptor-first streaming pipeline
 
 Three-stage pipeline replacing the per-batch rayon barrier:
 
@@ -262,7 +308,7 @@ POOL_SIZE=16 is hard-coded in
 [`crates/lib/src/write/parallel_writer.rs`](../../crates/lib/src/write/parallel_writer.rs); the
 comment explains the measurement. Over-contends above 16.
 
-### Same-disk `-j N` sweep (LOW + zstd:1, planet, commit `16e3694`)
+#### Same-disk `-j N` sweep (LOW + zstd:1, planet, commit `16e3694`)
 
 Default writer (parallel pwrite, POOL_SIZE=16). `-j` is the
 descriptor-first scanner's worker pool size; default auto-detect on
@@ -280,7 +326,7 @@ table-row same-disk parallel pwrite zstd:1 (104.5 s) within noise -
 confirming the writer-pool ceiling at POOL_SIZE=16, not the scanner
 ceiling.
 
-### `-j 1` against the automatic count (commit `eda3b670`, bygg)
+#### `-j 1` against the automatic count (commit `eda3b670`, bygg)
 
 What an explicit `-j 1` costs. The automatic count on bygg is 30
 workers (`merge_worker_count`). `-j` sizes only the worker pool, the `-l`
@@ -304,7 +350,7 @@ the pipeline starts (the OSC parse and diff index, 474 MB in the
 the concurrent workers' buffers and queued results, not the floor. No
 code change followed: one sequential worker is what `-j 1` promises.
 
-### Inline-location refresh (`--locations-on-ways`, commit `81f3fbe4`)
+#### Inline-location refresh (`--locations-on-ways`, commit `81f3fbe4`)
 
 Since `81f3fbe4` a surviving base way takes the OSC coordinate for every
 ref whose node the OSC creates or modifies. Way blobs the merge used to
@@ -392,7 +438,7 @@ same interleaving: `8f8ef92a` 52.5 s and 25.0 s, `81f3fbe4` 50.7 s and
 26.4 s (UUIDs `49d6c2b4`, `2c21e88c`, `040ad80b`, `08bc51e8`); first pair
 cold, second warm. No regression outside the noise.
 
-### Missing-node refusal at the barrier (`--locations-on-ways`, commit `8efb71bd`)
+#### Missing-node refusal at the barrier (`--locations-on-ways`, commit `8efb71bd`)
 
 Since `8efb71bd` the missing-node refusal is taken at the node-to-way
 barrier, and the scanner polls the barrier channel on every held way and
@@ -429,7 +475,7 @@ the barrier comes about 14 s before the scanner's header walk would have
 reached end of input, so a refusal that waited for the walk would have
 come at about 26 s.
 
-### Way work starts at publication (`--locations-on-ways`, commit `0f417a44`)
+#### Way work starts at publication (`--locations-on-ways`, commit `0f417a44`)
 
 Since `0f417a44` the scanner blocks for the barrier signal at the first
 way or relation header and dispatches way work as it walks from there;
@@ -456,7 +502,7 @@ way phase (barrier end to loop end) is 126.4 to 127.9 s in every cell. The
 scanner waits about 0.5 s for the drain at the first way header
 (`MERGE_SCANNER_BARRIER_WAIT_START` to `_END`), the node tail.
 
-### Claims checked on decoded blobs (bygg, 2026-10-27, commit `ac482666`)
+#### Claims checked on decoded blobs (bygg, 2026-10-27, commit `ac482666`)
 
 Since `ac482666` every blob an apply-changes worker decodes is walked
 against its claim (count, numeric min and max, OSM-key order) on the loops
@@ -487,7 +533,7 @@ overlap runs, so the believed sweep runs on valid input only for
 `cat --dedupe`, and an unsorted-header `sort` sweeps scanned entries, which
 the tally skips.
 
-### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
+#### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
 
 Apply-changes without `--locations-on-ways` is a structurally
 different code path: no node→way coord-fusion barrier, no per-worker
@@ -510,7 +556,7 @@ uncompressed bytes through the same pipe). For OSC-only daily-diff
 pipelines that don't need osmium-interop output, zstd:1 is the right
 default.
 
-### apply-changes frames each block as it completes (bygg, 2026-10-30)
+#### apply-changes frames each block as it completes (bygg, 2026-10-30)
 
 A planet input blob holds about 200k elements and is rewritten into about
 27 output blocks (8,000 elements each). The workers built all of them as
@@ -538,7 +584,7 @@ wall, nearly all of it kernel time, for 112 MB less peak. The arena cap
 alone causes it, and the hook is gone; see "The CLI no longer caps malloc
 arenas".
 
-### apply-changes' memory step at the node-to-way transition (bygg, 2026-11-02, against `2cd85f7e`)
+#### apply-changes' memory step at the node-to-way transition (bygg, 2026-11-02, against `2cd85f7e`)
 
 Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
 zstd:1`, `--bench 1`, 30 workers. All cells are unstored `--force` cells
@@ -607,7 +653,7 @@ while the drain was writer-bound, in the node phase and at the transition,
 not after way blobs start ("apply-changes' drain channel held the node
 phase's backlog" below).
 
-### apply-changes' rewrite workers frame from their builder (bygg, 2026-11-02, against `cbf48cc8`)
+#### apply-changes' rewrite workers frame from their builder (bygg, 2026-11-02, against `cbf48cc8`)
 
 The change cells ran as uncommitted edits on `cbf48cc8`; the change
 landed unaltered as the commit after it.
@@ -640,7 +686,7 @@ landed as a simplification, not for its numbers; the arenas' free heap
 was not instrumented, so how much of apply-changes' residual step these
 buffers fed is not attributed.
 
-### apply-changes' drain channel held the node phase's backlog (bygg, 2026-11-02, against `eeb7ab6c`)
+#### apply-changes' drain channel held the node phase's backlog (bygg, 2026-11-02, against `eeb7ab6c`)
 
 Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
 zstd:1`, `--bench 1`, 30 workers.
@@ -713,7 +759,7 @@ change, HEAD, HEAD, change) ran 3.01 and 3.00 s against 3.05 and 3.06 s
 (`b0a5b51a`, `cffb4f7c`). Under `-l`, one pair: 261.8 s against 258.5 s
 (`44becd1a`), within noise, as the channel there never fills.
 
-### apply-changes' worker scratch follows the release rule (bygg, 2026-11-03, against `149944a1`)
+#### apply-changes' worker scratch follows the release rule (bygg, 2026-11-03, against `149944a1`)
 
 The change: every buffer an apply-changes worker keeps across blobs
 (`WorkerScratch` in `streaming.rs`) is checked once per blob against
@@ -765,7 +811,7 @@ resolves. The workers' other kept scratch (group, node-group and refresh
 scratch and the coordinate accumulator, `merge_streaming_scratch_peak_bytes`)
 peaks at 30 MB summed over 30 workers (38 MB under `-l`).
 
-### apply-changes' retained encode storage, attributed (bygg, 2026-11-03, against `062d7cce`)
+#### apply-changes' retained encode storage, attributed (bygg, 2026-11-03, against `062d7cce`)
 
 Planet (`planet-20260223-with-indexdata`), OSC 4913, `--compression
 zstd:1`, `--bench 1`, 30 workers.
@@ -856,7 +902,7 @@ ahead of them is final, the string table itself, and dense vectors kept
 through the way phase (44.5 MB). Each of the last two is about 2 % of the
 peak.
 
-### apply-changes checks the string indices it copies (bygg, 2026-11-03, against `59802597`)
+#### apply-changes checks the string indices it copies (bygg, 2026-11-03, against `59802597`)
 
 The change: every string index a rewrite copies raw is checked against the
 source block's table (dense and plain node tag pairs and the dense user,
@@ -887,7 +933,7 @@ the `Info` user; its walls and rewrite CPU are inside HEAD's spread. The
 `--locations-on-ways` path, which copies ways through the same checks, was
 not measured.
 
-### apply-changes' create-run builders are made per block (bygg, 2026-11-03, against `cf73c10f`)
+#### apply-changes' create-run builders are made per block (bygg, 2026-11-03, against `cf73c10f`)
 
 The question: a create run longer than one block is encoded on the
 executor with a fresh `BlockBuilder` per block (about 309 blocks in five
@@ -932,7 +978,7 @@ and per-task groups of contiguous blocks were not tested. A thread-local
 builder was not tested because it is ruled out on other grounds: the
 executor's threads belong to the caller and outlive the invocation.
 
-### apply-changes keeps absent OSC metadata absent (bygg, 2026-11-10, `cb42cf0f` against `bd169b02`)
+#### apply-changes keeps absent OSC metadata absent (bygg, 2026-11-10, `cb42cf0f` against `bd169b02`)
 
 A node with partial OSC metadata is written as a plain Node message;
 nodes with complete or no metadata stay dense, and a dense run now holds
@@ -945,7 +991,7 @@ against 308 ms (`36db967b`); pair 2, 315 ms (`dd6fe479`) against 306 ms
 (`cb4a0943`). Within noise: neutral, as expected. Denmark only; no planet
 cell was run, since the dense hot path's work is unchanged.
 
-### apply-changes' create-run loop lifted into a function its tests drive (bygg, 2026-11-04, against `3c5b8d3a`)
+#### apply-changes' create-run loop lifted into a function its tests drive (bygg, 2026-11-04, against `3c5b8d3a`)
 
 `CreateEncoder::emit`'s batching and ordered-write loop moved, unchanged,
 into `write_run` (`crates/lib/src/commands/apply_changes/stream_output.rs`), which
@@ -961,7 +1007,7 @@ zstd:1`, `--bench 1`. Baseline is the stored cell at `3c5b8d3a`
 21.1 ms. Within noise on every figure; the phase split matches phase for
 phase.
 
-## Node boundary on the drain channel, not measured (2026-11-09, at `a5a9ba08`)
+### Node boundary on the drain channel, not measured (2026-11-09, at `a5a9ba08`)
 
 `ff0b0a37` moved the `--locations-on-ways` node boundary from its own
 one-slot channel, which the drain polled with `try_recv` on every loop
@@ -1000,7 +1046,7 @@ resolved key, role and user name; tag values are still checked with
 `from_utf8`. It is an ancestor of both arms of the pair above, so that
 pair could never have measured it. It has no cell of its own.
 
-## Apply-changes sequence window (bygg, 2026-10-31)
+### Apply-changes sequence window (bygg, 2026-10-31)
 
 The apply-changes scanner admits each blob seq against a window
 (`APPLY_CHANGES_SEQ_WINDOW`, 512), returned when the drain processes the
@@ -1035,7 +1081,7 @@ what is in flight; a window under about 420 would start to bind at planet.
 The window caps the worst case, not these runs' peak: the reorder map
 still reaches 174 items / 415 MB on the first zstd:1 variant cell.
 
-## Apply-changes overlay: superseded records (bygg, 2026-10-31)
+### Apply-changes overlay: superseded records (bygg, 2026-10-31)
 
 Measured at `3f8d9f35` with temporary per-record length counters in the
 overlay's push and delete paths (unstored `--force` run stopped at
@@ -1057,7 +1103,7 @@ reduced 26,261,540 changes to 25,417,990, 3.2 % by count. Compacting the
 overlay was declined on these numbers; the reasoning sits on
 `CompactDiffOverlay` in `crates/lib/src/osc/parse.rs`.
 
-## Apply-changes retained lookup storage (bygg, 2026-11-02)
+### Apply-changes retained lookup storage (bygg, 2026-11-02)
 
 What apply-changes held beside the arena records for the whole run, counted
 at `b5680edb` with temporary counters (exact allocation sizes from `Vec`
@@ -1111,8 +1157,6 @@ backlog in the drain channel (later removed, "apply-changes' drain channel
 held the node phase's backlog"), wider than the 120 MB this removes. Under
 `-l` the setup phase went 6.1 s to 5.5 s (the referenced-node lookup is a
 merge join over sorted refs), one pair.
-
-## History
 
 ### Merge (apply-changes)
 

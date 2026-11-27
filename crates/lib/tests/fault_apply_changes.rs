@@ -16,6 +16,81 @@
 
 #![allow(clippy::unwrap_used)]
 
+/// The bad role is in the second compact batch of a rewritten blob. The
+/// writer has started staging the output, so this exercises production
+/// cleanup after a worker refusal, including the unpublished destination.
+#[test]
+fn compact_rewrite_refuses_an_out_of_range_surviving_role() {
+    use crate::common;
+    use pbfhogg::apply_changes::{MergeOptions, merge};
+    use pbfhogg::block_builder::{DEFAULT_ELEMENT_CAP, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+    use protohoggr::{encode_bytes_field, encode_bytes_field_always, encode_int64_field_always};
+
+    let dir = common::test_scratch();
+    let base = dir.path().join("bad-role.osm.pbf");
+    let osc = dir.path().join("changes.osc");
+    let out = dir.path().join("result.osm.pbf");
+
+    // After deleting relation 1, there is a full batch followed by one
+    // survivor. Its role SID 127 is past the table's sole (empty) slot.
+    let last = i64::try_from(DEFAULT_ELEMENT_CAP.get()).unwrap() + 2;
+    let mut group = Vec::new();
+    let mut relation = Vec::new();
+    for id in 1..=last {
+        relation.clear();
+        encode_int64_field_always(&mut relation, 1, id);
+        let role = if id == last { 127 } else { 0 };
+        encode_bytes_field(&mut relation, 8, &[role]);
+        encode_bytes_field(&mut relation, 9, &[2]); // member ID delta 1
+        encode_bytes_field(&mut relation, 10, &[1]); // way member
+        encode_bytes_field(&mut group, 4, &relation);
+    }
+    let mut table = Vec::new();
+    encode_bytes_field_always(&mut table, 1, b"");
+    let mut payload = Vec::new();
+    encode_bytes_field(&mut payload, 1, &table);
+    encode_bytes_field(&mut payload, 2, &group);
+    let mut writer = PbfWriter::new(std::fs::File::create(&base).unwrap(), Compression::None);
+    writer
+        .write_header(&HeaderBuilder::new().sorted().build().unwrap())
+        .unwrap();
+    writer.write_primitive_block(&payload).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    std::fs::write(
+        &osc,
+        r#"<osmChange version="0.6"><delete><relation id="1"/></delete></osmChange>"#,
+    )
+    .unwrap();
+
+    let before = common::snapshot_dir(dir.path());
+    let opts = MergeOptions {
+        parallelism: pbfhogg::Parallelism::from_jobs(1),
+        ..MergeOptions::default()
+    };
+    let err = merge(
+        &base,
+        &osc,
+        common::out(&out),
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &common::test_host(),
+    )
+    .err()
+    .expect("merge must refuse the surviving role");
+    assert!(matches!(
+        err.kind(),
+        pbfhogg::ErrorKind::StringtableIndexOutOfBounds { index: 127 }
+    ));
+    let report = err.report();
+    assert!(
+        report.contains(&format!("relation {last} member 0: role string index 127")),
+        "unexpected refusal: {report}"
+    );
+    assert_eq!(common::snapshot_dir(dir.path()), before);
+}
+
 #[cfg(pbfhogg_test_hooks)]
 mod apply_changes {
     use std::fs::File;

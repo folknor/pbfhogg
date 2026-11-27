@@ -115,8 +115,8 @@ pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactR
 /// The string table a block holding surviving base elements starts from.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum SourceSeed<'a> {
-    /// The source block's whole table, slot for slot: the rewrite's first
-    /// pass, whose survivors copy their indices unchanged.
+    /// The source block's whole table, slot for slot: the original rewrite
+    /// path, whose survivors copy their indices unchanged.
     Whole,
     /// Only the source slots marked (by source index): the overflow
     /// replay's, whose survivors' indices are translated so a block carries
@@ -131,10 +131,13 @@ pub(super) enum SourceSeed<'a> {
 /// write a user naming the empty string as 0, and
 /// `element_raw_partial_metadata`; the effective `Info` user of a way or
 /// relation). An index outside the table is skipped: the raw add refuses
-/// it with its own error.
-pub(super) fn mark_used_slots(element: &crate::Element<'_>, used: &mut [bool]) -> Result<()> {
+/// it with its own error. Returns the number of references for a bound on
+/// the bytes the original writer could have used for their indices.
+pub(super) fn mark_used_slots(element: &crate::Element<'_>, used: &mut [bool]) -> Result<usize> {
     use crate::read::wire::{PackedInt32Iter, PackedUint32Iter, WireInfo};
+    let mut count = 0;
     let mut mark = |sid: u32| {
+        count += 1;
         if let Some(slot) = used.get_mut(sid as usize) {
             *slot = true;
         }
@@ -187,7 +190,7 @@ pub(super) fn mark_used_slots(element: &crate::Element<'_>, used: &mut [bool]) -
             }
         }
     }
-    Ok(())
+    Ok(count)
 }
 
 /// Seed `bb` from `block` for a surviving base element, unless the block in

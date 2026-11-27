@@ -251,6 +251,19 @@ an unused column with full reconstruction.
 Kind: high-conviction architectural rewrite; medium conviction on whole-command
 payoff (indexdata).
 
+Measurement for the ID-only consumer class on bygg, HEAD `5caa1101`
+against the working tree on `5caa1101`: fusing ID judging with block
+validation reduced median wall time on planet `id-order` by about 2 %, within
+noise. The second ID walk did not bound `check --ids` at planet scale.
+Decompression is the likely bottleneck. The prototype did not land.
+For a retry, pick a consumer whose profile shows decode dominating
+decompression. See the [check measurements](../reference/performance/check.md#check---ids-fused-validation-and-id-judging-bygg-baseline-5caa1101).
+
+To resurface: the code is in
+`notes/stashed-perf-006-fused-id-validation.patch` (made against
+`5caa1101` on bygg). It edits `read/block.rs` and
+`commands/check/verify_ids.rs` and needs no tunables.
+
 ## PERF-007 - Transforms decode and rebuild fields they do not change
 
 Reported by: decode, encoding, tags, spatial, copy, merge, sort, apply-core,
@@ -302,47 +315,29 @@ multi-source merges flushing per source would create tiny blocks.
 
 Kind: high-conviction architectural rewrite.
 
-## PERF-008 - apply-changes rebuilds every survivor of a touched blob and multiplies its string table
+## PERF-008 - apply-changes still rebuilds survivors of touched blobs
 
-Reported by: apply-core, apply-locations.
+Reported by apply-core and apply-locations.
 
-Mechanism: `handle_candidate` decompresses, builds a validated `PrimitiveBlock`,
-runs a precise overlap walk, then `rewrite_block_parallel` walks again; every
-surviving dense node passes through accessors, tag decode, builder columns and
-re-encoding. Output blocks cap at 8,000 elements and every block holding base
-survivors is pre-seeded with the source blob's whole string table, so a source
-of string table size S split into r blocks serializes about r * S table bytes
-and hashes it r times (`element_writes.rs` flush and reseed). In locations mode
-`detect_stale_wire` stops at the first stale way and keeps only a verdict; the
-rewrite then runs `evaluate_way` again and `refreshed_locations` decodes refs
-and probes the OSC again; one stale coordinate sends every surviving way in the
-blob through `BlockBuilder`.
+String-table compaction reduced planet daily apply wall time on bygg by
+about 24 % with `--locations-on-ways` and 30 % in plain mode. Plain output
+went from about 174 GB to 98 GB. A was HEAD `5caa1101` and B was the
+working tree on `5caa1101`. See the
+[apply-changes measurements](../reference/performance/apply-changes.md#string-table-compaction-bygg-baseline-5caa1101).
 
-Redesign: an editor whose unit is the decompressed source blob. Validate and
-discover edits together into runs of retained rows, replacements, deletions and
-insertions; keep source string slots and append only new strings via a diff-SID
-to PBF-SID map (duplicate string contents are legal); copy surviving ordinary
-messages as spans; edit dense columns by retaining packed runs and repairing
-deltas at edit boundaries; size output blocks by encoded bytes and PBF limits.
-Merge OSC edits and refresh edits in one traversal: refresh hits keep positions
-and replacement coordinates; a refresh-only blob keeps tags, metadata, refs,
-IDs, count, string table and tag index and changes only coordinate fields and
-enclosing lengths. Compression should accept retained spans plus generated
-fragments backed by a stable source owner. Return the original compressed frame
-when inspection finds no effective edit. Precedents: `validate_in_place`,
-`BlockBuffer::project`, renumber wire rewriter, ALTW reframe (which rejects
-non-default coordinate framing, so it cannot be called unchanged).
+Remaining work:
 
-Payoff: removes repeated tables, repeated survivor encoding, temporary dense
-columns and excess frames; raising the builder cap addresses only part.
-
-Risks: delta repair, partial metadata, string-index validation, non-default
-coordinate and date framing, repeated refs, blob-size limits, exact output
-sidecars (regenerated indexdata and tagdata, stale-enrichment dropping); clean
-refresh scans must keep their light path; dirty blobs need validation without
-restarting the edit traversal.
-
-Kind: high-conviction full rewrite.
+- Copy surviving ordinary messages as wire spans where their string indices
+  and framing permit it. Retain packed runs for dense nodes and repair deltas
+  at edit boundaries. Preserve metadata and validate retained string indices.
+- For refresh-only blobs, edit coordinate fields and their enclosing lengths
+  while preserving IDs, refs, tags, metadata, and the string table. Respect
+  source coordinate framing and repeated refs.
+- Size output blocks by encoded bytes within PBF limits. Revisit the
+  [documented element cap](../docs/cli/commands.md#apply-changes), which is
+  8000 in HEAD `5caa1101` and the working tree measured on bygg.
+- Reuse the per-`Info` field-span scratch allocation in
+  `translate_info_user` when remapping the user string slot.
 
 ## PERF-009 - Encode and compress cross an ordered boundary between them
 

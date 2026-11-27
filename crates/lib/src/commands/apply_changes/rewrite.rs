@@ -69,6 +69,8 @@ pub struct MergeOptions {
     /// [`crate::osc::CompactDiffOverlay::allow_version_regression`]
     /// describes.
     pub allow_version_regression: bool,
+    #[cfg(test)]
+    whole_table_oracle: bool,
 }
 
 impl MergeOptions {
@@ -307,6 +309,8 @@ pub(crate) fn merge_to<'a>(
         locations_on_ways: locations,
         parallelism,
         allow_version_regression,
+        #[cfg(test)]
+        whole_table_oracle,
     } = *opts;
     // The header and the stats read the mode as this flag; the stages get
     // their shares of it from `wire_locations`.
@@ -605,6 +609,8 @@ pub(crate) fn merge_to<'a>(
         route: worker_route,
         failure: Arc::clone(&failure),
         cancel: host.invocation.permit(),
+        #[cfg(test)]
+        whole_table_oracle,
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,
@@ -811,6 +817,264 @@ pub(crate) fn merge_to<'a>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::ElementKind::{Node, Relation, Way};
+    use crate::block_builder::{DEFAULT_ELEMENT_CAP, HeaderBuilder};
+    use crate::commands::digest::{Form, digest};
+    use crate::read::header_walker::HeaderWalker;
+    use crate::writer::{Compression, PbfWriter};
+    use crate::{BlobDecode, BlobReader, Element, ElementKind};
+    use protohoggr::{encode_bytes_field, encode_bytes_field_always, encode_varint};
+
+    const UNUSED: &str = "source-only unused slot";
+
+    fn varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
+        protohoggr::encode_tag(out, field, protohoggr::WIRE_VARINT);
+        encode_varint(out, value);
+    }
+
+    fn source_payload(kind: ElementKind, first: u64, count: usize) -> Vec<u8> {
+        let mut table = Vec::new();
+        for s in ["", "name", "name", "author", "author", "outer", "", UNUSED] {
+            encode_bytes_field_always(&mut table, 1, s.as_bytes());
+        }
+        for i in 0..32 {
+            let value = format!("value-{i}-{}", "x".repeat(512));
+            encode_bytes_field_always(&mut table, 1, value.as_bytes());
+        }
+        let mut payload = Vec::new();
+        encode_bytes_field(&mut payload, 1, &table);
+        varint_field(&mut payload, 17, 50); // coordinate granularity
+        varint_field(&mut payload, 18, 100); // date granularity
+        let key_and_val = |i: usize| {
+            let band = if i < DEFAULT_ELEMENT_CAP.get() { 0 } else { 16 };
+            [
+                1 + u8::from(i % 2 != 0),
+                8 + band + u8::try_from(i % 16).unwrap(),
+            ]
+        };
+        let mut group = Vec::new();
+        if kind == Node {
+            let mut ids = Vec::new();
+            encode_varint(&mut ids, first * 2); // zigzag for positive first ID
+            ids.extend(std::iter::repeat_n(4, count - 1)); // subsequent ID deltas are 2
+            let mut tags = Vec::new();
+            for i in 0..count {
+                tags.extend_from_slice(&key_and_val(i));
+                tags.push(0);
+            }
+            let mut dense = Vec::new();
+            encode_bytes_field(&mut dense, 1, &ids);
+            // The optional timestamp and user columns name the same
+            // partial metadata on every dense node in this source group.
+            let mut dense_info = Vec::new();
+            let mut deltas = vec![0; count];
+            deltas[0] = 30; // zigzag: 15 units of 100 ms
+            encode_bytes_field(&mut dense_info, 2, &deltas);
+            deltas[0] = 8; // zigzag: author at slot 4
+            encode_bytes_field(&mut dense_info, 5, &deltas);
+            encode_bytes_field(&mut dense, 5, &dense_info);
+            encode_bytes_field(&mut dense, 8, &vec![4; count]);
+            encode_bytes_field(&mut dense, 9, &vec![4; count]);
+            encode_bytes_field(&mut dense, 10, &tags);
+            encode_bytes_field(&mut group, 2, &dense);
+            encode_bytes_field(&mut payload, 2, &group);
+            group.clear();
+
+            // Partial Info and an explicit empty tag key at slot zero.
+            let mut node = Vec::new();
+            varint_field(&mut node, 1, (first + 2 * count as u64) * 2);
+            encode_bytes_field(&mut node, 2, &[0]);
+            encode_bytes_field(&mut node, 3, &[6]);
+            encode_bytes_field(&mut node, 4, &[0x10, 15, 0x28, 4]);
+            varint_field(&mut node, 8, 8);
+            varint_field(&mut node, 9, 10);
+            encode_bytes_field(&mut group, 1, &node);
+        } else {
+            let mut message = Vec::new();
+            for i in 0..count {
+                message.clear();
+                varint_field(&mut message, 1, first + i as u64);
+                let [key, value] = key_and_val(i);
+                encode_bytes_field(&mut message, 2, &[key]);
+                encode_bytes_field(&mut message, 3, &[value]);
+                encode_bytes_field(&mut message, 4, &[0x10, 25, 0x28, 4]);
+                if kind == Way {
+                    // The first way references moved node 2 twice. Others
+                    // keep their references and coordinates throughout.
+                    let refs = if i == 0 { [4, 0, 4] } else { [8, 0, 0] };
+                    encode_bytes_field(&mut message, 8, &refs);
+                    encode_bytes_field(&mut message, 9, &[4, 0, 0]);
+                    encode_bytes_field(&mut message, 10, &[4, 0, 0]);
+                    encode_bytes_field(&mut message, 20, &[1]);
+                    encode_bytes_field(&mut group, 3, &message);
+                } else {
+                    encode_bytes_field(&mut message, 8, &[5, 6]);
+                    encode_bytes_field(&mut message, 9, &[2, 0]);
+                    encode_bytes_field(&mut message, 10, &[1, 1]);
+                    encode_bytes_field(&mut group, 4, &message);
+                }
+            }
+        }
+        encode_bytes_field(&mut payload, 2, &group);
+        payload
+    }
+
+    fn run_merge(
+        base: &Path,
+        osc: &Path,
+        out: &Path,
+        locations: bool,
+        whole_table_oracle: bool,
+    ) -> Result<MergeStats> {
+        let options = MergeOptions {
+            write: WriteOptions {
+                compression: Compression::None,
+                ..WriteOptions::default()
+            },
+            locations_on_ways: locations.then(LocationsOnWays::default),
+            parallelism: crate::host::Parallelism::from_jobs(1),
+            whole_table_oracle,
+            ..MergeOptions::default()
+        };
+        merge(
+            base,
+            osc,
+            crate::output::Output::new(
+                out,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            &options,
+            &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
+        )
+    }
+
+    fn assert_sidecars_and_count_unused(path: &Path, refreshed: bool) -> usize {
+        let host = crate::host::Host::for_tests();
+        let entered = host.entered();
+        let mut reader = BlobReader::open_in(path, false, &entered).unwrap();
+        let mut headers = HeaderWalker::open(path, &entered).unwrap();
+        let mut unused = 0;
+        let mut checked_refresh = false;
+        for blob in &mut reader {
+            let blob = blob.unwrap();
+            let meta = headers.next_header().unwrap().unwrap();
+            let BlobDecode::OsmData(block) = blob.decode().unwrap() else {
+                continue;
+            };
+            let mut payload = Vec::new();
+            blob.decompress_into(&mut payload).unwrap();
+            let (index, tags) = crate::blob_meta::try_scan_block_ids_and_tags(&payload).unwrap();
+            assert_eq!(meta.index, index.map(|(i, _)| i));
+            let actual_tags = meta
+                .tagdata
+                .as_deref()
+                .map(|data| crate::blob_meta::TagIndex::deserialize(data).expect("valid tagdata"));
+            // The scanner describes a tagless block with an empty key set.
+            // BlockBuilder omits tagdata for that block, as for the gap
+            // create in this fixture. An explicit empty key is still a key.
+            let expected_tags = tags.as_ref().filter(|tags| !tags.keys_empty());
+            assert_eq!(
+                actual_tags.as_ref().map(crate::blob_meta::TagIndex::keys),
+                expected_tags.map(crate::blob_meta::TagIndex::keys),
+                "tagdata in {} at blob {}",
+                path.display(),
+                meta.blob_index,
+            );
+            for slot in 0..block.string_table_len() {
+                unused += usize::from(block.string_table_entry(slot) == Some(UNUSED));
+            }
+            if refreshed && let Some(Element::Way(way)) = block.elements().next() {
+                assert!(block.element_count() <= DEFAULT_ELEMENT_CAP.get() as u64);
+                assert_eq!(block.coord_framing(), (100, 0, 0));
+                assert_eq!(block.date_granularity(), 1000);
+                assert!(way.shared_node_pins().is_none());
+                if way.id() == 10 {
+                    let lats: Vec<_> = way
+                        .node_locations()
+                        .map(|loc| loc.decimicro_lat().unwrap())
+                        .collect();
+                    assert_eq!(lats, [10_000_000, 10_000_000, 1]);
+                    checked_refresh = true;
+                }
+            }
+        }
+        assert_eq!(checked_refresh, refreshed);
+        assert!(headers.next_header().unwrap().is_none());
+        unused
+    }
+
+    #[test]
+    fn compact_rewrites_match_whole_table_output_across_blobs() {
+        let dir = crate::path_guard::tests::scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("changes.osc");
+        let mut writer = PbfWriter::new(std::fs::File::create(&base).unwrap(), Compression::None);
+        writer
+            .write_header(
+                &HeaderBuilder::new()
+                    .sorted()
+                    .optional_feature(crate::HeaderBlock::LOCATIONS_ON_WAYS)
+                    .optional_feature(crate::HeaderBlock::SHARED_NODE_PINS_V1)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let count = DEFAULT_ELEMENT_CAP.get() + 4;
+        for (kind, first) in [(Node, 2), (Node, 20_002), (Way, 10), (Relation, 1)] {
+            writer
+                .write_primitive_block(&source_payload(kind, first, count))
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        std::fs::write(&osc, r#"<osmChange version="0.6">
+<modify>
+  <node id="2" lat="1" lon="2" user="author"/>
+  <node id="20002" lat="3" lon="4" version="2"/>
+  <relation id="1" user="author"><member type="way" ref="10" role="outer"/><tag k="name" v="new"/></relation>
+</modify>
+<delete><node id="8"/><node id="20008"/><relation id="9"/></delete>
+<create>
+  <node id="5" lat="5" lon="6"/>
+  <node id="19000" lat="5" lon="6"/>
+  <node id="20005" lat="5" lon="6"/>
+</create>
+</osmChange>"#).unwrap();
+
+        for locations in [false, true] {
+            let run = |whole_table_oracle| {
+                let out = dir
+                    .path()
+                    .join(format!("result-{locations}-{whole_table_oracle}.osm.pbf"));
+                let stats = run_merge(&base, &osc, &out, locations, whole_table_oracle).unwrap();
+                assert_eq!(stats.deleted, 3);
+                assert_eq!(stats.frames_created, 1, "the create between base blobs");
+                assert_eq!(stats.loc_refresh_only_blobs, u64::from(locations));
+                assert_eq!(stats.loc_refreshed_refs, 2 * u64::from(locations));
+                out
+            };
+            let compact = run(false);
+            let oracle = run(true);
+            let full_digest = |path: &Path| {
+                digest(path, Form::Full, false, &crate::host::Host::for_tests()).unwrap()
+            };
+            assert_eq!(
+                full_digest(&compact),
+                full_digest(&oracle),
+                "full digest with locations={locations}"
+            );
+            let compact_unused = assert_sidecars_and_count_unused(&compact, locations);
+            let oracle_unused = assert_sidecars_and_count_unused(&oracle, locations);
+            assert_eq!(
+                compact_unused,
+                usize::from(!locations),
+                "only the spliced way blob may retain unused strings"
+            );
+            assert!(oracle_unused > compact_unused);
+        }
+    }
 
     #[test]
     fn merge_refuses_output_equal_to_base_before_reading_inputs() {

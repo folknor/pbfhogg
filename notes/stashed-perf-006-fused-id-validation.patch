@@ -1,0 +1,974 @@
+diff --git a/crates/lib/src/commands/check/verify_ids.rs b/crates/lib/src/commands/check/verify_ids.rs
+index 8fa830cf..2a20d3f1 100644
+--- a/crates/lib/src/commands/check/verify_ids.rs
++++ b/crates/lib/src/commands/check/verify_ids.rs
+@@ -5,7 +5,7 @@ use crate::error::Result;
+ use crate::idset::IdSet;
+ use crate::osm_id::osm_id_cmp;
+ use crate::owned::TypeFilter;
+-use crate::read::block::BlockBuffer;
++use crate::read::block::{BlockBuffer, GroupProjection};
+ use crate::read::input::{InputSource, PinnedInput};
+ use crate::read::project_ids::{IdScratch, KindIds};
+ use crate::scan::classify::KindSchedules;
+@@ -288,8 +288,8 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
+ /// Two internal paths depending on `opts.full`:
+ ///
+ /// - **Streaming (default):** one parallel phase per kind via
+-///   `parallel_project_phase`, each blob read through the `KindIds`
+-///   projection on the block validator (no block built), no IdSet
++///   `parallel_project_phase`, each blob's IDs judged during validation
++///   (no block built), no IdSet
+ ///   population. Monotonicity + offset-based type-order only (no
+ ///   duplicate detection).
+ /// - **Full:** the streaming scan first, which proves a kind with no order
+@@ -731,10 +731,10 @@ fn push_bounded(ids: &mut Vec<i64>, id: i64, limit: Option<usize>) {
+     }
+ }
+ 
+-/// Validate one blob through [`KindIds`] (the shared ID projection: block
+-/// construction's validator and kind-claim refusal, no block built) and
+-/// judge its IDs of `kind` once it is accepted ([`KindJudge`]). The
+-/// projection takes IDs by the element's own kind, never the blob's claim.
++/// Validate one blob and judge its IDs of `kind` ([`KindJudge`]). The proof
++/// pass keeps the judge local until validation and the kind claim pass. The
++/// duplicate pass uses [`KindIds`] to defer inserts into the shared set
++/// until then.
+ fn verify_blob(
+     buffer: BlockBuffer<'_>,
+     kind: ElementKind,
+@@ -742,14 +742,25 @@ fn verify_blob(
+     limit: Option<usize>,
+     scratch: &mut IdScratch,
+ ) -> Result<BlobVerifyResult> {
+-    let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
+     let mut judge = KindJudge::new(kind, limit);
+-    scratch.each(accepted.bytes(), |_, id| {
+-        judge.push(id, atomic_ids);
+-        Ok(())
+-    })?;
+-    // The bytes go back to their pool.
+-    drop(accepted);
++    if let Some(atomic_ids) = atomic_ids {
++        let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
++        scratch.each(accepted.bytes(), |_, id| {
++            judge.push(id, Some(atomic_ids));
++            Ok(())
++        })?;
++    } else {
++        let mut kinds = crate::element_kind::ElementKindSet::default();
++        kinds.add(kind);
++        buffer.project_ids(
++            kinds,
++            |_, id| {
++                judge.push(id, None);
++                Ok(())
++            },
++            |_| {},
++        )?;
++    }
+     Ok(judge.r)
+ }
+ 
+@@ -786,10 +797,9 @@ fn kind_phase(
+     Ok(per_blob)
+ }
+ 
+-/// The one pass over an unindexed file: each blob validated once through
+-/// [`KindIds`] of the selected kinds, its IDs judged per kind as
+-/// [`verify_blob`] judges one kind's (the projection yields each kind's IDs
+-/// in element-walk order), the results returned per kind by blob position,
++/// The one pass over an unindexed file: each blob validated once, its
++/// selected IDs judged as [`verify_blob`] judges one kind's, and the results
++/// returned per kind by blob position,
+ /// a kind not selected holding empty ones. Under `--full` each kind's
+ /// overflow is settled in its own side set. Beside them, where each kind's
+ /// elements first and last appear in the file, at `(blob position, group
+@@ -812,21 +822,34 @@ fn unindexed_pass(
+     let mut per_kind: PerKind = std::array::from_fn(|_| (0..blobs.len()).map(|_| None).collect());
+     let mut overflow: [IdSet; 3] = std::array::from_fn(|_| IdSet::new());
+     let mut spans: KindSpans<(usize, usize)> = [None; 3];
++    let replay = sets.iter().any(Option::is_some);
+     crate::scan::classify::parallel_project_phase(
+         file,
+         blobs,
+         None,
+         IdScratch::default,
+         |_, buffer, scratch| -> Result<([BlobVerifyResult; 3], KindSpans<usize>)> {
+-            let ((KindIds { .. }, groups), accepted) = buffer
+-                .project(|_, _| (KindIds::new(kinds, &mut *scratch), GroupKinds::default()))?;
+             let mut judges = KINDS.map(|kind| KindJudge::new(kind, limit));
+-            scratch.each(accepted.bytes(), |kind, id| {
+-                let index = usize::from(kind.ordinal());
+-                judges[index].push(id, sets[index]);
+-                Ok(())
+-            })?;
+-            drop(accepted);
++            let mut groups = GroupKinds::default();
++            if replay {
++                let ((KindIds { .. }, projected_groups), accepted) = buffer
++                    .project(|_, _| (KindIds::new(kinds, &mut *scratch), GroupKinds::default()))?;
++                scratch.each(accepted.bytes(), |kind, id| {
++                    let index = usize::from(kind.ordinal());
++                    judges[index].push(id, sets[index]);
++                    Ok(())
++                })?;
++                groups = projected_groups;
++            } else {
++                buffer.project_ids(
++                    kinds,
++                    |kind, id| {
++                        judges[usize::from(kind.ordinal())].push(id, None);
++                        Ok(())
++                    },
++                    |kinds| groups.group_end(kinds),
++                )?;
++            }
+             Ok((judges.map(|judge| judge.r), groups.spans))
+         },
+         |seq, (results, groups)| {
+@@ -899,7 +922,7 @@ pub(super) struct GroupKinds {
+     pub(super) spans: KindSpans<usize>,
+ }
+ 
+-impl crate::read::block::GroupProjection for GroupKinds {
++impl GroupProjection for GroupKinds {
+     fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
+         for (kind, span) in KINDS.into_iter().zip(&mut self.spans) {
+             if kinds.has(kind) {
+diff --git a/crates/lib/src/read/block.rs b/crates/lib/src/read/block.rs
+index f6af8d79..3eeb5668 100644
+--- a/crates/lib/src/read/block.rs
++++ b/crates/lib/src/read/block.rs
+@@ -894,7 +894,7 @@ pub(crate) fn packed_varint_count(data: &[u8]) -> Result<usize> {
+         return packed_varint_count_exact(data);
+     }
+     if run != 0 {
+-        return Err(new_wire_error("packed varint array ends mid-varint"));
++        return Err(truncated_packed_varint_err());
+     }
+     Ok(count)
+ }
+@@ -922,11 +922,17 @@ fn packed_varint_count_exact(data: &[u8]) -> Result<usize> {
+         }
+     }
+     if pos != 0 {
+-        return Err(new_wire_error("packed varint array ends mid-varint"));
++        return Err(truncated_packed_varint_err());
+     }
+     Ok(count)
+ }
+ 
++#[cold]
++#[inline(never)]
++fn truncated_packed_varint_err() -> crate::error::Error {
++    new_wire_error("packed varint array ends mid-varint")
++}
++
+ /// A varint that runs past ten bytes or carries payload past bit 63 - one the
+ /// decoder refuses, which the packed iterators would turn into a silent end.
+ #[cold]
+@@ -1120,11 +1126,12 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
+ /// (`scan_block_fields`), every group ([`validate_groups`]), then the string
+ /// table's UTF-8 ([`validate_stringtable_utf8`]). Block construction is the
+ /// projection that keeps nothing ([`NoProjection`]); a reader that needs
+-/// less than a block (inspect, `check --ids`, getparents) passes its own
++/// less than a block (inspect, getparents) passes its own
+ /// [`GroupProjection`] through [`BlockBuffer::project`], or through
+ /// [`validate_in_place`] when it holds the bytes borrowed, so it refuses
+ /// exactly the blocks construction refuses, with the same error, by running
+-/// the same code rather than a copy of it.
++/// the same code. The ID order check also uses this validator, delivering
++/// IDs while it validates.
+ ///
+ /// `make` builds the projection once the top level is framed, from the
+ /// block's scalar fields and its string table entries (buffer-relative
+@@ -1279,6 +1286,30 @@ impl<'w> BlockBuffer<'w> {
+         ))
+     }
+ 
++    /// Validate the block and send each selected ID to `sink` in element
++    /// order. `group_end` sees the kinds of every completed group, including
++    /// unselected kinds. Both callbacks are provisional: the caller must
++    /// discard everything they gather on any error, including a late
++    /// string-table or kind-claim error. Keep effects local to the block.
++    ///
++    /// A sink error stops ID delivery. Validation and group notifications
++    /// continue, and any block error takes precedence over the sink error.
++    #[cfg(any(feature = "commands", test))]
++    pub(crate) fn project_ids(
++        self,
++        kinds: crate::element_kind::ElementKindSet,
++        sink: impl FnMut(crate::ElementKind, i64) -> Result<()>,
++        group_end: impl FnMut(crate::element_kind::ElementKindSet),
++    ) -> Result<()> {
++        let (projection, _) = self.project(|_, _| IdProjection {
++            kinds,
++            sink,
++            group_end,
++            sink_error: None,
++        })?;
++        projection.sink_error.map_or(Ok(()), Err)
++    }
++
+     /// The block, validated as every block is.
+     pub(crate) fn block(self) -> Result<PrimitiveBlock> {
+         let (NoProjection, validated) = self.project(|_, _| NoProjection)?;
+@@ -1410,16 +1441,25 @@ impl Drop for ValidatedBlock<'_> {
+ ///
+ /// A hook sees data that passed its own checks, not a validated block: a
+ /// later piece of the same group may still fail, and the string table's
+-/// UTF-8 is checked only after every group. So a hook never fails, keeps
+-/// what it gathers provisional (discarded when the scan fails), and reads
++/// UTF-8 is checked only after every group. A projection keeps
++/// what it gathers provisional (discarded when the scan fails) and reads
+ /// string table entries only by index bound and length, never as `str`.
+ ///
+-/// Within a group the hooks fire in validation order (plain nodes, ways,
+-/// relations, then the dense message), not element iteration order (dense
+-/// nodes first): a projection whose statistics depend on element order
+-/// keeps each group's parts apart and joins them at [`Self::group_end`].
++/// Within a group the element hooks fire in validation order (plain nodes,
++/// ways, relations, then the dense message). The ID-only projection uses
++/// [`Self::dense_id_count`] to send dense IDs before the ordinary hooks.
+ pub(crate) trait GroupProjection {
+     fn group_begin(&mut self) {}
++    /// The ID projection requests early dense ID delivery to match element
++    /// iteration order. The validator defers any error from that work to
++    /// the dense validation step.
++    fn dense_ids_first(&self) -> bool {
++        false
++    }
++    /// Validate the packed dense ID array and return its cardinality.
++    fn dense_id_count(&mut self, data: &[u8]) -> Result<usize> {
++        packed_varint_count(data)
++    }
+     /// A plain node and its parsed `Info`, if it carries one.
+     fn node(&mut self, _node: &WireNode<'_>, _info: Option<&super::wire::WireInfo>) {}
+     fn way(&mut self, _way: &WireWay<'_>, _info: Option<&super::wire::WireInfo>) {}
+@@ -1522,6 +1562,85 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
+     }
+ }
+ 
++/// The ID sink rides on the same checks as every projection. It keeps a
++/// sink failure separate from the validator's errors.
++#[cfg(any(feature = "commands", test))]
++struct IdProjection<F, G> {
++    kinds: crate::element_kind::ElementKindSet,
++    sink: F,
++    group_end: G,
++    sink_error: Option<crate::error::Error>,
++}
++
++#[cfg(any(feature = "commands", test))]
++impl<F, G> IdProjection<F, G>
++where
++    F: FnMut(crate::ElementKind, i64) -> Result<()>,
++{
++    fn emit(&mut self, kind: crate::ElementKind, id: i64) {
++        if self.sink_error.is_none() && self.kinds.has(kind) {
++            self.sink_error = (self.sink)(kind, id).err();
++        }
++    }
++}
++
++#[cfg(any(feature = "commands", test))]
++impl<F, G> GroupProjection for IdProjection<F, G>
++where
++    F: FnMut(crate::ElementKind, i64) -> Result<()>,
++    G: FnMut(crate::element_kind::ElementKindSet),
++{
++    fn dense_ids_first(&self) -> bool {
++        self.sink_error.is_none() && self.kinds.has(crate::ElementKind::Node)
++    }
++
++    fn dense_id_count(&mut self, data: &[u8]) -> Result<usize> {
++        if !self.dense_ids_first() {
++            return packed_varint_count(data);
++        }
++        let mut cursor = super::wire::Cursor::new(data);
++        let mut id = 0_i64;
++        let mut count = 0;
++        while !cursor.is_empty() {
++            let delta = cursor.read_sint64().map_err(dense_id_varint_err)?;
++            id = id.wrapping_add(delta);
++            count += 1;
++            if let Err(err) = (self.sink)(crate::ElementKind::Node, id) {
++                self.sink_error = Some(err);
++                return Ok(count + packed_varint_count(&data[cursor.position()..])?);
++            }
++        }
++        Ok(count)
++    }
++
++    fn node(&mut self, node: &WireNode<'_>, _info: Option<&super::wire::WireInfo>) {
++        self.emit(crate::ElementKind::Node, node.id);
++    }
++
++    fn way(&mut self, way: &WireWay<'_>, _info: Option<&super::wire::WireInfo>) {
++        self.emit(crate::ElementKind::Way, way.id);
++    }
++
++    fn relation(&mut self, relation: &WireRelation<'_>, _info: Option<&super::wire::WireInfo>) {
++        self.emit(crate::ElementKind::Relation, relation.id);
++    }
++
++    fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
++        (self.group_end)(kinds);
++    }
++}
++
++/// Preserve the packed validator's diagnostics for a strict value read.
++#[cfg(any(feature = "commands", test))]
++#[cold]
++fn dense_id_varint_err(err: protohoggr::WireError) -> crate::error::Error {
++    match err {
++        protohoggr::WireError::TruncatedVarint => truncated_packed_varint_err(),
++        protohoggr::WireError::VarintOverflow => overlong_varint_err(),
++        _ => crate::error::Error::internal("unexpected error reading a dense ID varint"),
++    }
++}
++
+ /// Validate every group of a block (`group(i)` for `i` in `0..group_count`)
+ /// and hand each validated piece to `projection`. Returns the kinds the
+ /// block holds and its element count. The group part of [`validate_block`],
+@@ -1553,6 +1672,15 @@ fn validate_groups<'a>(
+         let group = WireGroup::new(data);
+         projection.group_begin();
+ 
++        // Streaming IDs in element order needs dense IDs first. Hold the
++        // result until the dense step so ordinary element errors still win,
++        // without buffering the ordinary IDs of a mixed group.
++        let dense = if projection.dense_ids_first() {
++            Some(prepare_dense(&group, projection))
++        } else {
++            None
++        };
++
+         // 2. Every element sub-message, its optional Info sub-message, and
+         //    every packed array it carries - both well-formedness and the
+         //    parallel-array invariants the zipping iterators depend on.
+@@ -1600,21 +1728,12 @@ fn validate_groups<'a>(
+ 
+         // 3. The dense group, and the parallel-array invariant every dense
+         //    consumer indexes on.
+-        if let Some(dense_data) = group.dense()? {
+-            let dense = WireDenseNodes::parse(dense_data)?;
+-            let ids = packed_varint_count(dense.id_data)?;
+-            let lats = packed_varint_count(dense.lat_data)?;
+-            let lons = packed_varint_count(dense.lon_data)?;
+-            if ids != lats || ids != lons {
+-                return Err(new_wire_error(
+-                    "dense group has mismatched id/lat/lon array lengths",
+-                ));
+-            }
+-            validate_dense_keys_vals(dense.keys_vals_data, ids, strings)?;
+-            let info = match dense.info_data {
+-                Some(info_data) => validate_dense_info_arrays(info_data, ids)?,
+-                None => None,
+-            };
++        let dense = match dense {
++            Some(prepared) => prepared?,
++            None => prepare_dense(&group, projection)?,
++        };
++        if let Some((dense, ids)) = dense {
++            let info = validate_dense_arrays(&dense, ids, strings)?;
+             if ids > 0 {
+                 group_kinds.add(ElementKind::Node);
+             }
+@@ -1628,6 +1747,37 @@ fn validate_groups<'a>(
+     Ok((kinds, count))
+ }
+ 
++fn prepare_dense<'a>(
++    group: &WireGroup<'a>,
++    projection: &mut impl GroupProjection,
++) -> Result<Option<(WireDenseNodes<'a>, usize)>> {
++    let Some(data) = group.dense()? else {
++        return Ok(None);
++    };
++    let dense = WireDenseNodes::parse(data)?;
++    let ids = projection.dense_id_count(dense.id_data)?;
++    Ok(Some((dense, ids)))
++}
++
++fn validate_dense_arrays<'a>(
++    dense: &WireDenseNodes<'a>,
++    ids: usize,
++    strings: usize,
++) -> Result<Option<WireDenseInfo<'a>>> {
++    let lats = packed_varint_count(dense.lat_data)?;
++    let lons = packed_varint_count(dense.lon_data)?;
++    if ids != lats || ids != lons {
++        return Err(new_wire_error(
++            "dense group has mismatched id/lat/lon array lengths",
++        ));
++    }
++    validate_dense_keys_vals(dense.keys_vals_data, ids, strings)?;
++    match dense.info_data {
++        Some(info_data) => validate_dense_info_arrays(info_data, ids),
++        None => Ok(None),
++    }
++}
++
+ /// The string table's UTF-8 check, after every group, as block construction
+ /// makes it: the first entry that is not UTF-8 is refused, by index.
+ fn validate_stringtable_utf8<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Result<()> {
+@@ -2331,9 +2481,199 @@ fn tag_index_unresolved() -> ! {
+ #[cfg(test)]
+ #[allow(clippy::unwrap_used)]
+ mod strict_validation_tests {
+-    use super::PrimitiveBlock;
++    use super::{BlockBuffer, PrimitiveBlock};
++    use crate::ElementKind;
++    use crate::element_kind::ElementKindSet;
++    use crate::error::{Error, Location, Result};
+     use crate::read::elements::Element;
+ 
++    const ID_KINDS: [ElementKind; 3] = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
++
++    fn id_kinds(mask: u8) -> ElementKindSet {
++        let mut kinds = ElementKindSet::default();
++        for kind in ID_KINDS {
++            if mask & (1 << kind.ordinal()) != 0 {
++                kinds.add(kind);
++            }
++        }
++        kinds
++    }
++
++    fn project_ids(
++        input: Vec<u8>,
++        claim: Option<ElementKind>,
++        kinds: ElementKindSet,
++        sink: impl FnMut(ElementKind, i64) -> Result<()>,
++    ) -> Result<()> {
++        BlockBuffer::new(input, None, &mut Vec::new(), &mut Vec::new(), claim).project_ids(
++            kinds,
++            sink,
++            |_| {},
++        )
++    }
++
++    fn assert_same_refusal(full: &Error, fused: &Error) {
++        assert_eq!(
++            std::mem::discriminant(full.kind()),
++            std::mem::discriminant(fused.kind())
++        );
++        assert_eq!(full.to_string(), fused.to_string());
++        assert_eq!(full.byte_offset(), fused.byte_offset());
++        assert_eq!(full.blob_index(), fused.blob_index());
++        assert_eq!(full.source_path(), fused.source_path());
++    }
++
++    fn assert_id_parity(input: Vec<u8>, oracle: &Result<PrimitiveBlock>, kinds: ElementKindSet) {
++        let mut ids = Vec::new();
++        let fused = project_ids(input, None, kinds, |kind, id| {
++            ids.push((kind, id));
++            Ok(())
++        });
++        match (oracle, fused) {
++            (Err(full), Err(fused)) => assert_same_refusal(full, &fused),
++            (Ok(block), Ok(())) => {
++                let walked: Vec<_> = block
++                    .elements()
++                    .filter_map(|element| {
++                        let (kind, id) = match element {
++                            Element::Node(node) => (ElementKind::Node, node.id()),
++                            Element::DenseNode(node) => (ElementKind::Node, node.id()),
++                            Element::Way(way) => (ElementKind::Way, way.id()),
++                            Element::Relation(relation) => (ElementKind::Relation, relation.id()),
++                        };
++                        kinds.has(kind).then_some((kind, id))
++                    })
++                    .collect();
++                assert_eq!(ids, walked);
++            }
++            (full, fused) => panic!("validator verdicts differ: {full:?}, {fused:?}"),
++        }
++    }
++
++    /// Keep the targeted validation fixtures as independent assertions on
++    /// construction, and use each one to check the fused traversal too.
++    fn with_id_parity(input: Vec<u8>) -> Result<PrimitiveBlock> {
++        let oracle = PrimitiveBlock::from_vec(input.clone());
++        assert_id_parity(input, &oracle, id_kinds(7));
++        oracle
++    }
++
++    #[test]
++    fn fused_ids_match_the_element_walk_on_generated_blocks_and_mutations() {
++        use crate::read::wire_fixtures::{mutations, projection_fixtures};
++
++        let fixtures = projection_fixtures()
++            .into_iter()
++            .chain([("wrapping IDs and partial metadata", wrapping_ids_block())]);
++        for (what, bytes) in fixtures {
++            assert!(PrimitiveBlock::from_vec(bytes.clone()).is_ok(), "{what}");
++            for (_, input) in
++                std::iter::once((String::new(), bytes.clone())).chain(mutations(&bytes))
++            {
++                let oracle = PrimitiveBlock::from_vec(input.clone());
++                for mask in 0..8 {
++                    assert_id_parity(input.clone(), &oracle, id_kinds(mask));
++                }
++            }
++        }
++    }
++
++    fn wrapping_ids_block() -> Vec<u8> {
++        use crate::read::wire_fixtures::{
++            Group, block, dense, field_bytes, packed, plain_node, relation, way,
++        };
++
++        let ids = [i64::MAX, i64::MIN, 0, i64::MIN, i64::MAX, -1];
++        let mut dense = dense(&ids.map(|id| (id, 0, 0)), &[]);
++        let mut info = Vec::new();
++        field_bytes(&mut info, 2, &packed([2; 6]));
++        field_bytes(&mut info, 6, &packed([1, 0, 1, 1, 0, 1]));
++        field_bytes(&mut dense, 5, &info);
++        block(
++            &["", "k", "v"],
++            &[
++                Group {
++                    nodes: vec![plain_node(i64::MIN, 0, 0, &[], None)],
++                    dense: Some(dense),
++                    ways: vec![way(i64::MAX, &ids, (1, 2))],
++                    relations: vec![relation(i64::MIN, &[])],
++                },
++                Group {
++                    nodes: vec![plain_node(i64::MAX, 0, 0, &[], Some([1, 0, 0, 0, 0]))],
++                    ..Group::default()
++                },
++            ],
++        )
++    }
++
++    #[test]
++    fn fused_ids_keep_block_errors_ahead_of_sink_errors() {
++        let good = dense_group(2, 2, 2);
++        let mut bad_table = len_field(1, &len_field(1, &[0xff]));
++        bad_table.extend_from_slice(&len_field(2, &good));
++
++        // These checks see IDs before refusing. UTF-8 also beats
++        // a contradictory claim, and a malformed ordinary node beats the
++        // dense ID error whose prefix the sink has already seen.
++        let mut bad_dense_and_plain = len_field(2, &len_field(1, &[2, 0x80]));
++        bad_dense_and_plain.extend_from_slice(&len_field(1, &[0x12, 0x05]));
++        for (input, claim, message) in [
++            (
++                block_with_groups(&[dense_group(2, 1, 2)]),
++                None,
++                "id/lat/lon",
++            ),
++            (bad_table, Some(ElementKind::Way), "UTF-8"),
++            (
++                block_with_groups(std::slice::from_ref(&good)),
++                Some(ElementKind::Way),
++                "indexdata",
++            ),
++            (
++                block_with_groups(&[bad_dense_and_plain]),
++                None,
++                "extends past end",
++            ),
++        ] {
++            let loc = Location::new(None, Some(2), Some(crate::read::blob::ByteOffset(137)));
++            let full =
++                BlockBuffer::new(input.clone(), None, &mut Vec::new(), &mut Vec::new(), claim)
++                    .block()
++                    .expect_err("fixture fails full validation");
++            assert!(full.to_string().contains(message), "{full}");
++            let full_located = full.clone().locate_blob(loc.clone());
++            for sink_fails in [false, true] {
++                let mut provisional = Vec::new();
++                let fused = project_ids(input.clone(), claim, id_kinds(7), |kind, id| {
++                    provisional.push((kind, id));
++                    if sink_fails {
++                        return Err(Error::internal("sink refused the first ID"));
++                    }
++                    Ok(())
++                })
++                .expect_err("fixture fails fused validation");
++                assert_eq!(provisional.first(), Some(&(ElementKind::Node, 1)));
++                if sink_fails {
++                    assert_eq!(provisional.len(), 1);
++                }
++                assert_same_refusal(&full, &fused);
++                assert_same_refusal(&full_located, &fused.locate_blob(loc.clone()));
++            }
++        }
++
++        let mut delivered = 0;
++        let err = project_ids(block_with_groups(&[good]), None, id_kinds(7), |_, _| {
++            delivered += 1;
++            Err(Error::internal("sink refused the first ID"))
++        })
++        .expect_err("the sink error survives a valid block");
++        assert_eq!(delivered, 1);
++        assert!(
++            err.to_string().contains("sink refused the first ID"),
++            "{err}"
++        );
++    }
++
+     /// Wrap `body` as protobuf field `field`, wire type 2 (length-delimited).
+     /// Every fixture here is small enough for a single-byte length varint,
+     /// which keeps the hand-encoding readable.
+@@ -2508,10 +2848,10 @@ mod strict_validation_tests {
+     /// every block.
+     #[test]
+     fn dense_group_with_mismatched_array_lengths_is_rejected() {
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 4)]))
++        with_id_parity(block_with_groups(&[dense_group(4, 4, 4)]))
+             .expect("a dense group with equal-length arrays is valid");
+ 
+-        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 2, 4)]))
++        let err = with_id_parity(block_with_groups(&[dense_group(4, 2, 4)]))
+             .expect_err("a short lat array must be rejected");
+         assert!(
+             // "mismatched" alone also appears in the way and relation array
+@@ -2521,7 +2861,7 @@ mod strict_validation_tests {
+         );
+ 
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 3)])),
++            with_id_parity(block_with_groups(&[dense_group(4, 4, 3)])),
+             crate::ErrorKind::WireFormat { .. },
+             "a short lon array must be rejected"
+         );
+@@ -2545,7 +2885,7 @@ mod strict_validation_tests {
+         let mut dense = len_field(1, &[0x02, 0x02, 0x82]);
+         dense.extend_from_slice(&len_field(8, &[0x02, 0x02]));
+         dense.extend_from_slice(&len_field(9, &[0x02, 0x02]));
+-        let err = PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &dense)]))
++        let err = with_id_parity(block_with_groups(&[len_field(2, &dense)]))
+             .expect_err("a packed array ending mid-varint must be rejected");
+         assert!(
+             format!("{err}").contains("mid-varint"),
+@@ -2559,7 +2899,7 @@ mod strict_validation_tests {
+         let mut good = len_field(1, &[0x02, 0x02]);
+         good.extend_from_slice(&len_field(8, &[0x02, 0x02]));
+         good.extend_from_slice(&len_field(9, &[0x02, 0x02]));
+-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &good)]))
++        with_id_parity(block_with_groups(&[len_field(2, &good)]))
+             .expect("the untruncated fixture must parse");
+     }
+ 
+@@ -2574,7 +2914,7 @@ mod strict_validation_tests {
+         let mut dense = len_field(1, &overflow);
+         dense.extend_from_slice(&len_field(8, &[0x00]));
+         dense.extend_from_slice(&len_field(9, &[0x00]));
+-        let err = PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &dense)]))
++        let err = with_id_parity(block_with_groups(&[len_field(2, &dense)]))
+             .expect_err("a varint wider than 64 bits must be rejected");
+         assert!(
+             format!("{err}").contains("wider than 64 bits"),
+@@ -2587,7 +2927,7 @@ mod strict_validation_tests {
+         let mut good = len_field(1, &widest);
+         good.extend_from_slice(&len_field(8, &[0x00]));
+         good.extend_from_slice(&len_field(9, &[0x00]));
+-        let block = PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &good)]))
++        let block = with_id_parity(block_with_groups(&[len_field(2, &good)]))
+             .expect("a legal ten-byte varint must parse");
+         assert_eq!(block.elements().count(), 1);
+     }
+@@ -2736,12 +3076,12 @@ mod strict_validation_tests {
+ 
+         for field in [1u8, 3, 4] {
+             let mut group = len_field(field, &valid);
+-            PrimitiveBlock::from_vec(block_with_groups(&[group.clone()]))
++            with_id_parity(block_with_groups(&[group.clone()]))
+                 .unwrap_or_else(|e| panic!("field {field}: valid element must parse: {e}"));
+ 
+             group.extend_from_slice(&len_field(field, &truncated));
+             crate::test_support::assert_err_kind!(
+-                PrimitiveBlock::from_vec(block_with_groups(&[group])),
++                with_id_parity(block_with_groups(&[group])),
+                 crate::ErrorKind::WireFormat { .. },
+                 "field {field}: a malformed element sub-message must be rejected"
+             );
+@@ -2876,7 +3216,7 @@ mod strict_validation_tests {
+     /// public contract the consumer panics below stand behind.
+     fn refused_at_construction(buffer: &[u8]) {
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(buffer.to_vec()),
++            with_id_parity(buffer.to_vec()),
+             crate::ErrorKind::WireFormat { .. },
+             "construction must refuse the fixture"
+         );
+@@ -3036,13 +3376,13 @@ mod strict_validation_tests {
+             let mut ok = vec![0x08u8, 0x01];
+             ok.extend_from_slice(&packed(2, 3));
+             ok.extend_from_slice(&packed(3, 3));
+-            PrimitiveBlock::from_vec(block_with_groups(&[len_field(field, &ok)]))
++            with_id_parity(block_with_groups(&[len_field(field, &ok)]))
+                 .unwrap_or_else(|e| panic!("field {field}: equal keys/vals must parse: {e}"));
+ 
+             let mut short = vec![0x08u8, 0x01];
+             short.extend_from_slice(&packed(2, 3));
+             short.extend_from_slice(&packed(3, 2));
+-            let err = PrimitiveBlock::from_vec(block_with_groups(&[len_field(field, &short)]))
++            let err = with_id_parity(block_with_groups(&[len_field(field, &short)]))
+                 .expect_err("a short vals array must be rejected");
+             assert!(
+                 format!("{err}").contains("keys/vals"),
+@@ -3073,7 +3413,7 @@ mod strict_validation_tests {
+                 (&[0x00, 0x00][..], &[0x00, 0x01][..]),
+                 (&[0x81, 0x80, 0x80, 0x80, 0x00][..], &[0x00][..]),
+             ] {
+-                let err = PrimitiveBlock::from_vec(block_with_table(
++                let err = with_id_parity(block_with_table(
+                     1,
+                     &[len_field(field, &element(keys, vals))],
+                 ))
+@@ -3086,7 +3426,7 @@ mod strict_validation_tests {
+                     "field {field}, keys {keys:02x?}, vals {vals:02x?}: {err}"
+                 );
+             }
+-            let block = PrimitiveBlock::from_vec(block_with_table(
++            let block = with_id_parity(block_with_table(
+                 1,
+                 &[len_field(field, &element(&[0x80, 0x80, 0x00], &[0x00]))],
+             ))
+@@ -3102,7 +3442,7 @@ mod strict_validation_tests {
+         // the value position is covered with a larger table in
+         // `blob_meta/scan.rs`.
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(block_with_table(
++            with_id_parity(block_with_table(
+                 1,
+                 &[dense_group_with(1, &[0x01, 0x00], None)],
+             )),
+@@ -3123,7 +3463,7 @@ mod strict_validation_tests {
+         let mut way = vec![0x08u8, 0x01];
+         way.extend_from_slice(&len_field(8, &[0x02, 0x02, 0x82]));
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &way)])),
++            with_id_parity(block_with_groups(&[len_field(3, &way)])),
+             crate::ErrorKind::WireFormat { .. },
+             "a refs array ending mid-varint must be rejected"
+         );
+@@ -3131,7 +3471,7 @@ mod strict_validation_tests {
+         // The same way with a complete final varint is valid.
+         let mut good = vec![0x08u8, 0x01];
+         good.extend_from_slice(&len_field(8, &[0x02, 0x02, 0x02]));
+-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &good)]))
++        with_id_parity(block_with_groups(&[len_field(3, &good)]))
+             .expect("a complete refs array must parse");
+     }
+ 
+@@ -3152,7 +3492,7 @@ mod strict_validation_tests {
+             way.extend_from_slice(&packed(8, 3));
+             way
+         };
+-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &with_refs_only)]))
++        with_id_parity(block_with_groups(&[len_field(3, &with_refs_only)]))
+             .expect("a way without node locations must stay valid");
+ 
+         let build = |refs: usize, lats: usize, lons: usize| {
+@@ -3163,18 +3503,16 @@ mod strict_validation_tests {
+             block_with_groups(&[len_field(3, &way)])
+         };
+ 
+-        PrimitiveBlock::from_vec(build(3, 3, 3))
+-            .expect("parallel refs/lat/lon arrays must be valid");
++        with_id_parity(build(3, 3, 3)).expect("parallel refs/lat/lon arrays must be valid");
+ 
+-        let err = PrimitiveBlock::from_vec(build(3, 3, 2))
+-            .expect_err("a short lon array must be rejected");
++        let err = with_id_parity(build(3, 3, 2)).expect_err("a short lon array must be rejected");
+         assert!(
+             format!("{err}").contains("lat/lon"),
+             "expected a lat/lon mismatch error, got: {err}"
+         );
+ 
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(build(3, 2, 2)),
++            with_id_parity(build(3, 2, 2)),
+             crate::ErrorKind::WireFormat { .. },
+             "coordinates that do not cover every node ref must be rejected"
+         );
+@@ -3196,17 +3534,16 @@ mod strict_validation_tests {
+             block_with_groups(&[len_field(4, &rel)])
+         };
+ 
+-        PrimitiveBlock::from_vec(build(3, 3, 3)).expect("parallel member arrays must be valid");
++        with_id_parity(build(3, 3, 3)).expect("parallel member arrays must be valid");
+ 
+-        let err = PrimitiveBlock::from_vec(build(3, 3, 2))
+-            .expect_err("a short types array must be rejected");
++        let err = with_id_parity(build(3, 3, 2)).expect_err("a short types array must be rejected");
+         assert!(
+             format!("{err}").contains("member array"),
+             "expected a member-array mismatch error, got: {err}"
+         );
+ 
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(build(3, 2, 3)),
++            with_id_parity(build(3, 2, 3)),
+             crate::ErrorKind::WireFormat { .. },
+             "a short memids array must be rejected"
+         );
+@@ -3222,7 +3559,7 @@ mod strict_validation_tests {
+         let mut node = vec![0x08u8, 0x01];
+         node.extend_from_slice(&bad_info);
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &node)])),
++            with_id_parity(block_with_groups(&[len_field(1, &node)])),
+             crate::ErrorKind::WireFormat { .. },
+             "a truncated Info sub-message must be rejected"
+         );
+@@ -3230,7 +3567,7 @@ mod strict_validation_tests {
+         // Same node with a well-formed info (version = 1) still parses.
+         let mut good = vec![0x08u8, 0x01];
+         good.extend_from_slice(&len_field(4, &[0x08, 0x01]));
+-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &good)]))
++        with_id_parity(block_with_groups(&[len_field(1, &good)]))
+             .expect("a well-formed Info sub-message must parse");
+ 
+         // A malformed Info followed by a valid one: the element parser used to
+@@ -3240,7 +3577,7 @@ mod strict_validation_tests {
+         shadowed.extend_from_slice(&bad_info);
+         shadowed.extend_from_slice(&len_field(4, &[0x08, 0x01]));
+         crate::test_support::assert_err_kind!(
+-            PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &shadowed)])),
++            with_id_parity(block_with_groups(&[len_field(1, &shadowed)])),
+             crate::ErrorKind::WireFormat { .. },
+             "a malformed Info shadowed by a later valid one must be rejected"
+         );
+@@ -3255,7 +3592,7 @@ mod strict_validation_tests {
+         with_info.extend_from_slice(&len_field(4, &[0x08, 0x07])); // version = 7
+         let without_info = vec![0x08u8, 0x02];
+         for group_field in [1, 3, 4] {
+-            let block = PrimitiveBlock::from_vec(block_with_groups(&[
++            let block = with_id_parity(block_with_groups(&[
+                 len_field(group_field, &with_info),
+                 len_field(group_field, &without_info),
+             ]))
+@@ -3299,7 +3636,7 @@ mod strict_validation_tests {
+     #[test]
+     fn dense_keys_vals_run_count_must_match_the_id_array() {
+         // Two nodes, two terminated runs.
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[0x01, 0x01, 0x00, 0x02, 0x02, 0x00],
+             None,
+@@ -3307,10 +3644,10 @@ mod strict_validation_tests {
+         .expect("two runs for two nodes must parse");
+ 
+         // An absent keys_vals means "no node here has tags" and stays legal.
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], None)]))
++        with_id_parity(block_with_groups(&[dense_group_with(2, &[], None)]))
+             .expect("an empty keys_vals must parse");
+ 
+-        let short = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        let short = with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[0x01, 0x01, 0x00],
+             None,
+@@ -3321,7 +3658,7 @@ mod strict_validation_tests {
+             "the run-count check must be what rejects this, got: {short}"
+         );
+ 
+-        let long = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        let long = with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[0x01, 0x01, 0x00, 0x02, 0x02, 0x00, 0x03, 0x03, 0x00],
+             None,
+@@ -3335,7 +3672,7 @@ mod strict_validation_tests {
+         // A final run that ends without its 0 terminator still describes one
+         // node - some writers omit the trailing delimiter, and rejecting that
+         // would reject conforming-enough real files.
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[0x01, 0x01, 0x00, 0x02, 0x02],
+             None,
+@@ -3343,7 +3680,7 @@ mod strict_validation_tests {
+         .expect("a final run without a trailing delimiter must parse");
+ 
+         // A key with no value is corruption: DenseTagIter would drop the tag.
+-        let dangling = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        let dangling = with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[0x01, 0x01, 0x00, 0x02],
+             None,
+@@ -3366,18 +3703,17 @@ mod strict_validation_tests {
+     fn dense_denseinfo_arrays_must_match_the_id_array() {
+         // version, timestamp, changeset, uid, user_sid - fields 1..=5.
+         let full: Vec<u8> = (1u8..=5).flat_map(|f| packed(f, 2)).collect();
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], Some(&full))]))
++        with_id_parity(block_with_groups(&[dense_group_with(2, &[], Some(&full))]))
+             .expect("five full-length info arrays must parse");
+ 
+         // Absent denseinfo entirely is legal - metadata is optional.
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], None)]))
++        with_id_parity(block_with_groups(&[dense_group_with(2, &[], None)]))
+             .expect("an absent denseinfo must parse");
+ 
+         let mut short: Vec<u8> = packed(1, 1);
+         short.extend((2u8..=5).flat_map(|f| packed(f, 2)));
+-        let err =
+-            PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(2, &[], Some(&short))]))
+-                .expect_err("a short version array must be rejected");
++        let err = with_id_parity(block_with_groups(&[dense_group_with(2, &[], Some(&short))]))
++            .expect_err("a short version array must be rejected");
+         assert!(
+             format!("{err}").contains("denseinfo array length does not match"),
+             "the denseinfo length check must be what rejects this, got: {err}"
+@@ -3386,7 +3722,7 @@ mod strict_validation_tests {
+         // Some but not all of the columns, as libosmium writes under
+         // `add_metadata`: legal, but each present one must still be full.
+         let partial: Vec<u8> = (1u8..=2).flat_map(|f| packed(f, 2)).collect();
+-        let block = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        let block = with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[],
+             Some(&partial),
+@@ -3410,7 +3746,7 @@ mod strict_validation_tests {
+         assert_eq!(read, [(2, 1000, 0), (2, 2000, 0)]);
+         let mut partial_short = packed(1, 2);
+         partial_short.extend(packed(2, 1));
+-        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        let err = with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[],
+             Some(&partial_short),
+@@ -3420,7 +3756,7 @@ mod strict_validation_tests {
+             format!("{err}").contains("denseinfo array length does not match"),
+             "the denseinfo length check must be what rejects this, got: {err}"
+         );
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[],
+             Some(&packed(6, 2)),
+@@ -3430,7 +3766,7 @@ mod strict_validation_tests {
+         // `visible` (field 6) is optional but must be full length when present.
+         let mut with_visible = full.clone();
+         with_visible.extend(packed(6, 2));
+-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[],
+             Some(&with_visible),
+@@ -3439,7 +3775,7 @@ mod strict_validation_tests {
+ 
+         let mut short_visible = full.clone();
+         short_visible.extend(packed(6, 1));
+-        let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
++        let err = with_id_parity(block_with_groups(&[dense_group_with(
+             2,
+             &[],
+             Some(&short_visible),
+@@ -3482,7 +3818,7 @@ mod strict_validation_tests {
+             &dense_group_with(1, &[0x01, 0x82, 0x01], None),
+         ));
+ 
+-        let parsed = PrimitiveBlock::from_vec(block).expect("fixture block must parse");
++        let parsed = with_id_parity(block).expect("fixture block must parse");
+         let node = match parsed.elements().next().expect("one element") {
+             super::Element::DenseNode(node) => node,
+             other => panic!("expected a dense node, got {other:?}"),

@@ -369,6 +369,31 @@ runs on the planet bbox and was not measured.
 
 ### Check commands
 
+#### check --ids fused validation and ID judging (bygg, baseline `5caa1101`)
+
+The prototype judged IDs during block validation through a fallible sink
+for indexed and unindexed input, including the `--full` proof pass.
+Duplicate replay still used `KindIds`. The sink preserved dense-first
+order and wrapping deltas, and unused packed columns used count-only
+checks. Findings stayed provisional through validation and kind-claim
+checks, with malformed-block errors taking precedence over sink errors.
+
+Planet `id-order`, interleaved with `--iterations 1` on bygg. A was HEAD
+`5caa1101` and B was the working tree on `5caa1101`.
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 23.1 s | `d6e809b1` |
+| B | 22.3 s | `17ee6bb8` |
+| A | 22.1 s | `96a7bf62` |
+| B | 21.8 s | `37651a5e` |
+
+The median wall time fell about 2 %, within noise. The second ID walk did
+not bound planet `check --ids`. Decompression is the likely bottleneck.
+Tier 1 and `pbfhogg-verify check-ids` on denmark and germany passed on B.
+The measured effect did not justify changing the shared validator, so the
+prototype did not land.
+
 #### check --refs (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17)
 
 Sequential main-thread consumer pegged at 100 % CPU on `RoaringTreemap::insert`

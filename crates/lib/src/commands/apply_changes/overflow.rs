@@ -3,10 +3,10 @@
 //! retention threshold.
 //!
 //! An apply-changes output block can outgrow the limit although everything
-//! that went into it fits on its own: a rewritten block carries its source
-//! block's whole string table, because surviving base elements keep their
-//! string indices, plus the strings of every OSC element written into it,
-//! and blocks are cut by element count, not by bytes. A 17 MiB tag value
+//! that went into it fits on its own. Size-sensitive rewrites take the
+//! original whole-table path so its recovery and refusals stay intact.
+//! Its first pass carries the source table plus the strings of every OSC
+//! element written into the block, with cuts by element count. A 17 MiB tag value
 //! modified to another 17 MiB value makes a 34 MiB block from a source block
 //! and an OSC element that each fit. And a blob's frames can be many times
 //! its input: every block repeats the strings its elements share, so one

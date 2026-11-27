@@ -130,6 +130,8 @@ struct WorkerLoc<'a> {
 /// Streaming pool configuration. Channels are passed separately
 /// ([`StreamingChannels`]).
 pub(super) struct StreamingConfig {
+    #[cfg(test)]
+    pub(super) whole_table_oracle: bool,
     /// The run's pinned base; the pool opens one description of it.
     pub base: crate::read::input::PinnedInput,
     /// Open that description `O_DIRECT` (the run's `direct_reads`).
@@ -296,6 +298,8 @@ pub(super) fn run_workers(
         route,
         failure,
         cancel,
+        #[cfg(test)]
+        whole_table_oracle,
     } = cfg;
     let StreamingChannels {
         candidate_rx,
@@ -382,6 +386,8 @@ pub(super) fn run_workers(
                         route,
                         cancel,
                         &stream,
+                        #[cfg(test)]
+                        whole_table_oracle,
                     )
                 }));
                 // Publish before this closure returns: `drain_tx` and the
@@ -418,13 +424,16 @@ pub(super) fn run_workers(
     // Test-only: the same counters, kept on the run's token, so a test can
     // assert on them without an instrumentation sink.
     #[cfg(pbfhogg_test_hooks)]
-    {
-        let mut recorded = Vec::new();
-        counters.for_each(|name, value| recorded.push((name, value)));
-        cancel
-            .faults()
-            .record_apply_changes_worker_counters(recorded);
-    }
+    record_worker_counters(counters, &cancel);
+}
+
+#[cfg(pbfhogg_test_hooks)]
+fn record_worker_counters(counters: &WorkerCounters, cancel: &crate::host::Recorder) {
+    let mut recorded = Vec::new();
+    counters.for_each(|name, value| recorded.push((name, value)));
+    cancel
+        .faults()
+        .record_apply_changes_worker_counters(recorded);
 }
 
 /// Per-worker hot loop. Pulls candidates until the channel closes; for
@@ -443,6 +452,7 @@ fn worker_loop(
     route: Route<()>,
     cancel: &crate::host::Recorder,
     stream: &StreamTx<'_>,
+    #[cfg(test)] whole_table_oracle: bool,
 ) -> Result<()> {
     // The decode buffer moves into each parsed block and comes back through
     // this worker's pool when the block drops, so one buffer serves every
@@ -504,6 +514,8 @@ fn worker_loop(
                     route,
                     &cancel.metrics().writer,
                     stream,
+                    #[cfg(test)]
+                    whole_table_oracle,
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
                 // Only a sent end closes a stream, so one left open after a
@@ -719,6 +731,7 @@ fn handle_candidate(
     route: Route<()>,
     metrics: &crate::write::metrics::WriterMetrics,
     stream: &StreamTx<'_>,
+    #[cfg(test)] whole_table_oracle: bool,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     let WorkerScratch {
@@ -1127,6 +1140,8 @@ fn handle_candidate(
         metrics,
         stream,
         open,
+        #[cfg(test)]
+        whole_table_oracle,
     )?;
     counters.rewrite_ns.fetch_add(
         t_rewrite.elapsed_ns().saturating_sub(output.frame_ns),

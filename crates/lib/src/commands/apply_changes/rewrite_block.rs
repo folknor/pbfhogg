@@ -27,7 +27,7 @@ use crate::commands::{
 use super::Result;
 use super::classify::{DiffHit, KindSeeks, blob_walk, element_kind_id};
 use super::element_writes::{
-    BaseWrites, RefreshScratch, RefreshTally, add_osc_node, add_osc_relation,
+    BaseWrites, RefreshScratch, RefreshTally, add_osc_node, add_osc_relation, mark_used_slots,
     write_base_dense_node_local, write_base_node_local, write_base_relation_local,
     write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
 };
@@ -37,6 +37,8 @@ use super::overflow::{
 };
 use super::refresh::StaleProbe;
 use super::stats::MergeStats;
+
+const ELEMENT_CAP: usize = crate::block_builder::DEFAULT_ELEMENT_CAP.get();
 
 /// Output from `rewrite_block_parallel`, from a rewrite whose walk has
 /// ended.
@@ -327,25 +329,13 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
 /// accumulating them all before framing held each worker's whole raw output
 /// beside its framed copy.
 ///
-/// An output block is the source block's whole string table (survivors keep
-/// their string indices) plus what the OSC elements add, so it can outgrow
-/// the PBF blob limit although the source block and every changed element
-/// fit: a 17 MiB tag value modified to another 17 MiB value. Such a block's
-/// framing refusal is recorded, not returned, and so is the moment the
-/// held frames pass `APPLY_CHANGES_REWRITE_RETAIN_BYTES`. Either defers the
-/// blob (`overflow.rs`): once the walk has ended each overflow is planned
-/// into smaller blocks that carry only the strings they use, the walk's own
-/// refusal is returned, and then `open` sends the blob's item with a frame
-/// stream and the blob is written again, each frame sent as it is framed.
-/// A plan fails the rewrite, with a single element's framing error, where
-/// that element overflows alone with its own strings in every form tried
-/// (a bare node is retried plain), or where halving finds no fitting cut
-/// although one exists; see the `overflow.rs` module doc for what the plan
-/// does not search. A recorded overflow outranks
-/// any later error of the walk, as it would have had it been returned at
-/// its flush. Nothing of a blob refused before `open` leaves the worker; a
-/// failure while streaming leaves part of the blob in the output, which is
-/// then not published.
+/// When all operations can fit the element cap of one block, that block
+/// keeps the source slots. Otherwise each batch seeds only its survivors'
+/// slots. Where an original block could have exceeded the PBF limits, or
+/// the compact pass hits a refusal, the original writer handles the blob.
+/// This keeps the original size recovery and refusal order. A blob whose
+/// frames exceed the retention threshold is written again into a stream
+/// with the same cuts. See `overflow.rs` for recovery and stream admission.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
@@ -362,45 +352,8 @@ pub(super) fn rewrite_block_parallel(
     metrics: &crate::write::metrics::WriterMetrics,
     stream: &StreamTx<'_>,
     open: impl FnOnce(MergeStats) -> Result<()>,
+    #[cfg(test)] whole_table_oracle: bool,
 ) -> Result<RewriteOutput> {
-    let mut sink = RewriteSink::first_pass(FramedBlocks::new(*compression, metrics));
-    let mut stats = MergeStats::new();
-    let mut base_writes = BaseWrites::new(block, probe, scratch);
-    let walked = {
-        let mut cx = OpContext {
-            block,
-            diff,
-            loc,
-            stats: &mut stats,
-            base_writes: &mut base_writes,
-        };
-        walk_and_write(
-            block,
-            diff,
-            bb,
-            inline_upserts.clone(),
-            kind,
-            claim,
-            &mut sink,
-            &mut cx,
-        )
-    };
-    // The last use of `base_writes`, which releases `scratch` for a replay.
-    let refresh = base_writes.tally;
-    if !sink.deferred() {
-        walked?;
-        return Ok(RewriteOutput {
-            frames: Some(sink.framed.frames),
-            frame_ns: sink.framed.frame_ns,
-            stats,
-            refresh,
-        });
-    }
-    let RewriteSink {
-        framed, overflows, ..
-    } = sink;
-    let mut frame_ns = framed.frame_ns;
-    drop(framed.frames);
     let inputs = Inputs {
         block,
         diff,
@@ -410,37 +363,97 @@ pub(super) fn rewrite_block_parallel(
         compression,
         metrics,
     };
+    let compact = block
+        .element_count()
+        .saturating_add(inline_upserts.len() as u64)
+        > ELEMENT_CAP as u64;
+    #[cfg(test)]
+    let compact = compact && !whole_table_oracle;
+    rewrite_block(
+        inputs,
+        bb,
+        inline_upserts,
+        scratch,
+        claim,
+        stream,
+        open,
+        compact,
+    )
+}
+
+struct FirstPass<'a> {
+    sink: RewriteSink<'a>,
+    stats: MergeStats,
+    refresh: RefreshTally,
+    walked: Result<()>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_block(
+    inputs: Inputs<'_>,
+    bb: &mut BlockBuilder,
+    inline: Range<usize>,
+    scratch: &mut RefreshScratch,
+    claim: Option<&BlobIndex>,
+    stream: &StreamTx<'_>,
+    open: impl FnOnce(MergeStats) -> Result<()>,
+    mut compact: bool,
+) -> Result<RewriteOutput> {
+    let mut pass = first_pass(inputs, bb, inline.clone(), scratch, claim, compact);
+    let mut frame_ns = 0;
+    if compact && (pass.walked.is_err() || !pass.sink.overflows.is_empty()) {
+        // A raw add may have poisoned the builder. The whole-table walk
+        // must start fresh to reproduce the original refusal or recovery.
+        frame_ns = pass.sink.framed.frame_ns;
+        drop(pass);
+        *bb = BlockBuilder::new();
+        compact = false;
+        pass = first_pass(inputs, bb, inline.clone(), scratch, claim, compact);
+    }
+    let FirstPass {
+        sink,
+        stats,
+        refresh,
+        walked,
+    } = pass;
+    frame_ns += sink.framed.frame_ns;
+    if !sink.deferred() {
+        walked?;
+        return Ok(RewriteOutput {
+            frames: Some(sink.framed.frames),
+            frame_ns,
+            stats,
+            refresh,
+        });
+    }
+    let RewriteSink {
+        framed, overflows, ..
+    } = sink;
+    drop(framed.frames);
     let end = overflows.last().map_or(0, |o| o.ops().end);
-    let ops = collect_ops(inputs, inline_upserts.clone(), end, stream)?;
+    let ops = collect_ops(inputs, inline.clone(), end, stream)?;
     let plans = plan(inputs, &ops, &overflows, scratch, stream)?;
     walked?;
     open(stats)?;
-    // The second writing: the walk again (fresh steps, claim walk and
-    // seeded builder, so it writes what the first wrote), each block sent
-    // as it is framed and each overflow replaced by its plan.
+    // Replay the selected table strategy with fresh steps and claim walk.
+    // Send each frame as it completes and substitute the plans for any
+    // recorded overflows.
     let depth = plans.iter().map(overflow::Plan::depth).max().unwrap_or(0);
     let mut scratches: Vec<RefreshScratch> = std::iter::repeat_with(RefreshScratch::default)
         .take(depth)
         .collect();
     let mut emit = EmitSink::new(inputs, &ops, &plans, &mut scratches, stream, 0);
-    let mut again = MergeStats::new();
-    let mut base_writes = BaseWrites::new(block, probe, scratch);
-    let mut cx = OpContext {
-        block,
-        diff,
-        loc,
-        stats: &mut again,
-        base_writes: &mut base_writes,
-    };
-    walk_and_write(
-        block,
-        diff,
+    let mut stats = MergeStats::new();
+    let mut base_writes = BaseWrites::new(inputs.block, inputs.probe, scratch);
+    walk_pass(
+        inputs,
         bb,
-        inline_upserts,
-        kind,
+        inline,
         claim,
         &mut emit,
-        &mut cx,
+        compact,
+        &mut stats,
+        &mut base_writes,
     )?;
     frame_ns += emit.finish()?;
     end_stream(stream)?;
@@ -452,49 +465,285 @@ pub(super) fn rewrite_block_parallel(
     })
 }
 
+fn first_pass<'a>(
+    inputs: Inputs<'a>,
+    bb: &mut BlockBuilder,
+    inline: Range<usize>,
+    scratch: &mut RefreshScratch,
+    claim: Option<&BlobIndex>,
+    compact: bool,
+) -> FirstPass<'a> {
+    let mut sink = RewriteSink::first_pass(FramedBlocks::new(*inputs.compression, inputs.metrics));
+    let mut stats = MergeStats::new();
+    let mut base_writes = BaseWrites::new(inputs.block, inputs.probe, scratch);
+    let walked = walk_pass(
+        inputs,
+        bb,
+        inline,
+        claim,
+        &mut sink,
+        compact,
+        &mut stats,
+        &mut base_writes,
+    );
+    FirstPass {
+        sink,
+        stats,
+        refresh: base_writes.tally,
+        walked,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_pass<'a, S: OpSink>(
+    inputs: Inputs<'a>,
+    bb: &mut BlockBuilder,
+    inline: Range<usize>,
+    claim: Option<&BlobIndex>,
+    sink: &mut S,
+    compact: bool,
+    stats: &mut MergeStats,
+    base_writes: &mut BaseWrites<'a>,
+) -> Result<()> {
+    let mut cx = OpContext {
+        block: inputs.block,
+        diff: inputs.diff,
+        loc: inputs.loc,
+        stats,
+        base_writes,
+    };
+    if compact {
+        walk_and_write::<true, _>(bb, inline, inputs, claim, sink, &mut cx)
+    } else {
+        walk_and_write::<false, _>(bb, inline, inputs, claim, sink, &mut cx)
+    }
+}
+
 /// The rewrite's first pass: every step written into `bb`, blocks flushed
 /// into `sink` (which records an overflowing block instead of failing), the
 /// last block flushed, then the walk ended.
-#[allow(clippy::too_many_arguments)]
-fn walk_and_write<S: OpSink>(
-    block: &PrimitiveBlock,
-    diff: &SortedDiff,
+fn walk_and_write<'a, const COMPACT: bool, S: OpSink>(
     bb: &mut BlockBuilder,
     inline_upserts: Range<usize>,
-    kind: ElementKind,
+    inputs: Inputs<'a>,
     claim: Option<&BlobIndex>,
     sink: &mut S,
-    cx: &mut OpContext<'_, '_>,
+    cx: &mut OpContext<'_, 'a>,
 ) -> Result<()> {
     let mut walk = blob_walk(claim);
-    bb.pre_seed_string_table(block)?;
+    let mut batch = if COMPACT {
+        if cx.block.string_table_entry(0) != Some("") {
+            return Err(crate::Error::invalid_data(
+                "a rewritten block's string table does not begin with the empty string",
+            ));
+        }
+        Batch::new(cx.block, *inputs.compression)
+    } else {
+        bb.pre_seed_string_table(cx.block)?;
+        Batch::default()
+    };
     let mut observed = false;
-    for step in Steps::new(block, diff, kind, inline_upserts) {
-        match step? {
+    for step in Steps::new(cx.block, cx.diff, inputs.kind, inline_upserts) {
+        let op = match step? {
             Step::Observe(id) => {
                 walk.observe(id)?;
                 observed = true;
+                continue;
             }
-            Step::Create(op) => {
-                write_op(&op, bb, sink, cx)?;
-                sink.op_written();
-            }
+            Step::Create(op) => op,
             Step::Element { id, op } => {
                 if !std::mem::take(&mut observed) {
                     walk.observe(id)?;
                 }
-                match op {
-                    Some(op) => {
-                        write_op(&op, bb, sink, cx)?;
-                        sink.op_written();
-                    }
-                    None => cx.stats.deleted += 1,
-                }
+                let Some(op) = op else {
+                    cx.stats.deleted += 1;
+                    continue;
+                };
+                op
             }
+        };
+        if COMPACT {
+            batch.ops.push(op);
+            if batch.ops.len() == ELEMENT_CAP {
+                batch.write(bb, sink, cx)?;
+            }
+        } else {
+            write_op(&op, bb, sink, cx)?;
+            sink.op_written();
         }
     }
-    // Flush remaining elements in the BlockBuilder, then end the walk.
-    flush_local(bb, sink)?;
-    walk.finish()?;
-    Ok(())
+    if COMPACT {
+        batch.write(bb, sink, cx)?;
+    } else {
+        flush_local(bb, sink)?;
+    }
+    walk.finish().map(|_| ())
+}
+
+/// Only one output block's operations are retained. Their source indices
+/// still name the original table, including duplicate slots and slot zero.
+/// The builder translates those indices using the seed for this batch and
+/// interns the OSC strings into the same output table.
+#[derive(Default)]
+struct Batch<'a> {
+    ops: Vec<Op<'a>>,
+    used: Vec<bool>,
+    source_table_bytes: usize,
+    previous_bytes: usize,
+    sure_payload: usize,
+}
+
+impl<'a> Batch<'a> {
+    fn new(block: &PrimitiveBlock, compression: Compression) -> Self {
+        use crate::commands::split::{Limits, varint_len};
+        let source_table_bytes = (0..block.string_table_len())
+            .filter_map(|sid| block.string_table_entry(sid))
+            .map(|s| 1 + varint_len(s.len()) + s.len())
+            .sum();
+        Self {
+            ops: Vec::with_capacity(ELEMENT_CAP),
+            source_table_bytes,
+            sure_payload: Limits::new(compression).sure(),
+            ..Self::default()
+        }
+    }
+
+    fn write(
+        &mut self,
+        bb: &mut BlockBuilder,
+        sink: &mut impl OpSink,
+        cx: &mut OpContext<'_, 'a>,
+    ) -> Result<()> {
+        if self.ops.is_empty() {
+            return Ok(());
+        }
+        let mut has_base = false;
+        // Enclosing string/group fields and a possible additional empty
+        // string for a dense tag key. Per-element estimates are below.
+        let mut bytes = 2 * FIELD_OVERHEAD + 2;
+        for op in &self.ops {
+            let additional = match op {
+                Op::Base(element) => {
+                    if !has_base {
+                        self.used.resize(cx.block.string_table_len(), false);
+                        self.used.fill(false);
+                        has_base = true;
+                    }
+                    let count = mark_used_slots(element, &mut self.used)?;
+                    base_bytes(element, count, cx.loc)
+                }
+                Op::Osc(kind, i) => osc_bytes(cx.diff, *kind, *i, cx.loc),
+            };
+            bytes = bytes.saturating_add(additional);
+        }
+        // The previous encoder can flush before the first survivor after
+        // a block of OSC records. Its count-capped block therefore fits in
+        // at most two adjacent batches, plus the original string table.
+        // Keep its recovery even when compaction could avoid an overflow:
+        // its search can refuse an otherwise representable partition.
+        if self
+            .source_table_bytes
+            .saturating_add(self.previous_bytes)
+            .saturating_add(bytes)
+            > self.sure_payload
+        {
+            return Err(crate::Error::internal(
+                "apply-changes: original rewrite could exceed the blob limits",
+            ));
+        }
+        self.previous_bytes = bytes;
+        if has_base {
+            bb.pre_seed_subset_string_table(cx.block, &self.used)?;
+        }
+        // The precomputed seed belongs to exactly one block. A mid-batch
+        // split would reuse it for a different set of operations. Hand
+        // oversized batches to the legacy recovery instead, including
+        // before a further add could grow an already oversize builder.
+        for op in &self.ops {
+            if bb.content_over_payload_limit() {
+                return Err(crate::Error::internal(
+                    "apply-changes: compact rewrite batch exceeded the payload limit",
+                ));
+            }
+            write_op(op, bb, &mut NoMidBatchFlush, cx)?;
+            sink.op_written();
+        }
+        self.ops.clear();
+        flush_local(bb, sink)
+    }
+}
+
+// Maximum encoded varint width, and room for up to nine scalar values with
+// their field wrappers, two packed tag field wrappers, Info/DenseInfo and
+// enclosing element/group fields, even if each dense row starts a group.
+// The final byte is the dense end-of-tags marker.
+const VARINT_BYTES: usize = 10;
+const FIELD_OVERHEAD: usize = 2 + VARINT_BYTES;
+const ELEMENT_OVERHEAD: usize = 9 * VARINT_BYTES + (9 + 2 + 3) * FIELD_OVERHEAD + 1;
+
+fn base_bytes(element: &Element<'_>, string_refs: usize, loc: LocMode<'_>) -> usize {
+    let wire = match element {
+        Element::Way(way) => {
+            let refs = way.refs_data().len();
+            let coords = if matches!(loc, LocMode::Off) {
+                0
+            } else {
+                (way.lat_data().len() + way.lon_data().len()).max(refs * VARINT_BYTES)
+            };
+            refs + coords + way.info_data().map_or(0, <[u8]>::len)
+        }
+        Element::Relation(rel) => {
+            rel.memids_data().len()
+                + rel.types_data().len()
+                + rel.info_data().map_or(0, <[u8]>::len)
+        }
+        Element::Node(_) | Element::DenseNode(_) => 0,
+    };
+    ELEMENT_OVERHEAD + wire + string_refs * VARINT_BYTES
+}
+
+fn osc_bytes(diff: &SortedDiff, kind: ElementKind, i: usize, loc: LocMode<'_>) -> usize {
+    fn string_bytes(s: &str) -> usize {
+        s.len() + 1 + VARINT_BYTES + VARINT_BYTES // slot plus one reference
+    }
+    let (tags, meta, extra) = match kind {
+        ElementKind::Node => {
+            let node = diff.node(i);
+            (node.tags(), node.metadata(), 0)
+        }
+        ElementKind::Way => {
+            let way = diff.way(i);
+            let fields = if matches!(loc, LocMode::Off) { 1 } else { 3 };
+            (
+                way.tags(),
+                way.metadata(),
+                way.ref_count().saturating_mul(fields * VARINT_BYTES),
+            )
+        }
+        ElementKind::Relation => {
+            let rel = diff.relation(i);
+            let members = rel.members().fold(0usize, |bytes, (_, _, role)| {
+                bytes.saturating_add(string_bytes(role) + 2 * VARINT_BYTES)
+            });
+            (rel.tags(), rel.metadata(), members)
+        }
+    };
+    let base = ELEMENT_OVERHEAD
+        .saturating_add(extra)
+        .saturating_add(meta.and_then(|info| info.user).map_or(0, string_bytes));
+    tags.fold(base, |bytes, (key, value)| {
+        bytes
+            .saturating_add(string_bytes(key))
+            .saturating_add(string_bytes(value))
+    })
+}
+
+struct NoMidBatchFlush;
+
+impl BlockSink for NoMidBatchFlush {
+    fn flush(&mut self, _: &mut BlockBuilder) -> Result<()> {
+        Err(crate::Error::internal(
+            "apply-changes: compact rewrite batch unexpectedly needed a split",
+        ))
+    }
 }

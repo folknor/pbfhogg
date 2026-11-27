@@ -20,12 +20,16 @@ use crate::tunables::{
 
 use super::Result;
 use super::admin::AssembledPolygon;
-use super::cover::{Vertex, cover_path_raw, cover_segment};
+use super::cover::{Vertex, cover_segment};
 use super::pass2::SlimInterpWay;
 use crate::error::Error;
 use crate::scratch::{ScratchFile, ScratchPath, ScratchSubdir};
 
 use super::super::format::*;
+
+#[path = "pass3_admin.rs"]
+mod admin_cells;
+use admin_cells::admin_cells_for_polygon;
 
 // ---------------------------------------------------------------------------
 // Cell entry types
@@ -1072,13 +1076,9 @@ pub(super) fn assign_admin_cells(
 ) -> Vec<AdminCellEntry> {
     use rayon::prelude::*;
 
-    // Per-polygon work is independent: edge-cell cover + flood fill read the
-    // polygon vertices in isolation and produce a disjoint set of
-    // `AdminCellEntry`s. `par_iter().flat_map_iter().collect()` preserves
-    // input ordering so downstream `entries.sort_unstable_by_key(cell_id)`
-    // in `write_admin_index` gives a byte-identical result to the sequential
-    // path. Plan item #6 - Europe admin flood-fill was 10.7 s sequential
-    // (UUID bf8f2038); expected ~5× on 12 cores.
+    // Each polygon emits entries in the original flood order. Keep those
+    // sequences in polygon-index order since the writer's unstable sort by
+    // cell ID sees equal keys when polygons share a cell.
     executor.install(|| {
         polygons
             .par_iter()
@@ -1090,7 +1090,8 @@ pub(super) fn assign_admin_cells(
     })
 }
 
-fn admin_cells_for_polygon(
+#[cfg(test)]
+fn admin_cells_for_polygon_oracle(
     poly_idx: usize,
     poly: &AssembledPolygon,
     admin_level: u8,
@@ -1100,10 +1101,7 @@ fn admin_cells_for_polygon(
     if ext_f64.len() < 3 {
         return Vec::new();
     }
-    #[expect(
-        clippy::expect_used,
-        reason = "the builder refuses an admin-polygon count over u32::MAX before cell assignment"
-    )]
+    #[allow(clippy::expect_used, reason = "the oracle uses small fixture indexes")]
     let poly_index = u32::try_from(poly_idx).expect("admin count checked before cell assignment");
 
     let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
@@ -1193,8 +1191,11 @@ fn admin_cells_for_polygon(
 
 /// Insert into `cells` every cell at `level` on the boundary the point-in-ring
 /// test has for `ring` (`(lon, lat)` degrees, as `geo::point_in_ring` takes
-/// it); see `admin_cells_for_polygon`.
+/// it); see `admin_cells_for_polygon_oracle`.
+#[cfg(test)]
 fn cover_pip_ring_boundary(ring: &[(f64, f64)], level: u8, cells: &mut rustc_hash::FxHashSet<u64>) {
+    use super::cover::cover_path_raw;
+
     let frame = crate::geo::pip_ring_frame(ring);
     let n = frame.len();
     if n == 0 {

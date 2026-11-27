@@ -32,6 +32,27 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Prepared admin rings in Pass 3 (bygg, 2026-11-27)
+
+Pass 3 prepares each polygon's rings once, uses the padded edge cover to
+classify boundary cells, and reuses one center test per edge-free subtree.
+The legacy flood fill remains a test-only oracle.
+
+Germany `geocode-build` on bygg, single-iteration cells interleaved baseline
+first:
+
+| `0d1e05fb` | working tree on 0d1e05fb |
+|---|---|
+| 8.3 s `075b3636` (cold first cell, excluded), 6.8 s `d9cf2233` | 6.6 s `552620d0`, 6.3 s `32abf21d` |
+
+The sidecar comparison of `d9cf2233` (`0d1e05fb`) and `32abf21d` (working
+tree on 0d1e05fb) on bygg shows the `GEOCODE_PASS3_ADMIN_CELLS` span falling
+from 125 ms to 43 ms (65 % shorter). Most of the remaining wall delta is
+in the publish segment, where writeback timing varied. The measured gain
+is in admin cell assignment.
+
+Denmark `geocode` verify passed on the working tree on 0d1e05fb on bygg.
+
 ### Rings on one line refused, flattened rings stored whole (bygg, 2026-11-24, variant uncommitted against `3b534693`)
 
 Planet, one `--commit HEAD` baseline cell and one variant cell with

@@ -879,6 +879,19 @@ queue unboundedly behind a slow partition.
 
 Kind: structural follow-up, more conditional payoff.
 
+The stage 2 output experiment was refused. On bygg against `5973bfc4`,
+the experimental working tree on `5973bfc4` was slower in both default
+planet pairs, and neutral with `--keep-untagged-nodes`. Filtering and
+re-encoding on stage 2's capped workers cost more than skipping the
+later node reads saved. See the
+[external node output measurements](../reference/performance/add-locations-to-ways.md#external-node-output-from-stage-2-refused-bygg-baseline-5973bfc4).
+
+To resurface, schedule node encoding on workers outside stage 2's cap.
+The code is in `notes/stashed-perf-033-external-altw-stage2-node-output.patch`,
+against `5973bfc4`. It covers `mod.rs`, `stage2.rs`, `stage2_table.rs`,
+`stage4.rs` and the new `node_output.rs` under `altw/external/`, plus its
+tunables.
+
 ## PERF-034 - apply-changes location mode decodes every node blob and forces a whole-way refresh scan
 
 Reported by: apply-locations, apply-core.
@@ -1534,42 +1547,6 @@ Residue:
   runs no drop or unsort case. Unit tests hold
   the predicted listing, counts and digest to the merge's.
 
-## PERF-074 - sort runs osmium multipass even on already ordered input
-
-Reported by: heavy-codex, orchestration-codex.
-
-Mechanism: the check always runs osmium's multipass sort, which opens the input
-once per kind, even when independent decoding proves the input is strictly
-ordered, in which case a stable sort cannot permute anything. The multipass
-artifact also differs from the simple-sort artifact other checks request (the
-simple path writes a sort declaration).
-
-Redesign: on proven order, use the independently read input sequence with the
-same projection. On disorder, use an independent stable sort that emits
-comparison records directly. Keep type, signed-ID and version ordering,
-duplicate rejection and the way-location prediction. Provide a declared PBF
-only to the consumers that need one.
-
-Risks: the header alone is insufficient evidence; equivalence to osmium's PBF
-write/read normalization (visibility, coordinates) must be established first.
-
-Kind: high-payoff oracle rewrite (heavy-codex).
-
-## PERF-075 - cat and the reencode partition commission extra osmium passes
-
-Reported by: orchestration-codex, engine-codex, heavy-codex.
-
-Mechanism: `cat` asks osmium for three kind-filtered PBFs and decodes each
-again. On nonstandard order, `verify_reencode`'s partition path runs three
-filtered `osmium cat` passes plus a fourth to join them.
-
-Redesign: one independent base scan supplies the per-kind views and the stable
-kind partition. Keep real osmium output where a check observes its header,
-roundtrip behaviour or blob packing. A way-only result still needs an order
-judgment without its referenced nodes.
-
-Kind: smaller win.
-
 ## PERF-076 - diff and derive-changes prepare each input pair repeatedly
 
 Reported by: other-codex, other-opus, orchestration-codex, engine-codex.
@@ -1681,31 +1658,17 @@ the count comes from the OPL comparison. The ordered comparison and
 sequential reuse measurements are recorded in
 [verifier performance](../reference/performance/verifier.md).
 
-## PERF-081 - Selection checks run one tool invocation per request
+## PERF-081 - Getparents and tags-filter run separate selections
 
 Reported by: other-codex, other-opus.
 
-Mechanism:
+Getparents makes separate requests. Its node request depends on the
+selected way, and each request has its own add-self semantics. Sharing
+the scan would need to preserve both dependencies.
 
-- getparents runs eight selections per tool.
-- getid --add-referenced runs its plain and `--remove-tags` arms separately.
-- getid --invert takes counts from a fifth full decode (`osmium_counts`).
-- check-refs runs two modes, and osmium's `-r` report already holds the
-  ways-only count (cached).
-- inspect-tags runs one report per kind.
-- tags-filter runs one scan per expression.
-- The tags-filter OSC case runs four reference cases.
-- check-ids reads four dataset-sized cases with osmium and runs plain and
-  `--full` reports, which both execute the same order proof.
-
-Redesign: share the decoded relation pass across getparents' W, R, N and M
-requests and resolve the first ref of the selected W way first. Share closure
-in getid's arms. Take the invert counts from the comparison pass. Do the
-check-refs node/way work once. Count inspect-tags in one pass. Route
-tags-filter hits per expression in one scan with per-output pruning (a single
-OR would lose the way-only check). For check-ids, share the ID projection
-between plain and full, and reuse a summary for the stripped input after
-proving payload identity.
+Tags-filter scans separately for each expression, including its OSC
+reference cases. A shared scan would need to preserve each expression's
+membership, dependency closure and pruning.
 
 Kind: medium.
 

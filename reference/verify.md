@@ -21,8 +21,9 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
 
 - **Element equality** is the verifier's merge of osmium's decodings
   (`opl_compare`): `osmium cat -f opl[,add_metadata=false][,locations_on_ways=true]`
-  of each side to a file in the run's decoding store (`RUN/decodings/`,
-  below), then a streaming merge
+  writes PBF decodings to the run's store (`RUN/decodings/`, below). A
+  comparison reads those decodings or the expected streams projected from
+  them, then performs a streaming merge
   keyed by kind and ID in osmium's object order (kind node, way, relation;
   then ID zero, negative IDs by magnitude, positive IDs by magnitude) that
   requires each side strictly ascending, so it also certifies, as osmium
@@ -51,8 +52,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   lifecycle checkpointed. Order and counts are recorded per source once a
   decoding was read whole for its keys (an order scan, a completed strict
   merge, a judged walk's drain), under any policy, since every policy
-  writes the kind and ID alike; record bytes are never projected from one
-  policy to another. A call pins its retained operands before it makes any
+  writes the kind and ID alike. The store keeps the record bytes of each
+  policy separately. A call pins its retained operands before it makes any
   missing one, and makes its missing ones together, as one launch group (see
   Processes): one decode per distinct source and policy, a pin per operand,
   every operand path watched and its stamp rechecked once the group settles.
@@ -77,7 +78,7 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   coordinates are the command's promise (add-locations-to-ways), the check
   requires both declarations. Where pbfhogg keeps the input's declaration
   (cat, sort, getid in every mode, getparents, tags-filter, extract), the
-  osmium reference is written with
+  osmium reference PBF, when needed, is written with
   `-f pbf,locations_on_ways=true` when the input declares it, and every
   osmium output or sorted copy written with that option must declare it (a
   verifier error otherwise), so a kept declaration is compared coordinate
@@ -140,8 +141,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   comparison with osmium and the engine parity, each by name, which
   witnesses the both-declared branch of `Policy::between` there. On an
   input declaring `LocationsOnWays` whose first data blob is indexed, an
-  inline-coordinate-only change of pbfhogg's outputs fails every cat
-  arm and exactly sort's element comparison, by name, which witnesses
+  inline-coordinate-only change of pbfhogg's outputs fails cat's way arm
+  and sort's element comparison, by name, which witnesses
   that branch on cat and sort. On getid-removeid, over an input with one
   indexed node blob and one indexed way blob, the same change fails
   exactly the comparisons whose outputs hold the way: plain getid,
@@ -183,13 +184,14 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   input's elements without coordinates; whether its rewritten ways keep
   their arrays is not judged, since an undeclared output may carry them. The sort
   check holds its input to its domain of one object per kind and ID before
-  judging anything pbfhogg did: a `HistoricalInformation`
-  header is refused, and osmium's reference sort runs first, its output's
-  strict order scanned, so a repeated object anywhere in the input (across
-  blobs included) is a verifier error, never a pbfhogg verdict. The domain
-  assumes a conforming snapshot; a `visible=false` record under a header
-  without `HistoricalInformation` is not detected. The rest must drop it
-  with the loss warning. The warning is read from pbfhogg's stderr as the
+  judging anything pbfhogg did. A `HistoricalInformation` header is
+  refused. If the input decoding does not establish strict order, the
+  reference sort runs first and its output is scanned. A repeated object
+  anywhere in the input (across blobs included) is a verifier error. A
+  snapshot header can accompany `visible=false` records, which also keep
+  the reference sort so its visibility normalization is observed. The
+  remaining commands must drop the declaration with the loss warning as
+  documented. The warning is read from pbfhogg's stderr as the
   CLI renders
   `header.way_metadata_loss` (`Warning: the input declares ..., which the
   output does not declare`, `LocationsOnWays` a member of the list).
@@ -252,13 +254,14 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   copy that then does not declare it is a verifier error.
   Copies fed to pbfhogg use osmium's default `simple` strategy, the only one
   that writes the `Sort.Type_then_ID` claim pbfhogg branches on. The `sort`
-  check's own reference uses `-s multipass`: it judges elements and
-  pbfhogg's order, never the reference's header, and `simple` holds the whole
-  input in memory (osmium documents roughly ten times the PBF size), which
-  the kernel OOM killer ended on germany. Multipass holds one object type at
-  a time; its observed peak on germany is in the evidence below. A sorted
-  copy of an unsorted germany-sized input still takes the simple strategy
-  and its memory.
+  check reads the input itself when an independent OPL scan proves strict
+  order and the plain PBF roundtrip preserves the compared fields. It uses
+  `-s multipass` otherwise. `simple` holds the whole input in memory
+  (osmium documents roughly ten times the PBF size), which the kernel OOM
+  killer ended on germany. Multipass holds one object type at a time. Its
+  observed peak on germany is in the evidence below. A sorted copy of an
+  unsorted germany-sized input still takes the simple strategy and its
+  memory.
 
 ## Inputs
 
@@ -526,6 +529,11 @@ streams with the same keys could pass. That is accepted under the same
 assumption the reference cache already makes when an input digest selects
 a stored osmium output, for a local single-user tool with no adversary.
 An order scan (`order`) answers from a stored summary under any policy.
+The sort check also stores whether its input is eligible for the direct
+comparison. Cat stores the counts, order and digest of each kind view
+under the base decoding's key. A warm comparison can use a view's digest
+and the output's stored summary under one tool binding. A mismatch or miss
+materializes the views for the usual strict merge.
 Repack's and degrade's sequence walk against their verifier-written
 expected file (`compare_sequence_with_opl`) is decided without decoding
 the output when the input decoding the file was projected from carries a
@@ -682,19 +690,19 @@ suite because a later comparison cannot make that run complete.
 | Check | Compared against | Established by |
 |---|---|---|
 | `field-policies` | osmium decodings of one-field edits of an osmium-built slice of the input | each policy reads exactly the field classes it claims, with every edit isolated by an independent decoding; `between` by declaration (see How outputs are judged) |
-| `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim; an input holding an object more than once (a history header, or a repeat the reference sort's order scan finds) is `ERROR` |
-| `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
+| `sort` | osmium's decoding of an independently proven ordered input, or `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim; an input holding an object more than once (a history header, or a repeat the reference sort's order scan finds) is `ERROR` |
+| `cat` | per-kind views of one osmium decoding, with an osmium-written PBF for header checks and filtered PBFs for fallback arms | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
 | `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, the disjoint union of that subset and its complement in both orders, merges with a window of the input's own blobs in both orders, and on a `LocationsOnWays` input merges with the subset derived without the declaration in both orders: element equality with the input, blob layout and summary counts against the plan predicted from both framings, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
 | `tags-filter` | `osmium tags-filter -R`; `osmium tags-filter`, `-t` and `-i` | three expressions with omitted references, then default mode on `highway=primary`, `r/type=route_master` (nested relation closure), `--remove-tags w/highway=primary` and `--invert-match highway=primary`, same content/order checks as cat; default arms refuse inputs where osmium's sign folding could differ (below) |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
-| `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
-| `getid-removeid` (alias `getid`) | `osmium getid`, `removeid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert element equality with and without way IDs (inline coordinates on a `LocationsOnWays` input, in every mode) and count complement, recursive referenced content and tag removal, with absent witnesses named |
+| `inspect-tags` | one osmium XML decoding projected to both `tags-count` reports, or `osmium tags-count` when the decoding cannot be used | every kind and `-t way`: count and key rows in order, quoted keys decoded |
+| `getid-removeid` (alias `getid`) | `osmium getid`, `removeid`, and `getid -r` with its `-t` tag projection | endpoint selection by kind, invert element equality with and without way IDs (inline coordinates on a `LocationsOnWays` input, in every mode) and count complement, recursive referenced content and tag removal, with absent witnesses named |
 | `extract` | `osmium extract` | strict order, element content and per-strategy membership on the bbox and every configured polygon; simple relations follow the any-direct-node-or-way rule judged against complete_ways |
 | `multi-extract` | sequential pbfhogg extracts | each config run reports the route the input header predicts; for each strategy, config output per region has strict order and element equality with its sequential extract of the same strategy (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
 | `geocode` | a verifier-owned model of the documented query rules over `osmium tags-filter` and `osmium add-locations-to-ways` OPL (one decoding of address, highway and interpolation objects, one of boundary relations), both read from the osmium-sorted copy when the input does not claim `Sort.Type_then_ID` (osmium locates a way only from nodes stored before it), the input itself otherwise; a present claim is trusted, so a pass does not validate it | `geocode-query` over two `build-geocode-index` builds of the input, at `--admin-tolerance 20` and `0`, on seeded uniform and witness queries aiming at a quota per class within the fine radius, between the radii and beyond both (at least one each is enforced for every class the model holds), plus witnesses near boundary vertices: every judged address, street and interpolation answer is one of the nearest candidates (tied within 0.1 mm) with equal text and address coordinates, distance within 0.1 mm, a street's nearest point within two decimicrodegrees and an interpolation number one the documented range rules give within the reach of the nearest point's truncation, or none beyond the coarse radius, every answer key present; an input with no answering range judges interpolation absence only and says so. Every judged admin level is a containing area of least stored area (the area within a float error bound of the exact outer-ring shoelace, and no larger than any other containing area's bound), or none; a relation the builder withholds (an outer or inner member way absent from the input, without nodes or referring to an absent node, one way in both roles, or topology the builder refuses: a block of the node-id member graph that is neither a bridge nor a simple cycle, a ring revisiting a coordinate outside one run or lying on one line, or two rings of one graph where one has no edge midpoint, of an edge with neither node on the other ring, strictly outside the other) is judged as contributing no area, the rings being assembled by an independent oracle of the builder node-id rules (bridges dropped, lobes split at shared nodes, a way listed twice in one role counted once), and a ref osmium left unlocated is joined against its node record; a level is not judged within 1 mm (tolerance 0) or 21.2 m (tolerance 20) of a boundary of that level, inside the box of a relation the model leaves unmodelled (two rings of one member graph whose eligible edge midpoints disagree on whether one lies outside the other, where the builder decides by the first midpoint of its walk, unless another definite refusal withholds the relation), anywhere at the level of a relation with a member node whose record carries no location, or inside the box of a hole nearer than a decimicrodegree to an outer it may belong to (the relation is otherwise modelled, since that ownership decides answers only inside the hole); witness anchors are drawn class first, uniformly over the classes the model holds, then within the class; at least one containing answer per build is enforced. After every other draw come witnesses near sites where two areas of one level may overlap (proper edge crossings, vertices strictly inside the other ring, points of the intersection of their boxes inside both, over every whole-turn alignment), each kept only where the model finds two containing areas of a level with one certified larger; the run reports the pairs and sites searched and the judged answers with a competitor certified larger, and does not claim that no overlap is missed. Longitude is periodic throughout, as the documented rules read it: distances and bands take the shorter way round over every image of the query a turn apart, a segment of exactly half a turn is both half-world paths, a snap is folded with the antimeridian spelled +180, interpolation nodes meet addresses with +180 and -180 as one meridian, a building is placed by the shorter-arc mean, and a ring is judged in its containment frame (unwrapped when an edge spans more than half a turn, a query tried a turn either way); a relation with a ring winding round a pole, spanning a full turn unwrapped or with an edge of exactly half a turn is withheld, and a disjointness verdict that depends on which spelling of the antimeridian the builder's walk gives a midpoint leaves its rings' boxes unjudged. No latitude or longitude is outside the domain. Queries within 0.1 mm of the coarse radius are not judged; an object repeated in a decoding (adjacent repeats only; this does not certify the input's uniqueness) or a modelled way with an unlocated node is a verifier error; a tag value or member role holding a NUL is outside the comparison (libosmium cuts it), and so is a way whose refs end in an empty packed field (libosmium keeps only the last segment) |
 | `geocode-seam` | the `geocode` model, over a fixed OPL fixture the check writes, converted by `osmium cat` and rewritten by `pbfhogg cat` (no dataset; `--direct-io` only) | everything `geocode` establishes, on data straddling the antimeridian and past 85 degrees of latitude, plus named queries whose model expectation is held to what the fixture is drawn to show before they are judged: an address stored at -180 answering a query at +180, an interpolation range resolved through both spellings and one numbered across it, a snap on the antimeridian spelled +180 (every judged snap longitude must lie in (-180, 180]), a street answering across it, a street past 85 degrees answering, a hole across it removing a country that contains its far side, both spellings at a ring touching it left on that ring's band, and an overlap across it with a certified smaller winner at both tolerances; and half-turn path cases, on streets spanning exactly half a turn from a node at longitude 0, queried on that meridian where the two half-world paths tie exactly in the reader by mirror symmetry, the far end spelled +180, spelled -180 and listed first, each answer required to take the path east of the lesser endpoint, plus a control just west of the meridian where the strictly nearer west path is required (the general `geocode` judgement accepts either path within 0.1 mm and cannot tell an exact tie from a near one, so the path is judged only here, as its own verdict); a named case the model does not expect as drawn is a verifier error |
-| `check-refs` | `osmium check-refs` | missing counts per class in ways-only and relation modes, each exit held to its complete report |
+| `check-refs` | `osmium check-refs -r`, including its ways-only count | missing counts per class in ways-only and relation modes, each pbfhogg exit and the osmium relation-mode exit held to its complete report |
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
 | `repack` | osmium OPL decodings, walked in file order | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
 | `degrade` | osmium OPL decodings, walked in file order | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on an input whose ways carry them, declared or not (`--locations-on-ways`, suite `degrade -l`) |
@@ -811,6 +819,30 @@ strict order excludes repeated IDs. With it, outputs must be strictly
 ordered and a reference sort claim requires pbfhogg's claim. Getparents
 refuses negative IDs and negative references osmium could fold.
 
+The sort check's strict input scan proves every kind and ID key is unique
+and already in osmium order, so no version or timestamp tiebreaker can
+move a record. The old reference's PBF reader has already reduced
+metadata and coordinates to libosmium's in-memory types. Its writer and
+the OPL writer use the same NUL-terminated strings. The PBF writer uses
+the same fixed-point units for node and requested way coordinates,
+including undefined coordinates. When the input does not declare
+`LocationsOnWays`, both comparisons already omit inline coordinates.
+Plain PBF output does omit visibility, so an invisible record requires the
+real roundtrip. A possible overflow in the delta between adjacent nodes
+also keeps the PBF path. These same conditions apply to cat's per-kind
+views.
+
+For cat, a single-input `osmium cat` copies its input header before
+reading objects. `-t` only changes the reader's kind mask. The header
+checks use a PBF written with `-t changeset` and the same location options
+as the filtered references. Libosmium's PBF reader emits no changeset
+objects. One scan of the reference input's OPL produces a stable view per
+kind and judges its order without needing way nodes. When the output omits the way
+coordinate declaration, the comparison uses the way view whose `N`
+references contain just IDs. An ineligible or disordered view goes through
+the filtered osmium PBF path, which retains its roundtrip and order
+diagnostics.
+
 Tags-filter's default-mode arms (no `-R`) are compared only where osmium's
 selection by absolute value cannot differ from pbfhogg's by signed ID:
 before pbfhogg runs, each arm's osmium output is read, and an object with a
@@ -825,22 +857,30 @@ a FAIL otherwise. On unindexed input the arms pbfhogg would refuse get
 never read indexdata and take no `--force`.
 
 Check-refs reads pbfhogg's original input and osmium's sorted copy when
-needed. It accepts osmium exit 1 only with the complete final summary and
-requires empty stdout. It does not accept `--direct-io`. Osmium counts
+needed. Both pbfhogg reports are judged against osmium's `-r` report. The
+ways-only count is its node-in-way count, which both osmium modes accumulate
+in the same way handler. A failed relation reference leaves the ways-only
+comparison to its own osmium run. The verifier accepts osmium exit 1 only with the
+complete final summary and requires empty stdout. It does not accept
+`--direct-io`. Osmium counts
 missing node refs in ways and relation-to-relation members per referencing
 occurrence and node and way members once per ID, so each class compares
 osmium's count with pbfhogg's count of the same quantity: the parenthesized
 occurrence count where pbfhogg prints one, else its bare count. pbfhogg's
 unique counts must sum to its FAILED total.
 
-Inspect-tags runs `pbfhogg inspect tags` and `osmium tags-count` on the
-input, over every kind and over ways alone. Both reports are parsed whole
-into rows of decimal count, tab, one quoted key and newline, any other byte
-failing the comparison; osmium's doubled-quote quoting (a tab or newline in
-a key written literally) and pbfhogg's JSON string literal are each decoded,
-and the row lists must be equal in order, which DEVIATIONS.md promises. A
-pbfhogg key holding a NUL makes the check an error, not a verdict, since
-libosmium cannot count such a key faithfully.
+Inspect-tags runs `pbfhogg inspect tags` on the input over every kind and
+over ways alone. One pass over `osmium cat -f osm,add_metadata=false` counts
+every key occurrence for both scopes. XML attribute escapes are decoded to
+the original key bytes, including tabs and newlines. Counts wrap at 32 bits
+as in `osmium tags-count`, and rows sort by descending count then ascending
+key bytes. A stored projection can serve both scopes on later runs. If the
+decoding cannot be used, the verifier reads the original `osmium tags-count`
+reports, with doubled quotes decoded. The pbfhogg reports are parsed whole
+into rows of decimal count, tab, one JSON-quoted key and newline. Each row
+list must equal its reference in order, which DEVIATIONS.md promises. A
+pbfhogg key holding a NUL makes the check an error, since libosmium cannot
+count such a key faithfully.
 
 Add-locations-to-ways accepts `--mode sparse|external|all` (default all).
 On input without the optional sort feature, external must refuse with exit
@@ -864,13 +904,17 @@ and unique records by kind and ID. An input claiming a negative ID is
 refused before any run, since osmium removeid and getid -r match an ID by
 its absolute value. Include/invert requests take the lowest and highest
 claimed IDs per kind. Each selected count must match its request, and
-selected plus inverted counts must match the input; each invert output is
-compared with osmium removeid of the same IDs. A second invert request
+selected plus inverted counts must match the input. The inverted counts
+come from its element comparison with osmium removeid of the same IDs,
+using the sorted copy's counts on the unsorted route. A second invert request
 takes only the node and relation endpoints, so its output must keep a
 `LocationsOnWays` declaration; its PASS names it absent when the input
 claims ways but no node or relation. The referenced request separately
-chooses a relation, highest way and node; its PASS names missing
-recursion, member and tag witnesses. Negative references that osmium could
+chooses a relation, highest way and node. Both pbfhogg modes are judged
+against one osmium `getid -r` closure. The `-t` expectation clears tags of
+indirectly reached objects in that closure's decoding and keeps every other
+field. Both modes have the same missing-object count and header claims.
+Its PASS names missing recursion, member and tag witnesses. Negative references that osmium could
 fold are refused. Without the optional sort feature, comparisons use the
 same sorted-copy route as cat.
 
@@ -958,8 +1002,9 @@ the verifier's header-only reading of the framing (`pbf_frames::framing`), since
 an indexed file pbfhogg judges type order from the kind every data blob
 claims, an empty blob's included. A file passes when osmium reads it in
 strict order and, if indexed, its claims never step back a kind. An ordered
-report without `multiple_versions` is an error, never read as false. Each
-mode must exit as its report says (0 with a pass and no violation, 1 with a
+report without `multiple_versions` is an error, never read as false. The two
+modes share this independent reading, and each mode must exit as its report
+says (0 with a pass and no violation, 1 with a
 failure and at least one), answer as expected, count each kind as osmium
 does (what catches a reader that skips objects), and report `indexed`
 exactly when the framing carries indexdata. The violations themselves and
@@ -970,7 +1015,10 @@ check derives, the input stripped of indexdata (when it has any), `degrade
 `degrade --unsort-intra --strip-indexdata` (one inside a blob, unindexed),
 each required to keep the input's counts, its framing, and to be out of
 order exactly when its degradation fires on those counts (a kind above the
-cap, a kind with two objects), else the check is an error; and five fixed
+cap, a kind with two objects), else the check is an error. The stripped case
+reuses the input's fileinfo projection only when the header features and
+the bytes of every data payload in order match. Its framing is always read
+independently. The remaining cases are five fixed
 fixtures, written as OPL and converted by `osmium cat`, then rewritten by
 `pbfhogg cat` for an indexed form: a way before its nodes and an adjacent
 repeated ID in both forms, and an ordered file with an empty blob claiming
@@ -991,7 +1039,7 @@ an error here.
 
 `repack` and `degrade` hold pbfhogg's two re-encoders to
 osmium's reading of the input and to their documented block layout
-(`verify_reencode`, shared). Elements: osmium decodes a reference and the
+(`verify_reencode`, shared). Elements: osmium decodes the input and the
 output to OPL with metadata and way coordinates
 (`opl,locations_on_ways=true`), and the verifier walks the two record
 streams in file order as osmium diff walks its inputs, advancing the side
@@ -1004,9 +1052,9 @@ reference-side records means the output is a subsequence of the reference.
 A moved or removed object is listed with its line. The reference side uses
 osmium's decoding of the input under the same policy
 (`opl_compare::compare_sequence_with_opl`). One scan prepares a stable
-partition by kind and projects way-node coordinates to undefined
-(`n<id>xy`) where the command must drop them. Grouped decodings that need
-no projection are used directly. Checks with the same input and coordinate
+partition by kind from that base decoding and projects way-node coordinates
+to undefined (`n<id>xy`) where the command must drop them. Grouped
+decodings that need no projection are used directly. Checks with the same input and coordinate
 policy share the result for the life of the run. Libosmium's PBF writer
 chooses its own blocks and can exceed the 32 MiB limit on input pbfhogg re-encodes,
 and its plain writer drops `visible` without a history header. Whether the

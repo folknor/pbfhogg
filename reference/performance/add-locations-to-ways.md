@@ -756,6 +756,33 @@ the ordered pools is not decided by these cells.
 
 ## History
 
+### External node output from stage 2, refused (bygg, baseline `5973bfc4`)
+
+The experiment moved node output into stage 2. With
+`--keep-untagged-nodes`, it forwarded node frames verbatim. In default
+mode it rebuilt retained nodes from the bytes stage 2 had already
+decompressed. Stage 4 read only way and relation frames. The reorder
+budget was 512 MiB in the experimental working tree on `5973bfc4` on bygg.
+
+Planet `embed-locations --index-type external`, after one fstrim on bygg:
+
+| Mode | Baseline `5973bfc4` (bygg) | Experimental working tree on `5973bfc4` (bygg) |
+|---|---|---|
+| Default, first pair | 4m42s (`a016e9ce`) | 5m17s (`8a5dbe3a`) |
+| Default, second pair | 5m12s (`d4425564`) | 5m50s (`bd941b54`) |
+| `--keep-untagged-nodes yes` | 6m08s (`874e9f55`) | 6m11s (`12f30a2a`) |
+
+| Span | Baseline `5973bfc4` (bygg, `d4425564`) | Experimental working tree on `5973bfc4` (bygg, `bd941b54`) |
+|---|---|---|
+| `EXTJOIN_STAGE2` | 132.6 s | 186.0 s |
+| `EXTJOIN_STREAMING` | 122.0 s | 107.2 s |
+
+Default mode was slower in both pairs. Moving node filtering and
+re-encoding onto stage 2's capped six workers increased its span by
+more than streaming saved. Keeping untagged nodes was neutral.
+This design was refused. A retry needs workers outside stage 2's cap
+to encode node output.
+
 ### External packed per-way payloads, inconclusive (bygg, baseline `d64b3548`)
 
 The uncommitted variant writes complete packed latitude, longitude and pin

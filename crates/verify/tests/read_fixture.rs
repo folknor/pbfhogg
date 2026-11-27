@@ -6,6 +6,7 @@ use crate::{checks, fake_pbf, harness, process, reference, reference_cache, run}
 
 const SORTED: &str = "Sort.Type_then_ID";
 const LOW: &str = "LocationsOnWays";
+const CAT_FIXTURE: &str = "FixtureCat";
 
 #[allow(
     clippy::too_many_lines,
@@ -16,6 +17,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     std::fs::create_dir(&dir).unwrap();
     let input = dir.join("input.pbf");
     fake_pbf::write(&input, &[SORTED], "sorted");
+    let cat_input = dir.join("cat-input.pbf");
+    fake_pbf::write(&cat_input, &[SORTED, CAT_FIXTURE], "sorted");
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(&dir, "read-fixture".into(), false).unwrap();
     let mut h = harness::Harness::new(
@@ -26,34 +29,41 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         cache,
     );
     h.run.watch(&input).unwrap();
-    for (name, run) in [
-        ("cat", checks::cat::run as checks::ReadCheck),
-        ("tags-filter", checks::tags_filter::run),
+    for (name, run, input) in [
+        ("cat", checks::cat::run as checks::ReadCheck, &cat_input),
+        ("tags-filter", checks::tags_filter::run, &input),
     ] {
+        h.run.watch(input).unwrap();
         assert_eq!(
-            h.run_check(name, |h| run(h, &input, true)).unwrap(),
+            h.run_check(name, |h| run(h, input, true)).unwrap(),
             harness::CheckStatus::Passed
         );
     }
     // A content change fails both, and so does a version-only change: both
     // compare metadata, every arm by name.
     for fault in ["content", "metadata"] {
-        for (name, run, arms) in [
+        for (name, run, input, arms) in [
             (
                 "bad-cat",
                 checks::cat::run as checks::ReadCheck,
+                &cat_input,
                 &[
                     "cat -t node diff",
                     "cat -t way diff",
                     "cat -t relation diff",
                 ][..],
             ),
-            ("bad-tags", checks::tags_filter::run, &TAGS_FILTER_ARMS[..]),
+            (
+                "bad-tags",
+                checks::tags_filter::run,
+                &input,
+                &TAGS_FILTER_ARMS[..],
+            ),
         ] {
             h.run = run::Run::create(&dir, exe, true).unwrap();
-            h.run.watch(&input).unwrap();
+            h.run.watch(input).unwrap();
             std::fs::write(dir.join("fault"), fault).unwrap();
-            let judged = super::judge(&mut h, name, |h| run(h, &input, true));
+            let judged = super::judge(&mut h, name, |h| run(h, input, true));
             assert_eq!(
                 judged.status,
                 harness::CheckStatus::Failed,
@@ -155,14 +165,20 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         harness::CheckStatus::Failed
     );
     std::fs::write(dir.join("fault"), "").unwrap();
-    for (name, run) in [
-        ("unsorted-cat", checks::cat::run as checks::ReadCheck),
-        ("unsorted-tags", checks::tags_filter::run),
+    let unsorted_cat = dir.join("unsorted-cat.pbf");
+    fake_pbf::write(&unsorted_cat, &[CAT_FIXTURE], "unsorted");
+    for (name, run, input) in [
+        (
+            "unsorted-cat",
+            checks::cat::run as checks::ReadCheck,
+            &unsorted_cat,
+        ),
+        ("unsorted-tags", checks::tags_filter::run, &unsorted),
     ] {
         h.run = run::Run::create(&dir, exe, true).unwrap();
-        h.run.watch(&unsorted).unwrap();
+        h.run.watch(input).unwrap();
         assert_eq!(
-            h.run_check(name, |h| run(h, &unsorted, true)).unwrap(),
+            h.run_check(name, |h| run(h, input, true)).unwrap(),
             harness::CheckStatus::Passed
         );
     }
@@ -291,21 +307,17 @@ fn add_fold_witness(args: &[&str], fault: &str, out: &Path) {
 /// (a believed node claim, so sort has no way blob to rewrite): cat and
 /// sort keep the declaration, so both outputs declare it and every
 /// element comparison reads inline coordinates. One way coordinate
-/// altered on pbfhogg's outputs alone must fail each element arm by
+/// altered on pbfhogg's outputs alone must fail the arms that contain it by
 /// name and no other; a clean run passes.
 fn kept_locations(h: &mut harness::Harness, exe: &Path, dir: &Path) {
     let indexed = dir.join("indexed.pbf");
-    fake_pbf::write_indexed(&indexed, &[SORTED, LOW], "sorted @w1");
+    fake_pbf::write_indexed(&indexed, &[SORTED, LOW, CAT_FIXTURE], "sorted @w1");
     for fault in ["", "coords"] {
         for (name, run, arms) in [
             (
                 "indexed-cat",
                 checks::cat::run as checks::ReadCheck,
-                &[
-                    "cat -t node diff",
-                    "cat -t way diff",
-                    "cat -t relation diff",
-                ][..],
+                &["cat -t way diff"][..],
             ),
             (
                 "indexed-sort",
@@ -350,6 +362,51 @@ fn fault_output(fault: &str, input: &Path, output: &Path) {
     }
 }
 
+/// Give the cat fixture one record of each kind and select only the kind
+/// named in the output's bytes. Keep the selection through a fake sort.
+fn cat_decoding(args: &[&str], output: &Path) {
+    let features = fake_pbf::features(Path::new(args[1]));
+    if !features.iter().any(|feature| feature == CAT_FIXTURE) {
+        return;
+    }
+    let opl = std::fs::read_to_string(output).unwrap();
+    let mut lines = opl.lines();
+    let node = lines.next().unwrap();
+    let stem = node
+        .strip_prefix('n')
+        .unwrap()
+        .strip_suffix(" x1 y1")
+        .unwrap();
+    let (_, refs) = lines
+        .next()
+        .and_then(|line| line.rsplit_once(" N"))
+        .unwrap_or(("", "n1"));
+    let way = format!("w{stem} N{refs}");
+    let relation = format!("r{stem} M");
+    let kind = features
+        .iter()
+        .find_map(|feature| feature.strip_prefix("FixtureType."));
+    let text = match kind {
+        Some("node") => format!("{node}\n"),
+        Some("way") => format!("{way}\n"),
+        Some("relation") => format!("{relation}\n"),
+        None => format!("{node}\n{way}\n{relation}\n"),
+        Some(kind) => panic!("unexpected fixture kind {kind}"),
+    };
+    std::fs::write(output, text).unwrap();
+}
+
+fn mark_cat_output(args: &[&str], output: &Path) {
+    let mut features = fake_pbf::features(output);
+    if features.iter().any(|feature| feature == CAT_FIXTURE) {
+        let at = args.iter().position(|&arg| arg == "--type").unwrap();
+        features.push(format!("FixtureType.{}", args[at + 1]));
+        let features: Vec<_> = features.iter().map(String::as_str).collect();
+        let marker = format!("{}{}", fake_pbf::marker(output), fake_pbf::suffixes(output));
+        fake_pbf::write(output, &features, &marker);
+    }
+}
+
 /// Write an add-locations-to-ways `output` of `input`, by pbfhogg's
 /// `engine` or (`None`) by osmium. Every output carries a way with an inline
 /// coordinate; the parity faults alter one field class of the external
@@ -370,6 +427,7 @@ fn write_located(fault: &str, input: &Path, output: &Path, engine: Option<&str>)
 
 #[allow(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "One explicit arm per emulated tool invocation"
 )]
 pub fn tool(args: &[OsString]) -> i32 {
@@ -398,6 +456,7 @@ pub fn tool(args: &[OsString]) -> i32 {
     };
     if fake_pbf::is_opl_cat(&args) {
         fake_pbf::opl_cat(&args);
+        cat_decoding(&args, output());
         add_fold_witness(&args, &fault, output());
         return 0;
     }
@@ -412,10 +471,19 @@ pub fn tool(args: &[OsString]) -> i32 {
                 assert!(!args.contains(&"--tmp-dir"));
             } else if args[0] == "cat" {
                 asks_locations(&args);
+                if fake_pbf::features(Path::new(args[1]))
+                    .iter()
+                    .any(|feature| feature == CAT_FIXTURE)
+                {
+                    assert_eq!(value("-t"), "changeset");
+                }
             }
             std::fs::copy(args[1], output()).unwrap();
             if args.contains(&"--output") {
                 fault_output(&fault, Path::new(args[1]), output());
+                if args[0] == "cat" {
+                    mark_cat_output(&args, output());
+                }
             }
         }
         "sort" if args.contains(&"--output") => {
@@ -430,10 +498,23 @@ pub fn tool(args: &[OsString]) -> i32 {
         }
         "sort" => {
             let locations = asks_locations(&args);
-            let features: &[&str] = if locations { &[SORTED, LOW] } else { &[SORTED] };
+            let input_features = fake_pbf::features(Path::new(args[1]));
+            let mut features = vec![SORTED];
+            if locations {
+                features.push(LOW);
+            }
+            if input_features.iter().any(|feature| feature == CAT_FIXTURE) {
+                assert!(!args.contains(&"multipass"));
+                features.extend(
+                    input_features
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|feature| feature.starts_with("Fixture")),
+                );
+            }
             // Sorting keeps every field, the way and its coordinate too.
             let marker = format!("sorted{}", fake_pbf::suffixes(Path::new(args[1])));
-            fake_pbf::write(output(), features, &marker);
+            fake_pbf::write(output(), &features, &marker);
         }
         "check" if args.contains(&"--refs") => {
             assert!(!args.contains(&"--direct-io"));

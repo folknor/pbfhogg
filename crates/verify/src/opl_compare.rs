@@ -870,17 +870,7 @@ pub(crate) fn compare_judged(
     each: impl FnMut(Group),
 ) -> Result<Walked, Error> {
     if let Some(merged) = by_summaries(harness, first, second, listing, policy)? {
-        let scan = |counts| {
-            Ok(Scan {
-                ordered: true,
-                counts,
-            })
-        };
-        return Ok(Walked {
-            scans: [scan(merged.first), scan(merged.second)],
-            merged: Ok(merged),
-            listing_note: None,
-        });
+        return Ok(ordered_walk(merged));
     }
     let sides = [(first, policy), (second, policy)];
     with_decodings(harness, &sides, |harness, held| {
@@ -896,6 +886,62 @@ pub(crate) fn compare_judged(
             if let Some(summary) = summary {
                 publish_summary(harness, path, summary)?;
             }
+        }
+        if let Ok(merged) = &walked.merged {
+            log_merge(harness, listing, merged);
+        }
+        let failed = walked.merged.is_err();
+        Ok((walked, failed))
+    })
+}
+
+fn ordered_walk(merged: Merged) -> Walked {
+    let scan = |counts| {
+        Ok(Scan {
+            ordered: true,
+            counts,
+        })
+    };
+    Walked {
+        scans: [scan(merged.first), scan(merged.second)],
+        merged: Ok(merged),
+        listing_note: None,
+    }
+}
+
+/// The judged strict merge with a verifier-written second operand. Only
+/// the first side is an osmium decode whose summary can be published.
+pub(crate) fn compare_judged_with_opl(
+    harness: &mut Harness,
+    first: Operand<'_>,
+    listing: &Path,
+    policy: Policy,
+    basis: Option<(&Basis, Policy)>,
+    expected: impl FnOnce(&mut Harness) -> Result<PathBuf, Error>,
+) -> Result<Walked, Error> {
+    if let Some((basis, source_policy)) = basis
+        && let Some(merged) = sequence_by_summary(
+            harness,
+            basis,
+            first.0,
+            listing,
+            (source_policy, policy),
+            true,
+            unchanged(basis),
+        )?
+    {
+        return Ok(ordered_walk(merged));
+    }
+    let expected = expected(harness)?;
+    with_decodings(harness, &[(first, policy)], |harness, held| {
+        let a = &held[0];
+        let (walked, [summary, _]) =
+            harness.timed(MERGE_STEP, || merge_judged(a, &expected, listing, |_| {}))?;
+        if let Ok(scan) = walked.scans[0] {
+            harness.run.decodings.publish(a, scan);
+        }
+        if let Some(summary) = summary {
+            publish_summary(harness, a, &summary)?;
         }
         if let Ok(merged) = &walked.merged {
             log_merge(harness, listing, merged);
@@ -1064,6 +1110,105 @@ fn scan_order(opl: &Path) -> Result<(bool, [u64; 3], Summary), Error> {
     while stream.read_record()?.is_some() {}
     let summary = stream.summary();
     Ok((summary.ordered, stream.counts, summary))
+}
+
+/// Whether a record can stand in for its plain PBF roundtrip. The reader
+/// has already normalized metadata and strings to libosmium's own types
+/// and OPL uses the same NUL-terminated strings as the PBF writer. The
+/// writer stores decoded node and requested way coordinates at the
+/// reader's 1e-7 degree precision, including its undefined sentinel.
+/// Plain PBF omits visibility, though: a deleted object decodes as visible.
+/// Also defer to the writer if regrouping dense nodes can overflow an ID
+/// delta. Checking every adjacency covers any block split the writer picks.
+#[derive(Default)]
+pub(crate) struct PlainPbf {
+    last_node: i64,
+}
+
+impl PlainPbf {
+    pub(crate) fn preserves(&mut self, (kind, id): (usize, i64), line: &[u8]) -> bool {
+        let delta_fits = kind != 0
+            || id
+                .checked_sub(std::mem::replace(&mut self.last_node, id))
+                .is_some();
+        // With metadata enabled, the OPL writer emits ID, version and
+        // visibility in that order, before free text or escaped fields.
+        delta_fits && line.splitn(4, |&b| b == b' ').nth(2) == Some(b"dV")
+    }
+}
+
+/// A strict key scan with the additional proof that a plain PBF write
+/// preserves the visible record sequence under this comparison policy.
+pub(crate) fn ordered_plain_pbf(
+    harness: &mut Harness,
+    pbf: Operand<'_>,
+    policy: Policy,
+) -> Result<bool, Error> {
+    const OBSERVATION: &str = "ordered-plain-pbf 1";
+    harness.run.watch(pbf.0)?;
+    let source = Source::of(pbf.0)?;
+    if harness
+        .run
+        .decodings
+        .scans
+        .iter()
+        .any(|(seen, scan)| *seen == source && !scan.ordered)
+    {
+        harness.run.revalidate()?;
+        harness.checkpoint()?;
+        return Ok(false);
+    }
+    if let Some(keys) = planned_keys(harness, &[pbf.0], policy)? {
+        if let Some(eligible) = harness.summary_of::<bool>(&keys[0].derived(OBSERVATION)) {
+            harness.run.revalidate()?;
+            harness.checkpoint()?;
+            return Ok(eligible);
+        }
+        if harness
+            .summary(&keys[0])
+            .is_some_and(|summary| !summary.ordered)
+        {
+            harness.run.revalidate()?;
+            harness.checkpoint()?;
+            return Ok(false);
+        }
+    }
+    decoded(harness, pbf, policy, |harness, path| {
+        let (summary, eligible) = harness.timed("opl order scan", || scan_plain_pbf(path))?;
+        observe_scan(harness, path, &summary)?;
+        if let Some(key) = decoding_key(harness, path) {
+            harness.publish_summary_of(&key.derived(OBSERVATION), &eligible)?;
+        }
+        Ok(eligible)
+    })
+}
+
+fn scan_plain_pbf(path: &Path) -> Result<(Summary, bool), Error> {
+    let mut stream = Stream::open(path)?;
+    let mut plain = PlainPbf::default();
+    let mut preserved = true;
+    while let Some(key) = stream.read_record()? {
+        preserved &= plain.preserves(key, stream.line());
+    }
+    let summary = stream.summary();
+    let eligible = preserved && summary.ordered;
+    Ok((summary, eligible))
+}
+
+/// Record a complete, unprojected reading of a retained decoding.
+pub(crate) fn observe_scan(
+    harness: &mut Harness,
+    path: &Path,
+    summary: &Summary,
+) -> Result<(), Error> {
+    harness.run.decodings.publish(
+        path,
+        Scan {
+            ordered: summary.ordered,
+            counts: summary.counts,
+        },
+    );
+    publish_summary(harness, path, summary)
 }
 
 /// What `osmium derive-changes` from `old` to `new` gives once applied back
@@ -1241,13 +1386,13 @@ fn sequence_by_summary(
     basis: &Basis,
     pbf: &Path,
     listing: &Path,
-    policy: Policy,
+    (source_policy, policy): (Policy, Policy),
     strict: bool,
     predict: impl FnOnce(&Path) -> Result<Option<Predicted>, Error>,
 ) -> Result<Option<Merged>, Error> {
     harness.run.watch(&basis.source)?;
     harness.run.watch(pbf)?;
-    let runs = [key_run(&basis.source, policy), key_run(pbf, policy)];
+    let runs = [key_run(&basis.source, source_policy), key_run(pbf, policy)];
     let Some(keys) = harness.summary_keys(&runs, true)? else {
         return Ok(None);
     };
@@ -1315,8 +1460,15 @@ pub(crate) fn compare_sequence_with_opl(
     predict: impl FnOnce(&Path) -> Result<Option<Predicted>, Error>,
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
-        && let Some(merged) =
-            sequence_by_summary(harness, basis, pbf.0, listing, policy, false, predict)?
+        && let Some(merged) = sequence_by_summary(
+            harness,
+            basis,
+            pbf.0,
+            listing,
+            (policy, policy),
+            false,
+            predict,
+        )?
     {
         return Ok(merged);
     }
@@ -1382,7 +1534,7 @@ pub(crate) fn compare_with_projection_each<R: std::io::Read>(
             basis,
             pbf.0,
             listing,
-            policy,
+            (policy, policy),
             true,
             unchanged(basis),
         )?
@@ -1537,7 +1689,7 @@ impl<R: std::io::Read> Stream<R> {
     }
 
     /// Advance to the next record and count it, whatever its order.
-    fn read_record(&mut self) -> Result<Option<(usize, i64)>, Error> {
+    pub(super) fn read_record(&mut self) -> Result<Option<(usize, i64)>, Error> {
         self.line.clear();
         let read = self
             .reader
@@ -1841,6 +1993,51 @@ mod tests {
         std::fs::write(&pa, a).unwrap();
         std::fs::write(&pb, b).unwrap();
         merge(&pa, &pb, &pl, strict, |_| {}, |_| {}).unwrap().1
+    }
+
+    #[test]
+    fn ordered_visible_input_has_the_sorted_reference_sequence() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.path().join("input.opl");
+        let records = [
+            ((0, -1), "n-1 v9 dV T x0 y-0.0000001\n"),
+            ((0, -2), "n-2 v1 dV T x1 y2\n"),
+            ((0, 1), "n1 v4 dV T x1 y2\n"),
+            ((1, -3), "w-3 v2 dV T Nn-1x0y-0.0000001,n99xy\n"),
+            ((2, 7), "r7 v3 dV T Mw-3@outer\n"),
+        ];
+        let ordered: String = records.iter().map(|(_, line)| *line).collect();
+        std::fs::write(&input, &ordered).unwrap();
+        let (summary, eligible) = scan_plain_pbf(&input).unwrap();
+        assert!(eligible);
+        assert_eq!(summary.counts, [3, 1, 1]);
+
+        let mut sorted = records;
+        sorted.reverse();
+        sorted.sort_by_key(|&((kind, id), _)| (kind, id > 0, i64::unsigned_abs(id)));
+        let sorted: String = sorted.iter().map(|(_, line)| *line).collect();
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), sorted);
+        assert_eq!(summaries(&ordered, &sorted, true)[1], summary);
+    }
+
+    #[test]
+    fn disorder_repeats_and_visibility_keep_the_pbf_sort() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.path().join("input.opl");
+        for (records, ordered) in [
+            ("w2 v1 dV T N\nn1 v1 dV T x1 y1\n", false),
+            ("w2 v1 dV T N\nw2 v2 dV T N\n", false),
+            ("w2 v1 dD T N\n", true),
+            (
+                "n-9223372036854775808 v1 dV T x1 y1\nn1 v1 dV T x1 y1\n",
+                true,
+            ),
+        ] {
+            std::fs::write(&input, records).unwrap();
+            let (summary, eligible) = scan_plain_pbf(&input).unwrap();
+            assert_eq!(summary.ordered, ordered);
+            assert!(!eligible);
+        }
     }
 
     #[test]

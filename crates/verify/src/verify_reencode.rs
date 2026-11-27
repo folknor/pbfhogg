@@ -1794,14 +1794,12 @@ mod tests {
             stripped.digest,
             format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&written))
         );
+        let kept = partition(&decoding, &out, false).unwrap();
+        assert_eq!(kept.coordinate_ways, 1);
+        assert_eq!(kept.counts, [2, 2, 1]);
         assert_eq!(
-            partition(&decoding, &out, false).unwrap().coordinate_ways,
-            1
-        );
-        assert!(
-            std::fs::read_to_string(&out)
-                .unwrap()
-                .contains("w5 v1 Nn1x1y1\n")
+            std::fs::read(&out).unwrap(),
+            b"n2 v1\nn1 v1\nw5 v1 Nn1x1y1\nw3 v1 Nn2xy\nr1 v1 M\n"
         );
         std::fs::write(&decoding, "n1 v1").unwrap();
         crate::test_support::refused(

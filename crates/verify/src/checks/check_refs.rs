@@ -13,8 +13,10 @@
 //!   references)"), and that trailing number is what is compared with
 //!   osmium, in both modes; the distinct number reconciles the FAILED total.
 //!
-//! Each side's exit must agree with its report: exit 1 exactly when something
-//! is missing. pbfhogg is the command under test, so a disagreement there is
+//! Both pbfhogg modes and osmium's relation-mode exit must agree with their
+//! reports: exit 1 exactly when something is missing. The ways-only osmium
+//! report is projected from the same node-in-way count that `-r` reports.
+//! pbfhogg is the command under test, so a disagreement there is
 //! a failed finding. osmium also exits 1 when an exception ends its run
 //! before any count, so its exit 1 is accepted only on a complete summary
 //! (`ToolRun::accept_if`, at publication, at lookup and here), and a report
@@ -360,13 +362,31 @@ fn is_decimal(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The completion conditions osmium's exit 1 is accepted on, per mode.
+/// The completion conditions osmium's exit 1 is accepted on.
 fn osmium_ways_only_completed(stderr: &[u8]) -> bool {
     osmium_report(stderr, false).is_some()
 }
 
 fn osmium_with_relations_completed(stderr: &[u8]) -> bool {
     osmium_report(stderr, true).is_some()
+}
+
+/// The same summary osmium prints without `-r`. The handler visits every
+/// object in both modes and counts way refs before processing relations.
+fn osmium_ways_only_text(text: &str) -> String {
+    let mut ways = String::new();
+    for line in text.lines() {
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let label = normalized.split_once(':').map(|(label, _)| label);
+        if label == Some(WAYS_ONLY_LINES[0]) {
+            ways.push_str(&normalized);
+            ways.push('\n');
+        } else if !label.is_some_and(|label| WITH_RELATIONS_LINES[1..].contains(&label)) {
+            ways.push_str(line);
+            ways.push('\n');
+        }
+    }
+    ways
 }
 
 /// Run pbfhogg's side, save and print its report, and hold its exit to it:
@@ -409,7 +429,7 @@ fn run_osmium_side(
     out_file: &Path,
     label: &str,
     with_relations: bool,
-) -> Result<OsmiumReport, Error> {
+) -> Result<(String, OsmiumReport), Error> {
     let sink = out_file.with_extension("stdout");
     let captured = harness.reference(run, &sink)?;
     // Without --show-ids osmium writes nothing to stdout; its report is the
@@ -424,30 +444,67 @@ fn run_osmium_side(
     }
     let text = String::from_utf8_lossy(&captured.stderr).into_owned();
     fs::write(out_file, &text)?;
-    harness.msg(&format!("  {label}:"));
-    for line in text.lines() {
-        harness.msg(&format!("    {line}"));
-    }
-    let report = osmium_report(&captured.stderr, with_relations).ok_or_else(|| {
-        Error::Failed(format!(
+    let Some(report) = osmium_report(&captured.stderr, with_relations) else {
+        print_osmium_report(harness, label, &text);
+        return Err(Error::Failed(format!(
             "{label} did not complete: its stderr does not end in the summary osmium \
              check-refs prints after a whole read, so nothing can be compared with it"
-        ))
-    })?;
+        )));
+    };
     let code = captured.code();
     if code != Some(i32::from(report.any_missing())) {
+        print_osmium_report(harness, label, &text);
         return Err(Error::Failed(format!(
             "{label} exited {code:?}, which contradicts its summary {:?}",
             report.counts
         )));
     }
-    Ok(report)
+    Ok((text, report))
+}
+
+fn print_osmium_report(harness: &mut Harness, label: &str, text: &str) {
+    harness.msg(&format!("  {label}:"));
+    for line in text.lines() {
+        harness.msg(&format!("    {line}"));
+    }
+}
+
+fn ways_reference(
+    harness: &mut Harness,
+    input: &Path,
+    outdir: &Path,
+    with_relations: Option<&(String, OsmiumReport)>,
+) -> Result<Option<u64>, Error> {
+    let label = "osmium (ways only)";
+    let file = outdir.join("osmium-ways.txt");
+    let (text, count) = if let Some((text, report)) = with_relations {
+        let text = osmium_ways_only_text(text);
+        fs::write(&file, &text)?;
+        fs::write(file.with_extension("stdout"), b"")?;
+        (text, report.counts.first().copied())
+    } else {
+        // A reference failure confined to relation mode should still let
+        // the ways-only comparison give its independent verdict.
+        let (text, report) = run_osmium_side(
+            harness,
+            &ToolRun::osmium("check-refs.1")
+                .arg("check-refs")
+                .input(input, Origin::Other)
+                .accept_if(1, osmium_ways_only_completed),
+            &file,
+            label,
+            false,
+        )?;
+        (text, report.counts.first().copied())
+    };
+    print_osmium_report(harness, label, &text);
+    Ok(count)
 }
 
 /// Run check --refs cross-validation: pbfhogg check --refs vs osmium check-refs.
 ///
-/// Two modes: ways-only (default) and with relations. Both tools exit 1 when
-/// they find missing refs.
+/// Two pbfhogg modes: ways-only (default) and with relations, both judged
+/// against one osmium run with relations.
 ///
 /// No `--direct-io`: pbfhogg refuses it under `check --refs` without `--ids`
 /// or `--index` (exit 64, since pbfhogg 930ddfc9), since the ref check reads
@@ -469,18 +526,26 @@ pub fn run(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> {
         "pbfhogg (ways only)",
     )?;
     harness.record("pbfhogg (ways only) exit agrees with its report", agrees);
-    let osmium = run_osmium_side(
+    let osmium = match run_osmium_side(
         harness,
         &ToolRun::osmium("check-refs.1")
-            .arg("check-refs")
+            .args(&["check-refs", "-r"])
             .input(&order.reference_input, Origin::Other)
-            .accept_if(1, osmium_ways_only_completed),
-        &outdir.join("osmium-ways.txt"),
-        "osmium (ways only)",
-        false,
+            .accept_if(1, osmium_with_relations_completed),
+        &outdir.join("osmium-all.txt"),
+        "osmium (with relations)",
+        true,
+    ) {
+        result @ (Ok(_) | Err(Error::Failed(_) | Error::Tool(_))) => result,
+        Err(e) => return Err(e),
+    };
+    let theirs = ways_reference(
+        harness,
+        &order.reference_input,
+        &outdir,
+        osmium.as_ref().ok(),
     )?;
     let ours = pbfhogg_ways_only(&parse_pbfhogg(&pbfhogg_text));
-    let theirs = osmium.counts.first().copied();
     harness.msg(&format!(
         "  ways only counts: pbfhogg={ours:?}, osmium={theirs:?}"
     ));
@@ -502,16 +567,8 @@ pub fn run(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> {
         "pbfhogg (with relations) exit agrees with its report",
         agrees,
     );
-    let osmium = run_osmium_side(
-        harness,
-        &ToolRun::osmium("check-refs.1")
-            .args(&["check-refs", "-r"])
-            .input(&order.reference_input, Origin::Other)
-            .accept_if(1, osmium_with_relations_completed),
-        &outdir.join("osmium-all.txt"),
-        "osmium (with relations)",
-        true,
-    )?;
+    let (osmium_text, osmium) = osmium?;
+    print_osmium_report(harness, "osmium (with relations)", &osmium_text);
 
     let pbf_rel = pbfhogg_with_relations(&parse_pbfhogg(&pbfhogg_text));
     if pbf_rel.is_none() {
@@ -768,10 +825,39 @@ Referential integrity: FAILED (15 missing references)
     }
 
     #[test]
+    fn relation_report_projects_the_exact_ways_only_summary() {
+        let ways = "There are 1 nodes, 2 ways, and 1 relations in this file.\n\
+                    Nodes in ways missing: 2\n";
+        let relations = "There are 1 nodes, 2 ways, and 1 relations in this file.\n\
+                         Nodes     in ways      missing: 2\n\
+                         Nodes     in relations missing: 1\n\
+                         Ways      in relations missing: 0\n\
+                         Relations in relations missing: 1\n";
+        let projected = osmium_ways_only_text(relations);
+        assert_eq!(projected, ways);
+        let expected = osmium_report(ways.as_bytes(), false).unwrap();
+        let full = osmium_report(relations.as_bytes(), true).unwrap();
+        assert_eq!(&full.counts[..1], expected.counts.as_slice());
+        // The complete relation run exits 1 here even if the default run
+        // would exit 0, since only a relation member is missing.
+        let relations_only = relations.replace("missing: 2", "missing: 0");
+        let projected = osmium_ways_only_text(&relations_only);
+        let ways = osmium_report(projected.as_bytes(), false).unwrap();
+        assert!(!ways.any_missing());
+        assert!(
+            osmium_report(relations_only.as_bytes(), true)
+                .unwrap()
+                .any_missing()
+        );
+    }
+
+    #[test]
     fn an_incomplete_osmium_run_has_no_report() {
         assert_eq!(osmium_report(OSMIUM_OUT_OF_ORDER.as_bytes(), false), None);
         assert_eq!(osmium_report(OSMIUM_OUT_OF_ORDER.as_bytes(), true), None);
-        assert!(!osmium_ways_only_completed(OSMIUM_OUT_OF_ORDER.as_bytes()));
+        assert!(!osmium_with_relations_completed(
+            OSMIUM_OUT_OF_ORDER.as_bytes()
+        ));
         // The other mode's summary is not this mode's.
         assert_eq!(osmium_report(OSMIUM_WAYS.as_bytes(), true), None);
         assert_eq!(osmium_report(OSMIUM_RELATIONS.as_bytes(), false), None);

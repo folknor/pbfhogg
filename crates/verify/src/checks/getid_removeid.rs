@@ -1,8 +1,8 @@
 //! Verify: getid - pbfhogg getid vs osmium getid, getid --invert vs osmium
 //! removeid (with way IDs, plus the complement test, and without them, where
 //! a `LocationsOnWays` declaration must be kept), and getid --add-referenced
-//! (plain and with --remove-tags) vs osmium getid -r (plain and with -t), the
-//! last in [`crate::verify_getid_refs`].
+//! (plain and with --remove-tags) vs osmium getid -r and its projected -t
+//! records, the last in [`crate::verify_getid_refs`].
 //!
 //! Domain: a snapshot with one record per kind and ID, whose indexdata
 //! claims are true and non-negative (osmium removeid and getid -r match an
@@ -180,20 +180,19 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         order: &order,
         direct_io,
     };
-    let pbfhogg_invert = invert.run(harness, "getid-invert", &ids)?;
+    let inverted = invert.run(harness, "getid-invert", &ids)?;
 
     // The complement assertion: getid selects exactly the listed IDs (the
     // element comparison above pins that) and getid --invert drops exactly them, so
     // per element kind the two outputs must add up to the original. A kind
     // whose sum is off means --invert kept or dropped something it shouldn't.
     // The original's counts are its indexdata claims, from the walk above,
-    // without another pass; the outputs' counts are osmium fileinfo's.
+    // without another pass; the outputs' counts are from osmium's OPL.
     let original = Counts {
         nodes: summary.count(0),
         ways: summary.count(1),
         relations: summary.count(2),
     };
-    let inverted = osmium_counts(harness, (&pbfhogg_invert, Origin::Pbfhogg))?;
     for (kind, orig, sel, inv) in [
         ("nodes", original.nodes, selected.nodes, inverted.nodes),
         ("ways", original.ways, selected.ways, inverted.ways),
@@ -230,7 +229,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         );
     } else if !ids[1].is_empty() {
         harness.msg("--- getid --invert without way IDs: pbfhogg vs osmium removeid ---");
-        invert.run(harness, "getid-invert-no-ways", &ways_kept)?;
+        invert.compare(harness, "getid-invert-no-ways", &ways_kept)?;
     }
 
     // --- getid --add-referenced, plain and --remove-tags ---
@@ -263,12 +262,26 @@ struct Invert<'a> {
 }
 
 impl Invert<'_> {
+    fn run(&self, harness: &mut Harness, name: &str, ids: &[Vec<i64>; 3]) -> Result<Counts, Error> {
+        let ours = self.compare(harness, name, ids)?;
+        // compare_outputs has already read the keys on both sides. For
+        // unsorted input it read the sorted copy, which preserves the
+        // object count, so ask for that copy's scan rather than decoding
+        // pbfhogg's original output again.
+        if self.order.sorted {
+            osmium_counts(harness, (&ours, Origin::Pbfhogg))
+        } else {
+            let compared = ours.with_extension("sorted.pbf");
+            osmium_counts(harness, (&compared, Origin::Other))
+        }
+    }
+
     /// Run the request `ids` under the file stem `name`, judge the output's
     /// `LocationsOnWays` declaration and compare its elements with osmium
     /// removeid's (written with the input's inline coordinates when it
     /// declares them, so a kept declaration is compared coordinate by
     /// coordinate). Returns pbfhogg's output.
-    fn run(
+    fn compare(
         &self,
         harness: &mut Harness,
         name: &str,
@@ -334,6 +347,7 @@ fn complement_verdict(original: u64, selected: u64, inverted: u64) -> Verdict {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::{complement_verdict, endpoint_ids, id_args};
     use crate::harness::Verdict;
     use crate::pbf_frames::{IndexSummary, KindClaim};
@@ -381,5 +395,26 @@ mod tests {
         assert_eq!(complement_verdict(100, 3, 98), Verdict::Fail);
         assert_eq!(complement_verdict(100, 3, 96), Verdict::Fail);
         assert_eq!(complement_verdict(5, u64::MAX, 1), Verdict::Fail);
+    }
+
+    #[test]
+    fn invert_comparison_counts_match_the_unsorted_content_decode() {
+        let dir = pbfhogg_test_scratch::scratch();
+        let original = dir.path().join("invert-content.opl");
+        let compared = dir.path().join("invert-sorted-full.opl");
+        std::fs::write(&original, "w7 T Nn3\nn3 T x1 y1\nr5 T Mw7@\nn1 T x2 y2\n").unwrap();
+        std::fs::write(
+            &compared,
+            "n1 v1 dV T x2 y2\nn3 v1 dV T x1 y1\nw7 v1 dV T Nn3x1y1\nr5 v1 dV T Mw7@\n",
+        )
+        .unwrap();
+        let mut legacy = crate::opl_compare::Stream::open(&original).unwrap();
+        while legacy.read_record().unwrap().is_some() {}
+        let mut comparison = crate::opl_compare::Stream::open(&compared).unwrap();
+        while comparison.next().unwrap().is_some() {}
+        assert!(!legacy.summary().ordered);
+        assert!(comparison.summary().ordered);
+        assert_eq!(comparison.summary().counts, legacy.summary().counts);
+        assert_eq!(comparison.summary().counts, [2, 1, 1]);
     }
 }

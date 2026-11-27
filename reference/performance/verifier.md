@@ -1,5 +1,42 @@
 # pbfhogg-verify
 
+## Ordered sort, shared cat views and selection checks (bygg, working tree on `5973bfc4`)
+
+- Sort uses the verifier's decoding of the input as the expected sequence
+  after proving strict kind and ID order and that the plain PBF roundtrip
+  preserves the compared fields. Disorder, repeated IDs, `visible=false`
+  records and dense regroupings that could overflow an ID delta go through
+  osmium multipass sort. Osmium's plain PBF writer omits `visible=false`
+  records.
+- Cat derives the node, way and relation views from one scan and still uses
+  an osmium-written PBF to check the header. Reencode already partitioned
+  the kinds in one scan. The change there strengthens the test.
+- Getid counts invert results during the comparison pass and derives the
+  `-t` expectation from one osmium closure. Check-refs takes the ways-only
+  count from the `-r` report when usable and runs the ways-only reference
+  otherwise. Inspect-tags counts both scopes in one XML scan. Check-ids
+  shares one ID projection per case between plain and `--full`. The stripped
+  case reuses the base projection when header features and payload bytes
+  match.
+- Getparents retains separate requests because the node request depends on
+  the selected way and each request has its own add-self semantics.
+  Tags-filter retains separate scans because a shared scan would have to
+  preserve membership, dependency closure and pruning for each expression.
+
+Denmark `verify all`:
+
+| Check | Cold derivations on `5973bfc4` working tree (bygg, run `1795791061`) | Warm on `5973bfc4` working tree (bygg, run `1795791304`) |
+|---|---|---|
+| Suite | 3m54s, 25 of 25 PASS | 3m39s, 25 of 25 PASS |
+| `cat` | 4.1 s | 0.2 s |
+| `inspect-tags` | 4.7 s | 0.2 s |
+| `sort` | 6.8 s | 0.2 s |
+
+Warm verdict: neutral. The previous warm run on the `5a8af88b` working tree
+(bygg, run `1795788522`) also took 3m39s. The cold path avoids the osmium
+multipass sort and kind-filtered cats on this input, and skips the fifth
+getid decode. The cold wall-time saving against the old code is unmeasured.
+
 ## Shared producers and extract comparison reuse (bygg, `5a8af88b` working trees)
 
 The run-local single-flight memo keys shared pbfhogg producers by executable

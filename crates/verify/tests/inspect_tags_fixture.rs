@@ -1,17 +1,16 @@
 //! A generated tool protocol driving `verify inspect-tags` end to end.
 //!
-//! The input is a header-only fixture whose marker names [`MARKER`]; both
-//! fakes count [`TAGS`] themselves, order the rows by count descending then
-//! key ascending, and quote each key by their own tool's rule (pbfhogg a
-//! JSON string literal, osmium doubled quotes and nothing else escaped), so
-//! a clean run passes only when the verifier decodes both quotings. The
-//! keys hold a double quote, a backslash, a tab and a newline. The two
+//! The input is a header-only fixture whose marker names [`MARKER`]. The
+//! pbfhogg fake counts [`TAGS`] and prints JSON string literals. The osmium
+//! fake writes XML from the same tags, so the verifier must recover the
+//! counts, ordering and key bytes itself. The keys hold a double quote,
+//! a backslash, a tab and a newline. The two
 //! scopes report differently (a node key and a node occurrence of a way
 //! key), so a check that dropped either way filter fails a verdict, and
 //! every invocation is logged so the driver sees both scopes run.
 //!
 //! Every fault is on pbfhogg's side, so osmium's cached answer is the same
-//! across cases and the reference cache stays live.
+//! across cases and the cached projection stays live.
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -92,10 +91,10 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 let mut expected =
                     format!("inspect tags {shown}{dio}\ninspect tags {shown} --type way{dio}\n");
                 if i == 0 {
-                    // The first run misses the cache: osmium runs for each scope.
+                    // One cold decoding supplies both scopes.
                     expected = format!(
-                        "inspect tags {shown}{dio}\ntags-count {shown}\n\
-                         inspect tags {shown} --type way{dio}\ntags-count {shown} -t way\n"
+                        "inspect tags {shown}{dio}\ncat {shown} -f osm,add_metadata=false\n\
+                         inspect tags {shown} --type way{dio}\n"
                     );
                 }
                 assert_eq!(calls, expected, "{name}");
@@ -158,18 +157,6 @@ fn json_key(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn osmium_key(key: &[u8]) -> Vec<u8> {
-    let mut out = vec![b'"'];
-    for &b in key {
-        if b == b'"' {
-            out.push(b'"');
-        }
-        out.push(b);
-    }
-    out.push(b'"');
-    out
-}
-
 fn report(rows: &[(usize, Vec<u8>)], quote: fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
     let mut out = Vec::new();
     for (count, key) in rows {
@@ -177,6 +164,25 @@ fn report(rows: &[(usize, Vec<u8>)], quote: fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
         out.extend(quote(key));
         out.push(b'\n');
     }
+    out
+}
+
+fn xml() -> Vec<u8> {
+    let mut out = b"<?xml version='1.0' encoding='UTF-8'?>\n<osm version=\"0.6\">\n".to_vec();
+    for (id, &(way, key)) in TAGS.iter().enumerate() {
+        let kind = if way { "way" } else { "node" };
+        out.extend_from_slice(format!("  <{kind} id=\"{id}\">\n    <tag k=\"").as_bytes());
+        for &b in key {
+            match b {
+                b'"' => out.extend_from_slice(b"&quot;"),
+                b'\t' => out.extend_from_slice(b"&#x9;"),
+                b'\n' => out.extend_from_slice(b"&#xA;"),
+                _ => out.push(b),
+            }
+        }
+        out.extend_from_slice(format!("\" v=\"\"/>\n  </{kind}>\n").as_bytes());
+    }
+    out.extend_from_slice(b"</osm>\n");
     out
 }
 
@@ -191,13 +197,27 @@ pub fn tool(args: &[OsString]) -> i32 {
     let fault = std::fs::read_to_string(root.join("fault")).unwrap_or_default();
     let calls = root.join("calls");
     let mut log = std::fs::read_to_string(&calls).unwrap_or_default();
+    if let [
+        "cat",
+        _,
+        "-f",
+        "osm,add_metadata=false",
+        "-o",
+        output,
+        "--overwrite",
+    ] = args[..]
+    {
+        log.push_str(&args[..4].join(" "));
+        log.push('\n');
+        std::fs::write(&calls, log).unwrap();
+        std::fs::write(output, xml()).unwrap();
+        return 0;
+    }
     log.push_str(&args.join(" "));
     log.push('\n');
     std::fs::write(&calls, log).unwrap();
     let mut out = std::io::stdout();
     let text = match args[..] {
-        ["tags-count", _] => report(&rows(false), osmium_key),
-        ["tags-count", _, "-t", "way"] => report(&rows(true), osmium_key),
         ["inspect", "tags", _, ref rest @ ..] => {
             assert!(!args.contains(&"--staging-dir"), "{args:?}");
             let ways = match rest {

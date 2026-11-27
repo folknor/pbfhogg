@@ -90,7 +90,7 @@ impl<T: Copy> Kinds<T> {
     }
 }
 
-fn parse(reader: impl std::io::Read) -> Result<FileInfo, String> {
+pub(super) fn parse(reader: impl std::io::Read) -> Result<FileInfo, String> {
     let report: Report = serde_json::from_reader(reader).map_err(|e| e.to_string())?;
     let data = report.data;
     if data.objects_ordered && data.multiple_versions.is_none() {
@@ -125,6 +125,13 @@ pub(crate) fn fileinfo(
             report.display()
         ))
     })?;
+    narrate_fileinfo(harness, pbf, &info);
+    Ok(info)
+}
+
+/// Print the ID projection, including when a byte-identical sequence of
+/// data payloads lets another case reuse this reading.
+pub(crate) fn narrate_fileinfo(harness: &mut Harness, pbf: &Path, info: &FileInfo) {
     harness.msg(&format!(
         "  osmium fileinfo {}: {} nodes, {} ways, {} relations, {}",
         pbf.display(),
@@ -137,7 +144,6 @@ pub(crate) fn fileinfo(
             (true, _) => "ordered, no ID repeated",
         }
     ));
-    Ok(info)
 }
 
 #[cfg(test)]

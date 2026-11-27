@@ -28,7 +28,8 @@
 //! repeated ID in both forms, and an ordered file with an empty blob claiming
 //! nodes appended after its way blob. Each fixture must show the property it
 //! exists for, read from osmium and the framing, never inferred from how it
-//! was built.
+//! was built. The stripped copy can reuse osmium's input reading after a
+//! byte comparison of the data payloads and a check of the header features.
 //!
 //! Domain: true kind claims: a blob whose decoded kind contradicts its claim
 //! stops pbfhogg's check without an answer, which is an error here. Negative
@@ -46,7 +47,7 @@ use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::pbf_frames::{self, Framing, Origin};
 use crate::reference::ToolRun;
-use crate::verify_fileinfo::{FileInfo, fileinfo};
+use crate::verify_fileinfo::{FileInfo, fileinfo, narrate_fileinfo};
 
 /// The block cap `degrade --unsort` is given, so the check knows when it
 /// fires: on a kind with more objects than this.
@@ -77,6 +78,14 @@ impl Case {
             (path, origin),
             &outdir.join(format!("{stem}.fileinfo.json")),
         )?;
+        Self::with_info(label, (path, origin), info)
+    }
+
+    fn with_info(
+        label: &str,
+        (path, origin): (&Path, Origin),
+        info: FileInfo,
+    ) -> Result<Self, Error> {
         let framing = pbf_frames::framing(path, origin)?;
         Ok(Self {
             label: label.to_owned(),
@@ -156,12 +165,9 @@ fn compare(
         },
         if expected { "pass" } else { "fail" }
     ));
-    // Plain and --full are separate invocations on purpose: each mode's
-    // exit and report are the claim under test, so they cannot share one
-    // order proof. On an ordered case --full costs what plain does (no
-    // duplicate pass), and on a disordered one its duplicate pass reads
-    // only the blobs whose ID ranges overlap or that are out of order
-    // inside themselves, so there is no whole-kind reread left to share.
+    // Both modes share the case's independent ID projection and each must
+    // produce its own exit and report. Even on a disordered case the full
+    // mode's additional pass is limited to the suspected blobs.
     for full in [false, true] {
         let mode = if full {
             "check --ids --full"
@@ -256,17 +262,7 @@ fn compare(
 /// A derived case: `path`, written from the input by a pbfhogg fixture
 /// builder, must keep the input's counts, be framed as `indexed` says, and
 /// be out of order exactly when `disordered`.
-fn derived(
-    harness: &mut Harness,
-    outdir: &Path,
-    input: &Case,
-    label: &str,
-    path: &Path,
-    indexed: bool,
-    disordered: bool,
-) -> Result<Case, Error> {
-    // Every derived case is a pbfhogg output.
-    let case = Case::read(harness, outdir, label, (path, Origin::Pbfhogg))?;
+fn derived(input: &Case, case: Case, indexed: bool, disordered: bool) -> Result<Case, Error> {
     let why = if case.info.counts != input.info.counts {
         Some(format!(
             "holds {:?} objects per kind where the input holds {:?}",
@@ -288,11 +284,26 @@ fn derived(
     };
     match why {
         Some(why) => Err(Error::Failed(format!(
-            "derived case {label} ({}) {why}, so it cannot stand for the case it is built for",
-            path.display()
+            "derived case {} ({}) {why}, so it cannot stand for the case it is built for",
+            case.label,
+            case.path.display()
         ))),
         None => Ok(case),
     }
+}
+
+/// The stripped case keeps the input's osmium reading only when osmium
+/// would decode the same object stream. A rewrite of any payload or feature
+/// falls back to fileinfo so the original shape checks decide it.
+fn stripped_info(input: &Case, stripped: &Path) -> Result<Option<FileInfo>, Error> {
+    let base = (&*input.path, Origin::Other);
+    let copy = (stripped, Origin::Pbfhogg);
+    if pbf_frames::header(base.0, base.1)? != pbf_frames::header(copy.0, copy.1)? {
+        return Ok(None);
+    }
+    Ok(pbf_frames::same_data_payloads(base, copy)?
+        .is_ok()
+        .then_some(input.info))
 }
 
 /// Which of the four kinds of case real data could give (indexed or not, in
@@ -418,9 +429,17 @@ fn derive_cases(
     if input.indexed() {
         let stripped = outdir.join("stripped.osm.pbf");
         harness.strip_indexdata(pbf, &stripped)?;
-        cases.push(derived(
-            harness, outdir, input, "stripped", &stripped, false, false,
-        )?);
+        harness.run.watch(&stripped)?;
+        let copy = (&*stripped, Origin::Pbfhogg);
+        let case = if let Ok(Some(info)) = stripped_info(input, &stripped) {
+            harness.run.revalidate()?;
+            harness.checkpoint()?;
+            narrate_fileinfo(harness, &stripped, &info);
+            Case::with_info("stripped", copy, info)?
+        } else {
+            Case::read(harness, outdir, "stripped", copy)?
+        };
+        cases.push(derived(input, case, false, false)?);
     }
     let counts = input.info.counts;
     let unsort = outdir.join("unsort.osm.pbf");
@@ -435,9 +454,8 @@ fn derive_cases(
     )?;
     harness.require_success(&captured, "pbfhogg degrade --unsort")?;
     let fires = counts.iter().any(|&n| n > UNSORT_CAP);
-    cases.push(derived(
-        harness, outdir, input, "unsort", &unsort, true, fires,
-    )?);
+    let case = Case::read(harness, outdir, "unsort", (&unsort, Origin::Pbfhogg))?;
+    cases.push(derived(input, case, true, fires)?);
     let intra = outdir.join("unsort-intra.osm.pbf");
     let captured = harness.pbfhogg_discard(
         PbfArgv::new("degrade")
@@ -452,15 +470,8 @@ fn derive_cases(
         "pbfhogg degrade --unsort-intra --strip-indexdata",
     )?;
     let fires = counts.iter().any(|&n| n >= 2);
-    cases.push(derived(
-        harness,
-        outdir,
-        input,
-        "unsort intra",
-        &intra,
-        false,
-        fires,
-    )?);
+    let case = Case::read(harness, outdir, "unsort intra", (&intra, Origin::Pbfhogg))?;
+    cases.push(derived(input, case, false, fires)?);
     Ok(cases)
 }
 
@@ -588,6 +599,51 @@ mod tests {
         assert!(!case(true, Some(false), OUT_OF_ORDER).expected_pass());
         assert!(!case(true, Some(true), IN_ORDER).expected_pass());
         assert!(!case(false, None, Framing::Unindexed).expected_pass());
+    }
+
+    #[test]
+    fn stripped_projection_matches_the_independent_fileinfo_reading() {
+        let dir = pbfhogg_test_scratch::scratch();
+        let base = dir.path().join("input.osm.pbf");
+        let stripped = dir.path().join("stripped.osm.pbf");
+        let header = b"\0\0\0\x0d\x0a\x09OSMHeader\x18\x12\x0a\x10\x22\x0eOsmSchema-V0.6";
+        // Two non-dense nodes, IDs 1 and 2, both at (0, 0).
+        let nodes = b"\x0a\x16\x0a\x02\x0a\0\x12\x10\x0a\x06\x08\x02\x40\0\x48\0\
+                      \x0a\x06\x08\x04\x40\0\x48\0";
+        let mut raw = header.to_vec();
+        raw.extend_from_slice(b"\0\0\0\x0b\x0a\x07OSMData\x18\x18");
+        raw.extend_from_slice(nodes);
+        std::fs::write(&stripped, &raw).unwrap();
+        let mut indexed = header.to_vec();
+        indexed.extend_from_slice(b"\0\0\0\x27\x0a\x07OSMData\x12\x1a\x01\0");
+        for field in [1u64, 2, 2] {
+            indexed.extend_from_slice(&field.to_le_bytes());
+        }
+        indexed.extend_from_slice(b"\x18\x18");
+        indexed.extend_from_slice(nodes);
+        std::fs::write(&base, indexed).unwrap();
+
+        let mut input = case(true, Some(false), IN_ORDER);
+        input.path = base;
+        input.info.counts = [2, 0, 0];
+        input.info.min_ids = [1, 0, 0];
+        input.info.max_ids = [2, 0, 0];
+        let expected = crate::verify_fileinfo::parse(
+            &br#"{"data":{"objects_ordered":true,"multiple_versions":false,
+                "count":{"nodes":2,"ways":0,"relations":0},
+                "minid":{"nodes":1,"ways":0,"relations":0},
+                "maxid":{"nodes":2,"ways":0,"relations":0}}}"#[..],
+        )
+        .unwrap();
+        assert_eq!(stripped_info(&input, &stripped).unwrap(), Some(expected));
+        let copy = Case::with_info("stripped", (&stripped, Origin::Pbfhogg), expected).unwrap();
+        assert!(derived(&input, copy, false, false).unwrap().expected_pass());
+
+        // Changing only one payload byte invalidates the proof, even
+        // though these coordinates would leave the ID reading unchanged.
+        *raw.last_mut().unwrap() = 2;
+        std::fs::write(&stripped, raw).unwrap();
+        assert_eq!(stripped_info(&input, &stripped).unwrap(), None);
     }
 
     #[test]

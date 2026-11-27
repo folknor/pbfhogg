@@ -88,9 +88,13 @@ pub fn tool(args: &[std::ffi::OsString]) -> i32 {
             } else {
                 assert!(text.contains(&"-r"));
                 assert!(text.contains(&"-v"));
+                assert!(
+                    !text.contains(&"-t"),
+                    "the -t arm should use the plain closure"
+                );
             }
             let fault = std::fs::read_to_string(input.with_extension("fault")).unwrap();
-            let strip = text.contains(&"--remove-tags") || text.contains(&"-t");
+            let strip = text.contains(&"--remove-tags");
             let mut objects = OBJECTS.to_owned();
             if strip && !(ours && fault == "keep-tags") {
                 objects = objects.replace("n6 Tname=pulled", "n6 T");

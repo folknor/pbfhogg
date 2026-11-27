@@ -5,7 +5,9 @@
 //! members recursively through relations in relations, the node and way
 //! members of every relation reached, then the nodes of every way requested
 //! or pulled in; `--remove-tags` strips every pulled-in object that was not
-//! itself requested.
+//! itself requested. The `-t` reference is projected from the plain `-r`
+//! closure: osmium's copy loop changes only the tags of the records that
+//! were reached by reference. Both modes reach the same absent objects.
 //!
 //! The request is its own, not the include endpoints: one relation R, the
 //! highest way and the highest node the indexdata claims. R is chosen from
@@ -49,14 +51,16 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::pbf_frames::IndexSummary;
-use super::verify_input_order::{InputOrder, compare_outputs};
+use super::verify_input_order::{InputOrder, compare_outputs, compare_outputs_after_order};
 use super::verify_opl::{self as opl, OplObject, OplRelation};
 use crate::argv::PbfArgv;
 use crate::error::Error;
-use crate::harness::Harness;
+use crate::harness::{Harness, Role, Verdict};
+use crate::opl_compare::{self, Policy, Stream};
 use crate::osc::OscKind;
 use crate::reference::{Origin, ToolRun};
 
@@ -102,10 +106,50 @@ pub(crate) fn run(harness: &mut Harness, input: &RefsInput<'_>) -> Result<Vec<St
     // osmium's plain output is read, and a negative reference in it refused,
     // before either comparison records a verdict: such a reference makes the
     // tools differ by design, which is no pbfhogg failure.
-    let plain = run_mode(harness, input, &args, false)?;
-    let shown = exercised(harness, input.outdir, &plain.theirs, &request, choice.chain)?;
-    plain.compare(harness, input.order)?;
-    run_mode(harness, input, &args, true)?.compare(harness, input.order)?;
+    let ours = run_pbfhogg(harness, input, &args, false)?;
+    let (theirs, missing) = reference_closure(harness, input, &args)?;
+    let (shown, counts) = exercised(harness, input.outdir, &theirs, &request, choice.chain)?;
+    compare_outputs(
+        harness,
+        input.order,
+        "getid --add-referenced",
+        "osmium getid -r",
+        &ours,
+        &theirs,
+    )?;
+    let label = "getid --add-referenced --remove-tags";
+    let ours = run_pbfhogg(harness, input, &args, true)?;
+    report_completion(harness, "osmium getid -r -t", missing);
+    let [nodes, ways, relations] = counts;
+    harness.msg(&format!(
+        "  osmium getid -r -t: {nodes} nodes, {ways} ways, {relations} relations"
+    ));
+    harness.msg("  osmium getid -r -t: in strict order (osmium OPL) PASS");
+    compare_outputs_after_order(
+        harness,
+        input.order,
+        label,
+        &ours,
+        &theirs,
+        |h, a, listing| {
+            let policy = Policy::between(a.0, (&theirs, Origin::Other))?;
+            let projected = input.outdir.join("osmium-getid-r-remove-tags.opl");
+            let walked =
+                opl_compare::compare_judged_with_opl(h, a.0, listing, policy, None, |h| {
+                    opl_compare::decoded(h, (&theirs, Origin::Other), policy, |_, opl| {
+                        let stream = Stream::open(opl)?;
+                        let out = BufWriter::new(std::fs::File::create(&projected)?);
+                        project_tags(stream, &request, out)
+                    })?;
+                    Ok(projected)
+                })?;
+            let (merged, _) = h.judge_walk([(a.0.0, a.1), (&theirs, Role::Required)], walked)?;
+            if !merged.identical() {
+                h.replay_listing(listing)?;
+            }
+            Ok(Verdict::from_pass(merged.identical()))
+        },
+    )?;
     let missing = shown.missing();
     if missing.is_empty() {
         harness.msg("  getid -r exercised every case it looks for");
@@ -122,28 +166,19 @@ pub(crate) fn run(harness: &mut Harness, input: &RefsInput<'_>) -> Result<Vec<St
     }
 }
 
-/// One mode, plain or `--remove-tags` (osmium's `-t`): both tools on `args`,
-/// osmium's run judged by its completed verbose output.
-fn run_mode(
+fn run_pbfhogg(
     harness: &mut Harness,
     input: &RefsInput<'_>,
     args: &[String],
     remove_tags: bool,
-) -> Result<Mode, Error> {
-    let (label, stem, run_id, osmium_label) = if remove_tags {
+) -> Result<PathBuf, Error> {
+    let (stem, label) = if remove_tags {
         (
-            "getid --add-referenced --remove-tags",
             "getid-r-remove-tags",
-            "getid-rt.1",
-            "osmium getid -r -t",
+            "getid --add-referenced --remove-tags",
         )
     } else {
-        (
-            "getid --add-referenced",
-            "getid-r",
-            "getid-r.1",
-            "osmium getid -r",
-        )
+        ("getid-r", "getid --add-referenced")
     };
     let ours = input.outdir.join(format!("pbfhogg-{stem}.osm.pbf"));
     let captured = harness.pbfhogg_discard(
@@ -163,9 +198,17 @@ fn run_mode(
         &captured,
         crate::harness::WayLocations::Kept,
     )?;
+    Ok(ours)
+}
 
-    let theirs = input.outdir.join(format!("osmium-{stem}.osm.pbf"));
-    let mut osmium = ToolRun::osmium(run_id)
+fn reference_closure(
+    harness: &mut Harness,
+    input: &RefsInput<'_>,
+    args: &[String],
+) -> Result<(PathBuf, Option<u64>), Error> {
+    let label = "osmium getid -r";
+    let theirs = input.outdir.join("osmium-getid-r.osm.pbf");
+    let mut osmium = ToolRun::osmium("getid-r.1")
         .arg("getid")
         .input(&input.order.reference_input, Origin::Other);
     for id in args {
@@ -173,67 +216,78 @@ fn run_mode(
     }
     let (osmium, declares) = crate::checks::sort::ask_declared_locations(osmium, input.pbf)?;
     let osmium = osmium
-        .args(if remove_tags {
-            &["-r", "-t", "-v", "-o"]
-        } else {
-            &["-r", "-v", "-o"]
-        })
+        .args(&["-r", "-v", "-o"])
         .output(&theirs)
         .arg("--overwrite")
         .accept_if(1, osmium_completed);
-    let captured =
-        harness.reference(&osmium, &input.outdir.join(format!("osmium-{stem}.stdout")))?;
-    match captured.code() {
-        Some(0) => harness.msg(&format!("  {osmium_label}: found every object")),
-        Some(1) if osmium_completed(&captured.stderr) => harness.msg(&format!(
-            "  {osmium_label}: did not find {} object(s) the request reached, its exit 1 by \
-             design",
-            osmium_missing(&captured.stderr).unwrap_or_default()
-        )),
+    let captured = harness.reference(&osmium, &input.outdir.join("osmium-getid-r.stdout"))?;
+    let reported_missing = osmium_missing(&captured.stderr);
+    let missing = match captured.code() {
+        Some(0) => None,
+        Some(1) if reported_missing.is_some() => reported_missing,
         Some(1) => {
             return Err(Error::Failed(format!(
-                "{osmium_label} exited 1 without completing: its verbose output does not end \
+                "{label} exited 1 without completing: its verbose output does not end \
                  in a missing-object count and Done.; stderr: {}",
                 String::from_utf8_lossy(&captured.stderr).trim()
             )));
         }
         _ => {
-            harness.require_success(&captured, osmium_label)?;
+            harness.require_success(&captured, label)?;
             return Err(Error::tool(format!(
-                "{osmium_label} exited 0 after a non-zero status"
+                "{label} exited 0 after a non-zero status"
             )));
         }
-    }
+    };
+    report_completion(harness, label, missing);
     if declares {
-        crate::checks::sort::require_declared_locations(&theirs, osmium_label)?;
+        crate::checks::sort::require_declared_locations(&theirs, label)?;
     }
-    Ok(Mode {
-        label,
-        osmium_label,
-        ours,
-        theirs,
-    })
+    Ok((theirs, missing))
 }
 
-/// One mode's two outputs, not yet compared.
-struct Mode {
-    label: &'static str,
-    osmium_label: &'static str,
-    ours: PathBuf,
-    theirs: PathBuf,
+fn report_completion(harness: &mut Harness, label: &str, missing: Option<u64>) {
+    if let Some(count) = missing {
+        harness.msg(&format!(
+            "  {label}: did not find {count} object(s) the request reached, its exit 1 by design"
+        ));
+    } else {
+        harness.msg(&format!("  {label}: found every object"));
+    }
 }
 
-impl Mode {
-    fn compare(&self, harness: &mut Harness, order: &InputOrder) -> Result<(), Error> {
-        compare_outputs(
-            harness,
-            order,
-            self.label,
-            self.osmium_label,
-            &self.ours,
-            &self.theirs,
-        )
+/// In osmium's OPL the `T` field always follows an ASCII space and its
+/// contents cannot hold one. Keep the field marker and every other byte,
+/// including the original metadata and any inline way locations.
+fn project_tags(
+    mut stream: Stream,
+    request: &[(usize, i64)],
+    mut out: impl Write,
+) -> Result<(), Error> {
+    while let Some(key) = stream.next()? {
+        let line = stream.line();
+        if request.contains(&key) {
+            out.write_all(line)?;
+        } else {
+            let tags = line
+                .windows(2)
+                .position(|field| field == b" T")
+                .ok_or_else(|| {
+                    Error::tool("osmium getid -r decoding has a record without a T field")
+                })?
+                + 2;
+            let contents = &line[tags..];
+            let end = contents
+                .iter()
+                .position(|&byte| byte == b' ')
+                .unwrap_or(contents.len());
+            out.write_all(&line[..tags])?;
+            out.write_all(&contents[end..])?;
+        }
+        out.write_all(b"\n")?;
     }
+    out.flush()?;
+    Ok(())
 }
 
 /// Refuse an input whose indexdata claims a negative ID of any kind. Also
@@ -511,7 +565,7 @@ fn exercised(
     reference: &Path,
     request: &[(usize, i64)],
     chain: Option<(i64, i64)>,
-) -> Result<Exercised, Error> {
+) -> Result<(Exercised, [u64; 3]), Error> {
     let listing = outdir.join("osmium-getid-r.opl");
     let captured = harness.reference(
         &ToolRun::osmium("getid-r-opl.1")
@@ -524,7 +578,9 @@ fn exercised(
     )?;
     harness.require_success(&captured, "osmium cat -f opl")?;
     let mut objects = Vec::new();
+    let mut counts = [0; 3];
     opl::scan_objects(&listing, |o| {
+        counts[o.kind.index()] += 1;
         objects.push(OplObject {
             kind: o.kind,
             id: o.id,
@@ -548,12 +604,13 @@ fn exercised(
         )));
     }
     let requested: BTreeSet<(usize, i64)> = request.iter().copied().collect();
-    judge_exercised(&objects, &requested, chain.map(|(_, r3)| r3)).map_err(|why| {
+    let shown = judge_exercised(&objects, &requested, chain.map(|(_, r3)| r3)).map_err(|why| {
         Error::Tool(format!(
             "{}: {why}; getid --add-referenced cannot be compared on it",
             listing.display()
         ))
-    })
+    })?;
+    Ok((shown, counts))
 }
 
 /// [`exercised`] over the output's objects; a negative reference in any of
@@ -642,6 +699,36 @@ mod tests {
     }
 
     use OscKind::{Node as N, Relation as R, Way as W};
+
+    #[test]
+    fn projected_closure_matches_getid_r_t_including_inline_locations() {
+        let dir = pbfhogg_test_scratch::scratch();
+        let closure = dir.path().join("getid-r.opl");
+        std::fs::write(
+            &closure,
+            "n1 v1 dV c3 t i2 uA Tname=keep x1 y2\n\
+             n2 v1 dV c3 t i2 uA Tname=strip,x=%20%Tfake x2 y3\n\
+             w3 v1 dV c3 t i2 uA Tname=strip Nn1x1y2,n2x2y3,n9xy\n\
+             r4 v1 dV c3 t i2 uA Tname=keep Mw3@outer,r5@\n\
+             r5 v1 dV c3 t i2 uA Tname=strip Mr4@\n",
+        )
+        .unwrap();
+        let mut projected = Vec::new();
+        project_tags(
+            Stream::open(&closure).unwrap(),
+            &[(0, 1), (2, 4)],
+            &mut projected,
+        )
+        .unwrap();
+        assert_eq!(
+            projected,
+            b"n1 v1 dV c3 t i2 uA Tname=keep x1 y2\n\
+              n2 v1 dV c3 t i2 uA T x2 y3\n\
+              w3 v1 dV c3 t i2 uA T Nn1x1y2,n2x2y3,n9xy\n\
+              r4 v1 dV c3 t i2 uA Tname=keep Mw3@outer,r5@\n\
+              r5 v1 dV c3 t i2 uA T Mr4@\n"
+        );
+    }
 
     #[test]
     fn a_chain_two_deep_is_chosen_and_one_holding_nodes_or_ways_preferred() {

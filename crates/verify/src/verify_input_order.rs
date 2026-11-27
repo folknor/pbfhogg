@@ -32,7 +32,7 @@ use crate::argv::PbfArgv;
 use crate::checks::sort;
 use crate::error::Error;
 use crate::harness::{Harness, Role, Verdict};
-use crate::opl_compare::Policy;
+use crate::opl_compare::{Operand, Policy};
 use crate::pbf_frames::{self, Header, Origin, SORT_TYPE_THEN_ID};
 
 /// The input's header features, read by the verifier itself.
@@ -164,6 +164,25 @@ pub(crate) fn compare_outputs(
              pbfhogg's by ID"
         )));
     }
+    compare_outputs_after_order(harness, order, label, ours, theirs, |h, a, listing| {
+        let b = (theirs, Origin::Other);
+        let policy = Policy::between(a.0, b)?;
+        let (verdict, _) = h.same_elements_judged(a, (b, Role::Required), listing, policy)?;
+        Ok(verdict)
+    })
+}
+
+/// Judge the output once the expected side's order is established.
+/// The reference header is read for the one-way sort feature verdict on
+/// sorted input; the caller supplies the strict record comparison.
+pub(crate) fn compare_outputs_after_order(
+    harness: &mut Harness,
+    order: &InputOrder,
+    label: &str,
+    ours: &Path,
+    reference_header: &Path,
+    compare: impl FnOnce(&mut Harness, (Operand<'_>, Role<'_>), &Path) -> Result<Verdict, Error>,
+) -> Result<(), Error> {
     let pbfhogg_label = format!("pbfhogg {label}");
     // pbfhogg's order (on unsorted input, the osmium-sorted copy's, which
     // proves no repeated ID) is judged from the comparison's own decoding.
@@ -203,8 +222,8 @@ pub(crate) fn compare_outputs(
     } else {
         Origin::Other
     };
-    let policy = Policy::between((&compared, compared_origin), (theirs, Origin::Other))?;
-    let (diff, _) = harness.same_elements_judged(
+    let diff = compare(
+        harness,
         (
             (&compared, compared_origin),
             Role::Judged {
@@ -212,9 +231,7 @@ pub(crate) fn compare_outputs(
                 record: &order_record,
             },
         ),
-        ((theirs, Origin::Other), Role::Required),
         &crate::harness::listing_beside(&compared),
-        policy,
     )?;
     if diff.is_pass() {
         harness.msg(&format!("  {label}: PASS (identical)"));
@@ -223,7 +240,7 @@ pub(crate) fn compare_outputs(
     }
     harness.record(&format!("{label} diff"), diff);
     if order.sorted {
-        let feature = harness.compare_sort_feature(ours, theirs)?;
+        let feature = harness.compare_sort_feature(ours, reference_header)?;
         harness.record(&format!("{label} sort feature"), feature);
     }
     Ok(())

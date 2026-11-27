@@ -1,0 +1,1949 @@
+diff --git a/crates/lib/src/commands/altw/external/mod.rs b/crates/lib/src/commands/altw/external/mod.rs
+index e738bdee..fe614c55 100644
+--- a/crates/lib/src/commands/altw/external/mod.rs
++++ b/crates/lib/src/commands/altw/external/mod.rs
+@@ -9,7 +9,8 @@
+ //!    key families sharing the buckets; see `keys.rs`).
+ //! 2. **Node join**: build a bounded coordinate table per node-key
+ //!    partition, stream matching requests and emit `(slot_pos, lat, lon)`
+-//!    into 256 slot buckets partitioned by high bits of slot_pos.
++//!    into 256 slot buckets partitioned by high bits of slot_pos. Feed the
++//!    ordered writer's node prefix from the same reads.
+ //! 3. **Slot reorder**: per bucket, sort by slot_pos, emit final blob-ordered
+ //!    delta-varint `coord_payloads` (see `coord_payloads.rs`). The flat
+ //!    `coord_slots` array is a historical intermediate, retired in 2026-04.
+@@ -30,6 +31,7 @@ mod blob_bucket_index;
+ mod blob_meta;
+ mod coord_payloads;
+ mod keys;
++mod node_output;
+ mod radix;
+ mod relation_scan;
+ mod space;
+@@ -44,7 +46,7 @@ use crate::tunables::{
+ };
+ 
+ use stage1::stage1_way_pass;
+-use stage2::{SlotBuckets, stage2_node_join};
++use stage2::{NodeOutputJob, SlotBuckets, stage2_node_join};
+ use stage3::{IntegratedInputs, stage3_slot_reorder};
+ use stage4::stage4_assembly;
+ 
+@@ -1046,8 +1048,8 @@ mod slot_layout_tests {
+ /// did not ask for. The policy is applied here, right after stage 2: the
+ /// missing count is `total_slots - resolved_count`, and stages 3 and 4 only
+ /// scatter and encode the entries stage 2 resolved, so neither can change
+-/// it. Refusing there skips the coordinate encoding, way assembly and
+-/// output write a refused run would otherwise finish and throw away.
++/// it. Refusing there skips coordinate encoding and way assembly.
++/// The node prefix staged during the join is discarded with the output.
+ #[hotpath::measure]
+ #[allow(clippy::too_many_lines)]
+ pub(crate) fn external_join_in(
+@@ -1337,6 +1339,25 @@ pub(crate) fn external_join_in(
+     // tripled the summed pread time on europe (see
+     // `InputSource::open_random_access`).
+     let input_pbf = crate::read::input::InputFile::open(input)?;
++    let rel_ids_ref = relation_member_node_ids
++        .as_ref()
++        .and_then(|scan| scan.member_node_ids.as_ref());
++    // The metadata scan verified type order, so the indexed nodes form the
++    // first data frames. Give both stages the same writer and header.
++    let (node_meta, _) = blob_meta.split_at(node_blob_mapping.len());
++    let node_limits = crate::commands::split::Limits::new(write.compression);
++    let ordered_nodes = node_output::OrderedNodes::new(
++        super::writer_from_header(
++            output,
++            write.compression,
++            &header,
++            &super::altw_output_facts(inject_prepass),
++            overrides,
++            write.backend,
++            host,
++        ),
++        crate::tunables::ALTW_STAGE2_NODE_OUTPUT_BYTES,
++    );
+     let (resolved_count, slot_bucket_manifest) = stage2_node_join(
+         scratch,
+         &id_bucket_counts,
+@@ -1350,6 +1371,13 @@ pub(crate) fn external_join_in(
+         &input_pbf,
+         &node_blob_mapping,
+         &node_spans,
++        NodeOutputJob {
++            metas: node_meta,
++            keep_untagged: keep_untagged_nodes,
++            members: rel_ids_ref,
++            limits: &node_limits,
++            ordered: &ordered_nodes,
++        },
+         inject_prepass,
+         host,
+     )?;
+@@ -1381,6 +1409,7 @@ pub(crate) fn external_join_in(
+     let missing_locations = total_slots.saturating_sub(resolved_count);
+     host.invocation.check()?;
+     super::enforce_missing_locations_policy(missing_locations, options.ignore_missing_nodes)?;
++    let node_prefix = ordered_nodes.finish(node_meta.len(), &host.invocation)?;
+ 
+     // Free the per-blob mapping - it was a stage 2 input only.
+     drop(node_blob_mapping);
+@@ -1456,11 +1485,7 @@ pub(crate) fn external_join_in(
+     let router_ref = &router;
+     let per_way_rcs_ref = &per_way_rcs;
+     let blob_meta_ref = &blob_meta;
+-    let header_ref = &header;
+     let way_slot_starts_ref = way_slot_starts.as_slice();
+-    let rel_ids_ref = relation_member_node_ids
+-        .as_ref()
+-        .and_then(|scan| scan.member_node_ids.as_ref());
+     let member_way_ids_ref = relation_member_node_ids
+         .as_ref()
+         .and_then(|scan| scan.member_way_ids.as_ref());
+@@ -1519,7 +1544,7 @@ pub(crate) fn external_join_in(
+             let result = stage4_assembly(
+                 input,
+                 output,
+-                header_ref,
++                node_prefix,
+                 blob_meta_ref,
+                 router_ref,
+                 per_way_rcs_ref,
+@@ -1529,8 +1554,6 @@ pub(crate) fn external_join_in(
+                 member_way_ids_ref,
+                 inject_prepass,
+                 inject_metrics_ref,
+-                write,
+-                overrides,
+                 host,
+             );
+             // Stage 4's workers have joined inside `stage4_assembly`, so the
+diff --git a/crates/lib/src/commands/altw/external/node_output.rs b/crates/lib/src/commands/altw/external/node_output.rs
+new file mode 100644
+index 00000000..207e9017
+--- /dev/null
++++ b/crates/lib/src/commands/altw/external/node_output.rs
+@@ -0,0 +1,536 @@
++//! Stage 2 produces the node prefix in source order on the same writer that
++//! stage 4 uses for ways and relations.
++
++use std::collections::BTreeMap;
++use std::fs::File;
++use std::io::Write;
++use std::ops::Range;
++use std::os::unix::fs::FileExt as _;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::sync::{Arc, Condvar, Mutex, PoisonError};
++
++use super::blob_meta::BlobMeta;
++use super::keys::{Family, NodeKeyLayout, NodeSpans};
++use crate::blob_meta::AscendingTally;
++use crate::block_builder::{BlockBuilder, OwnedBlock};
++use crate::commands::split::Limits;
++use crate::commands::{ensure_node_capacity_local, flush_local};
++use crate::error::{Error, Result};
++use crate::idset::IdSet;
++use crate::owned::{dense_node_metadata, element_metadata};
++use crate::writer::PbfWriter;
++use crate::{Element, ElementKind, PrimitiveBlock};
++
++use super::super::Stats;
++
++pub(super) type OutputWriter = PbfWriter<crate::file_writer::FileWriter>;
++
++/// The old stage 4 whole-blob skip trusts the tag and ID claims. Missing
++/// tagdata is represented by `has_tags == true` and needs a payload decode.
++pub(super) fn keep_node_blob(meta: &BlobMeta, members: Option<&IdSet>) -> bool {
++    meta.has_tags || members.is_some_and(|ids| ids.any_in_numeric_range(meta.min_id, meta.max_id))
++}
++
++pub(super) struct NodePrefix<W: Write = crate::file_writer::FileWriter> {
++    pub writer: Result<PbfWriter<W>>,
++    /// Deferred to stage 4, after stage 2 finishes checking the join.
++    pub error: Option<Error>,
++    pub stats: Stats,
++}
++
++/// A coordinate bucket and its contiguous run of node output positions.
++pub(super) struct BucketWork {
++    pub bucket: Option<usize>,
++    pub output: Range<usize>,
++}
++
++/// The first nonempty request bucket touching a blob owns its output.
++/// This gives each repeated read of a straddler the same owner. The
++/// owner order is file order (negative-family buckets come first);
++/// blobs untouched by the join go immediately before the next owner,
++/// or at the end, with an output-only job for each.
++pub(super) fn bucket_work(
++    counts: &[u64],
++    layout: &NodeKeyLayout,
++    spans: &NodeSpans,
++    node_count: usize,
++) -> Result<Vec<BucketWork>> {
++    let mut buckets: Vec<_> = counts
++        .iter()
++        .enumerate()
++        .filter_map(|(i, &count)| (count != 0).then_some(i))
++        .collect();
++    buckets.sort_by_key(|&i| {
++        layout
++            .bucket(i)
++            .map(|(family, lo, _)| (family == Family::Pos, lo))
++    });
++    let mut owners = vec![None; node_count];
++    let mut first_touched = vec![node_count; buckets.len() + 1];
++    for (owner, &bucket) in buckets.iter().enumerate() {
++        let Some((family, lo, hi)) = layout.bucket(bucket) else {
++            continue;
++        };
++        let spans = spans.of(family);
++        let start = spans.partition_point(|s| s.hi < lo);
++        let end = spans.partition_point(|s| s.lo < hi);
++        for span in &spans[start..end] {
++            let slot = owners
++                .get_mut(span.blob as usize)
++                .ok_or_else(|| Error::internal("stage2: a key span names no node blob"))?;
++            if slot.is_none() {
++                *slot = Some(owner);
++                first_touched[owner] = first_touched[owner].min(span.blob as usize);
++            }
++        }
++    }
++    let mut next_owner = buckets.len();
++    for owner in owners.iter_mut().rev() {
++        next_owner = *owner.get_or_insert(next_owner);
++    }
++    if !owners.is_sorted() {
++        return Err(Error::internal(
++            "stage2: node output owners are out of file order",
++        ));
++    }
++
++    let mut start = 0;
++    let mut work = Vec::with_capacity(buckets.len() + 1);
++    for (owner, bucket) in buckets.into_iter().map(Some).chain([None]).enumerate() {
++        let end = start + owners[start..].partition_point(|&i| i == Some(owner));
++        // Output-only jobs stay parallel even when there are few way refs
++        // or none. Each has one source blob's work and the same byte gate.
++        let first = first_touched[owner].min(end);
++        for index in start..first {
++            work.push(BucketWork {
++                bucket: None,
++                output: index..index + 1,
++            });
++        }
++        if bucket.is_some() {
++            work.push(BucketWork {
++                bucket,
++                output: first..end,
++            });
++        }
++        start = end;
++    }
++    Ok(work)
++}
++
++enum NodeFrame {
++    Raw(Vec<u8>),
++    Rebuilt(Vec<OwnedBlock>),
++    Skipped,
++}
++
++pub(super) struct NodeResult {
++    frame: NodeFrame,
++    stats: Stats,
++}
++
++impl NodeResult {
++    pub fn raw(frame: Vec<u8>, count: u64) -> Self {
++        Self {
++            frame: NodeFrame::Raw(frame),
++            stats: Stats {
++                nodes_read: count,
++                nodes_written: count,
++                blobs_passthrough: 1,
++                ..Stats::default()
++            },
++        }
++    }
++
++    pub fn skipped(count: u64) -> Self {
++        Self {
++            frame: NodeFrame::Skipped,
++            stats: Stats {
++                nodes_read: count,
++                nodes_dropped: count,
++                ..Stats::default()
++            },
++        }
++    }
++}
++
++pub(super) fn read_frame(file: &File, meta: &BlobMeta) -> std::io::Result<(Vec<u8>, usize)> {
++    // Both offsets came from the same header read, so their difference
++    // is the bounded length prefix and BlobHeader.
++    #[allow(clippy::cast_possible_truncation)]
++    let body = (meta.data_offset - meta.frame_offset) as usize;
++    let mut frame = vec![0; body + meta.data_size];
++    file.read_exact_at(&mut frame, meta.frame_offset)?;
++    Ok((frame, body))
++}
++
++pub(super) struct NodeAssembler {
++    builder: BlockBuilder,
++    pool: Arc<crate::blob::DecompressPool>,
++    st_scratch: Vec<(u32, u32)>,
++    gr_scratch: Vec<(u32, u32)>,
++}
++
++impl NodeAssembler {
++    pub fn new(invocation: &crate::host::Recorder) -> Self {
++        Self {
++            builder: BlockBuilder::new(),
++            pool: crate::blob::DecompressPool::new(invocation),
++            st_scratch: Vec::new(),
++            gr_scratch: Vec::new(),
++        }
++    }
++
++    pub fn rebuild(
++        &mut self,
++        bytes: &mut Vec<u8>,
++        meta: &BlobMeta,
++        members: Option<&IdSet>,
++        limits: &Limits,
++    ) -> Result<NodeResult> {
++        let result = self.rebuild_inner(std::mem::take(bytes), meta, members, limits);
++        // Parsing extends the owned buffer in place. The block returns it
++        // when it drops, so the next scanner read can reuse the allocation.
++        *bytes = self.pool.get();
++        crate::retention::release_scratch(&mut self.st_scratch);
++        crate::retention::release_scratch(&mut self.gr_scratch);
++        // A failed assembly may have left partially accumulated elements.
++        if result.is_err() {
++            self.builder = BlockBuilder::new();
++        }
++        result
++    }
++
++    fn rebuild_inner(
++        &mut self,
++        bytes: Vec<u8>,
++        meta: &BlobMeta,
++        members: Option<&IdSet>,
++        limits: &Limits,
++    ) -> Result<NodeResult> {
++        let block = PrimitiveBlock::from_vec_pooled_with_scratch(
++            bytes,
++            &self.pool,
++            &mut self.st_scratch,
++            &mut self.gr_scratch,
++        )?;
++        block.refuse_foreign_kind(Some(ElementKind::Node))?;
++
++        let mut blocks = Vec::new();
++        let mut tally = AscendingTally::default();
++        let mut stats =
++            assemble_block(&block, &mut self.builder, &mut blocks, members, &mut tally)?;
++        crate::blob_meta::hold_claim(
++            &tally,
++            &meta.claim(),
++            super::blob_meta::EXTERNAL_ORDER,
++            || {
++                block.elements_skip_metadata().map(|e| match e {
++                    Element::DenseNode(n) => n.id(),
++                    Element::Node(n) => n.id(),
++                    Element::Way(w) => w.id(),
++                    Element::Relation(r) => r.id(),
++                })
++            },
++        )?;
++        stats.blobs_decoded = 1;
++        flush_local(&mut self.builder, &mut blocks)?;
++        let (blocks, _) = super::super::fit_output(blocks, limits)?;
++        Ok(NodeResult {
++            frame: NodeFrame::Rebuilt(blocks),
++            stats,
++        })
++    }
++}
++
++type Pending = Result<NodeResult>;
++
++fn buffered_bytes(item: &Pending) -> usize {
++    let payload = match item.as_ref().map(|output| &output.frame) {
++        Ok(NodeFrame::Raw(bytes)) => bytes.capacity(),
++        Ok(NodeFrame::Rebuilt(blocks)) => {
++            blocks.capacity() * size_of::<OwnedBlock>()
++                + blocks
++                    .iter()
++                    .map(|block| {
++                        block.bytes.capacity() + block.tagdata.as_ref().map_or(0, Vec::capacity)
++                    })
++                    .sum::<usize>()
++        }
++        Ok(NodeFrame::Skipped) | Err(_) => 0,
++    };
++    payload.saturating_add(size_of::<(usize, usize, Pending)>())
++}
++
++struct OrderedState<W: Write> {
++    prefix: NodePrefix<W>,
++    next: usize,
++    bytes: usize,
++    peak: usize,
++    pending: BTreeMap<usize, (usize, Pending)>,
++    stopped: bool,
++}
++
++/// Only out-of-order results use queue credit. The head writes directly, so
++/// it can always make progress, even for a frame larger than the budget.
++/// Each stage 2 worker can also hold one completed source blob while waiting
++/// for credit. The writer retains its own ordinary pipeline bounds.
++pub(super) struct OrderedNodes<W: Write = crate::file_writer::FileWriter> {
++    budget: usize,
++    state: Mutex<OrderedState<W>>,
++    room: Condvar,
++    wait_ns: AtomicU64,
++}
++
++impl<W: Write> OrderedNodes<W> {
++    pub fn new(writer: Result<PbfWriter<W>>, budget: usize) -> Self {
++        Self {
++            budget,
++            state: Mutex::new(OrderedState {
++                stopped: writer.is_err(),
++                prefix: NodePrefix {
++                    writer,
++                    error: None,
++                    stats: Stats::default(),
++                },
++                next: 0,
++                bytes: 0,
++                peak: 0,
++                pending: BTreeMap::new(),
++            }),
++            room: Condvar::new(),
++            wait_ns: AtomicU64::new(0),
++        }
++    }
++
++    pub fn submit(&self, index: usize, item: Pending) -> Result<()> {
++        let bytes = buffered_bytes(&item);
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut wait = None;
++        while !state.stopped && index > state.next && bytes > self.budget - state.bytes {
++            wait.get_or_insert_with(crate::counters::Stopwatch::start);
++            state = self
++                .room
++                .wait(state)
++                .unwrap_or_else(PoisonError::into_inner);
++        }
++        if let Some(wait) = wait {
++            self.wait_ns.fetch_add(wait.elapsed_ns(), Relaxed);
++        }
++        if state.stopped {
++            return Ok(());
++        }
++        if index < state.next || state.pending.contains_key(&index) {
++            return Err(Error::internal("stage2: duplicate node output owner"));
++        }
++        if index > state.next {
++            state.bytes += bytes;
++            state.peak = state.peak.max(state.bytes);
++            state.pending.insert(index, (bytes, item));
++            return Ok(());
++        }
++        state.write(item);
++        while !state.stopped {
++            let next = state.next;
++            let Some((bytes, item)) = state.pending.remove(&next) else {
++                break;
++            };
++            state.bytes -= bytes;
++            state.write(item);
++        }
++        drop(state);
++        self.room.notify_all();
++        Ok(())
++    }
++
++    pub fn stop(&self) {
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        state.stop();
++        drop(state);
++        self.room.notify_all();
++    }
++
++    pub fn finish(self, count: usize, host: &crate::host::Recorder) -> Result<NodePrefix<W>> {
++        let state = self
++            .state
++            .into_inner()
++            .unwrap_or_else(PoisonError::into_inner);
++        let complete = state.next == count && state.pending.is_empty();
++        let failed = state.prefix.writer.is_err() || state.prefix.error.is_some();
++        if !complete && !failed {
++            return Err(Error::internal("stage2: incomplete node output prefix"));
++        }
++        host.counter("s2_node_output_pending_peak_bytes", state.peak);
++        host.counter("s2_node_output_wait_ns", self.wait_ns.into_inner());
++        Ok(state.prefix)
++    }
++}
++
++impl<W: Write> OrderedState<W> {
++    fn write(&mut self, item: Pending) {
++        let result = item.and_then(|item| {
++            self.prefix.stats.merge(&item.stats)?;
++            let Ok(writer) = &mut self.prefix.writer else {
++                return Err(Error::internal(
++                    "stage2: node output started without a writer",
++                ));
++            };
++            match item.frame {
++                NodeFrame::Raw(bytes) => writer.write_raw_owned(bytes)?,
++                NodeFrame::Rebuilt(blocks) => {
++                    for block in blocks {
++                        writer.write_primitive_block_owned(block)?;
++                    }
++                }
++                NodeFrame::Skipped => {}
++            }
++            Ok(())
++        });
++        if let Err(error) = result {
++            self.prefix.error = Some(error);
++            self.stop();
++        }
++        self.next += 1;
++    }
++
++    fn stop(&mut self) {
++        self.stopped = true;
++        self.pending.clear();
++        self.bytes = 0;
++    }
++}
++
++/// Re-encode the retained nodes with the original stage 4 builder.
++#[cfg_attr(feature = "hotpath", hotpath::measure)]
++#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
++fn assemble_block(
++    block: &PrimitiveBlock,
++    bb: &mut BlockBuilder,
++    output: &mut Vec<OwnedBlock>,
++    relation_member_node_ids: Option<&IdSet>,
++    tally: &mut crate::blob_meta::AscendingTally,
++) -> crate::Result<Stats> {
++    let mut stats = Stats::default();
++
++    for element in block.elements() {
++        match &element {
++            Element::DenseNode(dn) => {
++                tally.add(dn.id());
++                stats.nodes_read += 1;
++                let has_tags = dn.tags().next().is_some();
++                if has_tags || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id())) {
++                    ensure_node_capacity_local(bb, output)?;
++                    let meta = dense_node_metadata(dn)?;
++                    bb.add_node_dense(
++                        dn.id(),
++                        dn.decimicro_lat()?,
++                        dn.decimicro_lon()?,
++                        dn.tags(),
++                        meta.as_ref(),
++                    );
++                    stats.nodes_written += 1;
++                } else {
++                    stats.nodes_dropped += 1;
++                }
++            }
++            Element::Node(n) => {
++                tally.add(n.id());
++                stats.nodes_read += 1;
++                let has_tags = n.tags().next().is_some();
++                if has_tags || relation_member_node_ids.is_some_and(|ids| ids.get(n.id())) {
++                    ensure_node_capacity_local(bb, output)?;
++                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
++                    bb.add_node_partial(
++                        n.id(),
++                        n.decimicro_lat()?,
++                        n.decimicro_lon()?,
++                        n.tags(),
++                        meta.as_ref(),
++                    );
++                    stats.nodes_written += 1;
++                } else {
++                    stats.nodes_dropped += 1;
++                }
++            }
++            // Only node blobs are decoded here (relation blobs pass through,
++            // way blobs are reframed), and the caller refused a block holding
++            // another kind under the node claim.
++            Element::Way(_) | Element::Relation(_) => {
++                return Err(Error::internal(
++                    "altw external stage 4: a decoded node blob holds a way or relation \
++                     its kind check should have refused",
++                ));
++            }
++        }
++    }
++
++    Ok(stats)
++}
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used, clippy::expect_used)]
++mod tests {
++    use super::super::keys::{FamilyPlan, KeyPlan, KeySpan};
++    use super::*;
++
++    #[test]
++    fn a_blob_in_both_key_families_has_one_owner() {
++        let plan = KeyPlan {
++            threshold: 1,
++            pos: FamilyPlan {
++                buckets: 2,
++                max_key: 20,
++            },
++            neg: FamilyPlan {
++                buckets: 2,
++                max_key: 20,
++            },
++            compact: true,
++        };
++        let span = |lo, hi, blob| KeySpan {
++            lo,
++            hi,
++            count: 2,
++            blob,
++        };
++        let spans = NodeSpans {
++            neg: vec![span(1, 3, 0), span(8, 15, 1)],
++            pos: vec![span(3, 8, 1), span(18, 20, 2)],
++        };
++        let layout = NodeKeyLayout::new(&plan, &spans);
++        let work = bucket_work(&[1, 0, 1, 1], &layout, &spans, 3).unwrap();
++        let actual: Vec<_> = work.into_iter().map(|w| (w.bucket, w.output)).collect();
++        assert_eq!(
++            actual,
++            [
++                (Some(2), 0..2),
++                (Some(3), 2..2),
++                (Some(0), 2..2),
++                (None, 2..3)
++            ]
++        );
++    }
++
++    #[test]
++    fn full_reorder_budget_allows_the_oversize_head_and_preserves_order() {
++        let recorder = crate::host::Host::for_tests();
++        let host = recorder.entered();
++        let last = Ok(NodeResult::raw(vec![3], 1));
++        let budget = buffered_bytes(&last);
++        let writer = PbfWriter::new(Vec::new(), crate::write::compression::Compression::None);
++        let ordered = OrderedNodes::new(Ok(writer), budget);
++        ordered.submit(2, last).unwrap();
++        ordered
++            .submit(0, Ok(NodeResult::raw(vec![1; budget + 1], 1)))
++            .unwrap();
++        ordered.submit(1, Ok(NodeResult::raw(vec![2], 1))).unwrap();
++
++        let prefix = ordered.finish(3, &host.invocation).unwrap();
++        let mut writer = prefix.writer.unwrap();
++        writer.flush().unwrap();
++        let output = writer.into_inner().unwrap();
++        assert_eq!(&output[..budget + 1], vec![1; budget + 1]);
++        assert_eq!(&output[budget + 1..], &[2, 3]);
++        assert_eq!(prefix.stats.nodes_written, 3);
++    }
++}
+diff --git a/crates/lib/src/commands/altw/external/stage2.rs b/crates/lib/src/commands/altw/external/stage2.rs
+index 640b2789..e57e4a7a 100644
+--- a/crates/lib/src/commands/altw/external/stage2.rs
++++ b/crates/lib/src/commands/altw/external/stage2.rs
+@@ -14,6 +14,9 @@ use std::sync::Arc;
+ 
+ use super::super::Result;
+ use super::keys::{Family, NodeKeyLayout, NodeSpans};
++use super::node_output::{
++    BucketWork, NodeAssembler, NodeResult, OrderedNodes, bucket_work, keep_node_blob, read_frame,
++};
+ use super::{
+     NodeBlobInfo, RESOLVED_ENTRY_SIZE, ResolvedEntry, ShardCodec, ShardFormat, ShardRecord,
+     slot_bucket_bounds,
+@@ -24,7 +27,7 @@ use crate::scan::node::NodeTuple;
+ use crate::scratch::RunScratch;
+ use crate::tunables::{
+     ALTW_STAGE2_WORKERS_CAP, BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN,
+-    DECODE_WORKERS_RESERVED, NUM_BUCKETS, STAGE2_FLUSH_THRESHOLD,
++    DECODE_WORKERS_RESERVED, STAGE2_FLUSH_THRESHOLD,
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -61,6 +64,9 @@ crate::counters::counter_set! {
+         node_walk_ns => "s2_node_walk_ns",
+         node_bytes_read => "s2_node_bytes_read",
+         node_blobs_read => "s2_node_blobs_read",
++        node_output_shared_blobs => "s2_node_output_shared_blobs",
++        node_output_only_reads => "s2_node_output_only_reads",
++        node_output_assemble_ms => "s2_node_output_assemble_ms",
+         /// Node blobs read whose id range crosses the bucket boundary
+         /// (straddlers). Each straddler is re-decompressed by adjacent
+         /// workers; high values mean wasted decode work. With id-bucketing,
+@@ -375,6 +381,7 @@ pub(super) fn stage2_node_join(
+     input_pbf: &crate::read::input::InputFile,
+     node_blob_mapping: &[NodeBlobInfo],
+     node_spans: &NodeSpans,
++    node_output: NodeOutputJob<'_>,
+     inject_prepass: bool,
+     host: &crate::host::Entered<'_>,
+ ) -> Result<(u64, SlotBucketManifest)> {
+@@ -390,6 +397,8 @@ pub(super) fn stage2_node_join(
+         input_pbf,
+         node_blob_mapping,
+         node_spans,
++        node_output: Some(node_output),
++        table_bytes: crate::tunables::ALTW_STAGE2_TABLE_BYTES,
+         inject_prepass,
+         host,
+     };
+@@ -428,10 +437,143 @@ struct Stage2Job<'j, 'h> {
+     input_pbf: &'j crate::read::input::InputFile,
+     node_blob_mapping: &'j [NodeBlobInfo],
+     node_spans: &'j NodeSpans,
++    node_output: Option<NodeOutputJob<'j>>,
++    table_bytes: usize,
+     inject_prepass: bool,
+     host: &'j crate::host::Entered<'h>,
+ }
+ 
++#[derive(Clone, Copy)]
++pub(super) struct NodeOutputJob<'a> {
++    pub metas: &'a [super::blob_meta::BlobMeta],
++    pub keep_untagged: bool,
++    pub members: Option<&'a crate::idset::IdSet>,
++    pub limits: &'a crate::commands::split::Limits,
++    pub ordered: &'a OrderedNodes,
++}
++
++/// The cursor is advanced only by the bucket that owns the node frame,
++/// and only once even if a smaller table partition visits the blob again.
++#[derive(Default)]
++struct WorkerOutput {
++    remaining: std::ops::Range<usize>,
++    assembler: Option<NodeAssembler>,
++}
++
++impl WorkerOutput {
++    fn owns(&self, index: usize) -> bool {
++        self.remaining.start == index && !self.remaining.is_empty()
++    }
++
++    /// Deal with entries that lack a coordinate read. The join visits
++    /// the blobs it touches in source order.
++    fn before(
++        &mut self,
++        job: &Stage2Job<'_, '_>,
++        counters: &Stage2Counters,
++        file: &std::fs::File,
++        stop: usize,
++        read: &mut crate::read::read_buf::ReadBuf,
++        decoded: &mut Vec<u8>,
++    ) -> Result<()> {
++        use std::sync::atomic::Ordering::Relaxed;
++
++        let Some(output) = job.node_output else {
++            return Ok(());
++        };
++        for index in self.remaining.start..stop.min(self.remaining.end) {
++            job.host.invocation.check()?;
++            let meta = &output.metas[index];
++            let item = (|| {
++                if output.keep_untagged {
++                    counters.node_output_only_reads.fetch_add(1, Relaxed);
++                    let (frame, _) = read_frame(file, meta)?;
++                    return Ok(NodeResult::raw(frame, meta.count));
++                }
++                if !keep_node_blob(meta, output.members) {
++                    return Ok(NodeResult::skipped(meta.count));
++                }
++                counters.node_output_only_reads.fetch_add(1, Relaxed);
++                let body = read
++                    .read_exact_at(file, meta.data_offset, meta.data_size)
++                    .map_err(Error::from)?;
++                crate::blob::decompress_blob_raw(body, decoded)?;
++                self.rebuild(output, index, decoded, counters, &job.host.invocation)
++            })()
++            .map_err(|e: Error| job.input_pbf.locate_at(meta.frame_offset, e));
++            output.ordered.submit(index, item)?;
++            self.remaining.start = index + 1;
++            read.release_outlier(&job.host.invocation);
++            crate::blob::release_decode_outlier(decoded, &job.host.invocation);
++        }
++        Ok(())
++    }
++
++    fn rebuild(
++        &mut self,
++        output: NodeOutputJob<'_>,
++        index: usize,
++        decoded: &mut Vec<u8>,
++        counters: &Stage2Counters,
++        invocation: &crate::host::Recorder,
++    ) -> Result<NodeResult> {
++        let timer = crate::counters::Stopwatch::start();
++        let result = self
++            .assembler
++            .get_or_insert_with(|| NodeAssembler::new(invocation))
++            .rebuild(decoded, &output.metas[index], output.members, output.limits);
++        timer.record_ms(&counters.node_output_assemble_ms);
++        result
++    }
++
++    fn scanned(
++        &mut self,
++        job: &Stage2Job<'_, '_>,
++        counters: &Stage2Counters,
++        index: usize,
++        raw: Option<Vec<u8>>,
++        decoded: &mut Vec<u8>,
++    ) -> Result<()> {
++        use std::sync::atomic::Ordering::Relaxed;
++
++        let Some(output) = job.node_output else {
++            return Ok(());
++        };
++        if !self.owns(index) {
++            return Ok(());
++        }
++        let meta = &output.metas[index];
++        let item = if let Some(frame) = raw {
++            counters.node_output_shared_blobs.fetch_add(1, Relaxed);
++            Ok(NodeResult::raw(frame, meta.count))
++        } else if output.keep_untagged {
++            return Err(Error::internal(
++                "stage2: output owner lost its raw node frame",
++            ));
++        } else if keep_node_blob(meta, output.members) {
++            counters.node_output_shared_blobs.fetch_add(1, Relaxed);
++            self.rebuild(output, index, decoded, counters, &job.host.invocation)
++                .map_err(|e| job.input_pbf.locate_at(meta.frame_offset, e))
++        } else {
++            Ok(NodeResult::skipped(meta.count))
++        };
++        self.remaining.start += 1;
++        output.ordered.submit(index, item)
++    }
++}
++
++/// Release other buckets waiting on node output credit if a worker
++/// unwinds or cannot complete its own run.
++struct StopNodeOutput<'a>(Option<&'a OrderedNodes>);
++
++impl Drop for StopNodeOutput<'_> {
++    fn drop(&mut self) {
++        if let Some(output) = self.0 {
++            output.stop();
++        }
++    }
++}
++
+ /// One worker's buffers, kept across its buckets.
+ struct WorkerBufs<R> {
+     loader: LoaderScratch<R>,
+@@ -440,6 +582,7 @@ struct WorkerBufs<R> {
+     node_tuples: Vec<NodeTuple>,
+     table: table::NodeTable,
+     node_group_starts: Vec<(usize, usize)>,
++    output: WorkerOutput,
+     entry_buf: [u8; RESOLVED_ENTRY_SIZE],
+     local_resolved: u64,
+     /// Per-slot-bucket local buffers. Flushed when any buffer exceeds
+@@ -457,6 +600,7 @@ impl<R> WorkerBufs<R> {
+             node_tuples: Vec::new(),
+             table: table::NodeTable::default(),
+             node_group_starts: Vec::new(),
++            output: WorkerOutput::default(),
+             entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
+             local_resolved: 0,
+             slot_bufs: (0..slot_bucket_count).map(|_| Vec::new()).collect(),
+@@ -476,16 +620,12 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
+     )
+     .min(ALTW_STAGE2_WORKERS_CAP);
+ 
+-    // A hand-built claim-counter pool, deliberately not on
+-    // `crate::ordered_pool`: it has no consumer and no order to keep.
+-    // Workers claim id buckets with one `fetch_add`, each holding its own
+-    // bucket scratch and buffered slot writes, under the stage's worker cap.
+-    // The first recorded error (not the lowest bucket) stops the others at
+-    // their next claim, and work in flight finishes; cancellation is checked
+-    // per non-empty bucket and per node blob inside it. Its one wait on
+-    // another thread is a shared slot-bucket writer's mutex, recorded as
+-    // `s2_slot_flush_lock_wait_ns`; the claim is a `fetch_add` and the
+-    // first-error slot is locked once per bucket, held for a load.
++    // Claim buckets in file order so the owner of the missing head is
++    // always running while later workers wait for output credit.
++    let node_count = job.node_output.map_or(0, |output| output.metas.len());
++    let work = bucket_work(job.id_bucket_counts, job.layout, job.node_spans, node_count)?;
++    let work = &work;
++    let node_output = job.node_output.map(|output| output.ordered);
+     let next_idx = std::sync::atomic::AtomicUsize::new(0);
+     let resolved_total = std::sync::atomic::AtomicU64::new(0);
+     let counters = Stage2Counters::new();
+@@ -502,6 +642,7 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
+             let spawned = scope.spawn(move || {
+                 use std::sync::atomic::Ordering::Relaxed;
+ 
++                let mut stop_output = StopNodeOutput(node_output);
+                 let mut w = WorkerBufs::new(job.slot_bucket_count);
+ 
+                 loop {
+@@ -513,14 +654,26 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
+                     {
+                         break;
+                     }
+-                    let bucket_idx = next_ref.fetch_add(1, Relaxed);
+-                    if bucket_idx >= NUM_BUCKETS {
++                    let Some(BucketWork { bucket, output }) =
++                        work.get(next_ref.fetch_add(1, Relaxed))
++                    else {
+                         break;
+-                    }
+-                    if job.id_bucket_counts[bucket_idx] == 0 {
+-                        continue;
+-                    }
+-                    if let Err(e) = join_bucket(codec, job, c, &pbf_file, bucket_idx, &mut w) {
++                    };
++                    w.output.remaining = output.clone();
++                    let joined = bucket.map_or(Ok(()), |bucket| {
++                        join_bucket(codec, job, c, &pbf_file, bucket, &mut w)
++                    });
++                    let completed = joined.and_then(|()| {
++                        w.output.before(
++                            job,
++                            c,
++                            &pbf_file,
++                            output.end,
++                            &mut w.node_read_buf,
++                            &mut w.node_decompress_buf,
++                        )
++                    });
++                    if let Err(e) = completed {
+                         // The first error wins: a later one (another worker
+                         // stopping on the same cancellation, say) must not
+                         // replace the cause.
+@@ -528,16 +681,18 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
+                             .lock()
+                             .unwrap_or_else(std::sync::PoisonError::into_inner)
+                             .get_or_insert(e);
+-                        break;
++                        return;
+                     }
+                 }
+ 
++                stop_output.0 = None;
+                 resolved_ref.fetch_add(w.local_resolved, Relaxed);
+             });
+             // A refusal is recorded in the first-error slot (an earlier
+             // failure keeps its place), so the workers already born stop at
+             // their next claim instead of joining the rest of the buckets.
+             if let Err(e) = spawned {
++                let _stop_output = StopNodeOutput(node_output);
+                 err_ref
+                     .lock()
+                     .unwrap_or_else(std::sync::PoisonError::into_inner)
+@@ -576,15 +731,7 @@ fn join_bucket<C: ShardCodec>(
+     if job.inject_prepass {
+         join_bucket_sorted(codec, job, c, pbf_file, bucket_idx, w)
+     } else {
+-        table::join_bucket(
+-            codec,
+-            job,
+-            c,
+-            pbf_file,
+-            bucket_idx,
+-            w,
+-            crate::tunables::ALTW_STAGE2_TABLE_BYTES,
+-        )
++        table::join_bucket(codec, job, c, pbf_file, bucket_idx, w, job.table_bytes)
+     }
+ }
+ 
+@@ -668,14 +815,8 @@ fn join_bucket_sorted<C: ShardCodec>(
+             bucket_straddlers += 1;
+         }
+ 
+-        read_node_blob(
+-            job,
+-            c,
+-            pbf_file,
+-            blob,
+-            &mut w.node_read_buf,
+-            &mut w.node_decompress_buf,
+-        )?;
++        let index = span.blob as usize;
++        let raw = read_join_node_blob(job, c, pbf_file, index, blob, w)?;
+         let in_input = |e: Error| job.input_pbf.locate_at(blob.data_offset, e);
+         let t_ex = crate::counters::Stopwatch::start();
+         w.node_tuples.clear();
+@@ -763,6 +904,8 @@ fn join_bucket_sorted<C: ShardCodec>(
+         node_read_peak = node_read_peak.max(w.node_read_buf.capacity());
+         w.node_read_buf.release_outlier(&host.invocation);
+         node_decompress_peak = node_decompress_peak.max(w.node_decompress_buf.capacity());
++        w.output
++            .scanned(job, c, index, raw, &mut w.node_decompress_buf)?;
+         crate::blob::release_decode_outlier(&mut w.node_decompress_buf, &host.invocation);
+     }
+ 
+@@ -796,6 +939,52 @@ fn join_bucket_sorted<C: ShardCodec>(
+     flush_bucket(job, c, w)
+ }
+ 
++fn read_join_node_blob<R>(
++    job: &Stage2Job<'_, '_>,
++    c: &Stage2Counters,
++    file: &std::fs::File,
++    index: usize,
++    blob: &NodeBlobInfo,
++    w: &mut WorkerBufs<R>,
++) -> Result<Option<Vec<u8>>> {
++    use std::sync::atomic::Ordering::Relaxed;
++
++    w.output.before(
++        job,
++        c,
++        file,
++        index,
++        &mut w.node_read_buf,
++        &mut w.node_decompress_buf,
++    )?;
++    let raw_owner = job
++        .node_output
++        .filter(|output| output.keep_untagged && w.output.owns(index));
++    if let Some(output) = raw_owner {
++        job.host.invocation.check()?;
++        let meta = &output.metas[index];
++        let in_input = |e: Error| job.input_pbf.locate_at(blob.data_offset, e);
++        let t_pr = crate::counters::Stopwatch::start();
++        let (frame, body) = read_frame(file, meta)
++            .map_err(|e| in_input(Error::from(e).context("stage2 node pread")))?;
++        t_pr.record_ms(&c.node_pread_ms);
++        t_pr.record_ns(&c.node_pread_ns);
++        c.node_bytes_read.fetch_add(frame.len() as u64, Relaxed);
++        decompress_node_blob(c, &frame[body..], &mut w.node_decompress_buf, in_input)?;
++        Ok(Some(frame))
++    } else {
++        read_node_blob(
++            job,
++            c,
++            file,
++            blob,
++            &mut w.node_read_buf,
++            &mut w.node_decompress_buf,
++        )?;
++        Ok(None)
++    }
++}
++
+ fn read_node_blob(
+     job: &Stage2Job<'_, '_>,
+     c: &Stage2Counters,
+@@ -814,7 +1003,15 @@ fn read_node_blob(
+     t_pr.record_ms(&c.node_pread_ms);
+     t_pr.record_ns(&c.node_pread_ns);
+     c.node_bytes_read.fetch_add(blob.data_size as u64, Relaxed);
++    decompress_node_blob(c, raw, decompress_buf, in_input)
++}
+ 
++fn decompress_node_blob(
++    c: &Stage2Counters,
++    raw: &[u8],
++    decompress_buf: &mut Vec<u8>,
++    in_input: impl FnOnce(Error) -> Error,
++) -> Result<()> {
+     let t_dc = crate::counters::Stopwatch::start();
+     crate::blob::decompress_blob_raw(raw, decompress_buf)
+         .map_err(|e| in_input(e.context("stage2 node decompress")))?;
+@@ -1075,3 +1272,209 @@ fn emit_resolved<R: ShardRecord>(
+ }
+ 
+ pub(super) type SlotBuckets = SharedSlotBuckets;
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used, clippy::expect_used)]
++mod node_output_tests {
++    use super::*;
++    use crate::block_builder::{BlockBuilder, HeaderBuilder, OwnedBlock};
++    use crate::host::{Executor, Host};
++    use crate::read::input::{InputFile, PinnedInput};
++    use crate::write::compression::Compression;
++    use crate::writer::PbfWriter;
++
++    // Skipped by empty tagdata, all retained, mixed across a bucket cut
++    // and table cuts, no survivors despite a decode, a relation member
++    // in an empty-tagdata blob, and a tagged blob whose bucket has no refs.
++    const NODES: &[&[(i64, bool)]] = &[
++        &[(1, false), (2, false)],
++        &[(3, true), (4, true)],
++        &[
++            (6, false),
++            (7, true),
++            (8, true),
++            (9, false),
++            (10, true),
++            (12, false),
++            (15, true),
++        ],
++        &[(18, false), (19, false)],
++        &[(21, false), (22, false)],
++        &[(29, true), (30, true)],
++    ];
++
++    fn build_nodes(nodes: impl Iterator<Item = (i64, bool)>, source: bool) -> Option<OwnedBlock> {
++        let mut builder = BlockBuilder::new();
++        for (id, tagged) in nodes {
++            let coord = i32::try_from(id).unwrap();
++            let tags = tagged.then_some(("name", "node"));
++            if source && id == 10 {
++                builder.add_node_bare_plain(id, coord, -coord, tags);
++            } else {
++                builder.add_node(id, coord, -coord, tags, None);
++            }
++        }
++        builder.take_owned().unwrap()
++    }
++
++    fn input_bytes(header: &[u8]) -> Vec<u8> {
++        let mut writer = PbfWriter::new(Vec::new(), Compression::None);
++        writer.write_header(header).unwrap();
++        for (index, nodes) in NODES.iter().enumerate() {
++            let mut block = build_nodes(nodes.iter().copied(), true).unwrap();
++            if index == 0 || index == 4 {
++                block.tagdata = crate::blob_meta::encode_tag_index(std::iter::empty());
++            }
++            writer.write_primitive_block_owned(block).unwrap();
++        }
++        writer.flush().unwrap();
++        writer.into_inner().unwrap()
++    }
++
++    fn append_way<W: std::io::Write>(writer: &mut PbfWriter<W>) {
++        let mut builder = BlockBuilder::new();
++        builder.add_way_with_locations(42, [], &[7, 12], &[(7, -7), (12, -12)], None);
++        let mut block = builder.take_owned().unwrap().unwrap();
++        block.tagdata = None;
++        writer.write_primitive_block_owned(block).unwrap();
++        writer.flush().unwrap();
++    }
++
++    fn legacy_output(
++        header: &[u8],
++        source: &[u8],
++        metas: &[super::super::blob_meta::BlobMeta],
++        compression: Compression,
++        keep_untagged: bool,
++    ) -> Vec<u8> {
++        let mut writer = PbfWriter::new(Vec::new(), compression);
++        writer.write_header(header).unwrap();
++        for (meta, nodes) in metas.iter().zip(NODES) {
++            if keep_untagged {
++                let start = usize::try_from(meta.frame_offset).unwrap();
++                let end = usize::try_from(meta.data_offset).unwrap() + meta.data_size;
++                writer.write_raw_owned(source[start..end].to_vec()).unwrap();
++            } else if let Some(block) = build_nodes(
++                nodes
++                    .iter()
++                    .copied()
++                    .filter(|&(id, tagged)| tagged || id == 21),
++                false,
++            ) {
++                writer.write_primitive_block_owned(block).unwrap();
++            }
++        }
++        append_way(&mut writer);
++        writer.into_inner().unwrap()
++    }
++
++    fn make_shards(scratch: &RunScratch, codec: super::super::IdCodec) {
++        for (bucket, local, slot) in [(0, 7, 0), (1, 2, 1)] {
++            let path = super::super::radix::id_shard_path(scratch, 0, bucket).unwrap();
++            let mut bytes = [0; 2 * super::super::ID_WORD_SIZE];
++            let len = codec.encode(local, false, 0, slot, &mut bytes).unwrap();
++            crate::scratch::create(&path)
++                .unwrap()
++                .write_all(&bytes[..len])
++                .unwrap();
++        }
++    }
++
++    #[test]
++    #[allow(clippy::too_many_lines)]
++    fn node_output_matches_stage4_bytes_in_both_modes() {
++        let dir = crate::path_guard::tests::scratch();
++        let input_path = dir.path().join("source.pbf");
++        let header = HeaderBuilder::new().sorted().build().unwrap();
++        let source = input_bytes(&header);
++        std::fs::write(&input_path, &source).unwrap();
++
++        let host = Host::for_tests();
++        let pinned = PinnedInput::pin(&input_path, &host).unwrap();
++        let host = host.entered();
++        let input = InputFile::open(&pinned).unwrap();
++        use super::super::keys::{FamilyPlan, KeyPlan};
++
++        let plan = KeyPlan {
++            threshold: 0,
++            pos: FamilyPlan {
++                buckets: 3,
++                max_key: 30,
++            },
++            neg: FamilyPlan {
++                buckets: 0,
++                max_key: 0,
++            },
++            compact: true,
++        };
++        let mut members = crate::idset::IdSet::default();
++        members.insert(21);
++        let compression = Compression::default();
++        let limits = crate::commands::split::Limits::new(compression);
++
++        for keep_untagged in [false, true] {
++            for inject_prepass in [false, true] {
++                let scratch = RunScratch::create(dir.path(), &host).unwrap();
++                let metas =
++                    super::super::blob_meta::scan_blob_metadata(&pinned, !keep_untagged, &host)
++                        .unwrap();
++                let blobs = super::super::stage1::build_node_blob_mapping(&metas, &host.invocation);
++                let spans = NodeSpans::build(&metas, &plan).unwrap();
++                let layout = NodeKeyLayout::new(&plan, &spans);
++                let codec = super::super::IdCodec::new(layout.max_local(), 1).unwrap();
++                make_shards(&scratch, codec);
++
++                let output_path = dir
++                    .path()
++                    .join(format!("out-{keep_untagged}-{inject_prepass}.pbf"));
++                let ordered = OrderedNodes::new(
++                    PbfWriter::to_path(&output_path, compression, &header, Executor::for_tests()),
++                    1, // Only the current head can pass, even with concurrent workers.
++                );
++                let writers = SharedSlotBuckets::create(&scratch, 1).unwrap();
++                let job = Stage2Job {
++                    scratch: &scratch,
++                    id_bucket_counts: &[1, 1, 0],
++                    num_shard_workers: 1,
++                    layout: &layout,
++                    way_slot_starts: &[0],
++                    slot_buckets: &writers,
++                    slot_bucket_count: 1,
++                    total_slots: 2,
++                    input_pbf: &input,
++                    node_blob_mapping: &blobs,
++                    node_spans: &spans,
++                    node_output: Some(NodeOutputJob {
++                        metas: &metas,
++                        keep_untagged,
++                        members: Some(&members),
++                        limits: &limits,
++                        ordered: &ordered,
++                    }),
++                    table_bytes: 2 * size_of::<u64>(),
++                    inject_prepass,
++                    host: &host,
++                };
++                assert_eq!(node_join(codec, &job).unwrap(), 2);
++                let prefix = ordered.finish(metas.len(), &host.invocation).unwrap();
++                assert!(prefix.error.is_none(), "{:?}", prefix.error);
++                assert_eq!(prefix.stats.nodes_read, 17);
++                if keep_untagged {
++                    assert_eq!(prefix.stats.nodes_written, 17);
++                    assert_eq!(prefix.stats.blobs_passthrough, 6);
++                } else {
++                    assert_eq!(prefix.stats.nodes_written, 9);
++                    assert_eq!(prefix.stats.nodes_dropped, 8);
++                    assert_eq!(prefix.stats.blobs_decoded, 5);
++                }
++
++                let mut writer = prefix.writer.unwrap();
++                append_way(&mut writer);
++                assert_eq!(
++                    std::fs::read(output_path).unwrap(),
++                    legacy_output(&header, &source, &metas, compression, keep_untagged),
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/lib/src/commands/altw/external/stage2_table.rs b/crates/lib/src/commands/altw/external/stage2_table.rs
+index f3d77031..f4e273a9 100644
+--- a/crates/lib/src/commands/altw/external/stage2_table.rs
++++ b/crates/lib/src/commands/altw/external/stage2_table.rs
+@@ -8,8 +8,8 @@ use std::sync::atomic::Ordering::Relaxed;
+ use super::super::{ID_WORD_SIZE, keys::KeySpan};
+ use super::{
+     Error, Family, NodeBlobInfo, NodeTuple, Result, ShardCodec, ShardRecord, Stage2Counters,
+-    Stage2Job, WalkOut, WorkerBufs, check_duplicate, emit_resolved, flush_bucket, read_node_blob,
+-    record_max,
++    Stage2Job, WalkOut, WorkerBufs, check_duplicate, emit_resolved, flush_bucket,
++    read_join_node_blob, read_node_blob, record_max,
+ };
+ use crate::blob_meta::ClaimWalk;
+ use crate::coord_pack::PRESENT;
+@@ -305,14 +305,8 @@ impl NodeReads {
+         w.table.reset(partition);
+         for span in spans {
+             let blob = get_blob(job, span)?;
+-            read_node_blob(
+-                job,
+-                c,
+-                pbf_file,
+-                blob,
+-                &mut w.node_read_buf,
+-                &mut w.node_decompress_buf,
+-            )?;
++            let index = span.blob as usize;
++            let raw = read_join_node_blob(job, c, pbf_file, index, blob, w)?;
+             let t_extract = Stopwatch::start();
+             let table = &mut w.table;
+             let mut fits = true;
+@@ -345,6 +339,8 @@ impl NodeReads {
+                     + w.node_decompress_buf.capacity()
+                     + w.node_group_starts.capacity() * size_of::<(usize, usize)>(),
+             );
++            w.output
++                .scanned(job, c, index, raw, &mut w.node_decompress_buf)?;
+             w.node_read_buf.release_outlier(&job.host.invocation);
+             crate::blob::release_decode_outlier(&mut w.node_decompress_buf, &job.host.invocation);
+         }
+@@ -698,6 +694,8 @@ mod tests {
+             input_pbf: &input,
+             node_blob_mapping: &blobs,
+             node_spans: &spans,
++            node_output: None,
++            table_bytes: crate::tunables::ALTW_STAGE2_TABLE_BYTES,
+             inject_prepass: false,
+             host: &host,
+         };
+diff --git a/crates/lib/src/commands/altw/external/stage4.rs b/crates/lib/src/commands/altw/external/stage4.rs
+index 06bd8907..ccb1d0d0 100644
+--- a/crates/lib/src/commands/altw/external/stage4.rs
++++ b/crates/lib/src/commands/altw/external/stage4.rs
+@@ -1,29 +1,24 @@
+ //! Stage 4: Assembly - emit enriched PBF.
+ //!
+-//! Re-reads the PBF, attaches coordinates from per-blob coord_payloads preads
+-//! to ways.
+-//! P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
+-//! Way blobs use wire-format reframe (no full decode); non-way blobs use BlockBuilder.
++//! Continues the output after stage 2's node prefix. Workers attach
++//! coordinates with the wire-format way reframe; the consumer inserts
++//! original relation frames at their scheduled positions.
+ 
+ use std::path::Path;
+ 
+-use crate::block_builder::{BlockBuilder, OwnedBlock};
+-use crate::write::WriteOptions;
+-use crate::{Element, PrimitiveBlock};
++use crate::block_builder::OwnedBlock;
+ 
++use super::super::Result;
+ use super::super::Stats;
+ use super::super::inject_metrics::{InjectMetrics, PinTally};
+-use super::super::{
+-    HeaderOverrides, Result, ensure_node_capacity_local, flush_local, writer_from_header,
+-};
+ use crate::ElementKind;
+ use crate::counters::record_max;
+ use crate::error::Error;
+ use crate::idset::IdSet;
+-use crate::owned::{dense_node_metadata, element_metadata};
+ 
+ use super::blob_meta::BlobMeta;
+ use super::coord_payloads::AbortOnDrop;
++use super::node_output::{NodePrefix, OutputWriter, keep_node_blob};
+ 
+ /// Blob descriptor for the stage 4 pre-scan schedule.
+ ///
+@@ -67,9 +62,7 @@ crate::counters::counter_set! {
+         decompress_ms => "s4_decompress_ms",
+         assemble_ms => "s4_assemble_ms",
+         way_reframe_ms => "s4_way_reframe_ms",
+-        nonway_assemble_ms => "s4_nonway_assemble_ms",
+         way_blobs_processed => "s4_way_blobs_processed",
+-        nonway_blobs_processed => "s4_nonway_blobs_processed",
+         send_ms => "s4_send_ms",
+         blobs => "s4_blobs",
+         bytes_read => "s4_bytes_read",
+@@ -161,14 +154,8 @@ fn load_ref_count_sidecar_in(
+ /// One stage 4 decode worker's thread-local buffers, reused across blobs.
+ struct S4Local {
+     read_buf: crate::read::read_buf::ReadBuf,
+-    /// A way blob decodes into it and reframes from it in place; a non-way
+-    /// blob moves it into its block, which drops before the task returns.
++    /// A way blob decodes into it and reframes from it in place.
+     decompress_buf: Vec<u8>,
+-    /// Block-parse scratch for the non-way blocks.
+-    st_scratch: Vec<(u32, u32)>,
+-    gr_scratch: Vec<(u32, u32)>,
+-    bb: BlockBuilder,
+-    output_blocks: Vec<OwnedBlock>,
+     way_reframe_scratch: WayReframeScratch,
+     reframe_output: Vec<u8>,
+     /// Per-blob coord payload buffer.
+@@ -193,7 +180,7 @@ struct S4Consumer<'a> {
+     schedule: &'a [BlobDescriptor],
+     file: &'a std::fs::File,
+     input: &'a Path,
+-    writer: &'a mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
++    writer: &'a mut OutputWriter,
+     total_stats: Stats,
+     bytes_written: u64,
+     write_calls: u64,
+@@ -218,6 +205,11 @@ impl S4Consumer<'_> {
+         self.router.check()?;
+         self.cancel.check()?;
+         let desc = &self.schedule[position];
++        // Keep the ordered router checkpoint for each original raw node
++        // position. Its frame was handed off by stage 2.
++        if desc.kind == ElementKind::Node {
++            return Ok(());
++        }
+         let (frame_offset, frame_size) = (desc.frame_offset, desc.frame_size);
+         let t_pread = crate::counters::Stopwatch::start();
+         // The frame is handed to the writer whole, so it is read into a
+@@ -241,26 +233,11 @@ impl S4Consumer<'_> {
+ 
+         self.passthrough_blobs += 1;
+         // Credited by the claimed count, checked: the claim is unbounded.
+-        let mut delta = Stats {
++        self.total_stats.merge(&Stats {
+             blobs_passthrough: 1,
++            relations_written: desc.count,
+             ..Stats::default()
+-        };
+-        match desc.kind {
+-            crate::ElementKind::Node => {
+-                delta.nodes_read = desc.count;
+-                delta.nodes_written = desc.count;
+-            }
+-            crate::ElementKind::Relation => {
+-                delta.relations_written = desc.count;
+-            }
+-            crate::ElementKind::Way => {
+-                // Ways never pass through (they need coord_payloads
+-                // splicing). Fall through without touching element stats;
+-                // unreachable in practice but we avoid a hard panic here
+-                // since this is on the output path.
+-            }
+-        }
+-        self.total_stats.merge(&delta)
++        })
+     }
+ }
+ 
+@@ -318,17 +295,13 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for S4Consum
+     }
+ }
+ 
+-/// Assembly pass: re-read the PBF, attach coordinates from per-blob
+-/// coord_payloads preads to ways.
+-/// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
++/// Finish the ordered PBF with enriched ways and raw relations.
+ #[cfg_attr(feature = "hotpath", hotpath::measure)]
+ #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+ pub(super) fn stage4_assembly(
+     input: &crate::read::input::PinnedInput,
+     output: &crate::output::BoundOutput,
+-    // The input's header, from the run's one front read; stage 4 does not
+-    // reopen the input for it.
+-    header: &crate::HeaderBlock,
++    node_prefix: NodePrefix,
+     blob_meta: &[BlobMeta],
+     coord_payloads_reader: &super::coord_payloads::ConcurrentBlobLocationRouter,
+     per_way_rcs: &super::coord_payloads::PerWayRcs,
+@@ -340,15 +313,8 @@ pub(super) fn stage4_assembly(
+     // coord_payloads already decoded ResolvedEntry before publishing bytes.
+     inject_prepass: bool,
+     inject_metrics: &InjectMetrics,
+-    write: &WriteOptions,
+-    overrides: &HeaderOverrides,
+     host: &crate::host::Entered<'_>,
+ ) -> Result<Stats> {
+-    let WriteOptions {
+-        compression,
+-        backend,
+-        ..
+-    } = *write;
+     #[cfg(pbfhogg_test_hooks)]
+     host.invocation.faults().on_altw_stage4_start()?;
+     // Build the blob schedule from the shared metadata scan.
+@@ -358,8 +324,6 @@ pub(super) fn stage4_assembly(
+     let mut schedule: Vec<BlobDescriptor> = Vec::new();
+     let mut way_sidecar_idx: usize = 0;
+     let mut skipped_node_blobs: u64 = 0;
+-    // Node statistics of the blobs dropped whole, seeding the consumer's.
+-    let mut skipped_stats = Stats::default();
+ 
+     // Stage 4 schedule diagnostics.
+     let mut s4_node_blobs_total: u64 = 0;
+@@ -391,23 +355,11 @@ pub(super) fn stage4_assembly(
+             if meta.has_tags {
+                 s4_node_blobs_kept_by_tags += 1;
+             } else {
+-                let has_members = relation_member_node_ids
+-                    .is_some_and(|ids| ids.any_in_numeric_range(meta.min_id, meta.max_id));
+-                if has_members {
+-                    s4_node_blobs_kept_by_members += 1;
+-                }
+-                if !has_members {
+-                    // Every node in it is read and dropped: credited by the
+-                    // claimed count, so the summary counts the same nodes
+-                    // a decode would (sparse counts them one by one).
++                if !keep_node_blob(meta, relation_member_node_ids) {
+                     skipped_node_blobs += 1;
+-                    skipped_stats.merge(&Stats {
+-                        nodes_read: meta.count,
+-                        nodes_dropped: meta.count,
+-                        ..Stats::default()
+-                    })?;
+                     continue;
+                 }
++                s4_node_blobs_kept_by_members += 1;
+             }
+         }
+ 
+@@ -464,15 +416,10 @@ pub(super) fn stage4_assembly(
+     let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
+     let input = input.path();
+ 
+-    let mut writer = writer_from_header(
+-        output,
+-        compression,
+-        header,
+-        &super::super::altw_output_facts(inject_prepass),
+-        overrides,
+-        backend,
+-        host,
+-    )?;
++    let mut writer = node_prefix.writer?;
++    if let Some(error) = node_prefix.error {
++        return Err(error);
++    }
+     // Test-only: the stage 3 and 4 peak rendezvous, held with the shared
+     // input and the output writer open, before the decode pool starts.
+     #[cfg(pbfhogg_test_hooks)]
+@@ -497,13 +444,9 @@ pub(super) fn stage4_assembly(
+     host.invocation
+         .counter("s4_decode_thread_count", decode_threads);
+ 
+-    // Split schedule: passthrough-eligible blobs (relations always; node
+-    // blobs when keep_untagged_nodes=true) are copied by the consumer
+-    // thread via direct pread + write_raw_owned, between the decoded ones.
+-    // Decode blobs (ways and the remaining filtered node blobs) go to the
+-    // workers of the ordered pool, which runs over them alone, so raw-frame
+-    // traffic never takes a worker, a channel slot or a window slot. This
+-    // mirrors extract's `pread_execute`.
++    // Relations still bypass the decode pool. Keep node positions in
++    // the schedule so the ordered callbacks retain their original
++    // ordinals and router checkpoints.
+     let decode_at =
+         crate::ordered_pool::DecodeSchedule::from_items(&schedule, |d| !d.is_passthrough);
+     let decode_at = &decode_at;
+@@ -537,7 +480,7 @@ pub(super) fn stage4_assembly(
+         file: &shared_file,
+         input,
+         writer: &mut writer,
+-        total_stats: skipped_stats,
++        total_stats: node_prefix.stats,
+         bytes_written: 0,
+         write_calls: 0,
+         write_ms: 0,
+@@ -577,10 +520,6 @@ pub(super) fn stage4_assembly(
+             let local = S4Local {
+                 read_buf: crate::read::read_buf::ReadBuf::default(),
+                 decompress_buf: Vec::new(),
+-                st_scratch: Vec::new(),
+-                gr_scratch: Vec::new(),
+-                bb: BlockBuilder::new(),
+-                output_blocks: Vec::new(),
+                 way_reframe_scratch: WayReframeScratch::new(),
+                 reframe_output: Vec::new(),
+                 coord_payload_buf: Vec::new(),
+@@ -618,40 +557,32 @@ pub(super) fn stage4_assembly(
+             let S4Local {
+                 read_buf,
+                 decompress_buf,
+-                st_scratch,
+-                gr_scratch,
+-                bb,
+-                output_blocks,
+                 way_reframe_scratch,
+                 reframe_output,
+                 coord_payload_buf,
+             } = l;
+             let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> =
+                 (|| -> crate::error::Result<(Vec<OwnedBlock>, Stats)> {
+-                    // For way blobs: block on the router's readiness
+-                    // BEFORE the input pread/decompress so a stalled
+-                    // decode thread never holds an already-expanded
+-                    // block + StringTable resident. Non-way blobs skip
+-                    // this entirely - they never consume a coord payload.
+-                    if desc.is_way_blob {
+-                        #[cfg(pbfhogg_test_hooks)]
+-                        host.invocation
+-                            .faults()
+-                            .on_altw_stage4_ready_wait(desc.way_blob_idx);
+-                        let t_wait = crate::counters::Stopwatch::start();
+-                        coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
+-                        // One sample feeds the total, the count and
+-                        // the maximum.
+-                        let wait_ns = t_wait.elapsed_ns();
+-                        if wait_ns > 0 {
+-                            c.readiness_wait_ns.fetch_add(wait_ns, Relaxed);
+-                            c.readiness_wait_blobs.fetch_add(1, Relaxed);
+-                            record_max(&c.readiness_wait_max_ns, wait_ns);
+-                        }
+-                    } else {
+-                        // A non-way blob skips the readiness wait, so it
+-                        // observes the router abort here, before its read.
++                    // Node entries keep the original decode ordinals,
++                    // but all their output was produced by stage 2.
++                    if !desc.is_way_blob {
+                         coord_payloads_reader.check()?;
++                        return Ok((Vec::new(), Stats::default()));
++                    }
++
++                    // Wait for the coordinate payload before reading the
++                    // input, so a parked worker holds no expanded block.
++                    #[cfg(pbfhogg_test_hooks)]
++                    host.invocation
++                        .faults()
++                        .on_altw_stage4_ready_wait(desc.way_blob_idx);
++                    let t_wait = crate::counters::Stopwatch::start();
++                    coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
++                    let wait_ns = t_wait.elapsed_ns();
++                    if wait_ns > 0 {
++                        c.readiness_wait_ns.fetch_add(wait_ns, Relaxed);
++                        c.readiness_wait_blobs.fetch_add(1, Relaxed);
++                        record_max(&c.readiness_wait_max_ns, wait_ns);
+                     }
+ 
+                     let t0 = crate::counters::Stopwatch::start();
+@@ -667,145 +598,75 @@ pub(super) fn stage4_assembly(
+                     t1.record_ms(&c.decompress_ms);
+ 
+                     let t2 = crate::counters::Stopwatch::start();
+-                    output_blocks.clear();
+-
+-                    if desc.is_way_blob {
+-                        // Read this blob's coord_payloads payload into a
+-                        // worker-local buffer before reframe.
+-                        let t_cpread = crate::counters::Stopwatch::start();
+-                        coord_payloads_reader
+-                            .pread_blob_payload(desc.way_blob_idx, coord_payload_buf)?;
+-                        t_cpread.record_ms(&c.coord_payload_pread_ms);
+-                        c.coord_payload_bytes
+-                            .fetch_add(coord_payload_buf.len() as u64, Relaxed);
+-
+-                        // Wire-format reframe: splice locations without
+-                        // full PrimitiveBlock decode or BlockBuilder.
+-                        let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
+-                            decompress_buf,
+-                            coord_payload_buf,
+-                            per_way_rcs.blob_record(desc.way_blob_idx),
+-                            desc.way_blob_idx,
+-                            reframe_output,
+-                            way_reframe_scratch,
+-                            way_reframe_cref,
+-                            member_way_ids,
+-                            inject_prepass,
+-                        )
+-                        .map_err(at_frame)?;
+-                        // The output index below is the reframe's count
+-                        // and range: a claim it does not match exactly (a
+-                        // blob claiming ways that holds none above all) is
+-                        // refused rather than re-indexed. Stage 1 refused
+-                        // it already; this guards what is written.
+-                        crate::blob_meta::IdTally::of(way_count, min_id, max_id)
+-                            .refuse_inexact(&desc.claim)
+-                            .map_err(at_frame)?;
+-
+-                        let index = crate::blob_meta::BlobIndex {
+-                            kind: crate::ElementKind::Way,
+-                            min_id,
+-                            max_id,
+-                            count: way_count,
+-                            bbox: None,
+-                        };
+-                        let taken = std::mem::take(reframe_output);
+-                        reframe_output.reserve(taken.len());
+-                        output_blocks.push(OwnedBlock {
+-                            bytes: taken,
+-                            index,
+-                            tagdata: None,
+-                            way_members: inject_prepass.then(|| {
+-                                crate::commands::altw::reframe::way_members_payload(
+-                                    way_count,
+-                                    &way_reframe_scratch.member_ways,
+-                                )
+-                            }),
+-                        });
+-                        let (blocks, field5_bytes) = crate::commands::altw::fit_output(
+-                            std::mem::take(output_blocks),
+-                            limits,
+-                        )
++                    // Read this blob's coord_payloads payload into a
++                    // worker-local buffer before reframe.
++                    let t_cpread = crate::counters::Stopwatch::start();
++                    coord_payloads_reader
++                        .pread_blob_payload(desc.way_blob_idx, coord_payload_buf)?;
++                    t_cpread.record_ms(&c.coord_payload_pread_ms);
++                    c.coord_payload_bytes
++                        .fetch_add(coord_payload_buf.len() as u64, Relaxed);
++
++                    // Wire-format reframe: splice locations without
++                    // full PrimitiveBlock decode or BlockBuilder.
++                    let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
++                        decompress_buf,
++                        coord_payload_buf,
++                        per_way_rcs.blob_record(desc.way_blob_idx),
++                        desc.way_blob_idx,
++                        reframe_output,
++                        way_reframe_scratch,
++                        way_reframe_cref,
++                        member_way_ids,
++                        inject_prepass,
++                    )
++                    .map_err(at_frame)?;
++                    // The output index below is the reframe's count
++                    // and range: a claim it does not match exactly (a
++                    // blob claiming ways that holds none above all) is
++                    // refused rather than re-indexed. Stage 1 refused
++                    // it already; this guards what is written.
++                    crate::blob_meta::IdTally::of(way_count, min_id, max_id)
++                        .refuse_inexact(&desc.claim)
+                         .map_err(at_frame)?;
+-                        if inject_prepass {
+-                            inject_metrics.record_blob(way_reframe_scratch.pin_tally, field5_bytes);
+-                        }
+ 
+-                        let block_stats = Stats {
+-                            ways_written: way_count,
+-                            blobs_decoded: 1,
+-                            ..Stats::default()
+-                        };
+-                        // One sample, so the pair agrees exactly.
+-                        let elapsed = t2.elapsed_ms();
+-                        c.assemble_ms.fetch_add(elapsed, Relaxed);
+-                        c.way_reframe_ms.fetch_add(elapsed, Relaxed);
+-                        c.blobs.fetch_add(1, Relaxed);
+-                        c.way_blobs_processed.fetch_add(1, Relaxed);
+-                        return Ok((blocks, block_stats));
++                    let index = crate::blob_meta::BlobIndex {
++                        kind: crate::ElementKind::Way,
++                        min_id,
++                        max_id,
++                        count: way_count,
++                        bbox: None,
++                    };
++                    let taken = std::mem::take(reframe_output);
++                    reframe_output.reserve(taken.len());
++                    let block = OwnedBlock {
++                        bytes: taken,
++                        index,
++                        tagdata: None,
++                        way_members: inject_prepass.then(|| {
++                            crate::commands::altw::reframe::way_members_payload(
++                                way_count,
++                                &way_reframe_scratch.member_ways,
++                            )
++                        }),
++                    };
++                    let (blocks, field5_bytes) =
++                        crate::commands::altw::fit_output(vec![block], limits).map_err(at_frame)?;
++                    if inject_prepass {
++                        inject_metrics.record_blob(way_reframe_scratch.pin_tally, field5_bytes);
+                     }
+ 
+-                    // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
+-                    // `decompress_buf` is already an owned, unshared Vec, so
+-                    // parse it in place; the old
+-                    // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
+-                    // Bytes only to copy it straight back out via `to_vec()`.
+-                    // The buffer moves into the block and is not pooled: the
+-                    // next blob allocates afresh, a cost inside noise
+-                    // (read/decompress.rs, "Take loops").
+-                    let block = PrimitiveBlock::from_vec_with_scratch(
+-                        std::mem::take(decompress_buf),
+-                        st_scratch,
+-                        gr_scratch,
+-                    )
+-                    .map_err(at_frame)?;
+-                    // A way or relation under the node claim would be
+-                    // re-encoded among the nodes with no coordinate source
+-                    // and outside the member scan: refused, as the sparse
+-                    // backend refuses it. The tally holds the claim and the
+-                    // header's order to every node, since stage 2 decodes
+-                    // only the node blobs a referenced bucket reaches. On a
+-                    // non-negative claim one raw compare per node decides
+-                    // it; a claim reaching below zero is walked in
+-                    // canonical order (`hold_claim`).
+-                    block
+-                        .refuse_foreign_kind(Some(desc.kind))
+-                        .map_err(at_frame)?;
+-                    let mut tally = crate::blob_meta::AscendingTally::default();
+-                    let mut block_stats = assemble_block(
+-                        &block,
+-                        bb,
+-                        output_blocks,
+-                        keep_untagged_nodes,
+-                        relation_member_node_ids,
+-                        &mut tally,
+-                    )
+-                    .map_err(at_frame)?;
+-                    crate::blob_meta::hold_claim(
+-                        &tally,
+-                        &desc.claim,
+-                        super::blob_meta::EXTERNAL_ORDER,
+-                        || {
+-                            block.elements_skip_metadata().map(|e| match e {
+-                                Element::DenseNode(n) => n.id(),
+-                                Element::Node(n) => n.id(),
+-                                Element::Way(w) => w.id(),
+-                                Element::Relation(r) => r.id(),
+-                            })
+-                        },
+-                    )
+-                    .map_err(at_frame)?;
+-                    block_stats.blobs_decoded = 1;
+-                    flush_local(bb, output_blocks).map_err(at_frame)?;
++                    let block_stats = Stats {
++                        ways_written: way_count,
++                        blobs_decoded: 1,
++                        ..Stats::default()
++                    };
++                    // One sample, so the pair agrees exactly.
+                     let elapsed = t2.elapsed_ms();
+                     c.assemble_ms.fetch_add(elapsed, Relaxed);
+-                    c.nonway_assemble_ms.fetch_add(elapsed, Relaxed);
+-                    c.nonway_blobs_processed.fetch_add(1, Relaxed);
++                    c.way_reframe_ms.fetch_add(elapsed, Relaxed);
+                     c.blobs.fetch_add(1, Relaxed);
+-
+-                    let (blocks, _) =
+-                        crate::commands::altw::fit_output(std::mem::take(output_blocks), limits)
+-                            .map_err(at_frame)?;
++                    c.way_blobs_processed.fetch_add(1, Relaxed);
+                     Ok((blocks, block_stats))
+                 })();
+ 
+@@ -819,8 +680,6 @@ pub(super) fn stage4_assembly(
+             // After the sample above, so the peak still sees the outlier.
+             read_buf.release_outlier(&host.invocation);
+             crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
+-            crate::retention::release_scratch(st_scratch);
+-            crate::retention::release_scratch(gr_scratch);
+ 
+             guard.disarm();
+             // The pool times the send (`s4_send_ms`), opens the
+@@ -904,80 +763,6 @@ pub(super) fn stage4_assembly(
+     Ok(total_stats)
+ }
+ 
+-/// Process a single block for assembly.
+-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+-fn assemble_block(
+-    block: &PrimitiveBlock,
+-    bb: &mut BlockBuilder,
+-    output: &mut Vec<OwnedBlock>,
+-    keep_untagged_nodes: bool,
+-    relation_member_node_ids: Option<&IdSet>,
+-    tally: &mut crate::blob_meta::AscendingTally,
+-) -> crate::Result<Stats> {
+-    let mut stats = Stats::default();
+-
+-    for element in block.elements() {
+-        match &element {
+-            Element::DenseNode(dn) => {
+-                tally.add(dn.id());
+-                stats.nodes_read += 1;
+-                let has_tags = dn.tags().next().is_some();
+-                if keep_untagged_nodes
+-                    || has_tags
+-                    || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
+-                {
+-                    ensure_node_capacity_local(bb, output)?;
+-                    let meta = dense_node_metadata(dn)?;
+-                    bb.add_node_dense(
+-                        dn.id(),
+-                        dn.decimicro_lat()?,
+-                        dn.decimicro_lon()?,
+-                        dn.tags(),
+-                        meta.as_ref(),
+-                    );
+-                    stats.nodes_written += 1;
+-                } else {
+-                    stats.nodes_dropped += 1;
+-                }
+-            }
+-            Element::Node(n) => {
+-                tally.add(n.id());
+-                stats.nodes_read += 1;
+-                let has_tags = n.tags().next().is_some();
+-                if keep_untagged_nodes
+-                    || has_tags
+-                    || relation_member_node_ids.is_some_and(|ids| ids.get(n.id()))
+-                {
+-                    ensure_node_capacity_local(bb, output)?;
+-                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
+-                    bb.add_node_partial(
+-                        n.id(),
+-                        n.decimicro_lat()?,
+-                        n.decimicro_lon()?,
+-                        n.tags(),
+-                        meta.as_ref(),
+-                    );
+-                    stats.nodes_written += 1;
+-                } else {
+-                    stats.nodes_dropped += 1;
+-                }
+-            }
+-            // Only node blobs are decoded here (relation blobs pass through,
+-            // way blobs are reframed), and the caller refused a block holding
+-            // another kind under the node claim.
+-            Element::Way(_) | Element::Relation(_) => {
+-                return Err(Error::internal(
+-                    "altw external stage 4: a decoded node blob holds a way or relation \
+-                     its kind check should have refused",
+-                ));
+-            }
+-        }
+-    }
+-
+-    Ok(stats)
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Wire-format way reframe for stage 4
+ // ---------------------------------------------------------------------------
+diff --git a/crates/lib/src/tunables.rs b/crates/lib/src/tunables.rs
+index 20bb3701..157ef504 100644
+--- a/crates/lib/src/tunables.rs
++++ b/crates/lib/src/tunables.rs
+@@ -788,6 +788,12 @@ pub(crate) const ALTW_STAGE2_TABLE_BYTES: usize = 512 * 1024 * 1024;
+ /// can be held across reads when a packed slot escapes.
+ pub(crate) const ALTW_STAGE2_SHARD_READ_BYTES: usize = 1024 * 1024;
+ 
++/// Global budget for out-of-order node output in the external join, with
++/// room for hundreds of raw frames so adjacent ID buckets can progress.
++/// The next blob writes directly even when the queue is full. Each worker
++/// can also hold one blob awaiting admission.
++pub(crate) const ALTW_STAGE2_NODE_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
++
+ /// Cap on the external join's stage 3 worker count (applied on top of the
+ /// decode-worker sizing). Backed off from the pre-streaming cap of 6 because
+ /// stage 3 and stage 4 worker buffers are now both resident at the same time

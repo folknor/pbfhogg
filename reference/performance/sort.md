@@ -220,8 +220,7 @@ on `5a8af88b`.
 
 No cell showed a `SORT_RANGE_PREPARE` or `SORT_RANGE_MERGE` span. No tested
 component crossed the threshold, so the parallel path was unmeasurable on
-bygg. The patch is saved in
-[notes/stashed-perf-015-sort-parallel-key-ranges.patch](../../notes/stashed-perf-015-sort-parallel-key-ranges.patch).
+bygg. The change was not landed.
 
 To resurface, first create a bench input whose disorder forms a large overlap
 component, for example by shuffling elements across the whole file. No such

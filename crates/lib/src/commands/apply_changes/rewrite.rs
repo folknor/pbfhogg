@@ -70,7 +70,31 @@ pub struct MergeOptions {
     /// describes.
     pub allow_version_regression: bool,
     #[cfg(test)]
-    whole_table_oracle: bool,
+    rewrite_mode: RewriteMode,
+}
+
+/// Only Wire exists outside tests, so the worker mode carries no runtime
+/// state in a production build.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum RewriteMode {
+    #[default]
+    Wire,
+    #[cfg(test)]
+    Builder,
+    #[cfg(test)]
+    WholeTable,
+}
+
+impl RewriteMode {
+    pub(super) fn compacts_builder_tables(self) -> bool {
+        match self {
+            Self::Wire => true,
+            #[cfg(test)]
+            Self::Builder => true,
+            #[cfg(test)]
+            Self::WholeTable => false,
+        }
+    }
 }
 
 impl MergeOptions {
@@ -310,8 +334,10 @@ pub(crate) fn merge_to<'a>(
         parallelism,
         allow_version_regression,
         #[cfg(test)]
-        whole_table_oracle,
+        rewrite_mode,
     } = *opts;
+    #[cfg(not(test))]
+    let rewrite_mode = RewriteMode::Wire;
     // The header and the stats read the mode as this flag; the stages get
     // their shares of it from `wire_locations`.
     let locations_on_ways = locations.is_some();
@@ -609,8 +635,7 @@ pub(crate) fn merge_to<'a>(
         route: worker_route,
         failure: Arc::clone(&failure),
         cancel: host.invocation.permit(),
-        #[cfg(test)]
-        whole_table_oracle,
+        rewrite_mode,
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,
@@ -816,6 +841,8 @@ pub(crate) fn merge_to<'a>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::ElementKind::{Node, Relation, Way};
     use crate::block_builder::{DEFAULT_ELEMENT_CAP, HeaderBuilder};
@@ -832,7 +859,12 @@ mod tests {
         encode_varint(out, value);
     }
 
-    fn source_payload(kind: ElementKind, first: u64, count: usize) -> Vec<u8> {
+    fn source_payload(
+        kind: ElementKind,
+        first: u64,
+        count: usize,
+        default_framing: bool,
+    ) -> Vec<u8> {
         let mut table = Vec::new();
         for s in ["", "name", "name", "author", "author", "outer", "", UNUSED] {
             encode_bytes_field_always(&mut table, 1, s.as_bytes());
@@ -843,8 +875,10 @@ mod tests {
         }
         let mut payload = Vec::new();
         encode_bytes_field(&mut payload, 1, &table);
-        varint_field(&mut payload, 17, 50); // coordinate granularity
-        varint_field(&mut payload, 18, 100); // date granularity
+        if !default_framing {
+            varint_field(&mut payload, 17, 50); // coordinate granularity
+            varint_field(&mut payload, 18, 100); // date granularity
+        }
         let key_and_val = |i: usize| {
             let band = if i < DEFAULT_ELEMENT_CAP.get() { 0 } else { 16 };
             [
@@ -924,7 +958,7 @@ mod tests {
         osc: &Path,
         out: &Path,
         locations: bool,
-        whole_table_oracle: bool,
+        rewrite_mode: RewriteMode,
     ) -> Result<MergeStats> {
         let options = MergeOptions {
             write: WriteOptions {
@@ -933,7 +967,7 @@ mod tests {
             },
             locations_on_ways: locations.then(LocationsOnWays::default),
             parallelism: crate::host::Parallelism::from_jobs(1),
-            whole_table_oracle,
+            rewrite_mode,
             ..MergeOptions::default()
         };
         merge(
@@ -1024,7 +1058,7 @@ mod tests {
         let count = DEFAULT_ELEMENT_CAP.get() + 4;
         for (kind, first) in [(Node, 2), (Node, 20_002), (Way, 10), (Relation, 1)] {
             writer
-                .write_primitive_block(&source_payload(kind, first, count))
+                .write_primitive_block(&source_payload(kind, first, count, false))
                 .unwrap();
         }
         writer.flush().unwrap();
@@ -1044,19 +1078,19 @@ mod tests {
 </osmChange>"#).unwrap();
 
         for locations in [false, true] {
-            let run = |whole_table_oracle| {
+            let run = |mode| {
                 let out = dir
                     .path()
-                    .join(format!("result-{locations}-{whole_table_oracle}.osm.pbf"));
-                let stats = run_merge(&base, &osc, &out, locations, whole_table_oracle).unwrap();
+                    .join(format!("result-{locations}-{mode:?}.osm.pbf"));
+                let stats = run_merge(&base, &osc, &out, locations, mode).unwrap();
                 assert_eq!(stats.deleted, 3);
                 assert_eq!(stats.frames_created, 1, "the create between base blobs");
                 assert_eq!(stats.loc_refresh_only_blobs, u64::from(locations));
                 assert_eq!(stats.loc_refreshed_refs, 2 * u64::from(locations));
                 out
             };
-            let compact = run(false);
-            let oracle = run(true);
+            let compact = run(RewriteMode::Builder);
+            let oracle = run(RewriteMode::WholeTable);
             let full_digest = |path: &Path| {
                 digest(path, Form::Full, false, &crate::host::Host::for_tests()).unwrap()
             };
@@ -1074,6 +1108,248 @@ mod tests {
             );
             assert!(oracle_unused > compact_unused);
         }
+    }
+
+    fn write_fixture(path: &Path, payloads: &[Vec<u8>], locations: bool) {
+        let mut writer = PbfWriter::new(std::fs::File::create(path).unwrap(), Compression::None);
+        let mut header = HeaderBuilder::new().sorted();
+        if locations {
+            header = header.optional_feature(crate::HeaderBlock::LOCATIONS_ON_WAYS);
+        }
+        writer.write_header(&header.build().unwrap()).unwrap();
+        for payload in payloads {
+            writer.write_primitive_block(payload).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    fn payloads_of(path: &Path, kind: ElementKind) -> Vec<Vec<u8>> {
+        let host = crate::host::Host::for_tests();
+        let entered = host.entered();
+        let mut payloads = Vec::new();
+        for blob in BlobReader::open_in(path, false, &entered).unwrap() {
+            let blob = blob.unwrap();
+            if let BlobDecode::OsmData(block) = blob.decode().unwrap()
+                && block.element_kinds().has(kind)
+            {
+                let mut payload = Vec::new();
+                blob.decompress_into(&mut payload).unwrap();
+                payloads.push(payload);
+            }
+        }
+        payloads
+    }
+
+    fn assert_rewrite_parity(
+        base: &Path,
+        osc: &Path,
+        dir: &Path,
+        locations: bool,
+    ) -> (PathBuf, PathBuf) {
+        let wire = dir.join("wire.osm.pbf");
+        let oracle = dir.join("builder.osm.pbf");
+        let wire_stats = run_merge(base, osc, &wire, locations, RewriteMode::Wire).unwrap();
+        let oracle_stats = run_merge(base, osc, &oracle, locations, RewriteMode::Builder).unwrap();
+        assert_eq!(wire_stats.deleted, oracle_stats.deleted);
+        assert_eq!(wire_stats.diff_nodes, oracle_stats.diff_nodes);
+        assert_eq!(wire_stats.diff_ways, oracle_stats.diff_ways);
+        assert_eq!(wire_stats.diff_relations, oracle_stats.diff_relations);
+        assert_eq!(
+            wire_stats.loc_refresh_only_blobs,
+            oracle_stats.loc_refresh_only_blobs
+        );
+        assert_eq!(
+            wire_stats.loc_refreshed_refs,
+            oracle_stats.loc_refreshed_refs
+        );
+        let full =
+            |path: &Path| digest(path, Form::Full, false, &crate::host::Host::for_tests()).unwrap();
+        assert_eq!(full(&wire), full(&oracle));
+        assert_sidecars_and_count_unused(&wire, false);
+        (wire, oracle)
+    }
+
+    #[test]
+    fn wire_rewrite_ordinary_remaps_duplicate_slots_and_falls_back_for_framing() {
+        let dir = crate::path_guard::tests::scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("changes.osc");
+        std::fs::write(
+            &osc,
+            r#"<osmChange version="0.6">
+<modify>
+  <way id="12" user="author"><nd ref="2"/><tag k="name" v="new"/></way>
+  <relation id="3" user="author"><member type="way" ref="12" role="outer"/></relation>
+</modify>
+<delete><way id="14"/><relation id="5"/></delete>
+</osmChange>"#,
+        )
+        .unwrap();
+        for default_framing in [true, false] {
+            write_fixture(
+                &base,
+                &[
+                    source_payload(Way, 10, 8, default_framing),
+                    source_payload(Relation, 1, 8, default_framing),
+                ],
+                false,
+            );
+            let (wire, oracle) = assert_rewrite_parity(&base, &osc, dir.path(), false);
+            for kind in [Way, Relation] {
+                let wire = payloads_of(&wire, kind);
+                let oracle = payloads_of(&oracle, kind);
+                if default_framing {
+                    assert_ne!(
+                        wire, oracle,
+                        "wire rewrite should compact the small fixture"
+                    );
+                    let block = crate::PrimitiveBlock::from_vec(wire[0].clone()).unwrap();
+                    let slots = (0..block.string_table_len())
+                        .filter_map(|i| block.string_table_entry(i))
+                        .collect::<Vec<_>>();
+                    assert_eq!(slots.iter().filter(|&&s| s == "name").count(), 2);
+                    assert!(!slots.contains(&UNUSED));
+                    for element in block.elements() {
+                        if let Element::Way(way) = element {
+                            assert!(way.shared_node_pins().is_none());
+                        }
+                    }
+                } else {
+                    assert_eq!(wire, oracle, "non-default framing must use the builder");
+                }
+            }
+        }
+    }
+
+    fn dense_wire_fixture() -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut table = Vec::new();
+        for s in ["", UNUSED, "name", "name", "value", "owner", "owner"] {
+            encode_bytes_field_always(&mut table, 1, s.as_bytes());
+        }
+        encode_bytes_field(&mut payload, 1, &table);
+        for first in [2, 12] {
+            let mut dense = Vec::new();
+            encode_bytes_field(&mut dense, 1, &[first * 2, 4, 4, 4, 4]);
+            if first == 2 {
+                let mut info = Vec::new();
+                // Partial columns, with different per-row deltas and duplicate users.
+                encode_bytes_field(&mut info, 2, &[20, 4, 6, 8, 10]);
+                encode_bytes_field(&mut info, 4, &[12, 1, 4, 2, 3]);
+                encode_bytes_field(&mut info, 5, &[10, 2, 1, 2, 1]);
+                encode_bytes_field(&mut info, 6, &[1, 0, 1, 0, 1]);
+                encode_bytes_field(&mut dense, 5, &info);
+            }
+            encode_bytes_field(&mut dense, 8, &[first, 4, 6, 8, 10]);
+            encode_bytes_field(&mut dense, 9, &[first, 3, 5, 7, 9]);
+            encode_bytes_field(
+                &mut dense,
+                10,
+                &[2, 4, 0, 3, 4, 0, 2, 4, 0, 3, 4, 0, 2, 4, 0],
+            );
+            let mut group = Vec::new();
+            encode_bytes_field(&mut group, 2, &dense);
+            encode_bytes_field(&mut payload, 2, &group);
+        }
+        payload
+    }
+
+    #[test]
+    fn wire_rewrite_dense_runs_keep_partial_metadata_across_edits() {
+        let dir = crate::path_guard::tests::scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("changes.osc");
+        write_fixture(&base, &[dense_wire_fixture()], false);
+        for (modifies, deletes) in [(&[2, 12, 20][..], &[8][..]), (&[8][..], &[2, 12, 20][..])] {
+            let modifies: String = modifies
+                .iter()
+                .map(|id| format!("<node id=\"{id}\" lat=\"1\" lon=\"2\" user=\"owner\"/>"))
+                .collect();
+            let deletes: String = deletes
+                .iter()
+                .map(|id| format!("<node id=\"{id}\"/>"))
+                .collect();
+            std::fs::write(&osc, format!(
+                "<osmChange version=\"0.6\"><modify>{modifies}</modify><delete>{deletes}</delete><create><node id=\"9\" lat=\"5\" lon=\"6\"/></create></osmChange>"
+            )).unwrap();
+            let (wire, oracle) = assert_rewrite_parity(&base, &osc, dir.path(), false);
+            assert_ne!(payloads_of(&wire, Node), payloads_of(&oracle, Node));
+            assert_eq!(assert_sidecars_and_count_unused(&wire, false), 0);
+        }
+
+        let mut non_default = dense_wire_fixture();
+        varint_field(&mut non_default, 17, 50);
+        varint_field(&mut non_default, 18, 100);
+        write_fixture(&base, &[non_default], false);
+        let (wire, oracle) = assert_rewrite_parity(&base, &osc, dir.path(), false);
+        assert_eq!(payloads_of(&wire, Node), payloads_of(&oracle, Node));
+    }
+
+    fn refresh_wire_fixture(refreshed: bool) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut table = Vec::new();
+        for s in ["", UNUSED, "name", "road", "author"] {
+            encode_bytes_field_always(&mut table, 1, s.as_bytes());
+        }
+        encode_bytes_field(&mut payload, 1, &table);
+        let locations = |column: &[i64], out: &mut Vec<u8>, field| {
+            let mut bytes = Vec::new();
+            let mut previous = 0;
+            for &value in column {
+                encode_varint(&mut bytes, protohoggr::zigzag_encode_64(value - previous));
+                previous = value;
+            }
+            encode_bytes_field(out, field, &bytes);
+        };
+        for id in [10, 11] {
+            let mut way = Vec::new();
+            varint_field(&mut way, 1, id);
+            encode_bytes_field(&mut way, 2, &[2]);
+            encode_bytes_field(&mut way, 3, &[3]);
+            encode_bytes_field(&mut way, 4, &[0x28, 4]);
+            encode_bytes_field(&mut way, 8, if id == 10 { &[4, 0, 4] } else { &[8] });
+            if id == 10 && refreshed {
+                locations(&[10_000_000, 10_000_000, 2], &mut way, 9);
+                locations(&[20_000_000, 20_000_000, 2], &mut way, 10);
+            } else if id == 10 {
+                locations(&[2, 2, 2], &mut way, 9);
+                locations(&[2, 2, 2], &mut way, 10);
+            } else {
+                locations(&[2], &mut way, 9);
+                locations(&[2], &mut way, 10);
+            }
+            let mut group = Vec::new();
+            encode_bytes_field(&mut group, 3, &way);
+            encode_bytes_field(&mut payload, 2, &group);
+        }
+        payload
+    }
+
+    #[test]
+    fn wire_refresh_only_changes_coordinates_and_lengths() {
+        let dir = crate::path_guard::tests::scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("changes.osc");
+        write_fixture(
+            &base,
+            &[dense_wire_fixture(), refresh_wire_fixture(false)],
+            true,
+        );
+        std::fs::write(
+            &osc,
+            r#"<osmChange version="0.6"><modify>
+<node id="2" lat="1" lon="2"/>
+</modify></osmChange>"#,
+        )
+        .unwrap();
+        let (wire, oracle) = assert_rewrite_parity(&base, &osc, dir.path(), true);
+        let expected = vec![refresh_wire_fixture(true)];
+        assert_eq!(payloads_of(&wire, Way), expected);
+        assert_ne!(
+            payloads_of(&oracle, Way),
+            expected,
+            "the builder combines the groups"
+        );
     }
 
     #[test]

@@ -665,9 +665,10 @@
 
 - **`apply-changes` writes smaller files and finishes faster.** Rewritten
   blocks no longer repeat the source string table across every output
-  block. On bygg, compared with HEAD `5caa1101`, the working tree on
-  `5caa1101` shrank plain daily planet output from about 174 GB to 98 GB
-  and cut wall time by about 24-30 % across both modes.
+  block, and eligible indexed blobs reuse wire data for unchanged elements.
+  On bygg, compared with HEAD `5caa1101`, the working tree on `a01df138`
+  shrank plain daily planet output from about 174 GB to 98 GB and cut wall
+  time by about 45 % in plain mode and 30 % with `--locations-on-ways`.
 
 - **Text `diff` is faster on independent indexed planet snapshots.**
   On bygg, the working tree on `b4e65632` cut wall time by about 15 %

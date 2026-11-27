@@ -91,6 +91,79 @@ fn compact_rewrite_refuses_an_out_of_range_surviving_role() {
     assert_eq!(common::snapshot_dir(dir.path()), before);
 }
 
+#[test]
+fn dense_rewrite_checks_surviving_users_after_a_delete() {
+    use crate::common;
+    use pbfhogg::apply_changes::{MergeOptions, merge};
+    use pbfhogg::block_builder::HeaderBuilder;
+    use pbfhogg::writer::{Compression, PbfWriter};
+    use protohoggr::{encode_bytes_field, encode_bytes_field_always};
+
+    let dir = common::test_scratch();
+    let base = dir.path().join("bad-user.osm.pbf");
+    let osc = dir.path().join("changes.osc");
+    let out = dir.path().join("result.osm.pbf");
+    let mut table = Vec::new();
+    encode_bytes_field_always(&mut table, 1, b"");
+    let mut info = Vec::new();
+    // Absolute user slots on nodes 1, 2, and 3 are 0, 127, and 0.
+    encode_bytes_field(&mut info, 5, &[0, 254, 1, 253, 1]);
+    let mut dense = Vec::new();
+    encode_bytes_field(&mut dense, 1, &[2, 2, 2]);
+    encode_bytes_field(&mut dense, 5, &info);
+    encode_bytes_field(&mut dense, 8, &[2, 2, 2]);
+    encode_bytes_field(&mut dense, 9, &[2, 2, 2]);
+    let mut group = Vec::new();
+    encode_bytes_field(&mut group, 2, &dense);
+    let mut payload = Vec::new();
+    encode_bytes_field(&mut payload, 1, &table);
+    encode_bytes_field(&mut payload, 2, &group);
+    let mut writer = PbfWriter::new(std::fs::File::create(&base).unwrap(), Compression::None);
+    writer
+        .write_header(&HeaderBuilder::new().sorted().build().unwrap())
+        .unwrap();
+    writer.write_primitive_block(&payload).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+
+    let run = |id| {
+        std::fs::write(
+            &osc,
+            format!(r#"<osmChange version="0.6"><delete><node id="{id}"/></delete></osmChange>"#),
+        )
+        .unwrap();
+        let before = common::snapshot_dir(dir.path());
+        let opts = MergeOptions {
+            parallelism: pbfhogg::Parallelism::from_jobs(1),
+            ..MergeOptions::default()
+        };
+        (
+            merge(
+                &base,
+                &osc,
+                common::out(&out),
+                &opts,
+                &pbfhogg::HeaderOverrides::default(),
+                &common::test_host(),
+            ),
+            before,
+        )
+    };
+    let (result, before) = run(1);
+    let err = result.err().expect("the bad user survived");
+    assert!(matches!(
+        err.kind(),
+        pbfhogg::ErrorKind::StringtableIndexOutOfBounds { index: 127 }
+    ));
+    assert!(err.report().contains("node 2: user name string index 127"));
+    assert_eq!(common::snapshot_dir(dir.path()), before);
+
+    let (result, _) = run(2);
+    let stats = result.unwrap();
+    assert_eq!(stats.deleted, 1);
+    assert_eq!(stats.base_nodes, 2);
+}
+
 #[cfg(pbfhogg_test_hooks)]
 mod apply_changes {
     use std::fs::File;

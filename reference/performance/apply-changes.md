@@ -1,6 +1,49 @@
 # Apply Changes
 
-## String-table compaction (bygg, baseline `5caa1101`)
+## Wire rewrites of indexed blobs (bygg, baseline `a01df138`)
+
+On bygg, A is HEAD `a01df138` (PERF-008 step 1) and B is the working tree
+on `a01df138` (step 2). Planet `apply-diff --osc 4913` cells used
+`--iterations 1`, interleaved as shown, with one fstrim at the head of
+the suite.
+
+| Workload | A | B | A | B | Wall reduction |
+|---|---|---|---|---|---:|
+| Indexed, plain | 2m18s `aabbafe0` | 1m49s `271347b3` | 2m20s `db43df19` | 1m51s `f1ad0ca3` | about 21 % |
+| `--variant altw-keep-untagged --locations-on-ways yes` | 3m23s `1fd4836d` | 3m06s `cdf4cfef` | 3m23s `5ac1c449` | 3m05s `665b630c` | about 9 % |
+
+Across both steps on bygg, daily planet apply went from 3m23s at
+`5caa1101` to about 1m50s on B in plain mode (about 45 % less wall
+time), and from 4m26s at `5caa1101` to about 3m05s on B with locations
+(about 30 % less wall time).
+
+Plain-mode `writer_bytes_written` on bygg held steady at 97,637,095,870
+on B (`f1ad0ca3`), compared with 97,663,726,827 for step 1 (working
+tree on `5caa1101`, recorded below). The added dense run boundaries
+had no measurable effect on compression.
+
+For eligible indexed blobs, unchanged ordinary ways and relations retain
+their wire spans where possible, with string indices remapped to output
+slots. The rewrite drops stale way enrichment, and compact rewrites drop
+shadowed `Info.user_sid` fields. Runs of unchanged dense nodes retain
+packed column interiors and rebase each delta column's first value at
+the run boundary. The rewrite still scans coordinates for range
+validation and exact bounding boxes.
+
+In locations mode, eligible refresh-only way blobs retain their string
+table and group layout. The rewrite changes only coordinate fields and
+enclosing lengths. On B, this path requires the blob to fit within the
+8000-element cap and to have no stale enrichment. Non-default framing,
+unindexed input, unsupported wire layouts, and size-sensitive batches
+use the existing writer.
+
+On B on bygg, tier 1 passed. `pbfhogg-verify apply-changes` passed in
+plain and locations modes on Denmark and Germany (Germany used
+`--osc-seq 4705`). The Germany `diff` verification also passed.
+
+## History
+
+### String-table compaction (bygg, baseline `5caa1101`)
 
 Each output batch holding base survivors seeds only the source string slots
 those survivors reference. OSC strings reuse matching entries through the
@@ -43,8 +86,6 @@ written with the same element count and source blob routing.
 On B on bygg, tier 1 passed. `pbfhogg-verify apply-changes` passed in plain
 and `--locations-on-ways` modes on Denmark and Germany (Germany used
 `--osc-seq 4705`).
-
-## History
 
 ### Selective node-blob decode in location mode (bygg, stashed on `c0ec89ca`)
 

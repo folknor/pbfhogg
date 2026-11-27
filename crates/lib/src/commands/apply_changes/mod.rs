@@ -31,6 +31,7 @@ mod stream_output;
 mod streaming;
 mod upsert_cursors;
 mod window;
+mod wire_rewrite;
 
 pub use rewrite::{LocationsOnWays, MergeOptions, merge};
 pub use stats::MergeStats;

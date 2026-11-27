@@ -35,10 +35,9 @@ use super::loc_mode::LocMode;
 use super::overflow::{
     self, EmitSink, Inputs, OpSink, RewriteSink, StreamTx, collect_ops, end_stream, plan,
 };
-use super::refresh::StaleProbe;
 use super::stats::MergeStats;
 
-const ELEMENT_CAP: usize = crate::block_builder::DEFAULT_ELEMENT_CAP.get();
+pub(super) const ELEMENT_CAP: usize = crate::block_builder::DEFAULT_ELEMENT_CAP.get();
 
 /// Output from `rewrite_block_parallel`, from a rewrite whose walk has
 /// ended.
@@ -336,39 +335,22 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
 /// This keeps the original size recovery and refusal order. A blob whose
 /// frames exceed the retention threshold is written again into a stream
 /// with the same cuts. See `overflow.rs` for recovery and stream admission.
-#[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
-    block: &PrimitiveBlock,
-    diff: &SortedDiff,
+    inputs: Inputs<'_>,
     bb: &mut BlockBuilder,
     inline_upserts: Range<usize>,
-    kind: ElementKind,
-    loc: LocMode<'_>,
-    probe: &StaleProbe,
     scratch: &mut RefreshScratch,
     claim: Option<&BlobIndex>,
-    compression: &Compression,
-    metrics: &crate::write::metrics::WriterMetrics,
     stream: &StreamTx<'_>,
     open: impl FnOnce(MergeStats) -> Result<()>,
-    #[cfg(test)] whole_table_oracle: bool,
 ) -> Result<RewriteOutput> {
-    let inputs = Inputs {
-        block,
-        diff,
-        kind,
-        loc,
-        probe,
-        compression,
-        metrics,
-    };
-    let compact = block
-        .element_count()
-        .saturating_add(inline_upserts.len() as u64)
-        > ELEMENT_CAP as u64;
-    #[cfg(test)]
-    let compact = compact && !whole_table_oracle;
+    let compact = inputs.rewrite_mode.compacts_builder_tables()
+        && inputs
+            .block
+            .element_count()
+            .saturating_add(inline_upserts.len() as u64)
+            > ELEMENT_CAP as u64;
     rewrite_block(
         inputs,
         bb,
@@ -677,9 +659,9 @@ impl<'a> Batch<'a> {
 // their field wrappers, two packed tag field wrappers, Info/DenseInfo and
 // enclosing element/group fields, even if each dense row starts a group.
 // The final byte is the dense end-of-tags marker.
-const VARINT_BYTES: usize = 10;
-const FIELD_OVERHEAD: usize = 2 + VARINT_BYTES;
-const ELEMENT_OVERHEAD: usize = 9 * VARINT_BYTES + (9 + 2 + 3) * FIELD_OVERHEAD + 1;
+pub(super) const VARINT_BYTES: usize = 10;
+pub(super) const FIELD_OVERHEAD: usize = 2 + VARINT_BYTES;
+pub(super) const ELEMENT_OVERHEAD: usize = 9 * VARINT_BYTES + (9 + 2 + 3) * FIELD_OVERHEAD + 1;
 
 fn base_bytes(element: &Element<'_>, string_refs: usize, loc: LocMode<'_>) -> usize {
     let wire = match element {
@@ -702,7 +684,7 @@ fn base_bytes(element: &Element<'_>, string_refs: usize, loc: LocMode<'_>) -> us
     ELEMENT_OVERHEAD + wire + string_refs * VARINT_BYTES
 }
 
-fn osc_bytes(diff: &SortedDiff, kind: ElementKind, i: usize, loc: LocMode<'_>) -> usize {
+pub(super) fn osc_bytes(diff: &SortedDiff, kind: ElementKind, i: usize, loc: LocMode<'_>) -> usize {
     fn string_bytes(s: &str) -> usize {
         s.len() + 1 + VARINT_BYTES + VARINT_BYTES // slot plus one reference
     }

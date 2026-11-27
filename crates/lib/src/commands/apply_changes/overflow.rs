@@ -101,6 +101,7 @@ use super::element_writes::{
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::refresh::StaleProbe;
+use super::rewrite::RewriteMode;
 use super::rewrite_block::{Op, OpContext, Step, Steps, write_op};
 use super::stats::MergeStats;
 
@@ -264,6 +265,7 @@ pub(super) struct Inputs<'a> {
     pub(super) probe: &'a StaleProbe,
     pub(super) compression: &'a Compression,
     pub(super) metrics: &'a crate::write::metrics::WriterMetrics,
+    pub(super) rewrite_mode: RewriteMode,
 }
 
 /// The operations the rewrite wrote, in order, up to `end`. The steps are a

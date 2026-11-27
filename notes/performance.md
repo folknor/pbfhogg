@@ -315,29 +315,22 @@ multi-source merges flushing per source would create tiny blocks.
 
 Kind: high-conviction architectural rewrite.
 
-## PERF-008 - apply-changes still rebuilds survivors of touched blobs
+## PERF-008 - apply-changes still has rewrite fallbacks and a dense coordinate scan
 
 Reported by apply-core and apply-locations.
 
-String-table compaction reduced planet daily apply wall time on bygg by
-about 24 % with `--locations-on-ways` and 30 % in plain mode. Plain output
-went from about 174 GB to 98 GB. A was HEAD `5caa1101` and B was the
-working tree on `5caa1101`. See the
-[apply-changes measurements](../reference/performance/apply-changes.md#string-table-compaction-bygg-baseline-5caa1101).
+String-table compaction and wire rewrites for eligible indexed blobs are
+covered in the [apply-changes performance record](../reference/performance/apply-changes.md#wire-rewrites-of-indexed-blobs-bygg-baseline-a01df138).
 
-Remaining work:
-
-- Copy surviving ordinary messages as wire spans where their string indices
-  and framing permit it. Retain packed runs for dense nodes and repair deltas
-  at edit boundaries. Preserve metadata and validate retained string indices.
-- For refresh-only blobs, edit coordinate fields and their enclosing lengths
-  while preserving IDs, refs, tags, metadata, and the string table. Respect
-  source coordinate framing and repeated refs.
-- Size output blocks by encoded bytes within PBF limits. Revisit the
-  [documented element cap](../docs/cli/commands.md#apply-changes), which is
-  8000 in HEAD `5caa1101` and the working tree measured on bygg.
-- Reuse the per-`Info` field-span scratch allocation in
-  `translate_info_user` when remapping the user string slot.
+- Size output blocks by encoded bytes within PBF limits. This requires
+  revisiting the [documented element cap](../docs/cli/commands.md#apply-changes),
+  which was 8000 on HEAD `a01df138` and its working tree measured on bygg.
+- Dense wire rewrites still scan coordinates for range validation and
+  exact bounding boxes.
+- Non-default framing, unindexed input, unsupported wire layouts, and
+  size-sensitive batches still use the existing writer. The coordinate-only
+  refresh path also falls back for blobs above the cap or with stale
+  enrichment.
 
 ## PERF-009 - Encode and compress cross an ordered boundary between them
 

@@ -18,9 +18,10 @@
 //!   thread-local scratch, extract node coords (checked, dense and plain
 //!   encodings, see `node_coords.rs`) if the blob is a Node and
 //!   `--locations-on-ways` is active, parse via
-//!   `PrimitiveBlock::from_vec_pooled_with_scratch` (the decode buffer
-//!   returns to the worker's pool when the block drops), precise-check via
-//!   [`block_overlaps_diff`]. False positives emit a `DrainItem::CopyRange`
+//!   the shared block validator (the decode buffer returns to the worker's
+//!   pool when the block drops), and try a wire rewrite of indexed hits.
+//!   Candidates on the element path precise-check via [`block_overlaps_diff`].
+//!   False positives emit a `DrainItem::CopyRange`
 //!   carrying the original descriptor so the drain can `copy_file_range`
 //!   the raw frame, or on the owned route a verbatim `DrainItem::OwnedBytes`
 //!   of the frame already read. An unindexed blob (`--force`) is scanned for the
@@ -67,6 +68,7 @@ use crate::blob::decompress_blob_raw;
 use crate::block_builder::BlockBuilder;
 use crate::commands::WorkerBuilder;
 use crate::error::{Error, Result};
+use crate::read::block::{BlockBuffer, NoProjection};
 use crate::writer::{Compression, reframe_raw_with_index};
 
 use super::classify::{blob_walk, block_overlaps_diff};
@@ -78,9 +80,11 @@ use super::element_writes::RefreshScratch;
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::node_coords::extract_node_coords;
-use super::overflow::{StreamSlot, StreamTx};
+use super::overflow::{Inputs, StreamSlot, StreamTx};
 use super::refresh::{StaleProbe, detect_stale_block, detect_stale_wire};
-use super::rewrite_block::rewrite_block_parallel;
+use super::rewrite::RewriteMode;
+use super::rewrite_block::{RewriteOutput, rewrite_block_parallel};
+use super::wire_rewrite::{WireInputs, WireRewrite, try_rewrite};
 
 use crate::osc::sorted::SortedDiff;
 
@@ -130,8 +134,7 @@ struct WorkerLoc<'a> {
 /// Streaming pool configuration. Channels are passed separately
 /// ([`StreamingChannels`]).
 pub(super) struct StreamingConfig {
-    #[cfg(test)]
-    pub(super) whole_table_oracle: bool,
+    pub(super) rewrite_mode: RewriteMode,
     /// The run's pinned base; the pool opens one description of it.
     pub base: crate::read::input::PinnedInput,
     /// Open that description `O_DIRECT` (the run's `direct_reads`).
@@ -298,8 +301,7 @@ pub(super) fn run_workers(
         route,
         failure,
         cancel,
-        #[cfg(test)]
-        whole_table_oracle,
+        rewrite_mode,
     } = cfg;
     let StreamingChannels {
         candidate_rx,
@@ -386,8 +388,7 @@ pub(super) fn run_workers(
                         route,
                         cancel,
                         &stream,
-                        #[cfg(test)]
-                        whole_table_oracle,
+                        rewrite_mode,
                     )
                 }));
                 // Publish before this closure returns: `drain_tx` and the
@@ -452,7 +453,7 @@ fn worker_loop(
     route: Route<()>,
     cancel: &crate::host::Recorder,
     stream: &StreamTx<'_>,
-    #[cfg(test)] whole_table_oracle: bool,
+    rewrite_mode: RewriteMode,
 ) -> Result<()> {
     // The decode buffer moves into each parsed block and comes back through
     // this worker's pool when the block drops, so one buffer serves every
@@ -514,8 +515,7 @@ fn worker_loop(
                     route,
                     &cancel.metrics().writer,
                     stream,
-                    #[cfg(test)]
-                    whole_table_oracle,
+                    rewrite_mode,
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
                 // Only a sent end closes a stream, so one left open after a
@@ -731,7 +731,7 @@ fn handle_candidate(
     route: Route<()>,
     metrics: &crate::write::metrics::WriterMetrics,
     stream: &StreamTx<'_>,
-    #[cfg(test)] whole_table_oracle: bool,
+    rewrite_mode: RewriteMode,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     let WorkerScratch {
@@ -902,18 +902,59 @@ fn handle_candidate(
         t_extract.record_ns(&counters.coord_extract_ns);
     }
 
+    // The barrier publishes the map before it dispatches a way candidate.
+    // A node candidate can still see Pending, which refuses any way add.
+    let loc_arc = loc.and_then(|l| l.loc_map.get().cloned());
+    let loc_mode = match loc {
+        None => LocMode::Off,
+        Some(_) => LocMode::on(loc_arc.as_deref()),
+    };
     let t_parse = crate::counters::Stopwatch::start();
     let raw = std::mem::take(decompress_buf);
-    let block = crate::PrimitiveBlock::from_vec_pooled_with_scratch(
+    let (_, validated) = BlockBuffer::new(
         raw,
-        decode_pool,
+        Some(decode_pool),
         st_scratch,
         gr_scratch,
-    )?;
+        claim.map(|c| c.kind),
+    )
+    .project(|_, _| NoProjection)?;
     t_parse.record_ns(&counters.parse_ns);
-    // The drain places the blob by its claimed kind, so an element of
-    // another kind would be written out of type order or dropped.
-    block.refuse_foreign_kind(claim.map(|c| c.kind))?;
+    if rewrite_mode == RewriteMode::Wire
+        && let Some(index) = claim.as_ref()
+    {
+        let t_rewrite = crate::counters::Stopwatch::start();
+        let inputs = WireInputs {
+            claim: index,
+            diff,
+            loc: loc_mode,
+            probe,
+            compression,
+            metrics,
+        };
+        let wire = try_rewrite(&validated, inputs, builder.task()?, refresh_only);
+        let elapsed = t_rewrite.elapsed_ns();
+        if let Some(wire) = wire {
+            if let Some(loc) = loc
+                && !local_coords.is_empty()
+            {
+                flush_local_coords(loc.slot, local_coords)?;
+            }
+            record_wire_rewrite(counters, &wire, elapsed, refresh_only);
+            return publish_rewrite(
+                drain_tx,
+                desc.seq,
+                index.kind,
+                (index.min_id, index.max_id),
+                wire.first,
+                wire.output,
+            );
+        }
+        counters.rewrite_ns.fetch_add(elapsed, Ordering::Relaxed);
+    }
+    let t_parse = crate::counters::Stopwatch::start();
+    let block = validated.into_block();
+    t_parse.record_ns(&counters.parse_ns);
 
     // What an unindexed blob's payload makes of it, decided before either
     // output branch below so an overlapping blob cannot bypass it.
@@ -1081,18 +1122,6 @@ fn handle_candidate(
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    // The drain publishes `loc_map` at the node→way barrier; the scanner
-    // barrier protocol guarantees it is set before any way/relation
-    // descriptor is dispatched to workers. Node blobs run before it, so
-    // they see `LocMode::Pending`, under which writing a way is an error:
-    // a way in a blob routed as nodes must never be written stripped of
-    // its coordinates under a LocationsOnWays header.
-    let loc_arc = loc.and_then(|l| l.loc_map.get().cloned());
-    let loc_mode = match loc {
-        None => LocMode::Off,
-        Some(_) => LocMode::on(loc_arc.as_deref()),
-    };
-
     let t_rewrite = crate::counters::Stopwatch::start();
     // P1.5: the rewrite frames each output block in-line, on this worker,
     // so drain submissions bypass the writer's
@@ -1126,27 +1155,51 @@ fn handle_candidate(
             },
         )
     };
-    let output = rewrite_block_parallel(
-        &block,
+    let inputs = Inputs {
+        block: &block,
         diff,
-        builder.task()?,
-        inline_upserts,
-        effective_kind,
-        loc_mode,
+        kind: effective_kind,
+        loc: loc_mode,
         probe,
-        refresh_scratch,
-        claim.as_ref(),
         compression,
         metrics,
+        rewrite_mode,
+    };
+    let output = rewrite_block_parallel(
+        inputs,
+        builder.task()?,
+        inline_upserts,
+        refresh_scratch,
+        claim.as_ref(),
         stream,
         open,
-        #[cfg(test)]
-        whole_table_oracle,
     )?;
-    counters.rewrite_ns.fetch_add(
-        t_rewrite.elapsed_ns().saturating_sub(output.frame_ns),
-        Ordering::Relaxed,
-    );
+    record_rewrite(counters, &output, t_rewrite.elapsed_ns());
+    publish_rewrite(drain_tx, seq, effective_kind, id_range, first, output)
+}
+
+fn record_wire_rewrite(
+    counters: &WorkerCounters,
+    wire: &WireRewrite,
+    elapsed: u64,
+    refresh_only: bool,
+) {
+    if refresh_only {
+        counters
+            .loc_refresh_only_blobs
+            .fetch_add(1, Ordering::Relaxed);
+    } else if wire.forced {
+        counters
+            .blobs_forced_rewrite
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    record_rewrite(counters, &wire.output, elapsed);
+}
+
+fn record_rewrite(counters: &WorkerCounters, output: &RewriteOutput, elapsed: u64) {
+    counters
+        .rewrite_ns
+        .fetch_add(elapsed.saturating_sub(output.frame_ns), Ordering::Relaxed);
     counters
         .frame_ns
         .fetch_add(output.frame_ns, Ordering::Relaxed);
@@ -1161,6 +1214,16 @@ fn handle_candidate(
         .fetch_add(output.refresh.deleted_refs, Ordering::Relaxed);
 
     counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
+}
+
+fn publish_rewrite(
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
+    seq: u64,
+    kind: ElementKind,
+    id_range: (i64, i64),
+    first: i64,
+    output: RewriteOutput,
+) -> Result<()> {
     let Some(frames) = output.frames else {
         // Streamed: the item went with the stream.
         return Ok(());
@@ -1170,7 +1233,7 @@ fn handle_candidate(
         DrainItem::Rewritten {
             seq,
             frames: RewrittenFrames::Held(frames),
-            kind: effective_kind,
+            kind,
             id_range,
             observed_first: first,
             stats: output.stats,

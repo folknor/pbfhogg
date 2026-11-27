@@ -109,14 +109,10 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
-    /// Sets a blob-type filter for the pipelined reader.
-    ///
-    /// When set, the pipeline skips decompressing blobs whose element type
-    /// (from indexdata) does not match the filter. For PBFs without indexdata,
-    /// all blobs pass through unchanged.
-    ///
-    /// This dramatically reduces CPU usage for type-filtered commands: e.g.
-    /// filtering for ways only skips decompressing ~85% of blobs (nodes).
+    /// Sets a header-based filter for the pipelined reader. The filter uses
+    /// readable indexdata and tagdata when present. The reader still validates
+    /// the framing and Blob envelope of a filtered-out data blob and skips
+    /// its payload without decompressing it.
     /// This optimization is consumed by the pipelined iteration methods only;
     /// the sequential [`for_each`](Self::for_each) and parallel
     /// [`par_map_reduce`](Self::par_map_reduce) methods process every element.

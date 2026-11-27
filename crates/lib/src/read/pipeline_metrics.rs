@@ -89,11 +89,11 @@ crate::counters::counter_set! {
         /// allocated capacity, not resident memory: pages past the most
         /// entries a list has held need not be touched.
         pub scratch_pool_capacity_peak_bytes => "pipeline_scratch_pool_capacity_peak_bytes",
-        /// Number of decode tasks dispatched (one per OsmData blob).
+        /// Number of decode tasks dispatched. A transform may decline to
+        /// decode a dispatched blob. Reader-filtered blobs are counted below.
         pub decode_tasks => "pipeline_decode_tasks",
-        /// Number of blobs skipped pre-decompression by the index/tag filter
-        /// (e.g. `BlobFilter` rejects). Subtract from `decode_tasks` for
-        /// actual decompression count.
+        /// Number of blobs skipped by the reader's index/tag filter after
+        /// validating their envelopes.
         pub blobs_skipped_by_filter => "pipeline_blobs_skipped_by_filter",
     }
 }

@@ -1,5 +1,27 @@
 # Tags Filter
 
+### Single-pass filtering skips rejected payloads on the reader (bygg, baseline `d64b3548`)
+
+The reader filters from the frame header before allocating the body. It still
+validates rejected blob envelopes. Seekable inputs seek past opaque payload
+bytes and streams drain them into one reused buffer. Refusal order is
+preserved, including declared-length truncation. A storage read error
+confined to bytes skipped by seeking is no longer observed.
+
+`tag-select --dataset planet --omit-referenced yes`, `--iterations 1`, on
+bygg. A is HEAD `d64b3548` and B is the working tree on `d64b3548`.
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 31.0 s | `7f0fbc78` |
+| B | 27.1 s | `4651a102` |
+| A | 30.0 s | `2fe55bfd` |
+| B | 27.3 s | `b1f2c891` |
+
+Wall time fell about 10 % with the same direction in both pairs.
+`copy-pbf --type way` still reads rejected bodies through cat's own
+raw-frame loop.
+
 ### Block-local SID masks for tag predicates (bygg, 2026-11-27)
 
 PBF selection checks raw SID pairs using lazy, block-local predicate masks.

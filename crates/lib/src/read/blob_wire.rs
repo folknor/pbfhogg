@@ -3,12 +3,16 @@
 //! blob handling (decompression, iterators, high-level APIs) lives in the
 //! sibling `blob` and `decompress` modules.
 
-use bytes::Bytes;
+use std::io::{self, Read};
 
+use bytes::Bytes;
+use protohoggr::{WIRE_32BIT, WIRE_64BIT, WireError};
+
+use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT, read_int32};
 use super::wire_schema::{blob, blob_header};
 
-use crate::blob_meta::{INDEX_SIZE, INDEX_SIZE_V1, WireIndexdata};
-use crate::error::{BlobError, Result, new_blob_error, new_wire_error};
+use crate::blob_meta::{BlobIndex, INDEX_SIZE, INDEX_SIZE_V1, TagIndex, WireIndexdata};
+use crate::error::{BlobError, Error, Result, new_blob_error, new_wire_error};
 
 /// Blob type parsed from BlobHeader, avoiding per-blob String allocation.
 ///
@@ -115,6 +119,18 @@ pub(crate) struct WireBlobHeader {
 }
 
 impl WireBlobHeader {
+    pub(crate) fn index(&self) -> Option<BlobIndex> {
+        self.indexdata
+            .as_ref()
+            .and_then(|data| BlobIndex::deserialize(data))
+    }
+
+    pub(crate) fn tag_index(&self) -> Option<TagIndex> {
+        self.tagdata
+            .as_ref()
+            .and_then(|data| TagIndex::deserialize(data))
+    }
+
     /// Parse a BlobHeader from raw protobuf bytes.
     ///
     /// When `parse_tagdata` is `false`, field 4 (tagdata) is skipped instead of
@@ -371,12 +387,12 @@ pub(crate) enum PayloadKind {
 /// an envelope that does not parse is refused by every route. What follows
 /// the parse differs: the decoding routes also decompress and cross-check
 /// `raw_size`, the comparison does neither.
-pub(crate) struct BlobEnvelope<'a> {
-    pub payload: Option<(PayloadKind, &'a [u8])>,
+pub(crate) struct BlobEnvelope<P> {
+    pub payload: Option<(PayloadKind, P)>,
     pub raw_size: Option<i32>,
 }
 
-impl<'a> BlobEnvelope<'a> {
+impl<'a> BlobEnvelope<&'a [u8]> {
     /// Parse a serialized `Blob`.
     ///
     /// Fields are recognised by number and wire type together. An
@@ -394,48 +410,245 @@ impl<'a> BlobEnvelope<'a> {
     /// or lz4 payload is refused as unsupported once the walk is complete,
     /// so a duplicate gets the duplicate verdict first.
     pub fn parse(input: &'a [u8]) -> Result<Self> {
-        use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
-        let mut cursor = Cursor::new(input);
-        let mut payload: Option<(u32, &'a [u8])> = None;
-        let mut raw_size: Option<i32> = None;
+        parse_envelope(&mut Cursor::new(input))
+    }
+}
 
-        while let Some((field, wire_type)) = cursor.read_tag()? {
-            match (field, wire_type) {
-                (
-                    blob::RAW
-                    | blob::ZLIB_DATA
-                    | blob::LZMA_DATA
-                    | blob::OBSOLETE_BZIP2_DATA
-                    | blob::LZ4_DATA
-                    | blob::ZSTD_DATA,
-                    WIRE_LEN,
-                ) => {
-                    let slice = cursor.read_len_delimited()?;
-                    if payload.is_some() {
-                        return Err(multiple_payload_fields());
-                    }
-                    payload = Some((field, slice));
+const RAW_SIZE_OVERFLOW: &str = "Blob.raw_size exceeds int32";
+
+/// The same envelope walk either borrows payload bytes or advances over them.
+trait BlobFields {
+    type Payload;
+    type Error: From<Error>;
+
+    fn tag(&mut self) -> std::result::Result<Option<(u32, u32)>, Self::Error>;
+    fn payload(&mut self) -> std::result::Result<Self::Payload, Self::Error>;
+    fn raw_size(&mut self) -> std::result::Result<i32, Self::Error>;
+    fn skip_field(&mut self, wire_type: u32) -> std::result::Result<(), Self::Error>;
+}
+
+impl<'a> BlobFields for Cursor<'a> {
+    type Payload = &'a [u8];
+    type Error = Error;
+
+    fn tag(&mut self) -> Result<Option<(u32, u32)>> {
+        Ok(self.read_tag()?)
+    }
+
+    fn payload(&mut self) -> Result<Self::Payload> {
+        Ok(self.read_len_delimited()?)
+    }
+
+    fn raw_size(&mut self) -> Result<i32> {
+        read_int32(self, RAW_SIZE_OVERFLOW)
+    }
+
+    fn skip_field(&mut self, wire_type: u32) -> Result<()> {
+        Ok(Cursor::skip_field(self, wire_type)?)
+    }
+}
+
+fn parse_envelope<C: BlobFields>(
+    cursor: &mut C,
+) -> std::result::Result<BlobEnvelope<C::Payload>, C::Error> {
+    let mut payload = None;
+    let mut raw_size = None;
+    while let Some((field, wire_type)) = cursor.tag()? {
+        match (field, wire_type) {
+            (
+                blob::RAW
+                | blob::ZLIB_DATA
+                | blob::LZMA_DATA
+                | blob::OBSOLETE_BZIP2_DATA
+                | blob::LZ4_DATA
+                | blob::ZSTD_DATA,
+                WIRE_LEN,
+            ) => {
+                let bytes = cursor.payload()?;
+                if payload.is_some() {
+                    return Err(multiple_payload_fields().into());
                 }
-                (blob::RAW_SIZE, WIRE_VARINT) => {
-                    // Validate before narrowing so 2^32 + N cannot alias N and
-                    // pass the decompressed-length check as an honest size.
-                    raw_size = Some(super::wire::read_int32(
-                        &mut cursor,
-                        "Blob.raw_size exceeds int32",
-                    )?);
-                }
-                _ => cursor.skip_field(wire_type)?,
+                payload = Some((field, bytes));
+            }
+            (blob::RAW_SIZE, WIRE_VARINT) => raw_size = Some(cursor.raw_size()?),
+            _ => cursor.skip_field(wire_type)?,
+        }
+    }
+
+    let payload = match payload {
+        None => None,
+        Some((blob::RAW, bytes)) => Some((PayloadKind::Raw, bytes)),
+        Some((blob::ZLIB_DATA, bytes)) => Some((PayloadKind::Zlib, bytes)),
+        Some((blob::ZSTD_DATA, bytes)) => Some((PayloadKind::Zstd, bytes)),
+        Some((field, _)) => return Err(unsupported_compression(field).into()),
+    };
+    Ok(BlobEnvelope { payload, raw_size })
+}
+
+pub(crate) type BodySkip<R> = fn(&mut R, u64) -> io::Result<bool>;
+
+enum BodyError {
+    Wire(Error),
+    Io(io::Error),
+}
+
+impl From<Error> for BodyError {
+    fn from(error: Error) -> Self {
+        Self::Wire(error)
+    }
+}
+
+/// A streaming envelope parser bounded to the declared frame body.
+/// Seekable inputs read the wire fields and skip the values they can ignore.
+/// Other inputs read into the pipeline's reused scratch, bounded to this body.
+pub(crate) struct BlobBody<'a, R> {
+    source: &'a mut R,
+    skip: Option<BodySkip<R>>,
+    scratch: &'a mut [u8],
+    buffered: std::ops::Range<usize>,
+    unread: usize,
+}
+
+impl<'a, R: Read> BlobBody<'a, R> {
+    pub(crate) fn new(
+        source: &'a mut R,
+        size: usize,
+        skip: Option<BodySkip<R>>,
+        scratch: &'a mut [u8],
+    ) -> Self {
+        Self {
+            source,
+            skip,
+            scratch,
+            buffered: 0..0,
+            unread: size,
+        }
+    }
+
+    /// Finish the whole body even when parsing finds an invalid field. The
+    /// original body read reported I/O errors before envelope errors.
+    pub(crate) fn validate(mut self) -> io::Result<Result<()>> {
+        match parse_envelope(&mut self) {
+            Ok(_) => Ok(Ok(())),
+            Err(BodyError::Io(error)) => Err(error),
+            Err(BodyError::Wire(error)) => {
+                self.discard(self.remaining())?;
+                Ok(Err(error))
             }
         }
+    }
 
-        let payload = match payload {
-            None => None,
-            Some((blob::RAW, s)) => Some((PayloadKind::Raw, s)),
-            Some((blob::ZLIB_DATA, s)) => Some((PayloadKind::Zlib, s)),
-            Some((blob::ZSTD_DATA, s)) => Some((PayloadKind::Zstd, s)),
-            Some((field, _)) => return Err(unsupported_compression(field)),
-        };
-        Ok(BlobEnvelope { payload, raw_size })
+    fn remaining(&self) -> usize {
+        self.unread + self.buffered.len()
+    }
+
+    fn refill(&mut self, limit: usize) -> io::Result<()> {
+        let n = limit.min(self.scratch.len());
+        assert!(n > 0 && n <= self.unread && self.buffered.is_empty());
+        self.source.read_exact(&mut self.scratch[..n])?;
+        self.unread -= n;
+        self.buffered = 0..n;
+        Ok(())
+    }
+
+    fn discard(&mut self, mut len: usize) -> io::Result<()> {
+        assert!(len <= self.remaining());
+        if len == 0 {
+            return Ok(());
+        }
+        if let Some(skip) = self.skip {
+            if !skip(self.source, len as u64)? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.unread -= len;
+            return Ok(());
+        }
+        while len != 0 {
+            if self.buffered.is_empty() {
+                self.refill(len)?;
+            }
+            let n = len.min(self.buffered.len());
+            self.buffered.start += n;
+            len -= n;
+        }
+        Ok(())
+    }
+
+    fn byte(&mut self) -> std::result::Result<u8, BodyError> {
+        if self.remaining() == 0 {
+            return Err(Error::from(WireError::TruncatedVarint).into());
+        }
+        if self.skip.is_some() {
+            let mut byte = [0];
+            self.source.read_exact(&mut byte).map_err(BodyError::Io)?;
+            self.unread -= 1;
+            return Ok(byte[0]);
+        }
+        if self.buffered.is_empty() {
+            self.refill(self.unread).map_err(BodyError::Io)?;
+        }
+        let byte = self.scratch[self.buffered.start];
+        self.buffered.start += 1;
+        Ok(byte)
+    }
+
+    /// Read one encoded varint (ten bytes maximum), then let the slice cursor
+    /// apply the same overflow and type checks it applies to a retained body.
+    fn decode_varint<T>(
+        &mut self,
+        decode: impl FnOnce(&mut Cursor<'_>) -> Result<T>,
+    ) -> std::result::Result<T, BodyError> {
+        let mut bytes = [0; 10];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.byte()?;
+            if *byte < 0x80 {
+                return Ok(decode(&mut Cursor::new(&bytes[..=i]))?);
+            }
+        }
+        Ok(decode(&mut Cursor::new(&bytes))?)
+    }
+
+    fn discard_field(&mut self, len: u64, error: WireError) -> std::result::Result<(), BodyError> {
+        let len = usize::try_from(len)
+            .ok() // ok-deliberate: past usize is the same refusal as past the body
+            .filter(|&len| len <= self.remaining())
+            .ok_or_else(|| Error::from(error))?;
+        self.discard(len).map_err(BodyError::Io)
+    }
+}
+
+impl<R: Read> BlobFields for BlobBody<'_, R> {
+    type Payload = ();
+    type Error = BodyError;
+
+    fn tag(&mut self) -> std::result::Result<Option<(u32, u32)>, BodyError> {
+        if self.remaining() == 0 {
+            return Ok(None);
+        }
+        self.decode_varint(|cursor| Ok(cursor.read_tag()?))
+    }
+
+    fn payload(&mut self) -> std::result::Result<(), BodyError> {
+        let len = self.decode_varint(|cursor| Ok(cursor.read_varint()?))?;
+        self.discard_field(len, WireError::LengthPastEnd)
+    }
+
+    fn raw_size(&mut self) -> std::result::Result<i32, BodyError> {
+        self.decode_varint(|cursor| read_int32(cursor, RAW_SIZE_OVERFLOW))
+    }
+
+    fn skip_field(&mut self, wire_type: u32) -> std::result::Result<(), BodyError> {
+        match wire_type {
+            WIRE_VARINT => {
+                // Like Cursor::skip_varint, only look for a terminator.
+                while self.byte()? >= 0x80 {}
+                Ok(())
+            }
+            WIRE_64BIT => self.discard_field(8, WireError::TruncatedFixed64),
+            WIRE_LEN => self.payload(),
+            WIRE_32BIT => self.discard_field(4, WireError::TruncatedFixed32),
+            _ => Err(Error::from(WireError::UnknownWireType).into()),
+        }
     }
 }
 

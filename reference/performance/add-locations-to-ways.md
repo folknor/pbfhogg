@@ -702,6 +702,34 @@ the ordered pools is not decided by these cells.
 
 ## History
 
+### External packed per-way payloads, inconclusive (bygg, baseline `d64b3548`)
+
+The uncommitted variant writes complete packed latitude, longitude and pin
+fields per way in stage 3, allowing stage 4 to append one range per way. The
+scratch precheck uses a worst case of 18 bytes per ref, raising the planet
+free-space threshold from about 267 GB to 348 GB on bygg. Expected growth in
+actual planet payloads is about 5 GB. The higher threshold is a cost on
+smaller hosts.
+
+`embed-locations --dataset planet --index-type external`, `--iterations 1`,
+on bygg after one `fstrim`. A is HEAD `d64b3548` and B is the experimental
+working tree on `d64b3548`.
+
+| Arm | Wall | Stage 1 | Streaming stages 3 and 4 | Run |
+|---|---:|---:|---:|---|
+| A | 5m20s | 22.9 s | 143.0 s | `3dca1454` |
+| B | 5m42s | 49.0 s | 130.8 s | `c28f2a08` |
+| A | 5m50s | 56.0 s | 132.4 s | `6131f50d` |
+| B | 6m27s | 63.7 s | 147.3 s | `6669d313` |
+
+Stage 1 ran identical code and slowed in every successive cell. Drive-state
+drift dominates the wall comparison, and the streaming span moved in opposite
+directions across the two pairs. The result is inconclusive. The variant
+remains stashed and uncommitted. A new matched suite needs equal predecessor
+workloads and equivalent first-after-trim positions, with a fresh trim at
+the start of the suite. Denmark and Germany
+`verify add-locations-to-ways --mode external` passed on B.
+
 ### Add-locations-to-ways
 
 #### Slot bucket counts from stage 2's manifest (baseline `ca672c71`, bygg, 2026-11-18)

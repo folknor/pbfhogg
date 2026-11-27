@@ -195,6 +195,10 @@ pub(crate) const ORDERED_POOL_WINDOW_MIN: usize = 32;
 // Read path
 // ---------------------------------------------------------------------------
 
+/// Pipelined reader: streams that cannot seek drain a filtered blob's body
+/// in chunks of this size through one reused buffer per pipeline.
+pub(crate) const FILTER_DRAIN_BUF_BYTES: usize = 8 * 1024;
+
 /// Number of raw blobs the I/O thread can read ahead.
 pub(crate) const DEFAULT_READ_AHEAD: usize = 16;
 

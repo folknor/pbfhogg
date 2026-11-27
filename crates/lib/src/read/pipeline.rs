@@ -3,10 +3,10 @@
 //! Overlaps sequential I/O with parallel decompression and protobuf parsing,
 //! delivering decoded `PrimitiveBlock`s to a caller-supplied closure in file order.
 
-use super::blob::{BlobReader, BlobType, DecompressPool};
+use super::blob::{BlobReader, BlobType, DecompressPool, WireBlobHeader};
 use super::block::PrimitiveBlock;
 use super::pipeline_metrics::PipelineMetrics;
-use crate::blob_meta::BlobFilter;
+use crate::blob_meta::{BlobFilter, BlobIndex};
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{
@@ -22,6 +22,8 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
+
+use crate::tunables::FILTER_DRAIN_BUF_BYTES;
 
 /// Notes, once per run (checked at most once per pipeline), that a blob filter can skip nothing because
 /// the input's first data blob carries no indexdata (the common "why is my
@@ -43,19 +45,16 @@ impl UnindexedFilterNote {
 
     fn observe(
         &mut self,
-        blob_result: &crate::error::Result<crate::blob::Blob>,
+        indexed: Option<bool>,
         diagnostics: &crate::host::Diagnostics,
         invocation: &crate::host::Recorder,
     ) {
         if !self.pending {
             return;
         }
-        let Ok(blob) = blob_result else { return };
-        if blob.get_type() != BlobType::OsmData {
-            return;
-        }
+        let Some(indexed) = indexed else { return };
         self.pending = false;
-        if blob.index().is_none() {
+        if !indexed {
             // Once per invocation: multi-pass commands open several
             // filtered pipelines over the same input.
             crate::host::diag_once!(
@@ -71,27 +70,88 @@ impl UnindexedFilterNote {
 }
 
 /// One decode slot's result as it crosses to the consumer: `None` delivers
-/// nothing (a skipped or non-data blob), and the permit rides with it until
+/// nothing (a transform declined the blob), and the permit rides with it until
 /// the consumer has handled it.
 type DecodedItem<T> = (usize, Option<Result<T>>, Option<Permit>);
 
 /// Returns `true` if the blob should be skipped based on the filter.
 ///
 /// Checks indexdata (element type + spatial bbox) and tagdata (tag key presence).
-/// Blobs without indexdata or tagdata always pass through (conservative).
-fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
-    if let Some(idx) = blob.index()
-        && !filter.wants_index(&idx)
+/// Only readable metadata can rule a blob out.
+fn should_skip_blob(
+    filter: &BlobFilter,
+    header: &WireBlobHeader,
+    index: Option<&BlobIndex>,
+) -> bool {
+    if let Some(idx) = index
+        && !filter.wants_index(idx)
     {
         return true;
     }
     if filter.has_tag_filter()
-        && let Some(tag_idx) = blob.tag_index()
+        && let Some(tag_idx) = header.tag_index()
         && !filter.wants_tag_index(&tag_idx)
     {
         return true;
     }
     false
+}
+
+fn feed_raw<R: Read + Send>(
+    mut reader: BlobReader<R>,
+    filter: Option<&BlobFilter>,
+    raw_tx: &SyncSender<RawItem>,
+    diagnostics: &crate::host::Diagnostics,
+    invocation: &crate::host::Recorder,
+    shutdown: &AtomicBool,
+) {
+    let metrics = &invocation.metrics().pipeline;
+    let mut unindexed = UnindexedFilterNote::new(filter);
+    let mut scratch = [0; FILTER_DRAIN_BUF_BYTES];
+    let seek = filter.and_then(|_| reader.body_skip());
+    let mut seq = 0;
+    // loop-ends: each pass reads one blob; EOF, an error or a closed channel breaks out
+    while !shutdown.load(Relaxed) {
+        let result = if let Some(filter) = filter {
+            let mut indexed = None;
+            let result = reader.next_filtered_blob(
+                |header| {
+                    let index = header.index();
+                    indexed = Some(index.is_some());
+                    should_skip_blob(filter, header, index.as_ref())
+                },
+                seek,
+                &mut scratch,
+            );
+            if matches!(&result, Some(Ok(_))) {
+                unindexed.observe(indexed, diagnostics, invocation);
+            }
+            match result {
+                Some(Ok(None)) => {
+                    metrics.blobs_skipped_by_filter.fetch_add(1, Relaxed);
+                    continue;
+                }
+                Some(Ok(Some(blob))) => Ok(blob),
+                Some(Err(e)) => Err(e),
+                None => break,
+            }
+        } else {
+            let Some(result) = reader.next_blob() else {
+                break;
+            };
+            result
+        };
+        let failed = result.is_err();
+        if crate::counters::send_recording_wait(raw_tx, (seq, result), &metrics.raw_send_wait_ns)
+            .is_err()
+            || failed
+        {
+            break;
+        }
+        // This key counts only channel items. Frames tracks the physical
+        // ordinal and offset, including the filtered frames.
+        seq += 1;
+    }
 }
 
 /// Bounds decode items admitted but not yet delivered from the reorder buffer.
@@ -482,11 +542,10 @@ struct DecodeTask<'scope, X: DecodeTransform> {
     blob: crate::blob::Blob,
     tx: SyncSender<DecodedItem<X::Out>>,
     buffer_pool: Arc<DecompressPool>,
-    blob_filter: Option<Arc<BlobFilter>>,
     /// Refuse a decoded block that contradicts its blob's kind claim.
     refuse_kinds: bool,
     permit: Permit,
-    shutdown: Arc<AtomicBool>,
+    shutdown: &'scope AtomicBool,
     /// The run's transform, borrowed from the caller for the whole scope.
     transform: &'scope X,
     /// The path of the reader the blob came from, borrowed from the
@@ -511,7 +570,6 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         blob,
         tx,
         buffer_pool,
-        blob_filter,
         refuse_kinds,
         permit,
         shutdown,
@@ -529,13 +587,6 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
             // spawn, which has no panic handler and would abort the process.
             #[cfg(pbfhogg_test_hooks)]
             faults.maybe_block_decode(seq);
-            if blob.get_type() == BlobType::OsmData
-                && let Some(filter) = blob_filter.as_ref()
-                && should_skip_blob(filter, &blob)
-            {
-                metrics.blobs_skipped_by_filter.fetch_add(1, Relaxed);
-                return None;
-            }
             let decode = Decoder {
                 blob: &blob,
                 pool: &buffer_pool,
@@ -605,8 +656,7 @@ where
     // the hottest read path for no bound the gate does not already give.
     // This engine keeps its own permit gate rather than the ordered pool's
     // (`crate::ordered_pool`): the permit travels with each decoded item and
-    // is released on delivery or drop, which fits rayon tasks and filtered
-    // items.
+    // is released on delivery or drop.
     let mut pending: ReorderBuffer<(Option<Result<T>>, Option<Permit>)> =
         ReorderBuffer::with_capacity(decode_ahead);
 
@@ -641,7 +691,8 @@ where
 
 /// Runs a three-stage pipeline over a PBF file:
 ///
-/// 1. **Reader thread**: sequential I/O, reads raw `Blob`s from the file.
+/// 1. **Reader thread**: sequential I/O, filters headers, validates skipped
+///    envelopes and sends the remaining `Blob`s to the dispatcher.
 /// 2. **Rayon pool**: parallel decompression (zlib) + protobuf parse, then
 ///    the [`DecodeTransform`] on the same worker. The pool is built for this
 ///    run and joined before it returns, thread-local destructors included.
@@ -701,15 +752,11 @@ where
     // Borrowed by every decode task for the whole scope.
     let transform = &transform;
     // Enable tagdata parsing only when the filter needs tag key matching.
-    // Enable indexdata parsing when any filter is active (should_skip_blob
-    // checks blob.index() for type + spatial filtering) or the transform
-    // reads it.
-    let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
+    // Retain indexdata for filtering and transforms that read it.
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
     let refuse_kinds = pipeline_config.kind_claims == crate::scan::classify::KindClaims::Refuse;
     blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA || refuse_kinds);
-    let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
     // The capability the caller runs the read under (a reader method's call,
     // a block iterator thread's permit), borrowed by every stage through
@@ -731,6 +778,7 @@ where
     // (`PipelineMetrics::record_scratch_growth`); per read, because each
     // read has its own decode pool.
     let scratch_pool = &AtomicU64::new(0);
+    let shutdown = &AtomicBool::new(false);
     // Declared before the scope so it drops after the scope has joined.
     let _emit = EmitOnDrop(metrics, invocation);
     let result = crate::threads::scope(invocation, |scope| {
@@ -741,17 +789,14 @@ where
         // spawn drops this closure and its `raw_tx`, the dispatcher's receive
         // loop ends, and the scope joins it.
         let reader = move || {
-            for (seq, blob_result) in std::iter::from_fn(|| blob_reader.next_blob()).enumerate() {
-                unindexed.observe(&blob_result, &diagnostics, invocation);
-                let send_result = crate::counters::send_recording_wait(
-                    &raw_tx,
-                    (seq, blob_result),
-                    &metrics.raw_send_wait_ns,
-                );
-                if send_result.is_err() {
-                    break; // receiver dropped, pipeline shutting down
-                }
-            }
+            feed_raw(
+                blob_reader,
+                blob_filter.as_ref(),
+                &raw_tx,
+                &diagnostics,
+                invocation,
+                shutdown,
+            );
         };
 
         // Stage 2: Dispatcher thread - fans out to dedicated pool for parallel decode.
@@ -808,6 +853,7 @@ where
             ) {
                 Ok(pool) => pool,
                 Err(err) => {
+                    shutdown.store(true, Relaxed);
                     // The build has joined the threads it spawned. Seq 0 is
                     // correct here, not a magic value that can collide
                     // with a real item: the pool is built before the loop over
@@ -823,7 +869,6 @@ where
             let dispatch_tx = dispatch_tx;
             let buffer_pool = DecompressPool::new(invocation);
             let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
-            let shutdown = Arc::new(AtomicBool::new(false));
             // Tasks borrow the reader's path from this scope: one capture per
             // pipeline, no refcounting per blob.
             let source = source.as_ref();
@@ -871,10 +916,9 @@ where
                                     blob,
                                     tx: dispatch_tx.clone(),
                                     buffer_pool: Arc::clone(&buffer_pool),
-                                    blob_filter: blob_filter.clone(),
                                     refuse_kinds,
                                     permit,
-                                    shutdown: Arc::clone(&shutdown),
+                                    shutdown,
                                     transform,
                                     source,
                                     metrics,
@@ -907,6 +951,7 @@ where
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);
 
+        let _stop_reader = StopReaderOnDrop(shutdown);
         drain_decoded(
             decoded_rx,
             pipeline_config.decode_ahead.get(),
@@ -922,6 +967,15 @@ where
     // consumer has returned). The invocation's pool-drop totals are emitted
     // separately, after dispatch.
     result
+}
+
+/// Stop a run of consecutive filter skips when the consumer exits.
+struct StopReaderOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopReaderOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Relaxed);
+    }
 }
 
 /// Emits the invocation's [`PipelineMetrics`] when dropped: after a run's
@@ -943,7 +997,7 @@ mod tests {
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
     use crate::writer::{Compression, PbfWriter};
     use crate::{BlobFilter, ElementReader};
-    use std::io::{Cursor, Read};
+    use std::io::{Cursor, Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
 
@@ -969,6 +1023,14 @@ mod tests {
             Ok(read)
         }
     }
+
+    impl Seek for CountingRead {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl crate::blob::BlobReaderSource for CountingRead {}
 
     /// Run `f` under a fail-stop hang bound: a hang ends the test binary
     /// with `label` and the test's name instead of detaching a hung thread.
@@ -1553,6 +1615,297 @@ mod tests {
             .unwrap()
             .with_blob_filter(BlobFilter::new(false, true, false));
         assert!(fused_counts(reader).unwrap().is_empty());
+    }
+
+    fn append_data_frame(
+        pbf: &mut Vec<u8>,
+        body: &[u8],
+        index: Option<&BlobIndex>,
+        tagdata: Option<&[u8]>,
+        missing_bytes: usize,
+    ) {
+        use crate::read::wire_schema::blob_header;
+        use protohoggr::{encode_bytes_field, encode_int32_field};
+
+        let mut header = Vec::new();
+        encode_bytes_field(&mut header, blob_header::TYPE, b"OSMData");
+        if let Some(index) = index {
+            encode_bytes_field(&mut header, blob_header::INDEXDATA, &index.serialize());
+        }
+        encode_int32_field(
+            &mut header,
+            blob_header::DATASIZE,
+            i32::try_from(body.len() + missing_bytes).unwrap(),
+        );
+        if let Some(tagdata) = tagdata {
+            encode_bytes_field(&mut header, blob_header::TAGDATA, tagdata);
+        }
+        pbf.extend_from_slice(&u32::try_from(header.len()).unwrap().to_be_bytes());
+        pbf.extend_from_slice(&header);
+        pbf.extend_from_slice(body);
+    }
+
+    fn append_way(pbf: &mut Vec<u8>, id: i64) {
+        let mut builder = BlockBuilder::new();
+        builder.add_way(id, std::iter::empty::<(&str, &str)>(), &[1], None);
+        let block = builder.take_owned().unwrap().unwrap();
+        let mut body = Vec::new();
+        protohoggr::encode_bytes_field(
+            &mut body,
+            crate::read::wire_schema::blob::RAW,
+            &block.bytes,
+        );
+        append_data_frame(pbf, &body, Some(&block.index), block.tagdata.as_deref(), 0);
+    }
+
+    fn node_index() -> BlobIndex {
+        BlobIndex {
+            kind: crate::ElementKind::Node,
+            min_id: 1,
+            max_id: 1,
+            count: 1,
+            bbox: None,
+        }
+    }
+
+    struct BlobIds;
+
+    impl DecodeTransform for BlobIds {
+        type Out = (Option<u64>, Vec<i64>);
+        const PARSE_INDEXDATA: bool = false;
+
+        fn apply(&self, blob: &crate::Blob, decode: Decoder<'_>) -> Option<Result<Self::Out>> {
+            Some(decode.block().map(|block| {
+                let ids = block
+                    .elements()
+                    .map(|element| match element {
+                        crate::Element::DenseNode(node) => node.id(),
+                        crate::Element::Node(node) => node.id(),
+                        crate::Element::Way(way) => way.id(),
+                        crate::Element::Relation(relation) => relation.id(),
+                    })
+                    .collect();
+                (blob.blob_index(), ids)
+            }))
+        }
+    }
+
+    type DeliveredIds = Vec<<BlobIds as DecodeTransform>::Out>;
+
+    fn filtered_ids<R: Read + Send>(
+        reader: ElementReader<R>,
+        filter: Option<BlobFilter>,
+        call: &crate::host::Invocation,
+    ) -> (Result<()>, DeliveredIds) {
+        let mut reader = reader
+            .invocation(call.clone())
+            .decode_threads(2)
+            .read_ahead(1)
+            .decode_ahead(1);
+        if let Some(filter) = filter {
+            reader = reader.with_blob_filter(filter);
+        }
+        let mut ids = Vec::new();
+        let result = reader.for_each_fused_blob(BlobIds, |item| {
+            ids.push(item);
+            Ok(())
+        });
+        (result, ids)
+    }
+
+    fn assert_filtered_refusal<R: Read + Send>(
+        open: impl Fn() -> ElementReader<R>,
+        filter: BlobFilter,
+        expected: &str,
+        offset: Option<crate::blob::ByteOffset>,
+    ) {
+        let (baseline, baseline_ids) = filtered_ids(open(), None, &crate::host::Invocation::new());
+        let invocation = crate::host::Invocation::new();
+        let (filtered, filtered_ids) = filtered_ids(open(), Some(filter), &invocation);
+        let filtered = filtered.unwrap_err();
+        assert!(filtered.to_string().contains(expected), "{filtered}");
+        assert_eq!(filtered.to_string(), baseline.unwrap_err().to_string());
+        assert_eq!(filtered.blob_index(), Some(2));
+        assert_eq!(filtered.byte_offset(), offset);
+        assert_eq!(filtered_ids, baseline_ids);
+        assert_eq!(filtered_ids, [(Some(1), vec![12])]);
+        let call = invocation.call().unwrap();
+        assert_eq!(
+            call.metrics()
+                .pipeline
+                .blobs_skipped_by_filter
+                .load(Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn filtered_blobs_keep_the_original_refusals() {
+        let cases: &[(&[u8], usize, &str)] = &[
+            (&[0x00], 0, "tag has field number 0"),
+            (&[0x80], 0, "truncated varint"),
+            (&[0x88, 0x80, 0x80, 0x80, 0x10], 0, "varint overflows u32"),
+            (&[0x0b], 0, "unknown wire type"),
+            (&[0x4d, 0], 0, "truncated 32-bit fixed-width value"),
+            (&[0x49, 0], 0, "truncated 64-bit fixed-width value"),
+            (&[0x48, 0x80], 0, "truncated varint"),
+            (&[0x0a, 2, 0], 0, "length-delimited field extends past end"),
+            (
+                &[0x10, 0x80, 0x80, 0x80, 0x80, 0x10],
+                0,
+                "raw_size exceeds int32",
+            ),
+            (&[0x0a, 0, 0x22, 0], 0, "more than one"),
+            (
+                &[0x22, 0, 0x0a, 2, 0],
+                0,
+                "length-delimited field extends past end",
+            ),
+            (&[0x22, 0], 0, "unsupported compression"),
+            (&[0x2a, 0], 0, "unsupported compression"),
+            (&[0x32, 0], 0, "unsupported compression"),
+            (&[0x0a, 2, 0], 1, "frame truncated"),
+            (&[0x00], 1, "frame truncated"),
+        ];
+        let dir = pbfhogg_test_scratch::scratch();
+        let path = dir.path().join("filtered.osm.pbf");
+        for &(body, missing, message) in cases {
+            let mut pbf = fused_pbf(0);
+            append_way(&mut pbf, 12);
+            let start = u64::try_from(pbf.len()).unwrap();
+            append_data_frame(&mut pbf, body, Some(&node_index()), None, missing);
+            std::fs::write(&path, &pbf).unwrap();
+            assert_filtered_refusal(
+                || ElementReader::from_path(&path).unwrap(),
+                BlobFilter::new(false, true, false),
+                message,
+                Some(crate::blob::ByteOffset(start)),
+            );
+            assert_filtered_refusal(
+                || ElementReader::for_tests(Cursor::new(&pbf)).unwrap(),
+                BlobFilter::new(false, true, false),
+                message,
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_blobs_keep_partial_index_refusal_ahead_of_envelope_errors() {
+        let dir = pbfhogg_test_scratch::scratch();
+        let path = dir.path().join("partial.osm.pbf");
+        let host = crate::host::Host::for_tests();
+        let entered = host.enter().unwrap();
+        let tagdata =
+            crate::blob_meta::encode_tag_index(std::iter::once(b"other".as_slice())).unwrap();
+        let mut pbf = fused_pbf(0);
+        append_way(&mut pbf, 12);
+        let start = u64::try_from(pbf.len()).unwrap();
+        append_data_frame(&mut pbf, &[0x00], None, Some(&tagdata), 0);
+        std::fs::write(&path, &pbf).unwrap();
+        assert_filtered_refusal(
+            || ElementReader::open_in(&path, false, &entered).unwrap(),
+            BlobFilter::new(true, true, true).with_required_tag_keys(vec!["keep".to_owned()]),
+            "partially indexed",
+            Some(crate::blob::ByteOffset(start)),
+        );
+    }
+
+    #[test]
+    fn skipped_blobs_preserve_output_ordinals_and_skip_counts() {
+        let mut pbf = fused_pbf(0);
+        let tagdata =
+            crate::blob_meta::encode_tag_index(std::iter::once(b"other".as_slice())).unwrap();
+        let mut opaque = Vec::new();
+        protohoggr::encode_bytes_field(
+            &mut opaque,
+            crate::read::wire_schema::blob::ZSTD_DATA,
+            &vec![0xff; crate::tunables::IO_BUF_BYTES * 2],
+        );
+        // A known field under the wrong wire type and an overlong unknown
+        // varint are accepted as unknown fields, even after the payload.
+        opaque.extend_from_slice(&[0x08, 0x01, 0x48]);
+        opaque.extend_from_slice(&[0x80; 11]);
+        opaque.push(0);
+        append_data_frame(&mut pbf, &opaque, Some(&node_index()), None, 0);
+        append_way(&mut pbf, 12);
+        append_data_frame(&mut pbf, &opaque, None, Some(&tagdata), 0);
+        append_way(&mut pbf, 34);
+        // A missing payload is an error only when decoded. A skipped Blob
+        // envelope with a legal raw_size is still accepted.
+        append_data_frame(&mut pbf, &[0x10, 1], Some(&node_index()), None, 0);
+
+        let dir = pbfhogg_test_scratch::scratch();
+        let path = dir.path().join("filtered.osm.pbf");
+        std::fs::write(&path, &pbf).unwrap();
+        let filter =
+            || BlobFilter::new(false, true, false).with_required_tag_keys(vec!["keep".to_owned()]);
+        let inv = crate::host::Invocation::new();
+        let (result, file_ids) = filtered_ids(
+            ElementReader::from_path(&path).unwrap(),
+            Some(filter()),
+            &inv,
+        );
+        result.unwrap();
+        let (result, stream_ids) = filtered_ids(
+            ElementReader::for_tests(Cursor::new(&pbf)).unwrap(),
+            Some(filter()),
+            &inv,
+        );
+        result.unwrap();
+        let call = inv.call().unwrap();
+        assert_eq!(file_ids, [(Some(2), vec![12]), (Some(4), vec![34])]);
+        assert_eq!(stream_ids, file_ids);
+        assert_eq!(call.metrics().pipeline.decode_tasks.load(Relaxed), 4);
+        assert_eq!(
+            call.metrics()
+                .pipeline
+                .blobs_skipped_by_filter
+                .load(Relaxed),
+            6
+        );
+
+        let (result, _) = filtered_ids(
+            ElementReader::for_tests(Cursor::new(&pbf)).unwrap(),
+            None,
+            &crate::host::Invocation::new(),
+        );
+        assert_eq!(result.unwrap_err().blob_index(), Some(1));
+    }
+
+    #[test]
+    fn seekable_filter_does_not_read_opaque_payloads() {
+        let mut pbf = fused_pbf(0);
+        let mut body = Vec::new();
+        protohoggr::encode_bytes_field(
+            &mut body,
+            crate::read::wire_schema::blob::RAW,
+            &vec![0; crate::tunables::IO_BUF_BYTES],
+        );
+        append_data_frame(&mut pbf, &body, Some(&node_index()), None, 0);
+        append_way(&mut pbf, 56);
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let mut reader =
+            BlobReader::new_seekable(CountingRead::new(pbf, Arc::clone(&bytes_read))).unwrap();
+        reader.leading_header().unwrap();
+        let mut output = Vec::new();
+        run_pipeline(
+            reader,
+            &crate::host::Call::detached(),
+            Some(1),
+            PipelineConfig::default(),
+            Some(BlobFilter::new(false, true, false)),
+            None,
+            crate::host::Diagnostics::discard(),
+            BlobIds,
+            |item| {
+                output.push(item);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, [(Some(2), vec![56])]);
+        assert!(bytes_read.load(Relaxed) < body.len());
     }
 
     #[test]

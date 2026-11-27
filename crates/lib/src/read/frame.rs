@@ -53,6 +53,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::blob_wire::{BlobBody, BodySkip};
 use crate::blob::{
     BlobKind, BlobReaderSource, BlobSite, ByteOffset, MAX_BLOB_HEADER_SIZE, WireBlobHeader,
     warn_unrecognised_indexdata,
@@ -694,6 +695,30 @@ impl<S: FrameSource> Frames<S> {
             tagdata_present,
             id: header.id,
         }))
+    }
+}
+
+impl<S: Read> Frames<S> {
+    /// Validate a skipped body's envelope without retaining the body. A
+    /// physical short read takes precedence over the partial-index guard,
+    /// which in turn takes precedence over any envelope error.
+    pub(crate) fn validate_payload(
+        &mut self,
+        skip: Option<BodySkip<S>>,
+        scratch: &mut [u8],
+    ) -> Result<Result<()>> {
+        let pending = self.take_pending()?;
+        let body = BlobBody::new(&mut self.src, pending.data_size, skip, scratch);
+        let envelope = match body.validate() {
+            Ok(envelope) => envelope,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let err = truncated(TruncatedPart::Payload, pending.data_size, self.pos);
+                return Err(self.fail(pending.id, err));
+            }
+            Err(e) => return Err(self.fail(pending.id, e.into())),
+        };
+        self.finish(pending)?;
+        Ok(envelope)
     }
 }
 

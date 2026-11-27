@@ -16,9 +16,8 @@
 ```
 
 Findings from the 2026-11 performance hunt: 18 codex hunters (gpt-6.1-sol, high
-effort), one per scope, reading code only. Findings are as reported and have not
-been verified; every payoff is a source-derived hypothesis, nothing was
-measured. "Reported by" names the scopes that raised a finding and is a fact
+effort), one per scope, reading code only. The original findings were source-derived hypotheses. Subsequent
+measurements and decisions are recorded where available. "Reported by" names the scopes that raised a finding and is a fact
 about the reports, not a verdict. "Kind" is the hunter's own label. Where
 hunters proposed different redesigns for one bottleneck, the entry records
 each. Entries are in no order of importance. Defects found on the way are in
@@ -64,33 +63,15 @@ decode.
 
 Kind: high-conviction architectural rewrite.
 
-## PERF-002 - Filtered blob bodies are read before the filter runs
+## PERF-002 - Type-filtered cat reads rejected raw-frame bodies
 
 Reported by: framing, pipeline, tags.
 
-Mechanism: in `run_pipeline` the reader reads and allocates the whole body and
-parses the envelope; `should_skip_blob` runs later on a worker
-(`spawn_decode_task`), so pruning saves decompression but not ingestion,
-allocation, dispatch, admission or ordered completion. Single-pass tags-filter
-(`with_blob_filter`, the `-R` path) and type-filtered cat
-(`cat_type_filtered`, `cat_type_passthrough`) reach this.
-
-Redesign: decide skip, copy or decode from the header before materializing the
-payload; the file reader already exposes header/read/skip operations
-(`blob.rs`). Skip validates framing and advances; copy keeps a source range;
-decode obtains a lease.
-
-Payoff: excluded bodies avoid allocation and userspace copies; physical I/O
-savings depend on selection density and readahead.
-
-Risks: the pipeline currently parses envelopes of filtered blobs; moving the
-filter earlier must keep required refusals (malformed envelope fields,
-truncated bodies) and `--distrust-metadata` behaviour, which needs an explicit
-decision about what rejected blobs promise. A seekable envelope validator can
-check tags and lengths while skipping payload contents. On generic streams
-skipping still drains bytes.
-
-Kind: high-conviction redesign (framing); local change (tags).
+Cat's raw-frame loop (`cat_type_filtered`, `cat_type_passthrough`) still
+reads rejected bodies before deciding whether to copy or decode. Move that
+decision to the header and retain the required framing and refusal checks.
+The remaining workload includes `copy-pbf --type way`. See the
+[reader-side filter measurements](../reference/performance/tags-filter.md).
 
 ## PERF-003 - Source ranges are not a first-class output representation
 
@@ -594,29 +575,16 @@ retain every occurrence independently of merge deduplication.
 
 Kind: high-conviction full rewrite.
 
-## PERF-016 - cat --dedupe decodes both copies of the same source
+## PERF-016 - Broader raw passthrough for cat --dedupe
 
 Reported by: copy, merge.
 
-Mechanism: merging an input with itself makes corresponding blobs overlap
-everywhere, so the sweep reads and decodes both copies and re-encodes
-survivors.
-
-Redesign: recognize repeated pinned sources before work; decode an aliased
-frame once with its multiplicity and precedence; evaluate duplicate identity
-once; copy compatible frames rather than recompress. After proving all
-competitors lose and the survivor has the required order and uniqueness, copy
-the block through.
-
-Payoff: especially compelling for self-dedupe.
-
-Risks: dropping the repeated argument is wrong, because overlap sweeps remove
-equal `(kind, ID, version)` records while isolated blobs keep internal
-duplicates, so merging a file with itself can change its duplicates; indexdata
-has no uniqueness proof; for different files compressed equality needs a byte
-comparison, not a fingerprint.
-
-Kind: high potential for the stated workload.
+Passthrough currently covers isolated raw dense-node frames with strictly
+ordered unique IDs, no tags or metadata, and framing equal to the sweep's.
+Those frames are rare in real files. Extending passthrough requires proving
+that the retained records and framing match the sweep's output. Indexdata
+alone cannot prove uniqueness. See the
+[self-dedupe measurements](../reference/performance/cat.md).
 
 ## PERF-019 - Complete-ways and smart extract decode the same payloads repeatedly
 
@@ -855,6 +823,15 @@ stale-location stripping, pin semantics, framing checks, publication; straddler
 assembly and way alignment.
 
 Kind: high-conviction architectural change.
+
+The packed per-way payload variant remains stashed and uncommitted. On bygg
+against HEAD `d64b3548`, the working tree on `d64b3548` showed no consistent
+effect on the streaming span, and drive-state drift dominated planet wall
+time. The worst-case precheck rose from about 267 GB to 348 GB, with about
+5 GB of expected actual payload growth. A new matched suite needs equal
+predecessor workloads and a fresh trim at its start. See the
+[external payload measurements](../reference/performance/add-locations-to-ways.md#external-packed-per-way-payloads-inconclusive-bygg-baseline-d64b3548)
+for the cells and verification results.
 
 ## PERF-032 - External ALTW scratch file fleets and shared appenders
 

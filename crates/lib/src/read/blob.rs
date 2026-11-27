@@ -1,8 +1,9 @@
 //! Read and decode blobs
 
+use super::blob_wire::BodySkip;
 use super::block::{HeaderBlock, PrimitiveBlock};
 use super::file_reader::FileReader;
-use super::frame::{FrameId, Frames, HeaderFields};
+use super::frame::{FrameHeader, FrameId, FrameSkip, Frames, HeaderFields};
 use crate::error::{Error, Location, Result};
 use bytes::Bytes;
 use std::fs::File;
@@ -283,10 +284,7 @@ impl Blob {
     /// PBFs written by pbfhogg embed indexdata automatically. Third-party PBFs
     /// (Geofabrik, osmium) typically do not - this returns `None` for those.
     pub(crate) fn index(&self) -> Option<crate::blob_meta::BlobIndex> {
-        self.header
-            .indexdata
-            .as_ref()
-            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
+        self.header.index()
     }
 
     /// Total bytes retained by this blob's payload allocation.
@@ -304,17 +302,6 @@ impl Blob {
         // datasize is the Blob message size = the parent buffer length that the
         // payload slices keep alive; positive by construction.
         u64::from(self.header.datasize.get())
-    }
-
-    /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
-    ///
-    /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs
-    /// do not - this returns `None` for those.
-    pub(crate) fn tag_index(&self) -> Option<crate::blob_meta::TagIndex> {
-        self.header
-            .tagdata
-            .as_ref()
-            .and_then(|d| crate::blob_meta::TagIndex::deserialize(d))
     }
 
     /// Decompress and construct PrimitiveBlock with inline string table entries,
@@ -432,6 +419,9 @@ pub struct BlobReader<R: Read + Send> {
     /// than none. By default indexdata is kept, so standalone readers expose
     /// `Blob::index()`, and tagdata and way members are skipped.
     frames: Frames<R>,
+    /// Determines once per filtered walk whether this source can skip by
+    /// seeking. The usual Read constructors leave it unset.
+    select_body_skip: Option<SelectBodySkip<R>>,
     /// Borrowed-reader callback for fadvise(DONTNEED) after each blob read. When set,
     /// the reader evicts page cache pages behind the read head, preventing
     /// sequential reads from accumulating the entire file in the page cache.
@@ -454,6 +444,8 @@ pub struct BlobReader<R: Read + Send> {
     /// ([`Self::skipping_unknown_frames`]).
     skip_unknown: bool,
 }
+
+type SelectBodySkip<R> = fn(&R) -> Option<BodySkip<R>>;
 
 impl<R: Read + Send> BlobReader<R> {
     /// Attach per-run diagnostics to this reader.
@@ -499,6 +491,7 @@ impl<R: Read + Send> BlobReader<R> {
     fn with_frames(frames: Frames<R>) -> Self {
         BlobReader {
             frames,
+            select_body_skip: None,
             #[cfg(target_os = "linux")]
             evict_prefix: None,
             #[cfg(target_os = "linux")]
@@ -802,7 +795,16 @@ impl BlobReader<FileReader> {
     fn from_reader(reader: FileReader, path: &Path) -> Self {
         let mut frames = Frames::over_file(reader, Some(0), Self::DEFAULT_FIELDS);
         frames.set_path(Some(Arc::from(path)));
-        Self::with_frames(frames)
+        let mut reader = Self::with_frames(frames);
+        // A path can also open a pipe or a device. Keep reading those as
+        // streams. The check is deferred until a filtered walk needs it.
+        reader.select_body_skip = Some(|source| {
+            source
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file())
+                .then_some(<FileReader as FrameSkip>::skip_bytes as BodySkip<FileReader>)
+        });
+        reader
     }
 }
 
@@ -843,14 +845,20 @@ impl<R: Read + Send> BlobReader<R> {
     /// [`RawFrame::into_blob`]. After any failure iteration ends: this
     /// returns `None` until a seek resumes it.
     pub(crate) fn next_frame(&mut self) -> Option<Result<RawFrame>> {
+        Some(
+            self.next_header()?
+                .and_then(|header| self.read_frame(header)),
+        )
+    }
+
+    fn next_header(&mut self) -> Option<Result<FrameHeader>> {
         if self.frames.failed() {
             return None;
         }
-        let header = match self.frames.next_header() {
-            Ok(Some(header)) => header,
-            Ok(None) => return None,
-            Err(err) => return Some(Err(err)),
-        };
+        self.frames.next_header().transpose()
+    }
+
+    fn read_frame(&mut self, header: FrameHeader) -> Result<RawFrame> {
         // Sized to the declared payload, so the bounded read fills it with
         // no reallocation (and, for a reader opened from a file, with no
         // zero-fill: `Frames::over_file`). One fresh allocation per blob, so under a glibc mmap threshold
@@ -861,9 +869,7 @@ impl<R: Read + Send> BlobReader<R> {
         // `Bytes` slice, which a raw payload carries past decompression.
         let frame_len = header.payload_offset() + header.data_size;
         let mut blob_data = Vec::with_capacity(header.data_size);
-        if let Err(err) = self.frames.read_payload(&mut blob_data) {
-            return Some(Err(err));
-        }
+        self.frames.read_payload(&mut blob_data)?;
 
         // Evict page cache pages behind the read head. After the blob data is
         // copied into owned buffers (blob_data Vec above), the kernel's cached
@@ -890,15 +896,63 @@ impl<R: Read + Send> BlobReader<R> {
         // before another planet A/B.
         self.evict_behind();
 
-        Some(Ok(RawFrame {
+        Ok(RawFrame {
             header: header.header,
             body: Bytes::from(blob_data),
             id: header.id,
             frame_len,
-        }))
+        })
     }
 
-    /// The page-cache eviction step after a payload was copied out (see
+    pub(crate) fn body_skip(&self) -> Option<BodySkip<R>> {
+        self.select_body_skip
+            .and_then(|select| select(&self.frames.src))
+    }
+
+    /// As `next_blob`, except the predicate can decline an OSMData frame
+    /// based on its header. `Some(Ok(None))` means one filtered body was
+    /// fully accounted for and its envelope was valid.
+    pub(crate) fn next_filtered_blob(
+        &mut self,
+        mut skip_data: impl FnMut(&WireBlobHeader) -> bool,
+        seek: Option<BodySkip<R>>,
+        scratch: &mut [u8],
+    ) -> Option<Result<Option<Blob>>> {
+        loop {
+            let header = match self.next_header()? {
+                Ok(header) => header,
+                Err(err) => return Some(Err(err)),
+            };
+            if matches!(header.header.blob_type, BlobKind::OsmData) && skip_data(&header.header) {
+                return Some(self.validate_skipped_frame(header.id, seek, scratch));
+            }
+            let frame = match self.read_frame(header) {
+                Ok(frame) => frame,
+                Err(err) => return Some(Err(err)),
+            };
+            if !self.skip_unknown || !matches!(frame.header.blob_type, BlobKind::Unknown(_)) {
+                return Some(self.parse_frame(frame).map(Some));
+            }
+        }
+    }
+
+    fn validate_skipped_frame(
+        &mut self,
+        id: FrameId,
+        seek: Option<BodySkip<R>>,
+        scratch: &mut [u8],
+    ) -> Result<Option<Blob>> {
+        let envelope = self.frames.validate_payload(seek, scratch)?;
+        self.evict_behind();
+        envelope.map_err(|err| {
+            let err = err.locate(self.frames.location(id));
+            self.frames.poison();
+            err
+        })?;
+        Ok(None)
+    }
+
+    /// The page-cache eviction step after a payload was consumed (see
     /// [`Self::next_frame`]); a no-op unless eviction is on.
     fn evict_behind(&mut self) {
         #[cfg(target_os = "linux")]
@@ -940,18 +994,8 @@ impl BlobReader<FileReader> {
     /// eviction behind the read head included. A malformed envelope ends
     /// the walk.
     pub(crate) fn read_frame_blob(&mut self, header: crate::frame::FrameHeader) -> Result<Blob> {
-        let frame_len = header.payload_offset() + header.data_size;
-        let mut body = Vec::with_capacity(header.data_size);
-        self.read_frame_payload(&mut body)?;
-        let frame = RawFrame {
-            header: header.header,
-            body: Bytes::from(body),
-            id: header.id,
-            frame_len,
-        };
-        frame
-            .into_blob(self.frames.path())
-            .inspect_err(|_| self.frames.poison())
+        let frame = self.read_frame(header)?;
+        self.parse_frame(frame)
     }
 }
 
@@ -992,16 +1036,13 @@ impl<R: Read + Send> BlobReader<R> {
                 Err(e) => return Some(Err(e)),
             }
         };
-        match frame.into_blob(self.frames.path()) {
-            Ok(blob) => Some(Ok(blob)),
-            Err(e) => {
-                // A malformed envelope ends iteration, like every other
-                // failure: the reader does not resume past a blob it could
-                // not read.
-                self.frames.poison();
-                Some(Err(e))
-            }
-        }
+        Some(self.parse_frame(frame))
+    }
+
+    fn parse_frame(&mut self, frame: RawFrame) -> Result<Blob> {
+        frame
+            .into_blob(self.frames.path())
+            .inspect_err(|_| self.frames.poison())
     }
 }
 
@@ -1033,11 +1074,10 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         // any) is the caller's, not something this can recover. Only a
         // stream handed over at its start can be counted from blob 0;
         // mid-stream the index is unknowable, not zero.
-        Ok(Self::with_frames(Frames::new(
-            reader,
-            Some(pos),
-            Self::DEFAULT_FIELDS,
-        )))
+        let mut blob_reader =
+            Self::with_frames(Frames::new(reader, Some(pos), Self::DEFAULT_FIELDS));
+        blob_reader.select_body_skip = Some(|_| Some(<R as FrameSkip>::skip_bytes));
+        Ok(blob_reader)
     }
 
     /// Read and return the [`Blob`] at the given offset. If successful, the cursor of the stream is

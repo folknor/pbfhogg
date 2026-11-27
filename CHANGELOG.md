@@ -663,6 +663,14 @@
 
 ### Changed
 
+- **Self-dedupe and single-pass tag filtering are faster.** On bygg,
+  the working tree on `d64b3548` versus HEAD `d64b3548` cut wall time
+  by 18 % for warm-cache Germany self-dedupe and about 10 % for planet
+  `tags-filter --omit-referenced`. Tag filtering now seeks past rejected
+  payload bytes on seekable inputs, so storage read errors confined to
+  those bytes are no longer observed. Declared-length truncation still
+  causes a refusal.
+
 - **A dense node group with no tags omits its `keys_vals` column.** Every
   re-encoding command used to write one zero delimiter per node even when
   no node in the group had a tag; such a group now carries no column,

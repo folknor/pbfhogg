@@ -1,6 +1,36 @@
 # Geocode
 
-## Planet build baseline (bygg, working tree on `63e4e397`)
+## Planet build after parallel Pass 3 stage B sorting (bygg, HEAD `5f14f9c4`)
+
+Pass 3 stage B fine and coarse buckets now sort large record sets in parallel
+on the build executor. The parallel sort preserves the prior sort's tie order:
+equal cell IDs may have different payloads, so tie order affects index bytes.
+Buckets are batched by estimated buffer use under a 4 GiB budget instead of a
+fixed eight-bucket window; a bucket larger than the budget runs alone. The
+serial sort remains the test oracle, with full index byte-equality coverage.
+
+At `5f14f9c4` (run `ecfe45ac`), the previous fine sort took 18.7 s at about
+2 cores (about 37 s of user CPU), and the coarse sort took 8.7 s. Planet
+`geocode-build`, interleaved `--iterations 1` cells in run order:
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A, HEAD `5f14f9c4` | 1m32s | `b7ce0f25` |
+| B, working tree on `5f14f9c4` | 1m26s | `452e4b83` |
+| A, HEAD `5f14f9c4` | 1m30s | `3128dc8b` |
+| B, working tree on `5f14f9c4` | 1m28s | `1a8e6293` |
+
+The paired cells show about a 4% wall-time reduction. On B run `1a8e6293`,
+`GEOCODE_PASS3_STAGEB_FINE` took 15.9 s and
+`GEOCODE_PASS3_STAGEB_COARSE` took 8.0 s. Peak RSS (`hwm`) was 34.3 GB on B
+against 33.5 GB on A, mostly mapped files and unchanged in effect. Tier 1
+passed, including byte equality against the serial oracle; `pbfhogg-verify
+geocode` on Germany and `geocode-seam` passed.
+
+The remaining serial work in stage B is each bucket's raw read and first
+partition. These now bound stage B.
+
+## Earlier planet build baseline (bygg, working tree on `63e4e397`)
 
 Planet `geocode-build`, interleaved `--iterations 1` cells in run order:
 

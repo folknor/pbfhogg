@@ -1222,7 +1222,11 @@ mod stage_b_tests {
         }
     }
 
-    fn write_fixture(path: &Path, sites: i32, extra_addresses: i32) {
+    fn write_fixture(
+        path: &Path,
+        sites: i32,
+        extra_addresses: impl IntoIterator<Item = (i32, i32)>,
+    ) {
         // Several S2 faces, with coincident streets, addresses and
         // interpolation segments at each repeated site.
         let locations = [
@@ -1261,16 +1265,14 @@ mod stage_b_tests {
             block.add_node(first + 2, lat + 80_000, lon + 80_000, [], None);
             block.add_node(first + 3, lat + 80_000, lon, [], None);
         }
-        for addr in 0..extra_addresses {
+        for (addr, (lat, lon)) in extra_addresses.into_iter().enumerate() {
             if addr % 2048 == 0 {
                 write_block(&mut writer, &mut block);
             }
-            // This grid stays in one top-byte bucket at both levels, but
-            // spreads addresses across cells within it.
             block.add_node(
-                i64::from(sites) * 4 + i64::from(addr) + 1,
-                120_000_000 + addr / 256 * 2_000,
-                120_000_000 + addr % 256 * 2_000,
+                i64::from(sites) * 4 + i64::try_from(addr).expect("address index") + 1,
+                lat,
+                lon,
                 [("addr:housenumber", "9"), ("addr:place", "West End")],
                 None,
             );
@@ -1370,7 +1372,7 @@ mod stage_b_tests {
         let dir = crate::path_guard::tests::scratch();
         let indexed = dir.path().join("indexed.pbf");
         let unindexed = dir.path().join("unindexed.pbf");
-        write_fixture(&indexed, 17, 0);
+        write_fixture(&indexed, 17, []);
         // A mixed group exercises unindexed schedule discovery and the dense
         // before plain node ordering. Each has a duplicated address key.
         let keys = [
@@ -1434,7 +1436,7 @@ mod stage_b_tests {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("indexed.pbf");
         let index = dir.path().join("index");
-        write_fixture(&input, 17, 0);
+        write_fixture(&input, 17, []);
         let config = BuildConfig::default();
         generation(&input, &index, &config, InputValidation::Scoped).expect("build index");
 
@@ -1477,7 +1479,7 @@ mod stage_b_tests {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("indexed.pbf");
         let index = dir.path().join("index");
-        write_fixture(&input, 1, 0);
+        write_fixture(&input, 1, []);
         let config = BuildConfig::default();
         generation(&input, &index, &config, InputValidation::Scoped).expect("build index");
         let bytes = std::fs::read(index.join(FILE_ADDR_POINTS)).expect("address points");
@@ -1590,7 +1592,19 @@ mod stage_b_tests {
 
     #[test]
     fn parallel_stage_b_matches_serial_for_every_index_file() {
-        for (sites, extra_addresses) in [(1, 0), (17, 0), (257, 74_000)] {
+        // The grid varies cell keys inside one top-byte bucket at both
+        // levels. The worldwide grid puts a few records in each of many
+        // buckets. Repeated sites put distinct payloads at the same key.
+        let clustered =
+            (0..74_000).map(|i| (120_000_000 + i / 256 * 2_000, 120_000_000 + i % 256 * 2_000));
+        let scattered = (-8..=8)
+            .flat_map(|lat| (-17..=17).map(move |lon| (lat * 100_000_000, lon * 100_000_000)));
+        let cases = [
+            ("heavy ties", 257, Vec::new()),
+            ("one large bucket", 1, clustered.collect()),
+            ("many small buckets", 1, scattered.collect()),
+        ];
+        for (case, sites, extra_addresses) in cases {
             let dir = crate::path_guard::tests::scratch();
             let input = dir.path().join("source.osm.pbf");
             let parallel = dir.path().join("parallel");
@@ -1630,10 +1644,7 @@ mod stage_b_tests {
             for name in names {
                 let actual = std::fs::read(parallel.join(&name)).expect("parallel file");
                 let expected = std::fs::read(serial.join(&name)).expect("serial file");
-                assert!(
-                    actual == expected,
-                    "{name:?} differs at {sites} sites and {extra_addresses} extra addresses"
-                );
+                assert!(actual == expected, "{name:?} differs for {case}");
             }
         }
     }

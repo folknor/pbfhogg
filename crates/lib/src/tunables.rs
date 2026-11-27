@@ -1456,10 +1456,15 @@ pub(crate) const GEOCODE_ADDR_CHUNK: usize = 500_000;
 /// Pass 3 stage A chunk size, in interpolation ways.
 pub(crate) const GEOCODE_INTERP_CHUNK: usize = 100_000;
 
-/// Maximum number of buckets held at once for sorting, encoding and writing
-/// in geocode pass 3 stage B. A decoded `BucketRecord` can take more space
-/// than its 15-byte scratch record, so keep a bounded window of buckets.
-pub(crate) const GEOCODE_STAGE_B_SORT_WINDOW: usize = 8;
+/// Estimated live Stage B buffer bytes admitted in one batch. Leave room
+/// under the former eight-bucket window's planet anonymous-memory peak
+/// for the rest of the builder and allocator retention. A bucket whose
+/// working set exceeds this allowance runs by itself.
+pub(crate) const GEOCODE_STAGE_B_BATCH_BYTES: u64 = 4 << 30;
+
+/// Minimum records on both sides of a Stage B partition before offering a
+/// parallel sort job. Each side then has at least 256 KiB of decoded data.
+pub(crate) const GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS: usize = 16 * 1024;
 
 /// Target records per parallel encode and write in geocode pass 3 stage B.
 /// About 1 MiB of decoded records per range keeps writes large and lets a

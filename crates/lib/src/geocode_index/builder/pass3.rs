@@ -19,7 +19,7 @@ use s2::latlng::LatLng;
 
 use crate::tunables::{
     ADMIN_CELL_COUNT_BUDGET, GEOCODE_ADDR_CHUNK, GEOCODE_INTERP_CHUNK, GEOCODE_NUM_BUCKETS,
-    GEOCODE_STAGE_B_CHUNK_RECORDS, GEOCODE_STAGE_B_SORT_WINDOW, GEOCODE_STREET_CHUNK,
+    GEOCODE_STAGE_B_BATCH_BYTES, GEOCODE_STAGE_B_CHUNK_RECORDS, GEOCODE_STREET_CHUNK,
 };
 
 use super::Result;
@@ -34,6 +34,9 @@ use super::super::format::*;
 #[path = "pass3_admin.rs"]
 mod admin_cells;
 use admin_cells::admin_cells_for_polygon;
+
+#[path = "pass3_sort.rs"]
+mod bucket_sort;
 
 // ---------------------------------------------------------------------------
 // Cell entry types
@@ -763,19 +766,13 @@ pub(super) fn bucketed_cell_assignment_fused(
     Ok((fine_count, coarse_count))
 }
 
-/// Read one bucket file, free it, and sort its records by cell id. An absent
-/// file is a bucket no record selected.
-///
-/// The sort is `sort_unstable_by_key` over the records in file order, and
-/// both are part of the index's bytes: the order of a cell's list entries
-/// is whatever this sort makes of the file order (see [`append_chunk`]).
-fn read_sorted_bucket(
+/// Read a bucket in file order and free it. An absent file is a bucket no
+/// record selected.
+fn read_bucket(
     scratch: &crate::scratch::RunScratch,
-    bucket_dir: &ScratchSubdir,
-    bucket_idx: usize,
+    bucket_path: &ScratchPath,
 ) -> Result<Vec<BucketRecord>> {
-    let bucket_path = bucket_path(bucket_dir, bucket_idx)?;
-    let mut file = match crate::scratch::open(&bucket_path) {
+    let mut file = match crate::scratch::open(bucket_path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
@@ -795,16 +792,13 @@ fn read_sorted_bucket(
     drop(file);
     // Freed as soon as it is read to give the space back; the tree itself is
     // removed by the caller afterwards.
-    scratch.unlink(&bucket_path).map_err(|e| {
+    scratch.unlink(bucket_path).map_err(|e| {
         Error::from(e).context(format!(
             "failed to remove scratch bucket {}",
             bucket_path.display()
         ))
     })?;
-    let mut entries = parse_bucket_file(&data)?;
-    drop(data);
-    entries.sort_unstable_by_key(|e| e.cell_id);
-    Ok(entries)
+    parse_bucket_file(&data)
 }
 
 /// A range of whole cells, with every list offset relative to the start of
@@ -1070,9 +1064,46 @@ fn write_cell_range(
     Ok(())
 }
 
-/// Stage B holds at most one window of buckets. Sorts are independent by
-/// bucket, and encoding and writes are independent by whole-cell range
-/// even when most of the work falls in one bucket. Only layout is ordered.
+/// Charge the read/decode/encode buffers by file length. During encoding,
+/// each input record can account for at most one cell row, one list count,
+/// one list entry and one temporary record reference. Allow for Vec growth
+/// (including old plus new allocations) and range metadata. The raw input
+/// bytes are gone by encoding time, and the sort partitions in place.
+fn bucket_charge(path: &ScratchPath) -> u64 {
+    let file_bytes = match std::fs::metadata(path.as_path()) {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        // Run the bucket alone and let read_bucket report any actual failure
+        // in its usual context and in bucket order.
+        Err(_) => return u64::MAX,
+    };
+    let records = file_bytes.div_ceil(BucketRecord::SIZE as u64);
+    let ranges = records.div_ceil(GEOCODE_STAGE_B_CHUNK_RECORDS as u64);
+    let encoded = GeoCell::SIZE + size_of::<ListCount>() + SegmentRef::SIZE;
+    let per_record = size_of::<BucketRecord>() + 3 * (encoded + size_of::<&BucketRecord>());
+    // Cover the Vec minimum capacities, range descriptors and offsets.
+    let range_overhead = 8 * size_of::<EncodedCells>();
+    records
+        .saturating_mul(per_record as u64)
+        .saturating_add(ranges.saturating_mul(range_overhead as u64))
+}
+
+fn stage_b_batch_len(charges: &[u64], budget: u64) -> usize {
+    charges
+        .iter()
+        .scan(0u64, |total, &charge| {
+            *total = total.saturating_add(charge);
+            Some(*total)
+        })
+        .take_while(|&total| total <= budget)
+        .count()
+        .max(1)
+}
+
+/// Sort and encode the buckets in a byte-budgeted batch concurrently. A
+/// bucket larger than the budget runs alone. The sort can split one large
+/// bucket across workers, and encoding and writes split at cell boundaries.
+/// Only layout is ordered.
 fn run_stage_b(
     scratch: &crate::scratch::RunScratch,
     bucket_dir: &ScratchSubdir,
@@ -1087,15 +1118,21 @@ fn run_stage_b(
         super::create_index_file(addrs)?,
         super::create_index_file(interps)?,
     ];
+    let inputs = (0..GEOCODE_NUM_BUCKETS)
+        .map(|idx| bucket_path(bucket_dir, idx))
+        .collect::<Result<Vec<_>>>()?;
+    let charges: Vec<_> = inputs.iter().map(bucket_charge).collect();
     let mut layout = StageBLayout::default();
-    for start in (0..GEOCODE_NUM_BUCKETS).step_by(GEOCODE_STAGE_B_SORT_WINDOW) {
+    let mut start = 0;
+    while start < inputs.len() {
         cancel.check()?;
-        let end = (start + GEOCODE_STAGE_B_SORT_WINDOW).min(GEOCODE_NUM_BUCKETS);
+        let end = start + stage_b_batch_len(&charges[start..], GEOCODE_STAGE_B_BATCH_BYTES);
         let buckets: Vec<_> = executor.install(|| {
-            (start..end)
-                .into_par_iter()
-                .map(|idx| {
-                    let entries = read_sorted_bucket(scratch, bucket_dir, idx)?;
+            inputs[start..end]
+                .par_iter()
+                .map(|input| {
+                    let mut entries = read_bucket(scratch, input)?;
+                    bucket_sort::sort_bucket(executor.borrowed(), &mut entries);
                     encode_bucket_ranges(&entries)
                 })
                 .collect()
@@ -1112,6 +1149,7 @@ fn run_stage_b(
                 write_cell_range(&files, paths, offsets, &mut out)
             })
         })?;
+        start = end;
     }
     Ok(layout.cell_count)
 }
@@ -1136,7 +1174,8 @@ fn run_stage_b_serial(
     let mut prev_cell_id = None;
     for bucket in 0..GEOCODE_NUM_BUCKETS {
         cancel.check()?;
-        let entries = read_sorted_bucket(scratch, bucket_dir, bucket)?;
+        let mut entries = read_bucket(scratch, &bucket_path(bucket_dir, bucket)?)?;
+        entries.sort_unstable_by_key(|e| e.cell_id);
         let mut out = encode_cells(&entries)?;
         let Some((first, last)) = out.span else {
             continue;
@@ -1337,11 +1376,12 @@ mod tests {
     use crate::tunables::MAX_BUILD_S2_LEVEL;
 
     #[test]
-    fn stage_b_retains_at_most_eight_sorted_buckets() {
-        let window = std::hint::black_box(GEOCODE_STAGE_B_SORT_WINDOW);
-        assert!(window > 0);
-        assert!(window <= 8);
-        assert!(window < GEOCODE_NUM_BUCKETS);
+    fn stage_b_batches_by_bytes_and_runs_oversized_buckets_alone() {
+        let small = [1; GEOCODE_NUM_BUCKETS];
+        assert_eq!(stage_b_batch_len(&small, 256), GEOCODE_NUM_BUCKETS);
+        assert_eq!(stage_b_batch_len(&[2, 3, 0, 6, 1], 5), 3);
+        assert_eq!(stage_b_batch_len(&[6, 0, 1], 5), 1);
+        assert_eq!(stage_b_batch_len(&[2, u64::MAX, 1], 5), 1);
     }
 
     #[test]

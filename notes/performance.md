@@ -1203,20 +1203,20 @@ rules at `AdminEntry`.
 
 Kind: highest-conviction query rewrite.
 
-## PERF-054 - Geocode build still has a serial pass 2 consumer and a largest-bucket sort
+## PERF-054 - Geocode build still has a serial pass 2 consumer and serial Pass 3 work
 
 Reported by: geocode, pipeline.
 
-After the smoke-test and scoped-validation changes, the longest spans
-in the planet build on bygg (working tree on `63e4e397`, `ecfe45ac`) are
-Pass 3 stage B fine (18.7 s), stage A streets (11.1 s) and stage B coarse
-(8.7 s). See the [planet baseline](../reference/performance/geocode.md#planet-build-baseline-bygg-working-tree-on-63e4e397).
+Pass 3 stage B fine and coarse bucket sorts now run in parallel on the build
+executor and preserve the serial sort's tie order. On bygg, interleaved planet
+cells on HEAD `5f14f9c4` and its working tree measured about 4% lower wall time
+for the working tree. Fine fell from 18.7 s to 15.9 s and coarse from 8.7 s to
+8.0 s. Full index byte equality against the serial oracle passed. See the
+[planet measurements](../reference/performance/geocode.md#planet-build-after-parallel-pass-3-stage-b-sorting-bygg-head-5f14f9c4).
 
-Pass 3 stage B now splits fine and coarse buckets at cell boundaries,
-encodes in parallel and writes at disjoint prefix offsets. The largest
-bucket still sorts on one core. Splitting that sort by record volume needs
-to keep each cell together and preserve the order used to break ties.
-See the [stage B measurements](../reference/performance/geocode.md#pass-3-stage-b-encodes-and-writes-cell-ranges-in-parallel-bygg-b4e65632).
+Stage B still reads each raw bucket and runs its first partition serially;
+these are now the remaining bounds on the stage. Buckets are batched by
+estimated buffer use under 4 GiB, with an oversized bucket running alone.
 
 Pass 2 parallelizes node processing and way resolution, but one consumer
 still interns strings, encodes records, assigns offsets, writes geometry,

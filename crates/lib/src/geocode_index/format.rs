@@ -814,8 +814,8 @@ record! {
     /// read, so this layout can change without a `FORMAT_VERSION` bump.
     ///
     /// In memory the fields reorder to a 16-byte struct, one byte over the 15
-    /// on disk; Stage B holds a window of sorted buckets of these, which is
-    /// what `GEOCODE_STAGE_B_SORT_WINDOW` bounds.
+    /// on disk. Stage B admits buckets under the working-set byte budget in
+    /// `tunables.rs` and processes an oversized bucket on its own.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct BucketRecord {
         pub cell_id: u64,

@@ -26,6 +26,61 @@ Denmark `copy-pbf --dedupe yes`, `--iterations 1` interleaved: `1361533e`
 1.2 s `3806bf9d`, 1.1 s `14a0fb04`; `da1f1a55` 1.2 s `83b51430`, 1.2 s
 `8788f3aa`. Neutral at this resolution.
 
+## Type-filtered cat skips rejected bodies (bygg, working tree on `c0ec89ca`)
+
+Type-filtered cat uses readable indexdata in the blob header to select
+frames. It checks the declared extent of rejected frames and skips their
+bodies without allocating them. It buffers kept frames and decodes
+unindexed blobs to select elements. On refusal it discards the staged
+writer, so nothing is published.
+
+On bygg, A is HEAD `c0ec89ca` and B is the working tree on `c0ec89ca`
+for the variant under test. Cells are interleaved, each with `--iterations 1`,
+with one fstrim at the head of the planet suite.
+
+Final `copy-pbf --dataset planet` with header skipping and buffered kept
+frames:
+
+| Workload | Arm | Wall | Run |
+|---|---|---:|---|
+| `--type way` | B | 29.8 s | `7a1dc8db` |
+| `--type way` | A | 32.4 s | `544afb63` |
+| Plain | B | 42.4 s | `d3b89dd3` |
+| Plain | A | 54.4 s | `a9225b83` |
+
+Filtered wall time fell about 8 %, consistent with the earlier bounded
+range pairs. Plain passthrough is neutral. Its copy path is unchanged from
+HEAD and its cells vary by about 10 s on this host. Denmark `verify cat`
+passed on the final B.
+
+### Rejected range-copy experiment
+
+Earlier `copy-pbf --dataset planet` cells submitted kept frames as source
+ranges on B:
+
+| Range submission | Workload | Arm | Wall | Run |
+|---|---|---|---:|---|
+| Unbounded | `--type way` | A | 33.2 s | `8fa9c0f8` |
+| Unbounded | `--type way` | B | 37.2 s | `61b84fcf` |
+| Unbounded | `--type way` | A | 28.6 s | `7c2dc85d` |
+| Unbounded | `--type way` | B | 30.0 s | `c0113a7e` |
+| 16 MiB | `--type way` | B | 29.6 s | `48b40018` |
+| 16 MiB | `--type way` | A | 31.5 s | `873d47a2` |
+| 16 MiB | `--type way` | B | 28.3 s | `8840e914` |
+| 16 MiB | `--type way` | A | 31.5 s | `52983ab5` |
+| 16 MiB | Plain | A | 43.5 s | `118d9659` |
+| 16 MiB | Plain | B | 64 s | `e0cc5b4f` |
+| 16 MiB | Plain | A | 54.1 s | `16d20848` |
+| 16 MiB | Plain | B | 65 s | `de159370` |
+
+Buffered cat range copy was removed. Unbounded ranges lost on filtered
+cat. Submitting at 16 MiB recovered the filtered gain, but plain passthrough
+was substantially slower in both pairs. The likely cause is that the
+buffered backend executes `copy_file_range` serially on its writer thread,
+while buffered frame transfer overlaps producer reads with writer writes.
+Revisit buffered cat range copy only after a named backend change such as
+parallel range execution.
+
 ## Cat passthrough (indexdata generation)
 
 No `--type` filter. Decompresses each blob to scan IDs/tags, reframes BlobHeader

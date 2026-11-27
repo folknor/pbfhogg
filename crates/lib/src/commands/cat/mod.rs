@@ -1,6 +1,7 @@
 //! Concatenate PBF files with optional type filtering. Equivalent to `osmium cat`.
 
 pub mod dedupe;
+mod raw;
 pub mod reindex;
 mod repair;
 
@@ -20,8 +21,10 @@ use crate::{BlobFilter, Element, ElementKind, PrimitiveBlock};
 use super::output_header::{Declared, OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
 use crate::error::Error;
+use crate::file_writer::FileWriter;
 use crate::read::frame::Frames;
 use crate::read::input::{InputSource, PinnedInput};
+use raw::RawInput;
 
 /// Which metadata attributes to strip via `--clean`.
 #[derive(Clone, Copy, Default)]
@@ -109,11 +112,12 @@ impl CatStats {
 
 /// Concatenate one or more PBF files into a single output.
 ///
-/// If `type_filter` is set, only elements of matching types are included
-/// (requires full decode). Without a filter, blobs are passed through as
-/// raw bytes (zero decode); an unindexed blob is scanned and reframed with
-/// indexdata, and one whose block no single index can describe is
-/// re-encoded into single-kind blocks (see `reencode_unclassifiable`).
+/// If `type_filter` is set, readable indexdata selects whole blobs by kind.
+/// Unindexed blobs are decoded and only matching elements are re-encoded.
+/// Without a filter, indexed blobs pass through as raw bytes. An unindexed
+/// blob is scanned and reframed with indexdata, and one whose block no
+/// single index can describe is re-encoded into single-kind blocks (see
+/// `reencode_unclassifiable`). Cleaning decodes and re-encodes selected data.
 ///
 /// Every input is pinned before any is read
 /// ([`PinnedInput`](crate::read::input::PinnedInput)), a path given twice
@@ -456,20 +460,60 @@ fn cat_passthrough(
         write.backend,
         host,
     )?;
+    let scanned = write_passthrough(files, write, declared, host, &mut writer);
+    let PassthroughTally {
+        blobs,
+        reencoded,
+        omitted,
+        elements,
+        opened,
+    } = finish_passthrough(writer, scanned)?;
+    note_reencoded(host, reencoded - omitted, omitted);
+    Ok(CatStats {
+        blobs_passthrough: blobs,
+        blobs_rewritten: 0,
+        blobs_reencoded: reencoded,
+        elements_written: elements,
+        blobs_payloads_opened: opened,
+        blobs_repaired: 0,
+    })
+}
+
+fn finish_passthrough<T>(mut writer: PbfWriter<FileWriter>, scanned: Result<T>) -> Result<T> {
+    match scanned {
+        Ok(value) => {
+            writer.flush()?;
+            Ok(value)
+        }
+        Err(error) => {
+            // Taking the inner writer fails the staging session. The pipeline
+            // owns its writer, so into_inner returns its ownership error and
+            // joins the pipeline through Drop. Keep the original scan error.
+            drop(writer.into_inner());
+            Err(error)
+        }
+    }
+}
+
+fn write_passthrough(
+    files: &[PinnedInput],
+    write: &WriteOptions,
+    declared: Declared,
+    host: &crate::host::Entered<'_>,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<PassthroughTally> {
     let compression = write.compression;
     let metrics = &host.invocation.metrics().writer;
     let mut tally = PassthroughTally::default();
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     for input in files {
-        let file = input.path();
         let mut frames = Frames::of_file_input(
-            FileReader::open_in(input, direct_io, &host.invocation)?,
-            file,
+            FileReader::open_in(input, write.direct_reads, &host.invocation)?,
+            input.path(),
             host,
         );
-        // cat is the remedy for a partially indexed file: it indexes every
-        // blob that lacks indexdata, so it is exempt from the refusal.
+        // Plain cat indexes the blobs that lack indexdata.
         frames.accept_partial_index();
 
         // The indexed prefix is copied on the walk itself, with no decode and
@@ -480,12 +524,12 @@ fn cat_passthrough(
         // - indexed or not - takes the pool, so a partially indexed file is
         // handled either way, with the blobs written in input order.
         let mut first_unindexed = None;
-        while let Some(mut frame) = frames.next_raw()? {
+        while let Some(frame) = frames.next_raw()? {
             if !matches!(frame.blob_type, BlobKind::OsmData) {
                 continue;
             }
             if frame.index.is_some() {
-                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                writer.write_raw_owned(frame.frame_bytes)?;
                 tally.blobs += 1;
             } else {
                 first_unindexed = Some(frame);
@@ -498,34 +542,18 @@ fn cat_passthrough(
         let id = first.id;
         let done = reindex_frame(first, &mut decompress_buf, declared, compression, metrics)
             .map_err(|e| frames.locate(id, e))?;
-        tally.fold(done, &mut writer)?;
+        tally.fold(done, writer)?;
         crate::read::frame_pool::map_frames_ordered(
             &mut frames,
             host,
             |frame| matches!(frame.blob_type, BlobKind::OsmData).then_some(frame),
             Vec::new,
             |buf, frame| reindex_frame(frame, buf, declared, compression, metrics),
-            |done| tally.fold(done, &mut writer),
+            |done| tally.fold(done, writer),
         )?;
     }
 
-    writer.flush()?;
-    let PassthroughTally {
-        blobs,
-        reencoded,
-        omitted,
-        elements,
-        opened,
-    } = tally;
-    note_reencoded(host, reencoded - omitted, omitted);
-    Ok(CatStats {
-        blobs_passthrough: blobs,
-        blobs_rewritten: 0,
-        blobs_reencoded: reencoded,
-        elements_written: elements,
-        blobs_payloads_opened: opened,
-        blobs_repaired: 0,
-    })
+    Ok(tally)
 }
 
 /// What plain cat did with one data blob.
@@ -592,14 +620,14 @@ impl PassthroughTally {
 /// built, or re-encoded when no single index describes its block. Errors are
 /// unlocated; the caller places them at the frame.
 fn reindex_frame(
-    mut frame: crate::read::frame::RawBlobFrame,
+    frame: crate::read::frame::RawBlobFrame,
     buf: &mut Vec<u8>,
     declared: Declared,
     compression: Compression,
     metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<Reindexed> {
     if frame.index.is_some() {
-        return Ok(Reindexed::Copied(std::mem::take(&mut frame.frame_bytes)));
+        return Ok(Reindexed::Copied(frame.frame_bytes));
     }
     let blob_bytes = frame.blob_bytes();
     decompress_blob_raw(blob_bytes, buf)?;
@@ -953,7 +981,6 @@ fn cat_type_passthrough(
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<CatStats> {
-    let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
     let direct_io = write.direct_reads;
 
     // Matching indexed blobs are copied whole; an unindexed blob is decoded
@@ -970,6 +997,19 @@ fn cat_type_passthrough(
         write.backend,
         host,
     )?;
+    let scanned = write_type_passthrough(files, tf, write, declared, host, &mut writer);
+    finish_passthrough(writer, scanned)
+}
+
+fn write_type_passthrough(
+    files: &[PinnedInput],
+    tf: TypeFilter,
+    write: &WriteOptions,
+    declared: Declared,
+    host: &crate::host::Entered<'_>,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<CatStats> {
+    let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
     let mut blobs_passthrough: u64 = 0;
     let mut blobs_decoded: u64 = 0;
     let mut elements_written: u64 = 0;
@@ -986,76 +1026,64 @@ fn cat_type_passthrough(
     let mut refs_buf: Vec<i64> = Vec::new();
 
     for input in files {
-        let file = input.path();
-        let mut frames = Frames::of_file_input(
-            FileReader::open_in(input, direct_io, &host.invocation)?,
-            file,
-            host,
-        );
-        // cat is the remedy for a partially indexed file, so `--type` is
-        // exempt from the refusal: a blob without indexdata is decoded and
-        // its selected elements re-encoded with fresh indexdata.
-        frames.accept_partial_index();
-
-        while let Some(mut frame) = frames.next_raw()? {
-            match &frame.blob_type {
-                BlobKind::OsmHeader => {}
-                BlobKind::OsmData => {
-                    if let Some(ref idx) = frame.index {
-                        if !blob_filter.wants_index(idx) {
-                            continue;
-                        }
-                        writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
-                        blobs_passthrough += 1;
-                    } else {
-                        let blob_bytes = frame.blob_bytes();
-                        decompress_buf.clear();
-                        let id = frame.id;
-                        let locate = |e: Error| frames.locate(id, e);
-                        decompress_blob_raw(blob_bytes, &mut decompress_buf).map_err(locate)?;
-                        // Take the decompressed Vec straight into the block: no
-                        // Bytes round-trip, no second whole-buffer copy (the
-                        // dropped `new_with_scratch(Bytes)` route paid a `to_vec`).
-                        // `decompress_buf` is left empty and reallocated next blob.
-                        let block = PrimitiveBlock::from_vec_with_scratch(
-                            std::mem::take(&mut decompress_buf),
-                            &mut st_scratch,
-                            &mut gr_scratch,
-                        )
-                        .map_err(locate)?;
-                        output_blocks.clear();
-                        let count = process_block(
-                            &block,
-                            &mut bb,
-                            &mut output_blocks,
-                            &tf,
-                            &clean,
-                            &mut refs_buf,
-                        )?;
-                        flush_local(&mut bb, &mut output_blocks)?;
-                        if declared.way_enrichment()
-                            && output_blocks
-                                .iter()
-                                .any(|b| b.index.kind == crate::ElementKind::Way)
-                        {
-                            return Err(locate(
-                                declared.broken_by_unindexed_way_blob("re-encoding it"),
-                            ));
-                        }
-                        super::split::fit_blocks(&mut output_blocks, &limits).map_err(locate)?;
-                        for block in output_blocks.drain(..) {
-                            writer.write_primitive_block_owned(block)?;
-                        }
-                        blobs_decoded += 1;
-                        elements_written += count;
-                    }
-                }
-                _ => {}
+        let mut raw = RawInput::open(input, write.direct_reads, host)?;
+        while let Some(frame) = raw.next_header()? {
+            if !matches!(frame.header.blob_type, BlobKind::OsmData) {
+                raw.frames.skip_payload()?;
+                continue;
             }
+            if let Some(idx) = frame.header.index() {
+                if blob_filter.wants_index(&idx) {
+                    writer.write_raw_owned(raw.read_frame(&frame)?)?;
+                    blobs_passthrough += 1;
+                } else {
+                    // Indexed passthrough has always treated the Blob body
+                    // as opaque, even when the type filter drops the frame.
+                    raw.frames.skip_payload()?;
+                }
+                continue;
+            }
+
+            let mut blob_bytes = Vec::with_capacity(frame.data_size);
+            raw.frames.read_payload(&mut blob_bytes)?;
+            decompress_buf.clear();
+            let locate = |e: Error| raw.frames.locate(frame.id, e);
+            decompress_blob_raw(&blob_bytes, &mut decompress_buf).map_err(locate)?;
+            // Give the block the decompressed Vec directly, without copying it.
+            let block = PrimitiveBlock::from_vec_with_scratch(
+                std::mem::take(&mut decompress_buf),
+                &mut st_scratch,
+                &mut gr_scratch,
+            )
+            .map_err(locate)?;
+            output_blocks.clear();
+            let count = process_block(
+                &block,
+                &mut bb,
+                &mut output_blocks,
+                &tf,
+                &clean,
+                &mut refs_buf,
+            )?;
+            flush_local(&mut bb, &mut output_blocks)?;
+            if declared.way_enrichment()
+                && output_blocks
+                    .iter()
+                    .any(|b| b.index.kind == ElementKind::Way)
+            {
+                return Err(locate(
+                    declared.broken_by_unindexed_way_blob("re-encoding it"),
+                ));
+            }
+            super::split::fit_blocks(&mut output_blocks, &limits).map_err(locate)?;
+            for block in output_blocks.drain(..) {
+                writer.write_primitive_block_owned(block)?;
+            }
+            blobs_decoded += 1;
+            elements_written += count;
         }
     }
 
-    writer.flush()?;
     // Only an unindexed blob is opened, and every one is re-encoded.
     Ok(CatStats {
         blobs_passthrough,
@@ -1441,5 +1469,202 @@ impl KindPhase {
             (ElementKind::Relation, true) => "CAT_RELATIONS_START",
             (ElementKind::Relation, false) => "CAT_RELATIONS_END",
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::block_builder::HeaderBuilder;
+    use crate::host::{Diagnostics, Host};
+    use crate::output::{Output, Overwrite};
+    use crate::write::OutputBackend;
+
+    const WAYS: TypeFilter = TypeFilter {
+        nodes: false,
+        ways: true,
+        relations: false,
+    };
+
+    fn header_frame() -> Vec<u8> {
+        let mut writer = PbfWriter::new(Vec::new(), Compression::None);
+        writer
+            .write_header(&HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        writer.into_inner().unwrap()
+    }
+
+    fn data_frame(kind: ElementKind, id: i64) -> Vec<u8> {
+        let mut block = BlockBuilder::new();
+        let tags = std::iter::empty::<(&str, &str)>();
+        match kind {
+            ElementKind::Node => block.add_node(id, 0, 0, tags, None),
+            ElementKind::Way => block.add_way(id, tags, &[1], None),
+            ElementKind::Relation => block.add_relation(id, tags, &[], None),
+        }
+        let mut writer = PbfWriter::new(Vec::new(), Compression::None);
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        writer.into_inner().unwrap()
+    }
+
+    fn write_input(path: &Path, data: &[Vec<u8>]) {
+        let mut bytes = header_frame();
+        for frame in data {
+            bytes.extend_from_slice(frame);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The previous path read each frame whole before deciding whether to
+    /// write it. These fixtures only contain data with readable indexdata.
+    fn buffered_reference(path: &Path, filter: Option<TypeFilter>) -> Result<Vec<u8>> {
+        let owner = Host::for_tests();
+        let host = owner.entered();
+        let pin = PinnedInput::pin(path, &host)?;
+        let header = cat_output_header(
+            &[read_header(&pin, false, &host)?],
+            Ways::BlobsCopied,
+            &HeaderOverrides::default(),
+            &host,
+        )?;
+        let mut writer = PbfWriter::new(Vec::new(), Compression::None);
+        let framed = writer.write_header(&header.bytes);
+        let inner = writer.into_inner();
+        let mut bytes = framed.and(inner)?;
+        let mut frames = Frames::of_file_input(
+            FileReader::open_in(&pin, false, &host.invocation)?,
+            path,
+            &host,
+        );
+        frames.accept_partial_index();
+        let filter = filter.map(|tf| BlobFilter::new(tf.nodes, tf.ways, tf.relations));
+        while let Some(frame) = frames.next_raw()? {
+            if matches!(frame.blob_type, BlobKind::OsmData)
+                && filter.as_ref().is_none_or(|filter| {
+                    frame
+                        .index
+                        .as_ref()
+                        .is_some_and(|idx| filter.wants_index(idx))
+                })
+            {
+                bytes.extend_from_slice(&frame.frame_bytes);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn run_cat(
+        input: &Path,
+        dest: &Path,
+        filter: Option<TypeFilter>,
+        backend: OutputBackend,
+        host: &Host,
+    ) -> Result<CatStats> {
+        cat(
+            &[input],
+            Output::new(dest, Overwrite::Refuse, &Diagnostics::discard())?,
+            filter,
+            &CleanAttrs::default(),
+            &WriteOptions {
+                compression: Compression::None,
+                backend,
+                ..WriteOptions::default()
+            },
+            &HeaderOverrides::default(),
+            host,
+        )
+    }
+
+    #[test]
+    fn indexed_cat_matches_buffered_reference() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.path().join("indexed.pbf");
+        let data = [
+            data_frame(ElementKind::Way, 10),
+            data_frame(ElementKind::Way, 11),
+            data_frame(ElementKind::Node, 1),
+            data_frame(ElementKind::Way, 12),
+            data_frame(ElementKind::Way, 13),
+        ];
+        write_input(&input, &data);
+
+        for (name, filter, backend, blobs) in [
+            ("plain", None, OutputBackend::Buffered, 5),
+            ("ways-parallel", Some(WAYS), OutputBackend::Parallel, 4),
+            ("ways-buffered", Some(WAYS), OutputBackend::Buffered, 4),
+        ] {
+            let dest = scratch.path().join(name);
+            let host = Host::for_tests();
+            let stats = run_cat(&input, &dest, filter, backend, &host).unwrap();
+            assert_eq!(
+                std::fs::read(dest).unwrap(),
+                buffered_reference(&input, filter).unwrap()
+            );
+            assert_eq!(stats.blobs_passthrough, blobs);
+            assert_eq!(stats.blobs_payloads_opened, 0);
+        }
+    }
+
+    #[test]
+    fn type_filtered_cat_refuses_truncated_or_malformed_rejected_frames() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.path().join("rejected.pbf");
+        let dest = scratch.path().join("out.pbf");
+        let first = data_frame(ElementKind::Way, 10);
+        // Cat submits the kept way before it reaches the bad node frame.
+        let rejected = data_frame(ElementKind::Node, 1);
+        let header_len = u32::from_be_bytes(rejected[..4].try_into().unwrap());
+        let body_start = 4 + header_len as usize;
+
+        let mut truncated = rejected.clone();
+        truncated.pop().unwrap();
+        let mut bad_header = rejected;
+        bad_header.insert(body_start, 0x0f);
+        bad_header[..4].copy_from_slice(&(header_len + 1).to_be_bytes());
+
+        for bad in [truncated, bad_header] {
+            write_input(&input, &[first.clone(), bad]);
+            let reference = buffered_reference(&input, Some(WAYS)).unwrap_err();
+            for backend in [OutputBackend::Buffered, OutputBackend::Parallel] {
+                let Err(error) = run_cat(&input, &dest, Some(WAYS), backend, &Host::for_tests())
+                else {
+                    panic!("cat accepted a malformed frame");
+                };
+                assert_eq!(error.report(), reference.report(), "{backend:?}");
+                assert!(!dest.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn type_filtered_cat_preserves_opaque_envelope_handling() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.path().join("rejected.pbf");
+        let dest = scratch.path().join("out.pbf");
+        let mut rejected = data_frame(ElementKind::Node, 1);
+        let header_len = u32::from_be_bytes(rejected[..4].try_into().unwrap());
+        let body = &mut rejected[4 + header_len as usize..];
+        body.fill(0xff);
+        let error = decompress_blob_raw(body, &mut Vec::new()).unwrap_err();
+        assert!(matches!(error.kind(), crate::ErrorKind::WireFormat { .. }));
+        write_input(&input, &[data_frame(ElementKind::Way, 10), rejected]);
+
+        run_cat(
+            &input,
+            &dest,
+            Some(WAYS),
+            OutputBackend::Buffered,
+            &Host::for_tests(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dest).unwrap(),
+            buffered_reference(&input, Some(WAYS)).unwrap()
+        );
     }
 }

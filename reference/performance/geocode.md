@@ -1,6 +1,52 @@
 # Geocode
 
-## Format 10: persisted interpolation prefixes (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
+## Planet build baseline (bygg, working tree on `63e4e397`)
+
+Planet `geocode-build`, interleaved `--iterations 1` cells in run order:
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A, HEAD `63e4e397` | 1m48s | `461fc6eb` |
+| B, working tree on `63e4e397` | 1m30s | `1566b13c` |
+| A, HEAD `63e4e397` | 1m47s | `a92a27b6` |
+| B, working tree on `63e4e397` | 1m31s | `ecfe45ac` |
+
+The build was about 16 % faster in both pairs. The planet hotpath at
+`63e4e397` (`15055959`, 107.3 s wall) showed 16.65 s in
+`GEOCODE_SMOKE_TEST`, 291 core-s in `decompress_blob_raw` and 159 core-s
+in `validate_block`.
+
+| Span | A hotpath `15055959` | B timing `ecfe45ac` |
+|---|---:|---:|
+| `GEOCODE_SMOKE_TEST` | 16.65 s | 3.04 s |
+| `GEOCODE_SCHEDULES` | 7.1 s | 6.5 s |
+| `GEOCODE_PASS1_5` | 12.2 s | 11.3 s |
+| `GEOCODE_PASS2` | 29.3 s | 26.9 s |
+| `GEOCODE_PASS3` | 41.6 s | 43.3 s |
+
+The smoke test accounts for most of the wall gain. Pass 3 held within
+run-to-run variation. Its largest spans on `ecfe45ac` were stage B fine
+(18.7 s), stage A streets (11.1 s) and stage B coarse (8.7 s).
+
+The build smoke test opens the written index once, validates its structure
+and checks that address record 0, when present, appears in its own fine
+and coarse cells. Structural scans run on the build executor and report
+the same first failure as serial validation. The smoke test runs no
+reverse-geocode queries and skips the query-only interpolation lookup table.
+
+Passes 1, 1.5 and 2 scope validation to their consumers. They retain
+framing, array counts, string-table UTF-8, kind claims and validation of
+every field that contributes to the index. Node coordinates still receive
+the exact nanodegree domain check before narrowing to `i32`. See
+[DEVIATIONS.md](../../DEVIATIONS.md#input-validation-during-geocode-index-builds)
+for the changes in input refusals.
+
+Verification passed on B on bygg. This included tier 1,
+`pbfhogg-verify geocode` on Denmark and Germany, and `geocode-seam`.
+
+## History
+
+### Format 10: persisted interpolation prefixes (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 Format 10 stores each interpolation section's total and segment prefix
 lengths and drops unresolved ways; Pass 1.5 spills fold into one shared
@@ -20,7 +66,7 @@ command over the library bench's point sequence), germany measured call:
 `1361533e` 3.9 s `ba89b165`, 3.9 s `16ec1d27`; `6808a7c1` 1.2 s
 `a86fd3b0`, 1.1 s `cb3f3e24`. About 3.4x faster.
 
-## build-geocode-index
+### Earlier build baselines
 
 Reverse geocoding index build. 4-pass pipeline: nodes (address points + dense
 node index), ways (streets, buildings, interpolation), relations (admin boundary
@@ -763,9 +809,7 @@ predates the presence test.
 The build is unchanged: Denmark `--bench 3 --force`, 1770.6 ms against the
 stored `0bf93c83` at `7e7ede73`, 1929.8 ms.
 
-## History
-
-### build-geocode-index
+### Early build optimization and profiling
 
 #### Optimization arc (Denmark, plantasjen)
 

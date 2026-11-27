@@ -8,6 +8,7 @@ use std::path::Path;
 use std::{error::Error, fmt};
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use s2::cell::Cell;
 use s2::cellid::CellID;
@@ -566,8 +567,8 @@ impl Reader {
     /// scanned; a query that reads an entry naming a record past its file
     /// fails with [`QueryError::DanglingReference`] or
     /// [`QueryError::DanglingSegment`] rather than skipping it. The
-    /// builder's smoke test calls this same open path, so its validation pass
-    /// is also part of build time. There is no unvalidated open: a caller that
+    /// builder's smoke test runs the same structural checks in parallel,
+    /// so this validation is also part of build time. There is no unvalidated open: a caller that
     /// reopens an index it has just built or checksummed pays this pass again
     /// (a content checksum would not avoid it, since verifying one reads every
     /// byte). Open also keeps in memory the IDs of the coarse cells that list
@@ -592,22 +593,41 @@ impl Reader {
     /// A file is missing, unreadable or malformed; the error names the
     /// index directory, and the file (and record) where one is at fault.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_located(dir).map_err(|e| e.locate(crate::error::Location::in_file(dir)))
+        Self::map_located(dir)
+            .and_then(Self::finish_open)
+            .map_err(|e| e.locate(crate::error::Location::in_file(dir)))
     }
 
     #[cfg(unix)]
-    fn open_located(dir: &Path) -> Result<Self> {
+    fn map_located(dir: &Path) -> Result<Self> {
         use std::os::fd::AsFd;
         let handle = crate::read::input::open_directory(dir)?;
-        Self::open_in(&IndexDir {
+        Self::map_in(&IndexDir {
             handle: handle.as_fd(),
             name: dir,
         })
     }
 
     #[cfg(not(unix))]
-    fn open_located(dir: &Path) -> Result<Self> {
-        Self::open_in(&IndexDir { name: dir })
+    fn map_located(dir: &Path) -> Result<Self> {
+        Self::map_in(&IndexDir { name: dir })
+    }
+
+    /// Validate a just-written index through the same mappings and checks
+    /// as a public open. The smoke check only needs two cell lookups, so it
+    /// does not populate the query-time interpolation lookup table.
+    #[cfg(feature = "commands")]
+    pub(super) fn check_written_index(
+        dir: &Path,
+        executor: &crate::host::Executor,
+        address_cells: impl FnOnce() -> Option<(u64, u64)>,
+    ) -> Result<Option<(bool, bool)>> {
+        let check = || {
+            let reader = Self::map_located(dir)?;
+            executor.install(|| reader.validate_structure(true))?;
+            Ok(address_cells().map(|(fine, coarse)| reader.address_listed_in(0, fine, coarse)))
+        };
+        check().map_err(|e: crate::Error| e.locate(crate::error::Location::in_file(dir)))
     }
 
     /// Open the index directory `dir`, an open handle to it (a `File`,
@@ -622,13 +642,14 @@ impl Reader {
     /// path to name, errors name the file within the directory.
     #[cfg(unix)]
     pub fn open_dir(dir: impl std::os::fd::AsFd) -> Result<Self> {
-        Self::open_in(&IndexDir {
+        Self::map_in(&IndexDir {
             handle: dir.as_fd(),
             name: Path::new(""),
         })
+        .and_then(Self::finish_open)
     }
 
-    fn open_in(dir: &IndexDir<'_>) -> Result<Self> {
+    fn map_in(dir: &IndexDir<'_>) -> Result<Self> {
         let header_path = dir.label(format::FILE_HEADER);
         let header_bytes = dir.read(format::FILE_HEADER)?;
         let in_header = |e: crate::Error| e.locate(crate::error::Location::in_file(&header_path));
@@ -654,7 +675,7 @@ impl Reader {
                 format::min_cell_width_m(level) >= GEOCODE_PRESENCE_CELL_RADII * coarse_radius_m
             })
             .unwrap_or(0);
-        let mut reader = Self {
+        Ok(Self {
             #[cfg(pbfhogg_test_hooks)]
             admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
             fine_max_dist_sq: geo::meters_to_radians_sq(fine_radius_m),
@@ -681,16 +702,19 @@ impl Reader {
             admin_polygons: dir.records(format::FILE_ADMIN_POLYGONS)?,
             admin_vertices: dir.records(format::FILE_ADMIN_VERTICES)?,
             strings: dir.mmap(format::FILE_STRINGS)?,
-        };
-        reader.validate_structure()?;
-        reader.coarse_interp_cells = reader
+        })
+    }
+
+    fn finish_open(mut self) -> Result<Self> {
+        self.validate_structure(false)?;
+        self.coarse_interp_cells = self
             .coarse_geo_cells
             .table()
             .iter()
             .filter(|cell| cell.interp_offset != format::NO_DATA_U64)
             .map(|cell| cell.cell_id)
             .collect();
-        Ok(reader)
+        Ok(self)
     }
 
     // Deliberately no per-entry reference sweep here (way_index against
@@ -712,7 +736,7 @@ impl Reader {
     // level, the string sentinel) are checked here instead.
     // To revisit: Reader::open wall and majflt on a cold planet index, with
     // and without the sweep.
-    fn validate_structure(&self) -> Result<()> {
+    fn validate_structure(&self, parallel: bool) -> Result<()> {
         fn exact(name: &str, actual: usize, count: u32, size: usize) -> Result<()> {
             let expected = usize::try_from(count)
                 .ok()
@@ -779,6 +803,7 @@ impl Reader {
             &self.addr_entries,
             &self.interp_entries,
             &self.header,
+            parallel,
         )?;
         Self::validate_geo_tree(
             format::FILE_COARSE_GEO_CELLS,
@@ -787,8 +812,9 @@ impl Reader {
             &self.coarse_addr_entries,
             &self.coarse_interp_entries,
             &self.header,
+            parallel,
         )?;
-        self.validate_admin_tree()?;
+        self.validate_admin_tree(parallel)?;
         // Offset 0 is the empty string of every absent optional field, so the
         // pool must begin with the length-zero sentinel entry, checked even
         // when no record names a string at all. Decoding alone is not enough:
@@ -801,7 +827,7 @@ impl Reader {
             )
             .context(format::FILE_STRINGS));
         }
-        self.validate_way_geometry()?;
+        self.validate_way_geometry(parallel)?;
         Ok(())
     }
 
@@ -815,14 +841,15 @@ impl Reader {
     /// Both admin searches binary-search the cells, as the geo searches do,
     /// so cells out of order or repeated would read as missing ones: the
     /// same strict ascending check as [`Self::validate_geo_tree`].
-    fn validate_admin_tree(&self) -> Result<()> {
-        let mut previous = None;
-        for (index, cell) in self.admin_cells.table().iter().enumerate() {
-            (|| -> Result<()> {
-                if previous.is_some_and(|previous| previous >= cell.cell_id) {
+    fn validate_admin_tree(&self, parallel: bool) -> Result<()> {
+        validate_records(
+            self.admin_cells.table(),
+            format::FILE_ADMIN_CELLS,
+            parallel,
+            |previous, cell| {
+                if previous.is_some_and(|p| p.cell_id >= cell.cell_id) {
                     return Err(corrupt("cell IDs are not strictly ascending"));
                 }
-                previous = Some(cell.cell_id);
                 validate_list(&self.admin_entries, cell.entries_offset, "admin entry")?;
                 no_targets(
                     &self.admin_entries,
@@ -830,10 +857,8 @@ impl Reader {
                     self.header.admin_polygon_count,
                     "admin entry",
                 )
-            })()
-            .map_err(|e| in_record(e, format::FILE_ADMIN_CELLS, index))?;
-        }
-        Ok(())
+            },
+        )
     }
 
     /// The remaining offset-into-a-file relationships in the format, all of
@@ -895,9 +920,12 @@ impl Reader {
         Ok(())
     }
 
-    fn validate_way_geometry(&self) -> Result<()> {
-        for (index, way) in self.street_ways.table().iter().enumerate() {
-            (|| -> Result<()> {
+    fn validate_way_geometry(&self, parallel: bool) -> Result<()> {
+        validate_records(
+            self.street_ways.table(),
+            format::FILE_STREET_WAYS,
+            parallel,
+            |_, way| {
                 validate_span(
                     &self.street_nodes,
                     way.node_offset,
@@ -905,15 +933,19 @@ impl Reader {
                     "street way node",
                 )?;
                 validate_string_offset(way.name_offset, &self.strings, "street way name")
-            })()
-            .map_err(|e| in_record(e, format::FILE_STREET_WAYS, index))?;
-        }
-        for (index, way) in self.interp_ways.table().iter().enumerate() {
-            self.validate_interp_way(&way)
-                .map_err(|e| in_record(e, format::FILE_INTERP_WAYS, index))?;
-        }
-        for (index, poly) in self.admin_polygons.table().iter().enumerate() {
-            (|| -> Result<()> {
+            },
+        )?;
+        validate_records(
+            self.interp_ways.table(),
+            format::FILE_INTERP_WAYS,
+            parallel,
+            |_, way| self.validate_interp_way(&way),
+        )?;
+        validate_records(
+            self.admin_polygons.table(),
+            format::FILE_ADMIN_POLYGONS,
+            parallel,
+            |_, poly| {
                 // Producer rings repeat their first vertex: assemble_rings
                 // keeps only closed rings and simplify_ring preserves both
                 // endpoints. Do not scan every vertex here solely to
@@ -950,11 +982,13 @@ impl Reader {
                     &self.strings,
                     "admin polygon country code",
                 )
-            })()
-            .map_err(|e| in_record(e, format::FILE_ADMIN_POLYGONS, index))?;
-        }
-        for (index, pt) in self.addr_points.table().iter().enumerate() {
-            (|| -> Result<()> {
+            },
+        )?;
+        validate_records(
+            self.addr_points.table(),
+            format::FILE_ADDR_POINTS,
+            parallel,
+            |_, pt| {
                 validate_string_offset(
                     pt.housenumber_offset,
                     &self.strings,
@@ -975,10 +1009,8 @@ impl Reader {
                     ));
                 }
                 Ok(())
-            })()
-            .map_err(|e| in_record(e, format::FILE_ADDR_POINTS, index))?;
-        }
-        Ok(())
+            },
+        )
     }
 
     // Fine and coarse trees have the same shape and different files. Keep
@@ -992,41 +1024,36 @@ impl Reader {
         addrs: &Lists<AddrEntry>,
         interps: &Lists<SegmentRef>,
         header: &Header,
+        parallel: bool,
     ) -> Result<()> {
         // Queries binary-search the cells and test ID ranges against them,
         // so out-of-order cells would read as missing ones.
-        let mut previous = None;
-        for (index, cell) in cells.table().iter().enumerate() {
-            (|| -> Result<()> {
-                if previous.is_some_and(|previous| previous >= cell.cell_id) {
-                    return Err(corrupt("cell IDs are not strictly ascending"));
-                }
-                previous = Some(cell.cell_id);
-                validate_list(addrs, cell.addr_offset, "address entry")?;
-                validate_list(streets, cell.street_offset, "street entry")?;
-                validate_list(interps, cell.interp_offset, "interpolation entry")?;
-                no_targets(
-                    addrs,
-                    cell.addr_offset,
-                    header.addr_point_count,
-                    "address entry",
-                )?;
-                no_targets(
-                    streets,
-                    cell.street_offset,
-                    header.street_way_count,
-                    "street entry",
-                )?;
-                no_targets(
-                    interps,
-                    cell.interp_offset,
-                    header.interp_way_count,
-                    "interpolation entry",
-                )
-            })()
-            .map_err(|e| in_record(e, cells_file, index))?;
-        }
-        Ok(())
+        validate_records(cells.table(), cells_file, parallel, |previous, cell| {
+            if previous.is_some_and(|p| p.cell_id >= cell.cell_id) {
+                return Err(corrupt("cell IDs are not strictly ascending"));
+            }
+            validate_list(addrs, cell.addr_offset, "address entry")?;
+            validate_list(streets, cell.street_offset, "street entry")?;
+            validate_list(interps, cell.interp_offset, "interpolation entry")?;
+            no_targets(
+                addrs,
+                cell.addr_offset,
+                header.addr_point_count,
+                "address entry",
+            )?;
+            no_targets(
+                streets,
+                cell.street_offset,
+                header.street_way_count,
+                "street entry",
+            )?;
+            no_targets(
+                interps,
+                cell.interp_offset,
+                header.interp_way_count,
+                "interpolation entry",
+            )
+        })
     }
 
     // -- Public query API ----------------------------------------------------
@@ -1852,6 +1879,7 @@ impl Reader {
     /// radius, distance or ranking takes part, and a zero search radius or a
     /// colocated address cannot change the answer. It proves placement in the
     /// written lists, not public query behaviour, which tests own.
+    #[cfg(feature = "commands")]
     pub(crate) fn address_listed_in(
         &self,
         index: u32,
@@ -2583,6 +2611,38 @@ pub(super) fn segment_length_radians(a: &NodeCoord, b: &NodeCoord) -> f64 {
         geo::e7_to_rad(a.lat_e7).cos(),
     )
     .sqrt()
+}
+
+/// Serial and parallel opens share the record checks. Run each file in the
+/// original order and select its lowest failing record, regardless of when
+/// workers finish. A cell can compare itself to the preceding cell even
+/// when they land in different worker ranges.
+fn validate_records<T: Record>(
+    table: Table<'_, T>,
+    file: &str,
+    parallel: bool,
+    check: impl Fn(Option<T>, T) -> Result<()> + Sync,
+) -> Result<()> {
+    if parallel {
+        let error = (0..table.len()).into_par_iter().find_map_first(|index| {
+            let previous = index.checked_sub(1).and_then(|i| table.get(i));
+            #[expect(
+                clippy::expect_used,
+                reason = "the range is bounded by the record count"
+            )]
+            let record = table.get(index).expect("record in table's index range");
+            check(previous, record)
+                .err()
+                .map(|e| in_record(e, file, index))
+        });
+        return error.map_or(Ok(()), Err);
+    }
+    let mut previous = None;
+    for (index, record) in table.iter().enumerate() {
+        check(previous, record).map_err(|e| in_record(e, file, index))?;
+        previous = Some(record);
+    }
+    Ok(())
 }
 
 /// Validate the list a cell names at `offset`. The framing is

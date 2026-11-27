@@ -677,11 +677,12 @@
   multi-region runs. Malformed fields that extract neither reads nor writes
   can now be accepted. Raw passthrough still requires full block validation.
   See [DEVIATIONS.md](DEVIATIONS.md#extract-pbf-validation-follows-classification-and-retained-output).
-  `check --ids`, `check --refs` (standalone and combined), `getid` and
-  `getparents` also scope validation to the fields each pass uses. The
-  getid and getparents writers validate retained fields before
-  re-encoding. See
-  [DEVIATIONS.md](DEVIATIONS.md#id-and-reference-commands-validation-follows-the-fields-used).
+  `check --ids`, `check --refs` (standalone and combined), `getid`,
+  `getparents` and `build-geocode-index` also scope validation to the
+  fields each pass uses. The getid and getparents writers validate
+  retained fields before re-encoding. See
+  [DEVIATIONS.md](DEVIATIONS.md#id-and-reference-commands-validation-follows-the-fields-used)
+  and the [geocode input validation rules](DEVIATIONS.md#input-validation-during-geocode-index-builds).
 
 - **`apply-changes` writes smaller files and finishes faster.** Rewritten
   blocks no longer repeat the source string table across every output
@@ -734,6 +735,11 @@
   planet.** Pass 1 now inserts way references on its decode workers
   instead of on one consumer (planet `-i w/highway=primary` 4m45s to
   3m03s).
+
+- **`build-geocode-index` is about 16 % faster on planet.** The build
+  parallelizes structural validation of the written index, skips setup
+  for reverse-geocode queries and scopes input validation to the fields
+  used by its scans.
 
 - **Geocode lookups are faster.** Format 10's stored interpolation
   prefixes cut a germany query batch by about 12 %.

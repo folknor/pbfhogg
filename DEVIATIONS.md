@@ -1065,6 +1065,35 @@ can report the reference error first.
 The existing `--invert` raw frame copy still uses indexdata to decide
 which blobs it copies without decoding.
 
+## Input validation during geocode index builds
+
+The relation, way and node scans keep block, group and element framing,
+packed-varint framing, countable parallel arrays, string-table UTF-8 and
+enforced indexdata kind claims. For the kind each pass reads, every tag key
+must resolve and every value for a key used by the pass must resolve. The
+node scan also keeps dense tag run validation and judges every node's
+coordinates in exact nanodegrees before narrowing to `i32`. IDs, way refs,
+relation member arrays and the way-member roles used by eligible boundaries
+are checked as before.
+
+The scans can accept malformed contents of unread Info and DenseInfo
+messages, including duplicate packed fields, invalid varints and wrong
+metadata column lengths inside the message. They can accept oversized or
+out-of-table values for unused tag keys. Unindexed schedule discovery uses
+only kinds and node IDs. On blobs with several kinds, each later pass
+resolves the tags for its own kind. An unused dense tag stream gets only
+packed-varint framing checks, so a dense group with no nodes that reaches
+no node scan can have an incorrect run count or an unpaired key.
+
+No index record comes from those unchecked fields. Geocode writes derived
+records, copies no PBF payload or metadata, and resolves only the tag
+values used for classification and index strings. Embedded way locations
+are not used; their framing and counts still agree with refs. On an
+unindexed blob with several defects the split between schedule discovery
+and the kind-specific passes can change which error is reported first.
+A tag corruption involving more than one defect can also report a
+different first error under the scoped checks.
+
 ## tags-filter and inspect tags: expression-syntax edge cases
 
 The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`

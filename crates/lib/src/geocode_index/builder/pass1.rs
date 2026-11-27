@@ -2,7 +2,7 @@
 //!
 //! Collects admin boundary metadata and the way IDs they reference.
 
-use crate::{Element, MemberId};
+use crate::{ElementKind, MemberId};
 
 use super::Result;
 use super::strings::StringPool;
@@ -54,8 +54,11 @@ struct PendingRelation {
 /// refused rather than read as an empty role: read as empty it would turn a
 /// hole into another outer area. Roles of node and relation members, and of
 /// relations that are not candidates, are never read and so not checked.
-fn select_relation(rel: &crate::read::elements::Relation<'_>) -> Result<Option<PendingRelation>> {
-    let Some(mut selected) = select_candidate(rel) else {
+fn select_relation<'a>(
+    rel: &crate::read::elements::Relation<'a>,
+    tags: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<Option<PendingRelation>> {
+    let Some(mut selected) = select_candidate(rel.id(), tags) else {
         return Ok(None);
     };
     for (position, m) in rel.members().enumerate() {
@@ -72,21 +75,24 @@ fn select_relation(rel: &crate::read::elements::Relation<'_>) -> Result<Option<P
 
 /// `rel` with no member ways yet when its tags make it a boundary
 /// candidate.
-fn select_candidate(rel: &crate::read::elements::Relation<'_>) -> Option<PendingRelation> {
+fn select_candidate<'a>(
+    id: i64,
+    tags: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<PendingRelation> {
     let mut boundary: Option<&str> = None;
     let mut level_str: Option<&str> = None;
     let mut rel_name: Option<&str> = None;
     let mut cc: Option<&str> = None;
     let mut postal: Option<&str> = None;
 
-    for (k, v) in rel.tags() {
-        match k {
-            "boundary" => boundary = Some(v),
-            "admin_level" => level_str = Some(v),
-            "name" => rel_name = Some(v),
-            "ISO3166-1:alpha2" => cc = Some(v),
-            "postal_code" => postal = Some(v),
-            _ => {}
+    for (k, v) in tags {
+        match BoundaryTag::classify(k.as_bytes()) {
+            Some(BoundaryTag::Boundary) => boundary = Some(v),
+            Some(BoundaryTag::Level) => level_str = Some(v),
+            Some(BoundaryTag::Name) => rel_name = Some(v),
+            Some(BoundaryTag::Country) => cc = Some(v),
+            Some(BoundaryTag::Postcode) => postal = Some(v),
+            None => {}
         }
     }
 
@@ -121,13 +127,38 @@ fn select_candidate(rel: &crate::read::elements::Relation<'_>) -> Option<Pending
         None
     };
     Some(PendingRelation {
-        id: rel.id(),
+        id,
         admin_level,
         name: name.into(),
         country_code,
         outer_way_ids: Vec::new(),
         inner_way_ids: Vec::new(),
     })
+}
+
+enum BoundaryTag {
+    Boundary,
+    Level,
+    Name,
+    Country,
+    Postcode,
+}
+
+impl BoundaryTag {
+    fn classify(key: &[u8]) -> Option<Self> {
+        match key {
+            b"boundary" => Some(Self::Boundary),
+            b"admin_level" => Some(Self::Level),
+            b"name" => Some(Self::Name),
+            b"ISO3166-1:alpha2" => Some(Self::Country),
+            b"postal_code" => Some(Self::Postcode),
+            _ => None,
+        }
+    }
+}
+
+fn uses_tag(key: &[u8]) -> bool {
+    BoundaryTag::classify(key).is_some()
 }
 
 /// Scan relation blobs and build:
@@ -146,21 +177,41 @@ pub(super) fn run_pass1(
     file: &crate::read::input::InputFile,
     strings: &mut StringPool,
     host: &crate::host::Entered<'_>,
+    validation: super::InputValidation,
 ) -> Result<(Vec<RawAdminRelation>, crate::idset::IdSet)> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
-    crate::scan::classify::parallel_classify_phase_ordered(
+    crate::scan::classify::parallel_project_phase_ordered(
         file,
         relation_schedule,
         None,
         std::num::NonZeroUsize::new(crate::tunables::GEOCODE_MERGE_WINDOW_BLOBS),
-        || (),
-        |block, _: &mut ()| -> Result<Vec<PendingRelation>> {
+        Vec::new,
+        |buffer, matches| -> Result<Vec<PendingRelation>> {
             let mut pending = Vec::new();
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(rel) = element
-                    && let Some(selected) = select_relation(&rel)?
-                {
-                    pending.push(selected);
+            match validation {
+                super::InputValidation::Scoped => {
+                    buffer
+                        .for_selection()?
+                        .select_tag_values(ElementKind::Relation, uses_tag, matches)?
+                        .visit_relations(|relation, tags| {
+                            if let Some(selected) =
+                                select_relation(&relation, tags.iter().copied())?
+                            {
+                                pending.push(selected);
+                            }
+                            Ok(())
+                        })?;
+                }
+                #[cfg(test)]
+                super::InputValidation::Full => {
+                    let block = buffer.block()?;
+                    for element in block.elements_skip_metadata() {
+                        if let crate::Element::Relation(relation) = element
+                            && let Some(selected) = select_relation(&relation, relation.tags())?
+                        {
+                            pending.push(selected);
+                        }
+                    }
                 }
             }
             Ok(pending)
@@ -265,25 +316,37 @@ mod tests {
         let relations: Vec<_> = block
             .elements()
             .map(|element| match element {
-                Element::Relation(relation) => relation,
+                crate::Element::Relation(relation) => relation,
                 _ => panic!("fixture contains only relations"),
             })
             .collect();
 
-        let first = select_relation(&relations[0]).unwrap().unwrap();
+        let first = select_relation(&relations[0], relations[0].tags())
+            .unwrap()
+            .unwrap();
         assert_eq!(first.outer_way_ids, [10]);
         assert_eq!(first.inner_way_ids, [11]);
 
-        let err = select_relation(&relations[1]).err().unwrap().to_string();
+        let err = select_relation(&relations[1], relations[1].tags())
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("relation 2 member 2: role string index 99"),
             "{err}"
         );
-        let err = select_relation(&relations[2]).err().unwrap().to_string();
+        let err = select_relation(&relations[2], relations[2].tags())
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("relation 3 member 0: role string index -1"),
             "{err}"
         );
-        assert!(select_relation(&relations[3]).unwrap().is_none());
+        assert!(
+            select_relation(&relations[3], relations[3].tags())
+                .unwrap()
+                .is_none()
+        );
     }
 }

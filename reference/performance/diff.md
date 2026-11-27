@@ -196,6 +196,32 @@ needed. This holds for revisions that carry the partial-index refusal
 
 ## History
 
+### Consumer-scoped validation for indexed diff and derive-changes (bygg, 2026-11-27, against `63e4e397`)
+
+The prototype applied consumer-scoped validation to indexed diff and
+derive-changes. It used selective projection for the merge cursor, validated
+metadata only where it supplied a verdict or output value, located deferred
+validation errors at their source blob, and replayed dense deltas for changed
+output. A hotpath profile on the baseline (`09571d96`, planet text diff from
+`base` to `20260411`, 1m32s) attributed 1161 core-s to
+`element_merge_pair` and 968 core-s to `BlockPairSide::decode`, including
+590 core-s in `decompress_blob_raw` and 352 core-s in `validate_block`.
+
+Planet text `diff-pair --from base --to 20260411`, `--iterations 1`, with
+interleaved cells:
+
+| Pair | Arm | Build | Wall | Run |
+|---|---|---|---:|---|
+| 1 | A | HEAD `63e4e397` | 1m32s | `6d9cc7e5` |
+| 1 | B | working tree on `63e4e397` | 1m30s | `1f375c18` |
+| 2 | A | HEAD `63e4e397` | 1m32s | `4bd4c6e4` |
+| 2 | B | working tree on `63e4e397` | 1m30s | `b6b2f3c8` |
+
+The roughly 2 % difference is noise. Diff's element comparison reads most
+fields, so the validation it can skip is small and does not justify relaxing
+refusals. Before shelving, the prototype passed tier 1, `pbfhogg-verify all`
+on Denmark (25 of 25), and diff on Germany.
+
 ### Planet, shard-based block-pair merge (2026-04, retired engine)
 
 `from=base` is the 2026-02-23 planet (87 GB); `to=20260411` is the

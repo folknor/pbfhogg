@@ -1,7 +1,7 @@
 //! Pass 1.5: way extraction and referenced-node collection.
 //!
-//! The one read of the way blobs. Each is validated as block construction
-//! validates it; its geocode-relevant ways (streets, building addresses,
+//! The one read of the way blobs. Each is structurally validated and its
+//! geocode-relevant ways (streets, building addresses,
 //! interpolation, admin members) are written to the way store
 //! (`super::way_store`), which Pass 2b resolves from, and the node IDs they
 //! reference are collected. The coordinate store in pass 2 only holds
@@ -195,6 +195,24 @@ const CLASS_INTERPOLATION: u8 = 9;
 const CLASS_KEY_MASK: u8 = 0x0f;
 const CLASS_EXCLUDED_HIGHWAY: u8 = 0x10;
 
+fn way_key(key: &[u8]) -> u8 {
+    match key {
+        b"highway" => CLASS_HIGHWAY,
+        b"name" => CLASS_NAME,
+        b"addr:housenumber" => CLASS_HOUSENUMBER,
+        b"addr:street" => CLASS_STREET,
+        b"addr:place" => CLASS_PLACE,
+        b"addr:postcode" => CLASS_POSTCODE,
+        b"building" => CLASS_BUILDING,
+        b"addr:interpolation" => CLASS_INTERPOLATION,
+        _ => CLASS_OTHER,
+    }
+}
+
+fn uses_tag(key: &[u8]) -> bool {
+    way_key(key) != CLASS_OTHER
+}
+
 /// One accepted blob's string table, read as bytes (its UTF-8 was checked
 /// by the validator before these are read).
 struct BlobStrings<'b> {
@@ -225,17 +243,7 @@ impl<'b> BlobStrings<'b> {
             return Ok(*slot);
         }
         let s = self.get(index)?;
-        let key = match s {
-            b"highway" => CLASS_HIGHWAY,
-            b"name" => CLASS_NAME,
-            b"addr:housenumber" => CLASS_HOUSENUMBER,
-            b"addr:street" => CLASS_STREET,
-            b"addr:place" => CLASS_PLACE,
-            b"addr:postcode" => CLASS_POSTCODE,
-            b"building" => CLASS_BUILDING,
-            b"addr:interpolation" => CLASS_INTERPOLATION,
-            _ => CLASS_OTHER,
-        };
+        let key = way_key(s);
         let excluded = if crate::tunables::GEOCODE_EXCLUDED_HIGHWAYS.contains(&s) {
             CLASS_EXCLUDED_HIGHWAY
         } else {
@@ -257,6 +265,7 @@ fn string_index_err() -> Error {
 /// Per-worker state of the way extraction.
 struct ExtractWorker {
     spans: Vec<WayTags>,
+    matches: Vec<bool>,
     classes: Vec<u8>,
     refs_buf: Vec<i64>,
     segment: Vec<u8>,
@@ -316,14 +325,12 @@ fn extract_blob_ways(
         // The validator holds keys and vals to one length.
         while !keys.is_empty() {
             let key = keys.read_varint_u32()?;
-            let val = vals.read_varint_u32()?;
             let class = strings.class(&mut w.classes, key)? & CLASS_KEY_MASK;
-            // The value is bounds-checked whatever the key, as the decoded
-            // tag walk resolves both strings of every tag. Only a highway
-            // value is ever classified (below), so the rest are not.
-            if val as usize >= strings.table.len() {
-                return Err(string_index_err());
+            if class == CLASS_OTHER {
+                vals.skip_field(crate::read::wire::WIRE_VARINT)?;
+                continue;
             }
+            let val = vals.read_varint_u32()?;
             match class {
                 CLASS_HIGHWAY => highway = Some(val),
                 CLASS_NAME => slots[VALUE_NAME] = Some(val),
@@ -397,8 +404,35 @@ fn extract_blob_ways(
     Ok(())
 }
 
-/// Pass 1.5: read every way blob once, validated as block construction
-/// validates it, and build the geocode-relevant way store
+fn project_way_blob(
+    validation: super::InputValidation,
+    bytes: &[u8],
+    st: &mut Vec<(u32, u32)>,
+    groups: &mut Vec<(u32, u32)>,
+    claim: Option<crate::ElementKind>,
+    w: &mut ExtractWorker,
+) -> Result<()> {
+    w.spans.clear();
+    match validation {
+        super::InputValidation::Scoped => crate::read::block::validate_selected_tags_in_place(
+            bytes,
+            st,
+            groups,
+            claim,
+            (crate::ElementKind::Way, uses_tag, &mut w.matches),
+            |_, _| WayTagSpans { ways: &mut w.spans },
+        ),
+        #[cfg(test)]
+        super::InputValidation::Full => {
+            crate::read::block::validate_in_place(bytes, st, groups, claim, |_, _| WayTagSpans {
+                ways: &mut w.spans,
+            })
+            .map(drop)
+        }
+    }
+}
+
+/// Pass 1.5: validate the fields the way scan uses and build the geocode-relevant way store
 /// (`super::way_store`) while filling the referenced-node set.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
@@ -409,6 +443,7 @@ pub(super) fn run_pass1_5(
     needed_admin_ways: &crate::idset::IdSet,
     scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
+    validation: super::InputValidation,
 ) -> Result<(
     crate::idset::IdSet,
     super::way_store::WayStore,
@@ -433,9 +468,8 @@ pub(super) fn run_pass1_5(
 
     // Custom worker pool that builds no PrimitiveBlock. Workers pread the
     // blob bytes, decompress, and validate them in place with the block
-    // validator (so a blob is refused exactly as block construction refuses
-    // it, kind claim included), recording each way's spans; then classify
-    // the ways from the accepted string table and append the relevant ones
+    // validator (including its kind claim), recording each way's spans.
+    // They classify ways from the accepted string table and append the relevant ones
     // to the worker's way-store file. This is the only decode of the way
     // blobs: Pass 2b resolves from the store.
     host.invocation.marker("GEOCODE_PASS1_5_SCAN_START");
@@ -499,6 +533,7 @@ pub(super) fn run_pass1_5(
                     let mut my_segments: Vec<(usize, super::way_store::Segment)> = Vec::new();
                     let mut w = ExtractWorker {
                         spans: Vec::new(),
+                        matches: Vec::new(),
                         classes: Vec::new(),
                         refs_buf: Vec::new(),
                         segment: Vec::new(),
@@ -531,13 +566,13 @@ pub(super) fn run_pass1_5(
                             crate::blob::decompress_blob_raw(raw, &mut decompress_buf)?;
                             // A blob claiming ways but holding other kinds is
                             // refused by the validator's claim check.
-                            w.spans.clear();
-                            crate::read::block::validate_in_place(
+                            project_way_blob(
+                                validation,
                                 &decompress_buf,
                                 &mut st,
                                 &mut groups,
                                 entry.claim(),
-                                |_, _| WayTagSpans { ways: &mut w.spans },
+                                &mut w,
                             )?;
                             let strings = BlobStrings {
                                 bytes: &decompress_buf,
@@ -668,6 +703,7 @@ pub(super) fn run_pass1_5(
 pub(super) fn build_schedules(
     input: &PinnedInput,
     host: &crate::host::Entered<'_>,
+    validation: super::InputValidation,
 ) -> Result<Schedules> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
@@ -724,39 +760,15 @@ pub(super) fn build_schedules(
     // goes into both schedules; Phase 2a completes before Phase 2b starts,
     // so the in-blob order of the two kinds does not matter.
     //
-    // This walk reads only node IDs and kinds, yet builds each block on
-    // purpose. It runs only on blobs without indexdata (`--force`), and an
-    // estimate says moving it to a projection (`read::project_ids::KindIds`
-    // plus the validated block's kinds) would not show: the same move cut
-    // check --ids' planet node scan by about 4 s, against a planet geocode
-    // build of over 300 s. Not measured on an unindexed planet build.
+    // This walk only needs node IDs and the kinds present in each blob.
     if !unindexed.is_empty() {
         let mut found: Vec<Option<UnindexedBlobKinds>> = vec![None; unindexed.len()];
-        crate::scan::classify::parallel_classify_phase(
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &unindexed,
             None,
-            || (),
-            |block, _scratch: &mut ()| {
-                let mut kinds = UnindexedBlobKinds::default();
-                for element in block.elements_skip_metadata() {
-                    let node_id = match element {
-                        crate::Element::Node(node) => node.id(),
-                        crate::Element::DenseNode(node) => node.id(),
-                        crate::Element::Way(_) => {
-                            kinds.has_ways = true;
-                            continue;
-                        }
-                        crate::Element::Relation(_) => {
-                            kinds.has_relations = true;
-                            continue;
-                        }
-                    };
-                    kinds.has_nodes = true;
-                    kinds.max_node_id = kinds.max_node_id.max(node_id);
-                }
-                Ok(kinds)
-            },
+            crate::read::project_ids::IdScratch::default,
+            |_, buffer, ids| classify_unindexed(buffer, ids, validation),
             |position, kinds| {
                 if let Some(slot) = found.get_mut(position) {
                     *slot = Some(kinds);
@@ -818,6 +830,52 @@ pub(super) struct Schedules {
     pub(super) file_size: u64,
 }
 
+fn classify_unindexed(
+    buffer: crate::read::block::BlockBuffer<'_>,
+    ids: &mut crate::read::project_ids::IdScratch,
+    validation: super::InputValidation,
+) -> Result<UnindexedBlobKinds> {
+    use crate::ElementKind;
+    use crate::read::project_ids::KindIds;
+
+    let mut kinds = UnindexedBlobKinds::default();
+    match validation {
+        super::InputValidation::Scoped => {
+            let (_, block) =
+                buffer.project_ids_and_refs(|_, _| KindIds::of(ElementKind::Node, ids))?;
+            let present = block.kinds();
+            kinds.has_nodes = present.has(ElementKind::Node);
+            kinds.has_ways = present.has(ElementKind::Way);
+            kinds.has_relations = present.has(ElementKind::Relation);
+            ids.each(&block, |_, id| {
+                kinds.max_node_id = kinds.max_node_id.max(id);
+                Ok(())
+            })?;
+        }
+        #[cfg(test)]
+        super::InputValidation::Full => {
+            let block = buffer.block()?;
+            for element in block.elements_skip_metadata() {
+                let id = match element {
+                    crate::Element::Node(node) => node.id(),
+                    crate::Element::DenseNode(node) => node.id(),
+                    crate::Element::Way(_) => {
+                        kinds.has_ways = true;
+                        continue;
+                    }
+                    crate::Element::Relation(_) => {
+                        kinds.has_relations = true;
+                        continue;
+                    }
+                };
+                kinds.has_nodes = true;
+                kinds.max_node_id = kinds.max_node_id.max(id);
+            }
+        }
+    }
+    Ok(kinds)
+}
+
 /// What decoding an unindexed blob says about it: which passes need it,
 /// and the largest node ID it holds (`i64::MIN` while it holds none).
 #[derive(Clone, Copy)]
@@ -863,20 +921,25 @@ mod tests {
     ) {
         let mut st = Vec::new();
         let mut groups = Vec::new();
-        let mut spans = Vec::new();
-        crate::read::block::validate_in_place(blob, &mut st, &mut groups, None, |_, _| {
-            super::WayTagSpans { ways: &mut spans }
-        })
-        .expect("valid block");
         let mut referenced = crate::idset::IdSet::new();
         referenced.pre_allocate(1000);
         let mut w = super::ExtractWorker {
-            spans,
+            spans: Vec::new(),
+            matches: Vec::new(),
             classes: Vec::new(),
             refs_buf: Vec::new(),
             segment: Vec::new(),
             overflow_nodes: Vec::new(),
         };
+        super::project_way_blob(
+            super::super::InputValidation::Scoped,
+            blob,
+            &mut st,
+            &mut groups,
+            None,
+            &mut w,
+        )
+        .expect("valid scoped block");
         let shared = super::ExtractShared {
             referenced: &referenced,
             overflow: Mutex::default(),
@@ -911,6 +974,38 @@ mod tests {
             referenced.insert(id);
         }
         (out, referenced)
+    }
+
+    #[test]
+    fn extraction_skips_unused_values_and_info_after_structural_checks() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes, field_varint, packed};
+
+        let strings = ["", "unused", "highway", "residential", "name", "Main"];
+        let mut way = Vec::new();
+        field_varint(&mut way, 1, 7);
+        field_bytes(&mut way, 2, &packed([1, 2, 4]));
+        field_bytes(&mut way, 3, &packed([u64::MAX, 3, 5]));
+        field_bytes(&mut way, 4, &[0xff]);
+        field_bytes(&mut way, 8, &packed([2, 2]));
+        let bytes = block(
+            &strings,
+            &[Group {
+                ways: vec![way],
+                ..Group::default()
+            }],
+        );
+        crate::test_support::assert_err_kind!(
+            crate::PrimitiveBlock::from_vec(bytes.clone()),
+            crate::ErrorKind::WireFormat {
+                msg: "truncated varint",
+            },
+        );
+        let (ways, refs) = extract(&bytes, &crate::idset::IdSet::new());
+        assert_eq!(ways.len(), 1);
+        assert_eq!(ways[0].0, 7);
+        assert_eq!(ways[0].1, super::super::way_store::ROLE_STREET);
+        assert_eq!(ways[0].3, [1, 2]);
+        assert!(refs.get(1) && refs.get(2));
     }
 
     #[test]

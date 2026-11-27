@@ -36,7 +36,7 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::Element;
+use crate::ElementKind;
 
 use super::Result;
 use super::strings::StringPool;
@@ -108,50 +108,29 @@ enum AddressKey {
 }
 
 impl AddressKey {
-    fn classify(key: &str) -> Option<Self> {
+    fn classify(key: &[u8]) -> Option<Self> {
         match key {
-            "addr:housenumber" => Some(Self::HouseNumber),
-            "addr:street" => Some(Self::Street),
-            "addr:place" => Some(Self::Place),
-            "addr:postcode" => Some(Self::Postcode),
+            b"addr:housenumber" => Some(Self::HouseNumber),
+            b"addr:street" => Some(Self::Street),
+            b"addr:place" => Some(Self::Place),
+            b"addr:postcode" => Some(Self::Postcode),
             _ => None,
         }
     }
 }
 
-fn classify_address_keys(
-    block: &crate::PrimitiveBlock,
-    classes: &mut Vec<Option<AddressKey>>,
-) -> Result<()> {
-    classes.clear();
-    for sid in 0..block.string_table_len() {
-        let key = block
-            .string_table_entry(sid)
-            .ok_or_else(|| Error::internal("validated node string table entry is missing"))?;
-        classes.push(AddressKey::classify(key));
-    }
-    Ok(())
+fn uses_tag(key: &[u8]) -> bool {
+    AddressKey::classify(key).is_some()
 }
 
-fn address_values<'a>(
-    block: &'a crate::PrimitiveBlock,
-    classes: &[Option<AddressKey>],
-    tags: impl Iterator<Item = (usize, usize)>,
-) -> Result<[Option<&'a str>; 4]> {
+fn address_values<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> [Option<&'a str>; 4] {
     let mut values = [None; 4];
     for (key, value) in tags {
-        let class = classes.get(key).ok_or_else(|| {
-            Error::internal("validated node tag key lies outside its string table")
-        })?;
-        let Some(class) = class else {
-            continue;
-        };
-        let value = block.string_table_entry(value).ok_or_else(|| {
-            Error::internal("validated node tag value lies outside its string table")
-        })?;
-        values[*class as usize] = Some(value);
+        if let Some(class) = AddressKey::classify(key.as_bytes()) {
+            values[class as usize] = Some(value);
+        }
     }
-    Ok(values)
+    values
 }
 
 /// The names an address carries, as `(street, place)`: an empty value is
@@ -686,6 +665,7 @@ pub(super) fn run_pass2(
     admin_totals: super::pass1_5::AdminWayTotals,
     strings: &mut StringPool,
     host: &crate::host::Entered<'_>,
+    validation: super::InputValidation,
 ) -> Result<Pass2Output> {
     let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
     // Compact rank-indexed coord array. Instead of a 128 GB sparse DenseMmapIndex
@@ -743,96 +723,108 @@ pub(super) fn run_pass2(
     host.invocation.marker("GEOCODE_PASS2A_START");
     {
         let referenced_ref = &referenced_nodes;
-        crate::scan::classify::parallel_classify_phase_ordered(
+        crate::scan::classify::parallel_project_phase_ordered(
             shared_file,
             node_schedule,
             None,
             std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS),
             || (Vec::new(), NodeBlobOut::default()),
-            |block, (address_keys, state)| -> Result<NodeBlobOut> {
-                // Dense validation in read/block.rs runs before this callback.
-                // Reusing it preserves the array and metadata refusals. The
-                // ALTW tuple scanner lacks tags and validates a different contract.
-                classify_address_keys(block, address_keys)?;
-                // Return the first node error in blob order to the pool,
-                // which adds the blob location.
-                for element in block.elements_skip_metadata() {
-                    macro_rules! process_node {
-                        ($node:expr) => {{
-                            let node = $node;
-                            let node_id = node.id();
-                            // Pass 1.5 dropped every way ref above
-                            // `max_node_id` as dangling. That is only sound
-                            // if no node in the file is above it, so check
-                            // every decoded node - before any other test can
-                            // skip it - rather than trust the claim.
-                            if node_id > max_node_id {
-                                return Err(crate::error::new_indexdata_mismatch(format!(
-                                    "node {node_id} exceeds the node-ID bound {max_node_id} derived \
-                                     from the blob metadata (the largest indexdata max_id over node \
-                                     blobs, widened by any blob without indexdata). Some blob's \
-                                     indexdata understates its ID range."
-                                )));
-                            }
-                            // The domain is judged on the exact nanodegree
-                            // value, before truncation, as `check --locations`
-                            // judges it. Judging the permissive
-                            // `decimicro_lat` instead let a corrupt framing
-                            // (raw latitude 4_294_967_296 at the default
-                            // granularity) wrap to latitude 0 and be indexed
-                            // there, and let 90.000000099 degrees truncate
-                            // into the domain.
-                            let (lat_nano, lon_nano) = (node.nano_lat_exact(), node.nano_lon_exact());
-                            let in_domain = crate::coord_pack::decimicro_in_domain(lat_nano, lon_nano);
-                            let Some(((lat_e7, lon_e7), packed)) = in_domain.and_then(|c| Some((c, pack_coord(c.0, c.1)?))) else {
-                                // An out-of-domain coordinate is decoded source
-                                // data, not an absent reference at an extract
-                                // edge. Silently skipping it could publish
-                                // plausible but incomplete geometry, so this
-                                // build remains fatal for that condition.
-                                return Err(Error::invalid_data(format!(
-                                    "node {node_id} has coordinates outside the geographic domain (lat {lat_nano}, lon {lon_nano} in nanodegrees)"
-                                )));
-                            };
-                            if let Some(rank) = referenced_ref.numeric_rank_if_set(node_id) {
-                                let Some(slot) = coord_slot(coord_store, rank) else {
-                                    return Err(Error::internal(format!(
-                                        "internal error: node {node_id} has coordinate rank {rank}, \
-                                         outside the {}-slot store built from the same \
-                                         referenced-node set",
-                                        coord_store.len()
-                                    )));
-                                };
-                                if !install_coord(slot, packed) {
-                                    return Err(Error::invalid_data(format!(
-                                        "node {node_id} has conflicting coordinates across occurrences"
-                                    )));
-                                }
-                            }
-                            // Dense tag indices are signed on this API, and
-                            // block validation already checked their bounds.
-                            #[allow(clippy::cast_sign_loss)]
-                            let tags = node.raw_tags().map(|(k, v)| (k as usize, v as usize));
-                            let [hn, st, place, pc] = address_values(block, address_keys, tags)?;
-                            let names = hn.and_then(|h| Some((h, address_names(st, place)?)));
-                            if let Some((h, (st, place))) = names {
-                                let text = &mut state.text;
-                                let point = FlatAddrPoint {
-                                    lat_e7,
-                                    lon_e7,
-                                    hn: Text::push(text, h, None),
-                                    st: st.map(|s| Text::push(text, s, None)),
-                                    place: place.map(|s| Text::push(text, s, None)),
-                                    pc: pc.map(|s| Text::push(text, s, None)),
-                                };
-                                state.addr_points.push(point);
-                            }
-                        }};
+            |buffer, (matches, state)| -> Result<NodeBlobOut> {
+                let mut visit = |node_id: i64,
+                                 (lat_nano, lon_nano): (i128, i128),
+                                 [hn, st, place, pc]: [Option<&str>; 4]|
+                 -> Result<()> {
+                    // Pass 1.5 dropped every way ref above
+                    // `max_node_id` as dangling. That is only sound
+                    // if no node in the file is above it, so check
+                    // every decoded node - before any other test can
+                    // skip it - rather than trust the claim.
+                    if node_id > max_node_id {
+                        return Err(crate::error::new_indexdata_mismatch(format!(
+                            "node {node_id} exceeds the node-ID bound {max_node_id} derived \
+                         from the blob metadata (the largest indexdata max_id over node \
+                         blobs, widened by any blob without indexdata). Some blob's \
+                         indexdata understates its ID range."
+                        )));
                     }
-                    match element {
-                        Element::DenseNode(node) => process_node!(node),
-                        Element::Node(node) => process_node!(node),
-                        _ => {}
+                    // The domain is judged on the exact nanodegree
+                    // value, before truncation, as `check --locations`
+                    // judges it. Judging the permissive
+                    // `decimicro_lat` instead let a corrupt framing
+                    // (raw latitude 4_294_967_296 at the default
+                    // granularity) wrap to latitude 0 and be indexed
+                    // there, and let 90.000000099 degrees truncate
+                    // into the domain.
+                    let in_domain = crate::coord_pack::decimicro_in_domain(lat_nano, lon_nano);
+                    let Some(((lat_e7, lon_e7), packed)) =
+                        in_domain.and_then(|c| Some((c, pack_coord(c.0, c.1)?)))
+                    else {
+                        // An out-of-domain coordinate is decoded source
+                        // data, not an absent reference at an extract
+                        // edge. Silently skipping it could publish
+                        // plausible but incomplete geometry, so this
+                        // build remains fatal for that condition.
+                        return Err(Error::invalid_data(format!(
+                            "node {node_id} has coordinates outside the geographic domain (lat {lat_nano}, lon {lon_nano} in nanodegrees)"
+                        )));
+                    };
+                    if let Some(rank) = referenced_ref.numeric_rank_if_set(node_id) {
+                        let Some(slot) = coord_slot(coord_store, rank) else {
+                            return Err(Error::internal(format!(
+                                "internal error: node {node_id} has coordinate rank {rank}, \
+                             outside the {}-slot store built from the same \
+                             referenced-node set",
+                                coord_store.len()
+                            )));
+                        };
+                        if !install_coord(slot, packed) {
+                            return Err(Error::invalid_data(format!(
+                                "node {node_id} has conflicting coordinates across occurrences"
+                            )));
+                        }
+                    }
+                    let names = hn.and_then(|h| Some((h, address_names(st, place)?)));
+                    if let Some((h, (st, place))) = names {
+                        let text = &mut state.text;
+                        let point = FlatAddrPoint {
+                            lat_e7,
+                            lon_e7,
+                            hn: Text::push(text, h, None),
+                            st: st.map(|s| Text::push(text, s, None)),
+                            place: place.map(|s| Text::push(text, s, None)),
+                            pc: pc.map(|s| Text::push(text, s, None)),
+                        };
+                        state.addr_points.push(point);
+                    }
+                    Ok(())
+                };
+                match validation {
+                    super::InputValidation::Scoped => {
+                        buffer
+                            .for_selection()?
+                            .select_tag_values(ElementKind::Node, uses_tag, matches)?
+                            .visit_nodes(|id, coords, tags| {
+                                visit(id, coords, address_values(tags.iter().copied()))
+                            })?;
+                    }
+                    #[cfg(test)]
+                    super::InputValidation::Full => {
+                        let block = buffer.block()?;
+                        for element in block.elements_skip_metadata() {
+                            match element {
+                                crate::Element::DenseNode(node) => visit(
+                                    node.id(),
+                                    (node.nano_lat_exact(), node.nano_lon_exact()),
+                                    address_values(node.tags()),
+                                )?,
+                                crate::Element::Node(node) => visit(
+                                    node.id(),
+                                    (node.nano_lat_exact(), node.nano_lon_exact()),
+                                    address_values(node.tags()),
+                                )?,
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 Ok(std::mem::take(state))

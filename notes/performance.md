@@ -223,9 +223,27 @@ scan uses. Writers check retained fields before re-encoding. See the
 [getid](../reference/performance/getid.md) and
 [getparents](../reference/performance/getparents.md) measurements.
 
-Remaining candidates for scoped validation are geocode, diff and other
-consumers still on full `PrimitiveBlock` validation where profiling shows
-validation accounts for substantial time.
+Diff's indexed text path was measured on planet, comparing HEAD `63e4e397`
+with the working tree on that commit: A 1m32s, B 1m30s, A 1m32s, B 1m30s.
+The measured result is neutral; the roughly 2 % difference is noise. Element
+comparison reads most fields, so the prototype's validation savings did not
+justify relaxing refusals; it did not land. Before shelving, it passed tier 1,
+`pbfhogg-verify all` on Denmark (25 of 25), and diff on Germany. See the
+[diff measurements](../reference/performance/diff.md).
+
+Geocode now scopes validation in passes 1, 1.5 and 2. Together with the
+faster build smoke test, this cut planet build wall time by about 16 %
+on bygg against HEAD `63e4e397`. See the
+[geocode measurements](../reference/performance/geocode.md).
+
+The remaining full-validation paths tracked here are diff's indexed text
+path, PBF `tags-filter` relation closure and member-way dependency scans,
+and extract raw passthrough.
+
+To resurface: the code is in
+`notes/stashed-perf-006-diff-scoped-validation.patch` (made against
+`63e4e397` on bygg). It edits `read/block.rs`, `osc/merge_join.rs`,
+`commands/diff/mod.rs`, `view.rs` and `DEVIATIONS.md`.
 
 - Getid's scoped relation scan duplicates the shared closure scan driver.
 - The selective writer builds offset tables for decoded blobs with no
@@ -1188,6 +1206,11 @@ Kind: highest-conviction query rewrite.
 ## PERF-054 - Geocode build still has a serial pass 2 consumer and a largest-bucket sort
 
 Reported by: geocode, pipeline.
+
+After the smoke-test and scoped-validation changes, the longest spans
+in the planet build on bygg (working tree on `63e4e397`, `ecfe45ac`) are
+Pass 3 stage B fine (18.7 s), stage A streets (11.1 s) and stage B coarse
+(8.7 s). See the [planet baseline](../reference/performance/geocode.md#planet-build-baseline-bygg-working-tree-on-63e4e397).
 
 Pass 3 stage B now splits fine and coarse buckets at cell boundaries,
 encodes in parallel and writes at disjoint prefix offsets. The largest

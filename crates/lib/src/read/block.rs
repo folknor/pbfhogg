@@ -1084,8 +1084,9 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 ///
 /// `make` builds the projection once the top level is framed, from the
 /// block's scalar fields and its string table entries (buffer-relative
-/// `(offset, length)`); `st` and `groups` are the caller's scratch, filled
-/// with the entries and the group ranges.
+/// `(offset, length)`). The tag scope can also use those entries.
+/// `st` and `groups` are the caller's scratch, filled with the entries and
+/// the group ranges.
 ///
 /// Returns the projection and the [`BlockScan`]: the kinds of the elements
 /// the block holds ([`ElementKindSet`](crate::element_kind::ElementKindSet)), recorded in
@@ -1094,11 +1095,11 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// `PrimitiveBlock::elements` yields: one per plain node, way and relation
 /// message and the dense ID count each dense group's validation computes.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn validate_block<const FULL: bool, P: GroupProjection>(
+fn validate_block<'a, const FULL: bool, P: GroupProjection>(
     buffer: &[u8],
     st: &mut Vec<(u32, u32)>,
     groups: &mut Vec<(u32, u32)>,
-    tags: [bool; 3],
+    tag_scopes: impl FnOnce(&[(u32, u32)]) -> [TagScope<'a>; 3],
     make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
 ) -> Result<(P, BlockScan)> {
     let fields = super::wire::scan_block_fields(buffer, st, groups)?;
@@ -1109,7 +1110,7 @@ fn validate_block<const FULL: bool, P: GroupProjection>(
         groups.len(),
         |i| slice(&groups[i]),
         st.len(),
-        tags,
+        tag_scopes(st),
         &mut projection,
     )?;
     validate_stringtable_utf8(st.iter().map(slice))?;
@@ -1139,9 +1140,41 @@ pub(crate) fn validate_in_place<P: GroupProjection>(
     claim: Option<crate::ElementKind>,
     make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
 ) -> Result<(P, BlockScan)> {
-    let (projection, scan) = validate_block::<true, _>(buffer, st, groups, [true; 3], make)?;
+    let (projection, scan) =
+        validate_block::<true, _>(buffer, st, groups, |_| [TagScope::Check(None); 3], make)?;
     scan.kinds.refuse_under(claim)?;
     Ok((projection, scan))
+}
+
+#[cfg(feature = "commands")]
+pub(crate) type TagValueSelection<'a> = (crate::ElementKind, fn(&[u8]) -> bool, &'a mut Vec<bool>);
+
+/// Borrowed counterpart of the selective tag view used by geocode.
+#[cfg(feature = "commands")]
+pub(crate) fn validate_selected_tags_in_place<P: GroupProjection>(
+    buffer: &[u8],
+    st: &mut Vec<(u32, u32)>,
+    groups: &mut Vec<(u32, u32)>,
+    claim: Option<crate::ElementKind>,
+    selection: TagValueSelection<'_>,
+    make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
+) -> Result<()> {
+    let (_, scan) = validate_block::<false, _>(
+        buffer,
+        st,
+        groups,
+        move |st| {
+            let (kind, predicate, matches) = selection;
+            let strings = st.iter().map(|&(offset, len)| {
+                let start = offset as usize;
+                &buffer[start..start + len as usize]
+            });
+            fill_tag_matches(matches, strings, predicate);
+            TagScope::for_kind(kind, matches)
+        },
+        make,
+    )?;
+    scan.kinds.refuse_under(claim)
 }
 
 /// What [`validate_block`] found in a block it accepted.
@@ -1253,12 +1286,12 @@ impl<'w> BlockBuffer<'w> {
             groups,
             claim,
         } = self;
-        let result = validate_block::<FULL, _>(&buffer, st, groups, tags, make).and_then(
-            |(projection, scan)| {
-                scan.kinds.refuse_under(claim)?;
-                Ok((projection, scan))
-            },
-        );
+        let result =
+            validate_block::<FULL, _>(&buffer, st, groups, |_| tags.map(TagScope::from), make)
+                .and_then(|(projection, scan)| {
+                    scan.kinds.refuse_under(claim)?;
+                    Ok((projection, scan))
+                });
         let (projection, scan) = match result {
             Ok(accepted) => accepted,
             Err(e) => {
@@ -1389,12 +1422,44 @@ impl SelectionBlock {
             wire.group_count(),
             |i| wire.group(i),
             wire.stringtable.len(),
-            [false; 3],
+            [TagScope::Ignore; 3],
             &mut NoProjection,
         )?;
         self.utf8.as_ref().map_err(Clone::clone)?;
         kinds.refuse_under(self.claim)?;
         Ok(kinds)
+    }
+
+    /// Validate the tag keys of the requested kind and the values whose
+    /// keys the consumer uses, with the regular selective structural checks.
+    #[cfg(feature = "commands")]
+    pub(crate) fn select_tag_values<'a>(
+        &'a self,
+        kind: crate::ElementKind,
+        predicate: fn(&[u8]) -> bool,
+        matches: &'a mut Vec<bool>,
+    ) -> Result<SelectedTagBlock<'a>> {
+        let wire = &self.data.wire;
+        fill_tag_matches(
+            matches,
+            (0..wire.stringtable.len()).filter_map(|i| wire.stringtable.get(i)),
+            predicate,
+        );
+        assert_eq!(matches.len(), wire.stringtable.len(), "inline string table");
+        let (kinds, _) = validate_groups::<false, _>(
+            wire.group_count(),
+            |i| wire.group(i),
+            wire.stringtable.len(),
+            TagScope::for_kind(kind, matches),
+            &mut NoProjection,
+        )?;
+        self.utf8.as_ref().map_err(Clone::clone)?;
+        kinds.refuse_under(self.claim)?;
+        Ok(SelectedTagBlock {
+            wire,
+            kind,
+            matches,
+        })
     }
 
     pub(crate) fn payload(&self) -> &[u8] {
@@ -1496,6 +1561,116 @@ impl SelectionBlock {
         self.utf8.as_ref().map_err(Clone::clone)?;
         kinds.refuse_under(self.claim)?;
         output
+    }
+}
+
+/// Replay just the selected tag values from an accepted block. The key
+/// mask is shared with validation, so a skipped value cannot reach a caller.
+#[cfg(feature = "commands")]
+pub(crate) struct SelectedTagBlock<'a> {
+    wire: &'a WireBlock<'static>,
+    kind: crate::ElementKind,
+    matches: &'a [bool],
+}
+
+#[cfg(feature = "commands")]
+impl<'a> SelectedTagBlock<'a> {
+    pub(crate) fn visit_relations(
+        &self,
+        mut visit: impl FnMut(Relation<'a>, &[(&'a str, &'a str)]) -> Result<()>,
+    ) -> Result<()> {
+        assert_eq!(self.kind, crate::ElementKind::Relation);
+        let mut tags = Vec::new();
+        for group in GroupIter::new(self.wire) {
+            for data in group.group.relations() {
+                let mut relation = validated(WireRelation::parse(data), "Relation");
+                self.plain_tags(relation.keys_data, relation.vals_data, &mut tags)?;
+                relation.keys_data = &[];
+                relation.vals_data = &[];
+                relation.info_data = None;
+                visit(Relation::new(self.wire, relation), &tags)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit dense then plain nodes in each group, as the element walk does.
+    /// Use the same exact scaling and modular deltas as the regular reader.
+    pub(crate) fn visit_nodes(
+        &self,
+        mut visit: impl FnMut(i64, (i128, i128), &[(&'a str, &'a str)]) -> Result<()>,
+    ) -> Result<()> {
+        let mut tags = Vec::new();
+        assert_eq!(self.kind, crate::ElementKind::Node);
+        for group in GroupIter::new(self.wire) {
+            if let Some(mut dense) = validated_dense(&group.group) {
+                let mut tag_runs = super::wire::Cursor::new(dense.keys_vals_data);
+                dense.keys_vals_data = &[];
+                for node in DenseNodeIter::new_skip_metadata(self.wire, dense) {
+                    tags.clear();
+                    while !tag_runs.is_empty() {
+                        let key = tag_runs.read_varint()?;
+                        if key == 0 {
+                            break;
+                        }
+                        self.read_value(key, &mut tag_runs, &mut tags)?;
+                    }
+                    visit(
+                        node.id(),
+                        (node.nano_lat_exact(), node.nano_lon_exact()),
+                        &tags,
+                    )?;
+                }
+            }
+            for data in group.group.nodes() {
+                let node = validated(WireNode::parse(data), "Node");
+                self.plain_tags(node.keys_data, node.vals_data, &mut tags)?;
+                let node = Node::new(self.wire, node);
+                visit(
+                    node.id(),
+                    (node.nano_lat_exact(), node.nano_lon_exact()),
+                    &tags,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn plain_tags(
+        &self,
+        keys: &[u8],
+        vals: &[u8],
+        tags: &mut Vec<(&'a str, &'a str)>,
+    ) -> Result<()> {
+        use super::wire::Cursor;
+
+        tags.clear();
+        let mut keys = Cursor::new(keys);
+        let mut vals = Cursor::new(vals);
+        while !keys.is_empty() {
+            self.read_value(keys.read_varint()?, &mut vals, tags)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn read_value(
+        &self,
+        key: u64,
+        vals: &mut super::wire::Cursor<'_>,
+        tags: &mut Vec<(&'a str, &'a str)>,
+    ) -> Result<()> {
+        // The validator checked the key width and bound, and the value's
+        // width and bound exactly when its key matched.
+        let key = usize::try_from(key).map_err(|_| sid_past_the_table(key))?;
+        if self.matches[key] {
+            let value = vals.read_varint()?;
+            let value = usize::try_from(value).map_err(|_| sid_past_the_table(value))?;
+            tags.push(resolved_tag(self.wire, key, value));
+        } else {
+            vals.skip_field(super::wire::WIRE_VARINT)?;
+        }
+        Ok(())
     }
 }
 
@@ -1902,6 +2077,12 @@ impl ValidatedBlock<'_> {
 }
 
 impl ValidatedBlock<'_, false> {
+    /// Element kinds found by the structural scan.
+    #[cfg(feature = "commands")]
+    pub(crate) fn kinds(&self) -> crate::element_kind::ElementKindSet {
+        self.scan.kinds
+    }
+
     /// Read a span recorded from a field handed to the projection. The
     /// projection cannot borrow the full payload or turn it into a block.
     pub(crate) fn span(&self, span: super::project_ids::Span) -> Result<&[u8]> {
@@ -2053,6 +2234,41 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TagScope<'a> {
+    Check(Option<&'a [bool]>),
+    Ignore,
+}
+
+impl From<bool> for TagScope<'_> {
+    fn from(keep: bool) -> Self {
+        if keep {
+            Self::Check(None)
+        } else {
+            Self::Ignore
+        }
+    }
+}
+
+#[cfg(feature = "commands")]
+impl<'a> TagScope<'a> {
+    fn for_kind(kind: crate::ElementKind, matches: &'a [bool]) -> [Self; 3] {
+        let mut scopes = [Self::Ignore; 3];
+        scopes[usize::from(kind.ordinal())] = Self::Check(Some(matches));
+        scopes
+    }
+}
+
+#[cfg(feature = "commands")]
+fn fill_tag_matches<'a>(
+    matches: &mut Vec<bool>,
+    strings: impl Iterator<Item = &'a [u8]>,
+    predicate: fn(&[u8]) -> bool,
+) {
+    matches.clear();
+    matches.extend(strings.map(predicate));
+}
+
 /// Validate every group of a block (`group(i)` for `i` in `0..group_count`)
 /// and hand each validated piece to `projection`. Returns the kinds the
 /// block holds and its element count. The group part of [`validate_block`],
@@ -2062,7 +2278,7 @@ fn validate_groups<'a, const FULL: bool, P: GroupProjection>(
     group_count: usize,
     group: impl Fn(usize) -> &'a [u8],
     strings: usize,
-    [node_tags, way_tags, relation_tags]: [bool; 3],
+    [node_tags, way_tags, relation_tags]: [TagScope<'_>; 3],
     projection: &mut P,
 ) -> Result<(crate::element_kind::ElementKindSet, u64)> {
     use crate::ElementKind;
@@ -2090,10 +2306,10 @@ fn validate_groups<'a, const FULL: bool, P: GroupProjection>(
             count += 1;
             let mut node = WireNode::parse(element)?;
             let info = project_info::<FULL>(&mut node.info_data)?;
-            project_tags(
+            project_tag_scope::<FULL>(
                 &mut node.keys_data,
                 &mut node.vals_data,
-                FULL || node_tags,
+                node_tags,
                 strings,
                 "node has mismatched keys/vals tag array lengths",
             )?;
@@ -2104,10 +2320,10 @@ fn validate_groups<'a, const FULL: bool, P: GroupProjection>(
             count += 1;
             let mut way = WireWay::parse(element)?;
             let info = project_info::<FULL>(&mut way.info_data)?;
-            project_tags(
+            project_tag_scope::<FULL>(
                 &mut way.keys_data,
                 &mut way.vals_data,
-                FULL || way_tags,
+                way_tags,
                 strings,
                 "way has mismatched keys/vals tag array lengths",
             )?;
@@ -2119,10 +2335,10 @@ fn validate_groups<'a, const FULL: bool, P: GroupProjection>(
             count += 1;
             let mut relation = WireRelation::parse(element)?;
             let info = project_info::<FULL>(&mut relation.info_data)?;
-            project_tags(
+            project_tag_scope::<FULL>(
                 &mut relation.keys_data,
                 &mut relation.vals_data,
-                FULL || relation_tags,
+                relation_tags,
                 strings,
                 "relation has mismatched keys/vals tag array lengths",
             )?;
@@ -2135,7 +2351,7 @@ fn validate_groups<'a, const FULL: bool, P: GroupProjection>(
         if let Some(dense_data) = group.dense()? {
             let mut dense = WireDenseNodes::parse(dense_data)?;
             let ids = validate_dense_coordinates(&dense)?;
-            project_dense_tags(&mut dense, FULL || node_tags, ids, strings)?;
+            project_dense_tag_scope::<FULL>(&mut dense, node_tags, ids, strings)?;
             let info = if FULL {
                 validate_dense_info(&dense, ids)?
             } else {
@@ -2185,6 +2401,114 @@ fn project_info<const FULL: bool>(
         *info = None;
         Ok(None)
     }
+}
+
+#[inline]
+fn project_tag_scope<const FULL: bool>(
+    keys: &mut &[u8],
+    vals: &mut &[u8],
+    scope: TagScope<'_>,
+    strings: usize,
+    mismatch: &'static str,
+) -> Result<()> {
+    if !FULL && let TagScope::Check(Some(matches)) = scope {
+        return validate_selected_tag_arrays(keys, vals, matches, mismatch);
+    }
+    project_tags(
+        keys,
+        vals,
+        FULL || matches!(scope, TagScope::Check(_)),
+        strings,
+        mismatch,
+    )
+}
+
+fn project_dense_tag_scope<const FULL: bool>(
+    dense: &mut WireDenseNodes<'_>,
+    scope: TagScope<'_>,
+    ids: usize,
+    strings: usize,
+) -> Result<()> {
+    if !FULL && let TagScope::Check(Some(matches)) = scope {
+        return validate_dense_tag_runs(dense.keys_vals_data, ids, strings, || true, Some(matches));
+    }
+    project_dense_tags(
+        dense,
+        FULL || matches!(scope, TagScope::Check(_)),
+        ids,
+        strings,
+    )
+}
+
+/// Walk the arrays in pairs. Every key is checked because its value can
+/// only be skipped after the key resolves. Even skipped values must have
+/// complete varint framing, and the arrays must have the same length.
+fn validate_selected_tag_arrays(
+    keys: &[u8],
+    vals: &[u8],
+    matches: &[bool],
+    mismatch: &'static str,
+) -> Result<()> {
+    use super::wire::Cursor;
+
+    let mut key_cursor = Cursor::new(keys);
+    let mut val_cursor = Cursor::new(vals);
+    let mut walk = || -> Result<()> {
+        while !key_cursor.is_empty() && !val_cursor.is_empty() {
+            let key = ordinary_tag_index(key_cursor.read_varint()?, matches.len())?;
+            if matches[key] {
+                let start = val_cursor.position();
+                match val_cursor.read_varint() {
+                    Ok(value) => {
+                        ordinary_tag_index(value, matches.len())?;
+                    }
+                    Err(_) => return packed_uint32_count(&vals[start..], matches.len()).map(drop),
+                }
+            } else {
+                let start = val_cursor.position();
+                if skip_tag_varint(&mut val_cursor).is_err() {
+                    return packed_varint_count(&vals[start..]).map(drop);
+                }
+            }
+        }
+        if key_cursor.is_empty() && val_cursor.is_empty() {
+            Ok(())
+        } else {
+            packed_varint_count(&vals[val_cursor.position()..])?;
+            Err(new_wire_error(mismatch))
+        }
+    };
+    walk().or_else(|e| {
+        // The full validator checks all keys before any of the values.
+        packed_uint32_count(keys, matches.len())?;
+        Err(e)
+    })
+}
+
+#[inline]
+fn ordinary_tag_index(index: u64, count: usize) -> Result<usize> {
+    if index >= count as u64 {
+        if index > u64::from(u32::MAX) {
+            return Err(new_wire_error("tag string index exceeds uint32"));
+        }
+        return Err(sid_past_the_table(index));
+    }
+    // A PBF block's size limit bounds its string table below u32::MAX entries.
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(index as usize)
+}
+
+/// The cursor's skip alone accepts overlong varints. Keep the wire refusal
+/// without decoding valid values.
+#[inline]
+fn skip_tag_varint(cursor: &mut super::wire::Cursor<'_>) -> Result<()> {
+    use super::wire::{Cursor, WIRE_VARINT};
+
+    let raw = cursor.read_raw_field(WIRE_VARINT)?;
+    if raw.len() > 10 || (raw.len() == 10 && raw[9] > 1) {
+        Cursor::new(raw).read_varint()?;
+    }
+    Ok(())
 }
 
 /// Unread plain tags need only varint framing and a cardinality check. Clear
@@ -2300,7 +2624,7 @@ fn validate_dense_keys_vals(
     node_count: usize,
     strings: usize,
 ) -> Result<()> {
-    validate_dense_tag_runs(keys_vals_data, node_count, strings, || true)
+    validate_dense_tag_runs(keys_vals_data, node_count, strings, || true, None)
 }
 
 /// Check tag runs and find the last node the writer will read, so dense
@@ -2328,7 +2652,7 @@ fn validate_retained_dense_tags(
             keep_next();
         }
     } else {
-        validate_dense_tag_runs(dense.keys_vals_data, count, strings, keep_next)?;
+        validate_dense_tag_runs(dense.keys_vals_data, count, strings, keep_next, None)?;
     }
     Ok(retained_through)
 }
@@ -2339,6 +2663,7 @@ fn validate_dense_tag_runs(
     node_count: usize,
     strings: usize,
     mut keep_next: impl FnMut() -> bool,
+    value_matches: Option<&[bool]>,
 ) -> Result<()> {
     use super::wire::{Cursor, WIRE_VARINT};
 
@@ -2366,8 +2691,13 @@ fn validate_dense_tag_runs(
                 "dense keys_vals ends with a key that has no value",
             ));
         }
-        if keep {
+        // Key width and table bound were checked above when keep is true.
+        #[allow(clippy::cast_possible_truncation)]
+        let keep_value = keep && value_matches.is_none_or(|matches| matches[key as usize]);
+        if keep_value {
             validate_dense_tag_sid(cursor.read_varint()?, strings)?;
+        } else if value_matches.is_some() {
+            skip_tag_varint(&mut cursor)?;
         } else {
             cursor.skip_field(WIRE_VARINT)?;
         }
@@ -2968,6 +3298,249 @@ fn tag_index_unresolved() -> ! {
         "a tag string index lies past the string table after PrimitiveBlock construction \
          resolved it (validate_block in block.rs): construction invariant broken"
     )
+}
+
+#[cfg(all(test, feature = "commands"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod selected_tag_tests {
+    use super::{BlockBuffer, Result};
+    use crate::ElementKind::{self, Node, Relation, Way};
+    use crate::read::wire_fixtures::{
+        Group, block, dense, field_bytes, field_varint, packed, plain_node, zigzag,
+    };
+
+    const STRINGS: &[&str] = &["", "used", "unused", "value"];
+
+    fn check(
+        bytes: Vec<u8>,
+        kind: ElementKind,
+        claim: Option<ElementKind>,
+        full: bool,
+    ) -> Result<()> {
+        let (mut strings, mut groups, mut matches) = (Vec::new(), Vec::new(), Vec::new());
+        let buffer = BlockBuffer::new(bytes, None, &mut strings, &mut groups, claim);
+        if full {
+            return buffer.block().map(drop);
+        }
+        buffer
+            .for_selection()?
+            .select_tag_values(kind, |key| key == b"used", &mut matches)
+            .map(drop)
+    }
+
+    fn assert_refusal(bytes: Vec<u8>, kind: ElementKind, claim: Option<ElementKind>) {
+        let expected = check(bytes.clone(), kind, claim, true).expect_err("full refusal");
+        let observed = check(bytes, kind, claim, false).expect_err("scoped refusal");
+        assert_eq!(observed.report(), expected.report());
+    }
+
+    fn ordinary(kind: ElementKind, data: Vec<u8>) -> Vec<u8> {
+        let mut group = Group::default();
+        match kind {
+            Node => group.nodes.push(data),
+            Way => group.ways.push(data),
+            Relation => group.relations.push(data),
+        }
+        block(STRINGS, &[group])
+    }
+
+    #[test]
+    fn selected_plain_tags_keep_key_value_and_count_refusals() {
+        for kind in [Node, Way, Relation] {
+            for bad in [99, 1 << 32, u64::MAX] {
+                for (key, val) in [(bad, 3), (1, bad)] {
+                    let mut data = Vec::new();
+                    field_bytes(&mut data, 2, &packed([key]));
+                    field_bytes(&mut data, 3, &packed([val]));
+                    assert_refusal(ordinary(kind, data), kind, None);
+                }
+            }
+            for bad in [&[][..], &[0x80][..], &[3, 3][..]] {
+                let mut data = Vec::new();
+                field_bytes(&mut data, 2, &packed([1]));
+                field_bytes(&mut data, 3, bad);
+                assert_refusal(ordinary(kind, data), kind, None);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_dense_tags_keep_key_value_and_run_refusals() {
+        for kv in [
+            vec![99, 3, 0],
+            vec![1, 99, 0],
+            vec![1 << 31, 3, 0],
+            vec![1, 1 << 31, 0],
+            vec![1],
+            vec![0, 0],
+        ] {
+            assert_refusal(
+                block(
+                    STRINGS,
+                    &[Group {
+                        dense: Some(dense(&[(7, 1, 2)], &kv)),
+                        ..Group::default()
+                    }],
+                ),
+                Node,
+                None,
+            );
+        }
+        // This value belongs to an unused key, but its framing still fails.
+        let mut malformed_value = vec![2];
+        malformed_value.extend([0x80; 10]);
+        malformed_value.push(0);
+        let mut data = dense(&[(7, 1, 2)], &[]);
+        field_bytes(&mut data, 10, &malformed_value);
+        assert_refusal(
+            block(
+                STRINGS,
+                &[Group {
+                    dense: Some(data),
+                    ..Group::default()
+                }],
+            ),
+            Node,
+            None,
+        );
+    }
+
+    #[test]
+    fn selected_tags_keep_structure_ids_geometry_members_utf8_and_claim_checks() {
+        for kind in [Node, Way, Relation] {
+            assert_refusal(ordinary(kind, vec![0x08, 0x80]), kind, None);
+        }
+        for field in [8, 9] {
+            let mut node = vec![0x08, 0x02];
+            field_varint(&mut node, field, 0);
+            node.extend([u8::try_from(field << 3).expect("test field"), 0x80]);
+            assert_refusal(ordinary(Node, node), Node, None);
+        }
+        for field in [1, 8, 9] {
+            let mut cols = Vec::new();
+            for column in [1, 8, 9] {
+                let packed = if column == field {
+                    &[0x80][..]
+                } else {
+                    &[0][..]
+                };
+                field_bytes(&mut cols, column, packed);
+            }
+            assert_refusal(
+                block(
+                    STRINGS,
+                    &[Group {
+                        dense: Some(cols),
+                        ..Group::default()
+                    }],
+                ),
+                Node,
+                None,
+            );
+        }
+        let mut bad_refs = Vec::new();
+        field_bytes(&mut bad_refs, 8, &[0x80]);
+        assert_refusal(ordinary(Way, bad_refs), Way, None);
+        let mut bad_locations = Vec::new();
+        field_bytes(&mut bad_locations, 9, &[0]);
+        assert_refusal(ordinary(Way, bad_locations), Way, None);
+        for field in [8, 9, 10] {
+            for bad in [&[0x80][..], &[0, 0][..]] {
+                let mut member = Vec::new();
+                for column in [8, 9, 10] {
+                    field_bytes(
+                        &mut member,
+                        column,
+                        if column == field { bad } else { &[0] },
+                    );
+                }
+                assert_refusal(ordinary(Relation, member), Relation, None);
+            }
+        }
+        let node = ordinary(Node, plain_node(7, 1, 2, &[], None));
+        assert_refusal(node.clone(), Node, Some(Way));
+        let mut utf8 = node.clone();
+        let value = utf8
+            .windows(5)
+            .position(|bytes| bytes == b"value")
+            .expect("fixture string");
+        utf8[value] = 0xff;
+        assert_refusal(utf8, Node, None);
+        let mut framing = node;
+        framing.pop();
+        assert_refusal(framing, Node, None);
+    }
+
+    #[test]
+    fn skipped_metadata_and_values_never_reach_the_node_consumer() {
+        let mut dense = dense(&[(7, 100, -50), (2, -30, 60)], &[2, u64::MAX, 1, 3, 0, 0]);
+        field_bytes(&mut dense, 5, &[0xff]);
+        let mut node = plain_node(4, 9, 3, &[(2, u64::MAX), (1, 3)], None);
+        field_bytes(&mut node, 4, &[0xff]);
+        let bytes = block(
+            STRINGS,
+            &[Group {
+                dense: Some(dense),
+                nodes: vec![node],
+                ..Group::default()
+            }],
+        );
+        crate::test_support::assert_err_kind!(
+            check(bytes.clone(), Node, None, true),
+            crate::ErrorKind::WireFormat {
+                msg: "truncated varint",
+            },
+        );
+
+        let (mut strings, mut groups, mut matches) = (Vec::new(), Vec::new(), Vec::new());
+        let view = BlockBuffer::new(bytes, None, &mut strings, &mut groups, None)
+            .for_selection()
+            .expect("block framing");
+        let scoped = view
+            .select_tag_values(Node, |key| key == b"used", &mut matches)
+            .expect("scoped block");
+        let mut seen = Vec::new();
+        scoped
+            .visit_nodes(|id, coords, tags| {
+                seen.push((id, coords, tags.to_vec()));
+                Ok(())
+            })
+            .expect("node replay");
+        assert_eq!(
+            seen,
+            [
+                (7, (10_000, -5_000), vec![("used", "value")]),
+                (2, (-3_000, 6_000), Vec::new()),
+                (4, (900, 300), vec![("used", "value")]),
+            ],
+        );
+
+        // Test each relaxation in isolation, so a skipped field cannot
+        // mask a defect in a retained field in the preceding replay.
+        for kind in [Node, Way, Relation] {
+            let mut metadata = Vec::new();
+            field_varint(&mut metadata, 1, zigzag(1));
+            field_bytes(&mut metadata, 4, &[0xff]);
+            let tags = {
+                let mut data = Vec::new();
+                field_bytes(&mut data, 2, &packed([2, 1]));
+                field_bytes(&mut data, 3, &packed([u64::MAX, 3]));
+                data
+            };
+            for (data, expected) in [
+                (metadata, "truncated varint"),
+                (tags, "tag string index exceeds uint32"),
+            ] {
+                let bytes = ordinary(kind, data);
+                crate::test_support::assert_err_kind!(
+                    check(bytes.clone(), kind, None, true),
+                    crate::ErrorKind::WireFormat { msg } if *msg == expected,
+                    "full validation of {kind:?}",
+                );
+                check(bytes, kind, None, false).expect("only unused data is malformed");
+            }
+        }
+    }
 }
 
 // Tests use `unwrap()`/`expect()` because panicking is the correct failure mode

@@ -162,8 +162,8 @@ pub enum SmokeOutcome {
 /// those fields for API compatibility, but populate them from the header so
 /// the published index remains their single source of truth. Dropped admin
 /// relations are build-only diagnostics. The `smoke_test` field is a
-/// `SmokeOutcome` from querying the newly written index, so neither value can
-/// be derived from the header.
+/// `SmokeOutcome` from checking the newly written index, so neither value
+/// can be derived from the header.
 #[derive(Debug, Default)]
 pub struct BuildStats {
     pub addr_points: u64,
@@ -262,6 +262,7 @@ fn build_geocode_index_to(
         host,
         &scratch,
         pass3::StageB::Parallel,
+        InputValidation::Scoped,
     )
     .map_err(building)?;
     writer.finish();
@@ -467,6 +468,14 @@ pub fn index_output_with_staging(
     .map(IndexOutput)
 }
 
+/// Full input validation is retained as an oracle for generated fixtures.
+#[derive(Clone, Copy)]
+enum InputValidation {
+    Scoped,
+    #[cfg(test)]
+    Full,
+}
+
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn build_generation(
     input: &crate::read::input::PinnedInput,
@@ -475,6 +484,7 @@ fn build_generation(
     host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
     stage_b: pass3::StageB,
+    validation: InputValidation,
 ) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
 
@@ -525,7 +535,7 @@ fn build_generation(
         max_node_id,
         file: shared_file,
         file_size: walked_size,
-    } = pass1_5::build_schedules(input, host)?;
+    } = pass1_5::build_schedules(input, host, validation)?;
     host.invocation.marker("GEOCODE_SCHEDULES_END");
     host.invocation.check()?;
 
@@ -573,6 +583,7 @@ fn build_generation(
             scratch,
             host,
             stage_b,
+            validation,
         )
     })
 }
@@ -595,6 +606,7 @@ fn build_from_schedules(
     scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
     stage_b: pass3::StageB,
+    validation: InputValidation,
 ) -> Result<BuildStats> {
     let pass1_5::Schedules {
         relations: relation_schedule,
@@ -620,8 +632,13 @@ fn build_from_schedules(
     #[cfg(feature = "hotpath")]
     let pass1_start = crate::counters::Stopwatch::start();
 
-    let (admin_relations, needed_admin_ways) =
-        pass1::run_pass1(&relation_schedule, &shared_file, &mut strings, host)?;
+    let (admin_relations, needed_admin_ways) = pass1::run_pass1(
+        &relation_schedule,
+        &shared_file,
+        &mut strings,
+        host,
+        validation,
+    )?;
     drop(relation_schedule);
     crate::host::diag!(
         host.diagnostics,
@@ -664,6 +681,7 @@ fn build_from_schedules(
         &needed_admin_ways,
         scratch,
         host,
+        validation,
     )?;
     drop(needed_admin_ways);
     host.invocation.marker("GEOCODE_PASS1_5_END");
@@ -711,6 +729,7 @@ fn build_from_schedules(
         admin_totals,
         &mut strings,
         host,
+        validation,
     )?;
     way_store.remove(scratch);
     drop(node_schedule);
@@ -1004,9 +1023,8 @@ fn build_from_schedules(
     };
     write_data_file(&output_dir.join(FILE_HEADER), &header.to_bytes())?;
 
-    // `Reader::open` runs the same record and string validation described on
-    // its public API, so this smoke test intentionally repeats that structural
-    // pass on the files just written. Its work is part of the build wall
+    // The smoke test uses the record and string validation from
+    // `Reader::open` on the files just written. Its work is part of the build wall
     // time; skipping it would leave written output unchecked by the reader
     // path.
     //
@@ -1038,28 +1056,7 @@ fn build_from_schedules(
             "geocode.smoke_test",
             "  Running smoke test..."
         );
-        let test_reader = super::reader::Reader::open(output_dir)?;
-        if let Some(first_addr_point) = first_addr_point {
-            let (fine_cell, coarse_cell) =
-                pass3::addr_point_cells(first_addr_point.lat_e7, first_addr_point.lon_e7, sl, cl);
-            let (fine, coarse) = test_reader.address_listed_in(0, fine_cell, coarse_cell);
-            if !(fine && coarse) {
-                let missing = match (fine, coarse) {
-                    (false, false) => "fine and coarse cells",
-                    (false, true) => "fine cell",
-                    _ => "coarse cell",
-                };
-                return Err(Error::internal(format!(
-                    "geocode smoke test: address point 0 at ({:.7}, {:.7}) is not listed in its \
-                     own {missing}; refusing to publish",
-                    e7_to_deg(f64::from(first_addr_point.lat_e7)),
-                    e7_to_deg(f64::from(first_addr_point.lon_e7)),
-                )));
-            }
-            SmokeOutcome::Passed
-        } else {
-            SmokeOutcome::SkippedNoAddressPoints
-        }
+        check_written_index(output_dir, &host.executor, first_addr_point, sl, cl)?
     };
     host.invocation.marker("GEOCODE_SMOKE_TEST_END");
 
@@ -1171,6 +1168,37 @@ fn checked_count(count: usize, kind: &str) -> Result<u32> {
             "{kind} count exceeds u32::MAX; widen the on-disk count and bump FORMAT_VERSION"
         ))
     })
+}
+
+fn check_written_index(
+    output_dir: &std::path::Path,
+    executor: &crate::host::Executor,
+    first_addr_point: Option<AddrPoint>,
+    fine_level: u8,
+    coarse_level: u8,
+) -> Result<SmokeOutcome> {
+    let membership = super::reader::Reader::check_written_index(output_dir, executor, || {
+        first_addr_point.map(|point| {
+            pass3::addr_point_cells(point.lat_e7, point.lon_e7, fine_level, coarse_level)
+        })
+    })?;
+    let Some((fine, coarse)) = membership else {
+        return Ok(SmokeOutcome::SkippedNoAddressPoints);
+    };
+    let point = first_addr_point
+        .ok_or_else(|| Error::internal("smoke check tested a missing first address point"))?;
+    let missing = match (fine, coarse) {
+        (true, true) => return Ok(SmokeOutcome::Passed),
+        (false, false) => "fine and coarse cells",
+        (false, true) => "fine cell",
+        (true, false) => "coarse cell",
+    };
+    Err(Error::internal(format!(
+        "geocode smoke test: address point 0 at ({:.7}, {:.7}) is not listed in its \
+         own {missing}; refusing to publish",
+        e7_to_deg(f64::from(point.lat_e7)),
+        e7_to_deg(f64::from(point.lon_e7)),
+    )))
 }
 
 #[cfg(test)]
@@ -1300,6 +1328,266 @@ mod stage_b_tests {
         names
     }
 
+    fn generation(
+        input: &Path,
+        output: &Path,
+        config: &BuildConfig,
+        validation: InputValidation,
+    ) -> Result<BuildStats> {
+        let host = Host::for_tests();
+        std::fs::create_dir(output)?;
+        let pinned = PinnedInput::pin(input, &host)?;
+        let parent = output
+            .parent()
+            .ok_or_else(|| Error::internal("generation has no parent directory"))?;
+        let scratch = RunScratch::create(parent, &host)?;
+        build_generation(
+            &pinned,
+            config,
+            output,
+            &host.entered(),
+            &scratch,
+            pass3::StageB::Parallel,
+            validation,
+        )
+    }
+
+    fn write_unindexed_block(path: &Path, bytes: &[u8]) {
+        let file = std::fs::File::create(path).expect("create input");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        let header = HeaderBuilder::new().sorted().build().expect("PBF header");
+        writer.write_header(&header).expect("write PBF header");
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write raw block");
+        writer.flush().expect("flush input");
+    }
+
+    #[test]
+    fn scoped_validation_matches_full_validation_for_every_index_file() {
+        use crate::read::wire_fixtures::{Group, block, dense, plain_node, way};
+
+        let dir = crate::path_guard::tests::scratch();
+        let indexed = dir.path().join("indexed.pbf");
+        let unindexed = dir.path().join("unindexed.pbf");
+        write_fixture(&indexed, 17, 0);
+        // A mixed group exercises unindexed schedule discovery and the dense
+        // before plain node ordering. Each has a duplicated address key.
+        let keys = [
+            "",
+            "addr:housenumber",
+            "3",
+            "addr:street",
+            "Main",
+            "7",
+            "name",
+            "addr:interpolation",
+            "all",
+        ];
+        let bytes = block(
+            &keys,
+            &[Group {
+                dense: Some(dense(&[(1, 557_000_000, 125_000_000)], &[1, 5, 3, 4, 1, 2])),
+                nodes: vec![plain_node(
+                    2,
+                    557_000_000,
+                    125_001_000,
+                    &[(1, 2), (6, 4), (1, 5), (3, 4)],
+                    Some([1, 10, 20, 7, 0]),
+                )],
+                ways: vec![way(1, &[1, 2], (7, 8))],
+                ..Group::default()
+            }],
+        );
+        write_unindexed_block(&unindexed, &bytes);
+
+        for (source, allow_unindexed) in [(&indexed, false), (&unindexed, true)] {
+            let config = BuildConfig {
+                allow_unindexed,
+                ..BuildConfig::default()
+            };
+            let name = source.file_stem().expect("fixture name").to_string_lossy();
+            let scoped = dir.path().join(format!("{name}-scoped"));
+            let full = dir.path().join(format!("{name}-full"));
+            let new = generation(source, &scoped, &config, InputValidation::Scoped)
+                .expect("scoped build");
+            let old =
+                generation(source, &full, &config, InputValidation::Full).expect("full build");
+            assert!(new.addr_points > 0 && new.interp_ways > 0);
+            assert_eq!(new.addr_points, old.addr_points);
+            assert_eq!(new.smoke_test, old.smoke_test);
+            assert_eq!(file_names(&scoped), file_names(&full));
+            for name in file_names(&full) {
+                assert_eq!(
+                    std::fs::read(scoped.join(&name)).expect("scoped file"),
+                    std::fs::read(full.join(&name)).expect("full file"),
+                    "{source:?} {name:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smoke_reports_the_serial_failure_for_a_broken_index() {
+        use crate::geocode_index::reader::Reader;
+
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("indexed.pbf");
+        let index = dir.path().join("index");
+        write_fixture(&input, 17, 0);
+        let config = BuildConfig::default();
+        generation(&input, &index, &config, InputValidation::Scoped).expect("build index");
+
+        let path = index.join(FILE_GEO_CELLS);
+        let mut bytes = std::fs::read(&path).expect("fine cells");
+        let table = Table::<GeoCell>::new(&bytes);
+        let mut first = table.get(0).expect("first cell");
+        let mut second = table.get(1).expect("second cell");
+        first.addr_offset = NO_DATA_U64 - 1;
+        second.cell_id = first.cell_id;
+        bytes[..GeoCell::SIZE].copy_from_slice(&first.to_bytes());
+        bytes[GeoCell::SIZE..2 * GeoCell::SIZE].copy_from_slice(&second.to_bytes());
+        std::fs::write(&path, bytes).expect("corrupt two cells");
+
+        let serial = Reader::open(&index)
+            .err()
+            .expect("serial open failure")
+            .report();
+        assert!(
+            serial.contains(&format!("{FILE_GEO_CELLS} record 0")),
+            "{serial}"
+        );
+        assert!(serial.contains("address entry offset"), "{serial}");
+        let executor = crate::host::Executor::for_tests();
+        for _ in 0..4 {
+            let parallel = check_written_index(
+                &index,
+                &executor,
+                None,
+                config.street_level,
+                config.coarse_level,
+            )
+            .expect_err("smoke structural failure");
+            assert_eq!(parallel.report(), serial);
+        }
+    }
+
+    #[test]
+    fn smoke_keeps_the_address_membership_error() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("indexed.pbf");
+        let index = dir.path().join("index");
+        write_fixture(&input, 1, 0);
+        let config = BuildConfig::default();
+        generation(&input, &index, &config, InputValidation::Scoped).expect("build index");
+        let bytes = std::fs::read(index.join(FILE_ADDR_POINTS)).expect("address points");
+        let point = Table::<AddrPoint>::new(&bytes)
+            .get(0)
+            .expect("first address");
+        let (fine, _) = pass3::addr_point_cells(
+            point.lat_e7,
+            point.lon_e7,
+            config.street_level,
+            config.coarse_level,
+        );
+        let path = index.join(FILE_GEO_CELLS);
+        let mut bytes = std::fs::read(&path).expect("fine cells");
+        for record in bytes.as_chunks_mut::<{ GeoCell::SIZE }>().0 {
+            let mut cell = GeoCell::read(record).expect("cell");
+            if cell.cell_id == fine {
+                cell.addr_offset = NO_DATA_U64;
+                record.copy_from_slice(&cell.to_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).expect("remove fine address membership");
+        crate::geocode_index::reader::Reader::open(&index).expect("structure is valid");
+        let executor = crate::host::Executor::for_tests();
+        let err = check_written_index(
+            &index,
+            &executor,
+            Some(point),
+            config.street_level,
+            config.coarse_level,
+        )
+        .expect_err("smoke membership failure");
+        let crate::ErrorKind::Internal { msg, .. } = err.kind() else {
+            panic!("expected a smoke-test internal error, got {err}");
+        };
+        assert_eq!(
+            msg.as_ref(),
+            "geocode smoke test: address point 0 at (55.7000000, 12.5000000) is not listed in its own fine cell; refusing to publish",
+        );
+    }
+
+    #[test]
+    fn scoped_validation_keeps_exact_coordinate_and_role_refusals() {
+        use crate::read::wire_fixtures::{
+            Group, block, dense, field_bytes, packed, plain_node, relation,
+        };
+
+        let dir = crate::path_guard::tests::scratch();
+        let config = BuildConfig {
+            allow_unindexed: true,
+            ..BuildConfig::default()
+        };
+        let mut bad_role = relation(1, &[(99, 1, 1)]);
+        field_bytes(&mut bad_role, 2, &packed([1, 3, 5]));
+        field_bytes(&mut bad_role, 3, &packed([2, 4, 6]));
+        let fixtures = [
+            (
+                "dense-outside-i32",
+                Group {
+                    dense: Some(dense(&[(1, 4_294_967_296, 0)], &[])),
+                    ..Group::default()
+                },
+                "lat 429496729600, lon 0 in nanodegrees",
+            ),
+            (
+                "plain-outside-domain",
+                Group {
+                    nodes: vec![plain_node(1, 900_000_001, 0, &[], None)],
+                    ..Group::default()
+                },
+                "lat 90000000100, lon 0 in nanodegrees",
+            ),
+            (
+                "bad-role",
+                Group {
+                    relations: vec![bad_role],
+                    ..Group::default()
+                },
+                "relation 1 member 0: role string index 99",
+            ),
+        ];
+        for (name, group, message) in fixtures {
+            let input = dir.path().join(format!("{name}.pbf"));
+            let strings = [
+                "",
+                "boundary",
+                "administrative",
+                "admin_level",
+                "8",
+                "name",
+                "Test",
+            ];
+            write_unindexed_block(&input, &block(&strings, &[group]));
+            let error = |mode, suffix| {
+                generation(
+                    &input,
+                    &dir.path().join(format!("{name}-{suffix}")),
+                    &config,
+                    mode,
+                )
+                .expect_err("fixture must be refused")
+                .report()
+            };
+            let scoped = error(InputValidation::Scoped, "scoped");
+            let full = error(InputValidation::Full, "full");
+            assert!(full.contains(message), "{name}: {full}");
+            assert_eq!(scoped, full, "{name}");
+        }
+    }
+
     #[test]
     fn parallel_stage_b_matches_serial_for_every_index_file() {
         for (sites, extra_addresses) in [(1, 0), (17, 0), (257, 74_000)] {
@@ -1333,6 +1621,7 @@ mod stage_b_tests {
                 &host.entered(),
                 &RunScratch::create(dir.path(), &host).expect("serial scratch"),
                 pass3::StageB::Serial,
+                InputValidation::Scoped,
             )
             .expect("build serial index");
 

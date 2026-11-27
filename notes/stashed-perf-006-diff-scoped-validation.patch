@@ -1,0 +1,1163 @@
+diff --git a/DEVIATIONS.md b/DEVIATIONS.md
+index 88dd7059..d783b191 100644
+--- a/DEVIATIONS.md
++++ b/DEVIATIONS.md
+@@ -1065,6 +1065,48 @@ can report the reference error first.
+ The existing `--invert` raw frame copy still uses indexdata to decide
+ which blobs it copies without decoding.
+ 
++## diff and derive-changes: indexed validation follows comparison and output
++
++Decoded blobs still check block, group and element framing, string-table
++UTF-8, tag indices and dense tag runs, packed IDs, coordinates, refs and
++member arrays, and countable parallel arrays in the element messages.
++Kind, ID-range, count and order claims still pass the existing checks.
++Tags stay fully validated because the packed equality shortcut can decide
++equality without resolving each index. Dense tag run boundaries align the
++tags to node IDs. Refs and members keep their packed checks so an
++incomplete value cannot shorten the sequence used for comparison.
++Coordinate scaling and relation role resolution keep their existing
++comparison and output semantics.
++
++Metadata is checked at the first use of the record or dense group. Text
++checks the versions it prints, including the old version on common lines
++without `-c`. Verbose text adds content details for modified pairs, so
++only the printed versions need metadata. OSC checks visibility on both
++sides when the content is equal, the old version for a delete, and all
++metadata on the new record for a create or modify. Count-only diff
++needs no metadata. Once a dense metadata message is used, its framing
++and all packed columns are checked against the ID count. Full output
++replays the group's deltas from its start, including before a clipped
++window or an unchanged node.
++
++A metadata message with no such use can carry malformed inner framing,
++duplicate packed fields, invalid packed varints or mismatched dense
++metadata column lengths. Its enclosing message still has to be framed
++correctly. For plain Info opened only for version or visibility, field
++framing and the selected scalar are checked. A terminated varint in
++another scalar field can exceed the decoder's value width, since only
++its end is needed to find the selected field. No skipped value can
++contribute to equality or be printed. A used visibility column must
++be checked before it can supply an equality verdict, even when there
++will be no output for that element.
++
++Metadata defects can now be reported after a content or claim defect
++that the same blob also carries, or after earlier records have been
++written to a text stream. The sequential path for inputs without
++indexdata and public block construction retain full validation. The
++existing compressed-byte equality shortcut still skips decoding eligible
++identical blobs.
++
+ ## tags-filter and inspect tags: expression-syntax edge cases
+ 
+ The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`
+diff --git a/crates/lib/src/commands/diff/mod.rs b/crates/lib/src/commands/diff/mod.rs
+index 98e08116..ccc771d0 100644
+--- a/crates/lib/src/commands/diff/mod.rs
++++ b/crates/lib/src/commands/diff/mod.rs
+@@ -192,7 +192,7 @@ pub fn diff<'a, 'b>(
+ /// `verbose` off and the same `type_filter`, `parallelism` and `locations`
+ /// (see [`DiffOptions::locations`]): the same
+ /// paths (parallel work units for indexed inputs, the sequential fallback
+-/// otherwise) and the same input checks. Like `diff -c`, it skips a fresh
++/// otherwise) and the same comparison checks. Like `diff -c`, it skips a fresh
+ /// pair of byte-equal blobs without decoding it, so `common` counts such a
+ /// pair by the blobs' claimed `index.count` and a corrupt blob that is
+ /// byte-identical on both sides is not noticed. Every blob it decodes has its
+@@ -201,7 +201,8 @@ pub fn diff<'a, 'b>(
+ /// `deleted` are exact when the skipped pairs' claims are. Only the
+ /// formatting is skipped, so no output I/O happens at all.
+ ///
+-/// The inputs are pinned as in [`diff`], with the same refusals.
++/// The inputs are pinned as in [`diff`]. On the block-pair path the metadata
++/// checks that supply printed versions are omitted.
+ #[hotpath::measure]
+ pub fn diff_stats<'a, 'b>(
+     old: impl Into<InputSource<'a>>,
+@@ -457,7 +458,7 @@ impl<'a> DiffState<'a> {
+             ElementDetail::Id
+         };
+         let modified = if text && self.options.verbose {
+-            ElementDetail::Full
++            ElementDetail::Content
+         } else {
+             compact
+         };
+@@ -510,7 +511,7 @@ impl<'a> DiffState<'a> {
+                 if let Some(out) = output {
+                     write_modified_line(out, type_char, old.id(), old.version(), new.version())?;
+                     if self.options.verbose {
+-                        let (old, new) = (old.full()?, new.full()?);
++                        let (old, new) = (old.content()?, new.content()?);
+                         write_modified_details_borrowed(out, old, new)?;
+                         if self.options.locations
+                             && let (Element::Way(ow), Element::Way(nw)) = (old, new)
+diff --git a/crates/lib/src/commands/diff/view.rs b/crates/lib/src/commands/diff/view.rs
+index 1c07aef4..ecf5fddb 100644
+--- a/crates/lib/src/commands/diff/view.rs
++++ b/crates/lib/src/commands/diff/view.rs
+@@ -8,11 +8,12 @@ use std::cell::OnceCell;
+ 
+ use crate::ElementKind;
+ use crate::content::{Content, Equality, Relation, Token, content_equal};
+-use crate::error::{Result, new_stringtable_index_out_of_bounds, new_wire_error};
++use crate::error::{Location, Result, new_stringtable_index_out_of_bounds, new_wire_error};
++use crate::read::block::{DiffInfoField, DiffOutputBlock, diff_dense_info, diff_info_scalar};
+ use crate::read::elements::{MemberIdIter, WayRefIter};
+ use crate::read::wire::{
+-    BlockFields, Cursor, PackedBoolIter, PackedInt32Iter, PackedUint32Iter, WireDenseInfo,
+-    WireDenseNodes, WireGroup, WireInfo, WireMessageIter, WireNode, WireRelation, WireWay,
++    BlockFields, Cursor, PackedBoolIter, PackedInt32Iter, PackedUint32Iter, WireDenseNodes,
++    WireGroup, WireMessageIter, WireNode, WireRelation, WireWay,
+ };
+ use crate::scan::node::{
+     scale_to_decimicro, scale_to_nano, unrepresentable_coordinate_err,
+@@ -197,11 +198,14 @@ enum Geometry<'a> {
+ 
+ #[derive(Clone, Copy)]
+ enum Meta<'a> {
+-    Plain(Option<&'a [u8]>),
++    Plain {
++        data: &'a [u8],
++        info: Option<&'a [u8]>,
++    },
+     Dense {
+         group: usize,
+         slot: usize,
+-        info: Option<&'a [u8]>,
++        data: &'a [u8],
+     },
+ }
+ 
+@@ -223,7 +227,10 @@ impl<'a> Row<'a> {
+                 lon: node.lon,
+                 fields,
+             },
+-            meta: Meta::Plain(node.info_data),
++            meta: Meta::Plain {
++                data,
++                info: node.info_data,
++            },
+         }
+     }
+ 
+@@ -238,7 +245,10 @@ impl<'a> Row<'a> {
+                 lons: way.lon_data,
+                 fields,
+             },
+-            meta: Meta::Plain(way.info_data),
++            meta: Meta::Plain {
++                data,
++                info: way.info_data,
++            },
+         }
+     }
+ 
+@@ -252,7 +262,10 @@ impl<'a> Row<'a> {
+                 ids: rel.memids_data,
+                 types: rel.types_data,
+             },
+-            meta: Meta::Plain(rel.info_data),
++            meta: Meta::Plain {
++                data,
++                info: rel.info_data,
++            },
+         }
+     }
+ 
+@@ -264,20 +277,39 @@ impl<'a> Row<'a> {
+         }
+     }
+ 
+-    pub(crate) fn version(&self, dense: &mut MetadataCursor<'a>) -> Option<i32> {
++    pub(crate) fn version(&self, dense: &mut MetadataCursor<'a>) -> Result<Option<i32>> {
+         let version = match self.meta {
+-            Meta::Plain(info) => info.and_then(|data| accepted(WireInfo::parse(data)).version),
+-            Meta::Dense { group, slot, info } => dense.group(group, info).versions.at(slot),
++            // WireInfo narrows protobuf int32 scalars, including
++            // sign-extended negative versions. All versions below 1
++            // are unclaimed, including the -1 sentinel.
++            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
++            Meta::Plain { info, .. } => dense
++                .plain(info, DiffInfoField::Version)?
++                .map(|raw| raw as i32),
++            Meta::Dense { group, slot, data } => dense.group(group, data)?.versions.at(slot),
+         };
+-        version.filter(|&v| v >= 1)
++        Ok(version.filter(|&v| v >= 1))
+     }
+ 
+-    fn hidden(&self, dense: &mut MetadataCursor<'a>) -> bool {
+-        let visible = match self.meta {
+-            Meta::Plain(info) => info.and_then(|data| accepted(WireInfo::parse(data)).visible),
+-            Meta::Dense { group, slot, info } => dense.group(group, info).visible.at(slot),
+-        };
+-        visible == Some(false)
++    fn hidden(&self, dense: &mut MetadataCursor<'a>) -> Result<bool> {
++        Ok(match self.meta {
++            Meta::Plain { info, .. } => dense.plain(info, DiffInfoField::Visible)? == Some(0),
++            Meta::Dense { group, slot, data } => {
++                dense.group(group, data)?.visible.at(slot) == Some(false)
++            }
++        })
++    }
++
++    pub(crate) fn replay(
++        &self,
++        block: &'a DiffOutputBlock,
++        dense: &mut OutputCursor<'a>,
++        metadata: bool,
++    ) -> Result<crate::Element<'a>> {
++        match self.meta {
++            Meta::Plain { data, .. } => block.plain(self.kind(), data, metadata),
++            Meta::Dense { group, slot, data } => dense.node(block, group, slot, data, metadata),
++        }
+     }
+ }
+ 
+@@ -287,7 +319,7 @@ struct DenseRows<'a> {
+     lons: WayRefIter<'a>,
+     keys_vals: &'a [u8],
+     tags: Cursor<'a>,
+-    info: Option<&'a [u8]>,
++    data: &'a [u8],
+     group: usize,
+     slot: usize,
+ }
+@@ -301,7 +333,7 @@ impl<'a> DenseRows<'a> {
+             lons: WayRefIter::delta_decoded(dense.lon_data),
+             keys_vals: dense.keys_vals_data,
+             tags: Cursor::new(dense.keys_vals_data),
+-            info: dense.info_data,
++            data,
+             group,
+             slot: 0,
+         }
+@@ -321,7 +353,7 @@ impl<'a> DenseRows<'a> {
+             meta: Meta::Dense {
+                 group: self.group,
+                 slot,
+-                info: self.info,
++                data: self.data,
+             },
+         })
+     }
+@@ -344,6 +376,7 @@ fn dense_tags<'a>(data: &'a [u8], cursor: &mut Cursor<'a>) -> &'a [u8] {
+ #[derive(Default)]
+ pub(crate) struct MetadataCursor<'a> {
+     dense: Option<DenseMetadata<'a>>,
++    location: Option<&'a Location>,
+ }
+ 
+ struct DenseMetadata<'a> {
+@@ -353,22 +386,80 @@ struct DenseMetadata<'a> {
+ }
+ 
+ impl<'a> MetadataCursor<'a> {
+-    fn group(&mut self, group: usize, info: Option<&'a [u8]>) -> &mut DenseMetadata<'a> {
+-        if self
+-            .dense
+-            .as_ref()
+-            .is_some_and(|prior| prior.group != group)
+-        {
+-            self.dense = None;
++    pub(crate) fn located(location: &'a Location) -> Self {
++        Self {
++            dense: None,
++            location: Some(location),
++        }
++    }
++
++    fn locate(&self, err: crate::Error) -> crate::Error {
++        match self.location {
++            Some(location) => err.locate(location.clone()),
++            None => err,
+         }
+-        self.dense.get_or_insert_with(|| {
+-            let info = info.map(|data| accepted(WireDenseInfo::parse(data)));
+-            DenseMetadata {
++    }
++
++    fn plain(&self, data: Option<&[u8]>, field: DiffInfoField) -> Result<Option<u64>> {
++        diff_info_scalar(data, field).map_err(|err| self.locate(err))
++    }
++
++    fn group(&mut self, group: usize, data: &'a [u8]) -> Result<&mut DenseMetadata<'a>> {
++        if self.dense.as_ref().is_none_or(|prior| prior.group != group) {
++            let dense = accepted(WireDenseNodes::parse(data));
++            let info = diff_dense_info(&dense).map_err(|err| self.locate(err))?;
++            self.dense = Some(DenseMetadata {
+                 group,
+                 versions: Column::new(PackedInt32Iter::new(info.map_or(&[], |i| i.version_data))),
+                 visible: Column::new(PackedBoolIter::new(info.map_or(&[], |i| i.visible_data))),
+-            }
+-        })
++            });
++        }
++        self.dense
++            .as_mut()
++            .ok_or_else(|| crate::Error::internal("diff metadata cursor lost its group"))
++    }
++}
++
++/// Replay one dense output group forward, including the preceding deltas in
++/// that group. A group with no output does not need a replay.
++#[derive(Default)]
++pub(crate) struct OutputCursor<'a>(Option<Box<DenseOutput<'a>>>);
++
++struct DenseOutput<'a> {
++    group: usize,
++    next: usize,
++    nodes: crate::DenseNodeIter<'a>,
++}
++
++impl<'a> OutputCursor<'a> {
++    fn node(
++        &mut self,
++        block: &'a DiffOutputBlock,
++        group: usize,
++        slot: usize,
++        data: &'a [u8],
++        metadata: bool,
++    ) -> Result<crate::Element<'a>> {
++        if self.0.as_ref().is_none_or(|prior| prior.group != group) {
++            let nodes = block.dense(accepted(WireDenseNodes::parse(data)), metadata)?;
++            self.0 = Some(Box::new(DenseOutput {
++                group,
++                next: 0,
++                nodes,
++            }));
++        }
++        let output = self
++            .0
++            .as_mut()
++            .ok_or_else(|| crate::Error::internal("diff output cursor lost its group"))?;
++        let skip = slot
++            .checked_sub(output.next)
++            .ok_or_else(|| crate::Error::internal("diff output cursor moved backwards"))?;
++        let node = output.nodes.nth(skip).ok_or_else(|| {
++            crate::Error::internal("diff output cursor ended before the requested node")
++        })?;
++        output.next = slot + 1;
++        Ok(crate::Element::DenseNode(node))
+     }
+ }
+ 
+@@ -517,7 +608,7 @@ impl Pair {
+         let content = self.content_equal(blocks, old, new)?;
+         match equality {
+             Equality::ContentVisibility => {
+-                Ok(content && old.hidden(metadata.0) == new.hidden(metadata.1))
++                Ok(content && old.hidden(metadata.0)? == new.hidden(metadata.1)?)
+             }
+             Equality::Relation(Relation::ContentLocations)
+                 if old.kind() == ElementKind::Way && new.kind() == ElementKind::Way =>
+@@ -685,6 +776,10 @@ mod tests {
+     }
+ 
+     fn block(strings: &[&str], groups: &[Vec<u8>], framing: (i32, i64, i64)) -> Fixture {
++        Fixture::new(block_bytes(strings, groups, framing))
++    }
++
++    fn block_bytes(strings: &[&str], groups: &[Vec<u8>], framing: (i32, i64, i64)) -> Vec<u8> {
+         let mut table = Vec::new();
+         for s in strings {
+             message(&mut table, 1, s.as_bytes());
+@@ -697,7 +792,7 @@ mod tests {
+         field(&mut bytes, 17, i64::from(framing.0).cast_unsigned());
+         field(&mut bytes, 19, framing.1.cast_unsigned());
+         field(&mut bytes, 20, framing.2.cast_unsigned());
+-        Fixture::new(bytes)
++        bytes
+     }
+ 
+     fn plain_node(
+@@ -811,8 +906,14 @@ mod tests {
+                 }
+                 if equality == TEXT {
+                     // Common text without -c must print the old version.
+-                    assert_eq!(old_row.version(&mut old_meta), element_version(old_element));
+-                    assert_eq!(new_row.version(&mut new_meta), element_version(new_element));
++                    assert_eq!(
++                        old_row.version(&mut old_meta).unwrap(),
++                        element_version(old_element)
++                    );
++                    assert_eq!(
++                        new_row.version(&mut new_meta).unwrap(),
++                        element_version(new_element)
++                    );
+                 }
+             }
+         }
+@@ -896,11 +997,11 @@ mod tests {
+         let view = block.view();
+         let rows: Vec<_> = view.rows().collect();
+         let mut cursor = MetadataCursor::default();
+-        assert!(rows[2].hidden(&mut cursor));
+-        assert_eq!(rows[1].version(&mut cursor), Some(4));
+-        assert_eq!(rows[2].version(&mut cursor), Some(5));
+-        assert!(!rows[3].hidden(&mut cursor));
+-        assert_eq!(rows[3].version(&mut cursor), None);
++        assert!(rows[2].hidden(&mut cursor).unwrap());
++        assert_eq!(rows[1].version(&mut cursor).unwrap(), Some(4));
++        assert_eq!(rows[2].version(&mut cursor).unwrap(), Some(5));
++        assert!(!rows[3].hidden(&mut cursor).unwrap());
++        assert_eq!(rows[3].version(&mut cursor).unwrap(), None);
+     }
+ 
+     #[test]
+@@ -1039,20 +1140,24 @@ mod tests {
+         ]
+     }
+ 
+-    fn write_fixture(path: &std::path::Path, blocks: &[Fixture], indexed: bool) {
++    fn fixture_header() -> Vec<u8> {
+         use crate::block_builder::HeaderBuilder;
+         use crate::read::block::Feature;
+-        use crate::writer::{Compression, PbfWriter};
+ 
+-        let header = HeaderBuilder::new()
++        HeaderBuilder::new()
+             .sorted()
+             .historical()
+             .optional_feature(Feature::LOCATIONS_ON_WAYS)
+             .build()
+-            .unwrap();
++            .unwrap()
++    }
++
++    fn write_fixture(path: &std::path::Path, blocks: &[Fixture], indexed: bool) {
++        use crate::writer::{Compression, PbfWriter};
++
+         let mut bytes = Vec::new();
+         let mut writer = PbfWriter::new(&mut bytes, Compression::None);
+-        writer.write_header(&header).unwrap();
++        writer.write_header(&fixture_header()).unwrap();
+         for block in blocks {
+             if indexed {
+                 writer.write_primitive_block(&block.bytes).unwrap();
+@@ -1089,6 +1194,318 @@ mod tests {
+         host
+     }
+ 
++    /// Supply a claim without running the writer's payload scanner. This
++    /// lets a fixture exercise the diff reader's own refusal.
++    fn write_claimed(
++        path: &std::path::Path,
++        payload: &[u8],
++        kind: ElementKind,
++        ids: std::ops::RangeInclusive<i64>,
++    ) {
++        use crate::writer::{Compression, PbfWriter};
++
++        let index = crate::blob_meta::BlobIndex {
++            kind,
++            min_id: *ids.start(),
++            max_id: *ids.end(),
++            count: ids.count() as u64,
++            bbox: None,
++        };
++        let mut body = Vec::new();
++        message(&mut body, 1, payload);
++        let mut header = Vec::new();
++        crate::write::encode_blob_header_into(
++            "OSMData",
++            i32::try_from(body.len()).unwrap(),
++            Some(&index.serialize()),
++            None,
++            None,
++            &mut header,
++        )
++        .unwrap();
++
++        let mut bytes = Vec::new();
++        {
++            let mut writer = PbfWriter::new(&mut bytes, Compression::None);
++            writer.write_header(&fixture_header()).unwrap();
++            writer.flush().unwrap();
++        }
++        bytes.extend(u32::try_from(header.len()).unwrap().to_be_bytes());
++        bytes.extend(header);
++        bytes.extend(body);
++        std::fs::write(path, bytes).unwrap();
++    }
++
++    fn text_diff(
++        (old, new): (&std::path::Path, &std::path::Path),
++        suppress_common: bool,
++        verbose: bool,
++    ) -> Result<(String, [u64; 4])> {
++        let options = super::super::DiffOptions {
++            suppress_common,
++            verbose,
++            type_filter: None,
++            parallelism: crate::host::Parallelism::from_jobs(2),
++            locations: false,
++        };
++        let mut bytes = Vec::new();
++        let stats = super::super::diff(old, new, &mut bytes, &options, false, &entrypoint_host())?;
++        let Ok(text) = String::from_utf8(bytes) else {
++            panic!("diff text output is UTF-8");
++        };
++        Ok((
++            text,
++            [stats.common, stats.created, stats.modified, stats.deleted],
++        ))
++    }
++
++    fn osc_diff(
++        (old, new): (&std::path::Path, &std::path::Path),
++        dir: &std::path::Path,
++        name: &str,
++    ) -> Result<(String, [u64; 3])> {
++        let path = dir.join(name);
++        let host = entrypoint_host();
++        let output =
++            crate::output::Output::new(&path, crate::output::Overwrite::Refuse, &host.diagnostics)?;
++        let scratch = crate::scratch::RunScratch::create(dir, &host.entered())?;
++        let stats = super::super::derive::derive_changes(
++            old,
++            new,
++            output,
++            false,
++            true,
++            None,
++            crate::host::Parallelism::from_jobs(2),
++            &host,
++            scratch,
++        )?;
++        Ok((
++            std::fs::read_to_string(path)?,
++            [stats.creates, stats.modifies, stats.deletes],
++        ))
++    }
++
++    fn plain_payload(lat: i64, info: &[u8]) -> Vec<u8> {
++        let mut group = Vec::new();
++        plain_node(&mut group, 1, (lat, 0), (&[], &[]), info);
++        block_bytes(&[""], &[group], (100, 0, 0))
++    }
++
++    fn dense_payload(lats: &[i64; 2], columns: &[(u64, &[u8])]) -> Vec<u8> {
++        let mut info = Vec::new();
++        for &(column, data) in columns {
++            message(&mut info, column, data);
++        }
++        let group = dense_nodes(&[1, 2], lats, &[0; 2], &[], &info);
++        block_bytes(&[""], &[group], (100, 0, 0))
++    }
++
++    fn assert_matching_refusal<T>(
++        result: Result<T>,
++        full: &crate::Error,
++        source: &std::path::Path,
++    ) {
++        use crate::ErrorKind::{StringtableIndexOutOfBounds, WireFormat};
++
++        let Err(err) = result else {
++            panic!("indexed diff accepted input the full reader refused: {full}");
++        };
++        let matching = match (err.kind(), full.kind()) {
++            (WireFormat { msg: actual }, WireFormat { msg: expected }) => actual == expected,
++            (
++                StringtableIndexOutOfBounds { index: actual },
++                StringtableIndexOutOfBounds { index: expected },
++            ) => actual == expected,
++            _ => false,
++        };
++        assert!(matching, "expected {full}, got {err}");
++        assert_eq!(err.source_path(), Some(source));
++        assert!(err.blob_index().is_some());
++    }
++
++    #[test]
++    fn indexed_text_validates_only_the_versions_it_prints() {
++        let dir = crate::path_guard::tests::scratch();
++        let old = dir.path().join("old.pbf");
++        let new = dir.path().join("new.pbf");
++        let pair = (old.as_path(), new.as_path());
++        let write = |path: &std::path::Path, bytes: &[u8]| {
++            write_claimed(path, bytes, ElementKind::Node, 1..=1);
++        };
++        let good = plain_payload(0, &[8, 7]);
++        let bad = plain_payload(0, &[8, 0x80]);
++        let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
++        write(&old, &good);
++        write(&new, &bad);
++        assert_eq!(
++            text_diff(pair, false, false).unwrap(),
++            (" n1 v7\n".into(), [1, 0, 0, 0])
++        );
++        write(&old, &bad);
++        write(&new, &good);
++        assert_matching_refusal(text_diff(pair, false, false), &full, &old);
++        assert_matching_refusal(text_diff(pair, false, true), &full, &old);
++        for verbose in [false, true] {
++            assert_eq!(
++                text_diff(pair, true, verbose).unwrap(),
++                (String::new(), [1, 0, 0, 0])
++            );
++        }
++
++        write(&new, &plain_payload(1, &[8, 7]));
++        for verbose in [false, true] {
++            assert_matching_refusal(text_diff(pair, true, verbose), &full, &old);
++        }
++        let counts = super::super::diff_stats(
++            pair.0,
++            pair.1,
++            None,
++            crate::host::Parallelism::from_jobs(2),
++            false,
++            false,
++            &entrypoint_host(),
++        )
++        .unwrap();
++        assert_eq!([counts.common, counts.modified], [0, 1]);
++    }
++
++    #[test]
++    fn indexed_osc_checks_visibility_and_metadata_at_their_use_sites() {
++        let dir = crate::path_guard::tests::scratch();
++        let old = dir.path().join("old.pbf");
++        let new = dir.path().join("new.pbf");
++        let pair = (old.as_path(), new.as_path());
++        let write = |path: &std::path::Path, bytes: &[u8]| {
++            write_claimed(path, bytes, ElementKind::Node, 1..=2);
++        };
++        let old_coords = [0, 1];
++        let new_coords = [2, 3];
++        let bad = dense_payload(&old_coords, &[(6, &[1])]);
++        let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
++        write(&old, &bad);
++        write(&new, &dense_payload(&old_coords, &[(6, &[1, 1])]));
++        assert_matching_refusal(osc_diff(pair, dir.path(), "visibility.osc"), &full, &old);
++        assert_eq!(
++            text_diff(pair, true, false).unwrap(),
++            (String::new(), [2, 0, 0, 0])
++        );
++
++        // Both coordinates differ. Old visibility cannot decide either
++        // verdict and the OSC writer uses only new metadata for modifies.
++        write(&new, &dense_payload(&new_coords, &[(1, &[7, 8])]));
++        let (xml, stats) = osc_diff(pair, dir.path(), "modified.osc").unwrap();
++        assert_eq!(stats, [0, 2, 0]);
++        assert!(xml.contains("version=\"7\""));
++        assert_matching_refusal(text_diff(pair, false, true), &full, &old);
++
++        // Every printed column must be countable, even when only the
++        // second node is written and it depends on the first node's deltas.
++        write(&old, &dense_payload(&old_coords, &[]));
++        for column in 1..=6 {
++            let bad = dense_payload(&[0, 3], &[(column, &[0, 0x80])]);
++            let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
++            write(&new, &bad);
++            assert_matching_refusal(
++                osc_diff(pair, dir.path(), &format!("column-{column}.osc")),
++                &full,
++                &new,
++            );
++        }
++    }
++
++    #[test]
++    fn indexed_diff_skips_scalar_values_that_supply_neither_equality_nor_output() {
++        let dir = crate::path_guard::tests::scratch();
++        let old = dir.path().join("old.pbf");
++        let new = dir.path().join("new.pbf");
++        let pair = (old.as_path(), new.as_path());
++        let write = |path: &std::path::Path, bytes: &[u8]| {
++            write_claimed(path, bytes, ElementKind::Node, 1..=1);
++        };
++        let mut info = vec![8, 7, 16];
++        // An over-wide but terminated timestamp, followed by visible=true.
++        info.extend([0x80; 10]);
++        info.extend([0, 48, 1]);
++
++        write(&old, &plain_payload(0, &[8, 6, 48, 1]));
++        write(&new, &plain_payload(0, &info));
++        let (_, stats) = osc_diff(pair, dir.path(), "equal.osc").unwrap();
++        assert_eq!(stats, [0, 0, 0]);
++
++        let bad = plain_payload(1, &info);
++        let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
++        write(&new, &bad);
++        for (suppress, verbose) in [(false, false), (true, false), (false, true)] {
++            let (text, stats) = text_diff(pair, suppress, verbose).unwrap();
++            assert_eq!(stats, [0, 0, 1, 0]);
++            assert!(text.starts_with("*n1 v6 -> v7\n"));
++            assert_eq!(text.contains("coordinates:"), verbose);
++        }
++        assert_matching_refusal(osc_diff(pair, dir.path(), "timestamp.osc"), &full, &new);
++
++        let bad = plain_payload(0, &[8, 7, 48, 0x80]);
++        let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
++        write(&new, &bad);
++        assert_matching_refusal(
++            osc_diff(pair, dir.path(), "plain-visible.osc"),
++            &full,
++            &new,
++        );
++    }
++
++    #[test]
++    fn indexed_diff_keeps_structural_content_refusals() {
++        let dir = crate::path_guard::tests::scratch();
++        let old = dir.path().join("old.pbf");
++        let new = dir.path().join("new.pbf");
++        let pair = (old.as_path(), new.as_path());
++        let check = |kind, good: Vec<u8>, bad: Vec<u8>| {
++            let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
++            write_claimed(&old, &good, kind, 1..=1);
++            write_claimed(&new, &bad, kind, 1..=1);
++            for (suppress, verbose) in [(false, false), (true, false), (false, true)] {
++                assert_matching_refusal(text_diff(pair, suppress, verbose), &full, &new);
++            }
++            assert_matching_refusal(
++                osc_diff(pair, dir.path(), "structural.osc"),
++                &full,
++                &new,
++            );
++        };
++        let build = |group| block_bytes(&[""], &[group], (100, 0, 0));
++        for group in [
++            vec![0x0a, 2, 8, 0x80],                         // Plain ID varint
++            vec![0x0a, 2, 0x40, 0x80],                      // Plain latitude varint
++            dense_nodes(&[1], &[], &[0], &[], &[]),         // Dense coordinate count
++            dense_nodes(&[1], &[0], &[0], &[1, 0, 0], &[]), // Dense tag index
++        ] {
++            check(ElementKind::Node, plain_payload(0, &[]), build(group));
++        }
++        for fields in [
++            &[(2, &[1][..]), (3, &[0][..])][..], // Plain tag index
++            &[(8, &[0x80][..])][..],             // Way ref varint
++            &[(8, &[2][..]), (9, &[0][..])][..], // Way location count
++        ] {
++            check(
++                ElementKind::Way,
++                build(records(3, &[])),
++                build(records(3, fields)),
++            );
++        }
++        for fields in [
++            &[(8, &[0x80][..]), (9, &[2][..]), (10, &[0][..])][..],
++            &[(8, &[0][..]), (9, &[0x80][..]), (10, &[0][..])][..],
++            &[(8, &[0][..]), (9, &[2][..]), (10, &[0x80][..])][..],
++        ] {
++            check(
++                ElementKind::Relation,
++                build(records(4, &[])),
++                build(records(4, fields)),
++            );
++        }
++    }
++
+     #[test]
+     fn indexed_and_full_element_entry_points_write_identical_text() {
+         let dir = crate::path_guard::tests::scratch();
+@@ -1097,6 +1514,8 @@ mod tests {
+         for (suppress_common, locations, verbose) in [
+             (false, false, false),
+             (true, false, false),
++            (false, false, true),
++            (true, false, true),
+             (false, true, false),
+             (true, true, true),
+         ] {
+diff --git a/crates/lib/src/osc/merge_join.rs b/crates/lib/src/osc/merge_join.rs
+index 54f86bc0..7ba85e35 100644
+--- a/crates/lib/src/osc/merge_join.rs
++++ b/crates/lib/src/osc/merge_join.rs
+@@ -12,8 +12,9 @@
+ //! an element prints the same way whichever path found it.
+ 
+ use crate::ElementKind;
+-use crate::commands::diff::view::{BlockView, MetadataCursor, Pair, Row, Rows};
++use crate::commands::diff::view::{BlockView, MetadataCursor, OutputCursor, Pair, Row, Rows};
+ use crate::osm_id::OsmIdKey;
++use crate::read::block::{BlockScan, DiffOutputBlock, validate_diff_in_place};
+ use crate::{Element, PrimitiveBlock};
+ 
+ use crate::error::Result;
+@@ -428,6 +429,7 @@ pub(crate) enum BlockMergeAction<'a> {
+ pub(crate) enum ElementDetail {
+     Id,
+     Version,
++    Content,
+     Full,
+ }
+ 
+@@ -440,7 +442,14 @@ pub(crate) struct MergeDetails {
+ }
+ 
+ pub(crate) enum ChangeElement<'a> {
+-    Compact { id: i64, version: Option<i32> },
++    Compact {
++        id: i64,
++        version: Option<i32>,
++    },
++    Content {
++        element: Element<'a>,
++        version: Option<i32>,
++    },
+     Full(Element<'a>),
+ }
+ 
+@@ -448,13 +457,13 @@ impl<'a> ChangeElement<'a> {
+     pub(crate) fn id(&self) -> i64 {
+         match self {
+             Self::Compact { id, .. } => *id,
+-            Self::Full(element) => element_id(element),
++            Self::Content { element, .. } | Self::Full(element) => element_id(element),
+         }
+     }
+ 
+     pub(crate) fn version(&self) -> Option<i32> {
+         match self {
+-            Self::Compact { version, .. } => *version,
++            Self::Compact { version, .. } | Self::Content { version, .. } => *version,
+             Self::Full(element) => element_version(element),
+         }
+     }
+@@ -462,7 +471,16 @@ impl<'a> ChangeElement<'a> {
+     pub(crate) fn full(&self) -> Result<&Element<'a>> {
+         match self {
+             Self::Full(element) => Ok(element),
+-            Self::Compact { .. } => Err(crate::Error::internal("diff sink needs a full element")),
++            Self::Compact { .. } | Self::Content { .. } => {
++                Err(crate::Error::internal("diff sink needs full metadata"))
++            }
++        }
++    }
++
++    pub(crate) fn content(&self) -> Result<&Element<'a>> {
++        match self {
++            Self::Content { element, .. } | Self::Full(element) => Ok(element),
++            Self::Compact { .. } => Err(crate::Error::internal("diff sink needs element content")),
+         }
+     }
+ }
+@@ -485,12 +503,6 @@ impl<'a> BlockRun<'a> {
+         mut record: impl FnMut(ChangeElement<'a>) -> Result<()>,
+     ) -> Result<()> {
+         let mut cursor = self.cursor;
+-        if matches!(detail, ElementDetail::Full) {
+-            for slot in cursor.next..cursor.end {
+-                record(ChangeElement::Full(cursor.full_at(slot)?))?;
+-            }
+-            return Ok(());
+-        }
+         while let Some(row) = cursor.take()? {
+             record(cursor.change(&row, detail)?)?;
+         }
+@@ -502,16 +514,16 @@ impl<'a> BlockRun<'a> {
+ ///
+ /// The merge keeps one per side across its rounds, so a block that outlives
+ /// several of the peer's blocks is walked once. The comparison walk has
+-/// no full metadata. When output wants a full element, a separate forward
+-/// walk preserves the dense metadata delta state, including the prefix
+-/// before a clipped window. Neither walk restarts at a peer block boundary.
++/// no full metadata. When output wants an element, a separate forward
++/// walk within its group preserves the dense delta state, including the
++/// prefix before a clipped window. Neither walk restarts at a peer block
++/// boundary.
+ struct ElementCursor<'a> {
+     block: &'a BlockState,
+     view: BlockView<'a>,
+     rows: Rows<'a>,
+     metadata: MetadataCursor<'a>,
+-    full: Option<Box<crate::BlockElementsIter<'a>>>,
+-    full_next: usize,
++    output: OutputCursor<'a>,
+     /// Leading elements still to pass over before the first yield.
+     skip: usize,
+     next: usize,
+@@ -526,9 +538,8 @@ impl<'a> ElementCursor<'a> {
+             rows: view.rows(),
+             block,
+             view,
+-            metadata: MetadataCursor::default(),
+-            full: None,
+-            full_next: 0,
++            metadata: MetadataCursor::located(&block.location),
++            output: OutputCursor::default(),
+             skip: block.skip,
+             next: block.skip,
+             end: block.end,
+@@ -563,33 +574,29 @@ impl<'a> ElementCursor<'a> {
+         Ok(row)
+     }
+ 
+-    fn full_at(&mut self, slot: usize) -> Result<Element<'a>> {
+-        let skip = slot
+-            .checked_sub(self.full_next)
+-            .ok_or_else(|| crate::Error::internal("diff full-element cursor moved backwards"))?;
+-        let block = self.block;
+-        let iter = match self.full {
+-            Some(ref mut iter) => iter,
+-            None => self.full.insert(Box::new(block.full()?.elements())),
+-        };
+-        let element = iter.nth(skip).ok_or_else(short_comparison_block)?;
+-        self.full_next = slot + 1;
++    fn replay(&mut self, row: &Row<'a>, metadata: bool) -> Result<Element<'a>> {
++        let element = row
++            .replay(self.block.output(), &mut self.output, metadata)
++            .map_err(|err| err.locate(self.block.location.clone()))?;
++        if element_id(&element) != row.id {
++            return Err(crate::Error::internal(
++                "diff cursor element ID disagrees with its row",
++            ));
++        }
+         Ok(element)
+     }
+ 
+     fn change(&mut self, row: &Row<'a>, detail: ElementDetail) -> Result<ChangeElement<'a>> {
+         let version = match detail {
+             ElementDetail::Id => None,
+-            ElementDetail::Version => row.version(&mut self.metadata),
+-            ElementDetail::Full => {
+-                let element = self.full_at(self.next - 1)?;
+-                if element_id(&element) != row.id {
+-                    return Err(crate::Error::internal(
+-                        "diff cursor element ID disagrees with its row",
+-                    ));
+-                }
+-                return Ok(ChangeElement::Full(element));
++            ElementDetail::Version => row.version(&mut self.metadata)?,
++            ElementDetail::Content => {
++                return Ok(ChangeElement::Content {
++                    version: row.version(&mut self.metadata)?,
++                    element: self.replay(row, false)?,
++                });
+             }
++            ElementDetail::Full => return Ok(ChangeElement::Full(self.replay(row, true)?)),
+         };
+         Ok(ChangeElement::Compact {
+             id: row.id,
+@@ -685,8 +692,9 @@ struct BlockState {
+     bytes: Vec<u8>,
+     strings: Vec<(u32, u32)>,
+     groups: Vec<(u32, u32)>,
+-    scan: crate::read::block::BlockScan,
+-    full: std::cell::OnceCell<PrimitiveBlock>,
++    scan: BlockScan,
++    location: crate::error::Location,
++    output: std::cell::OnceCell<DiffOutputBlock>,
+     /// Elements before the window part (an earlier unit owns them).
+     skip: usize,
+     /// Exclusive bound of the window part.
+@@ -712,17 +720,10 @@ impl BlockState {
+         BlockView::new(&self.bytes, &self.groups, &self.strings, self.scan.fields)
+     }
+ 
+-    /// The full reader owns its backing buffer. Build it once, only when
+-    /// a writer requests a changed element, while the comparison walk
+-    /// continues to borrow the original validated bytes.
+-    fn full(&self) -> Result<&PrimitiveBlock> {
+-        if let Some(block) = self.full.get() {
+-            return Ok(block);
+-        }
+-        let block = PrimitiveBlock::from_vec(self.bytes.clone()).map_err(|err| {
+-            crate::Error::internal_with("diff could not rebuild a validated block", err)
+-        })?;
+-        Ok(self.full.get_or_init(|| block))
++    /// Only changed-element writers need a reader's inline string table.
++    fn output(&self) -> &DiffOutputBlock {
++        self.output
++            .get_or_init(|| DiffOutputBlock::new(&self.bytes, &self.strings, self.scan.fields))
+     }
+ }
+ 
+@@ -1134,9 +1135,9 @@ impl<'a> BlockPairSide<'a> {
+     /// range crosses it. Every [`BlockState`] is built here, so every block
+     /// the merge reads, emits or residualises has passed that check.
+     ///
+-    /// Keep the already-validated payload and its offset tables for the
+-    /// comparison cursor. No inline reader tables are needed until a
+-    /// writer requests a full element.
++    /// Keep the payload and its offset tables for the comparison cursor.
++    /// A writer requesting an element uses these same bytes and checks any
++    /// metadata it needs before handing them to the reader's accessors.
+     #[cfg_attr(feature = "hotpath", hotpath::measure)]
+     fn decode(&mut self, desc: BlobDesc) -> Result<BlockState> {
+         let mut decompressed: Vec<u8> = Vec::new();
+@@ -1150,7 +1151,7 @@ impl<'a> BlockPairSide<'a> {
+         let (mut strings, mut groups) = (Vec::new(), Vec::new());
+         let path = self.path;
+         let ids = &mut self.ids;
+-        let (_, scan) = crate::read::block::validate_in_place(
++        let (_, scan) = validate_diff_in_place(
+             &decompressed,
+             &mut strings,
+             &mut groups,
+@@ -1171,7 +1172,12 @@ impl<'a> BlockPairSide<'a> {
+             strings,
+             groups,
+             scan,
+-            full: std::cell::OnceCell::new(),
++            location: crate::error::Location {
++                file: Some(std::sync::Arc::clone(path)),
++                blob: Some(desc.blob_index),
++                offset: Some(crate::ByteOffset(desc.frame_offset)),
++            },
++            output: std::cell::OnceCell::new(),
+             skip,
+             end,
+             clip_last,
+@@ -1720,6 +1726,7 @@ fn element_merge_pair<S: MergeSink>(
+                         version: details
+                             .common_version
+                             .then(|| old.version(&mut old_iter.metadata))
++                            .transpose()?
+                             .flatten(),
+                     }
+                 } else {
+diff --git a/crates/lib/src/read/block.rs b/crates/lib/src/read/block.rs
+index 5085bbc3..bbf9cca8 100644
+--- a/crates/lib/src/read/block.rs
++++ b/crates/lib/src/read/block.rs
+@@ -1139,11 +1139,143 @@ pub(crate) fn validate_in_place<P: GroupProjection>(
+     claim: Option<crate::ElementKind>,
+     make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
+ ) -> Result<(P, BlockScan)> {
+-    let (projection, scan) = validate_block::<true, _>(buffer, st, groups, [true; 3], make)?;
++    validate_in_place_fields::<true, _>(buffer, st, groups, claim, make)
++}
++
++/// Diff retains all content fields. It checks metadata when a comparison
++/// needs visibility or an output row needs a version or full Info.
++pub(crate) fn validate_diff_in_place<P: GroupProjection>(
++    buffer: &[u8],
++    st: &mut Vec<(u32, u32)>,
++    groups: &mut Vec<(u32, u32)>,
++    claim: Option<crate::ElementKind>,
++    make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
++) -> Result<(P, BlockScan)> {
++    validate_in_place_fields::<false, _>(buffer, st, groups, claim, make)
++}
++
++fn validate_in_place_fields<const FULL: bool, P: GroupProjection>(
++    buffer: &[u8],
++    st: &mut Vec<(u32, u32)>,
++    groups: &mut Vec<(u32, u32)>,
++    claim: Option<crate::ElementKind>,
++    make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
++) -> Result<(P, BlockScan)> {
++    let (projection, scan) = validate_block::<FULL, _>(buffer, st, groups, [true; 3], make)?;
+     scan.kinds.refuse_under(claim)?;
+     Ok((projection, scan))
+ }
+ 
++/// Reader backing for scoped diff output. Its tables come from an accepted
++/// comparison block. Only its fallible replay methods expose elements.
++pub(crate) struct DiffOutputBlock(BlockData);
++
++impl DiffOutputBlock {
++    /// The element messages stay in the comparison buffer. The writer's
++    /// reader backing needs only the validated strings and block scales.
++    #[allow(clippy::cast_possible_truncation)]
++    pub(crate) fn new(
++        payload: &[u8],
++        strings: &[(u32, u32)],
++        fields: super::wire::BlockFields,
++    ) -> Self {
++        let mut buffer = Vec::new();
++        let mut entries = Vec::with_capacity(strings.len());
++        for &(offset, len) in strings {
++            // The entire string table fits in the validated payload's
++            // u32 offset space. Its entries are disjoint within it.
++            entries.push((buffer.len() as u32, len));
++            let offset = offset as usize;
++            buffer.extend_from_slice(&payload[offset..offset + len as usize]);
++        }
++        let meta = WireBlock::inline_tables(&mut buffer, &entries, &[], fields);
++        Self(BlockData::new(Bytes::from(buffer), &meta))
++    }
++
++    /// The element's content has already passed the diff projection. Strip
++    /// Info for verbose text, which gets its version from the comparison row.
++    pub(crate) fn plain<'a>(
++        &'a self,
++        kind: crate::ElementKind,
++        data: &'a [u8],
++        metadata: bool,
++    ) -> Result<Element<'a>> {
++        let wire = &self.0.wire;
++        let info = |data: Option<&'a [u8]>| -> Result<Option<&'a [u8]>> {
++            if metadata {
++                validate_info(data)?;
++                Ok(data)
++            } else {
++                Ok(None)
++            }
++        };
++        Ok(match kind {
++            crate::ElementKind::Node => {
++                let mut node = WireNode::parse(data)?;
++                node.info_data = info(node.info_data)?;
++                Element::Node(Node::new(wire, node))
++            }
++            crate::ElementKind::Way => {
++                let mut way = WireWay::parse(data)?;
++                way.info_data = info(way.info_data)?;
++                Element::Way(Way::new(wire, way))
++            }
++            crate::ElementKind::Relation => {
++                let mut relation = WireRelation::parse(data)?;
++                relation.info_data = info(relation.info_data)?;
++                Element::Relation(Relation::new(wire, relation))
++            }
++        })
++    }
++
++    pub(crate) fn dense<'a>(
++        &'a self,
++        dense: WireDenseNodes<'a>,
++        metadata: bool,
++    ) -> Result<DenseNodeIter<'a>> {
++        let wire = &self.0.wire;
++        if metadata {
++            diff_dense_info(&dense)?;
++            Ok(DenseNodeIter::new(wire, dense))
++        } else {
++            Ok(DenseNodeIter::new_skip_metadata(wire, dense))
++        }
++    }
++}
++
++/// Dense metadata columns align to the IDs. Count them before a version or
++/// visibility lookup can mistake a missing trailing value for an absent
++/// column, or a writer can replay deltas from an invalid column.
++pub(crate) fn diff_dense_info<'a>(dense: &WireDenseNodes<'a>) -> Result<Option<WireDenseInfo<'a>>> {
++    match dense.info_data {
++        Some(data) => validate_dense_info_arrays(data, packed_varint_count(dense.id_data)?),
++        None => Ok(None),
++    }
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum DiffInfoField {
++    Version = 1,
++    Visible = 6,
++}
++
++/// Scan the whole message's framing to find the last occurrence of one
++/// scalar, as `WireInfo` does. Decode and check the selected varint's value.
++pub(crate) fn diff_info_scalar(data: Option<&[u8]>, field: DiffInfoField) -> Result<Option<u64>> {
++    use super::wire::{Cursor, WIRE_VARINT};
++
++    let mut cursor = Cursor::new(data.unwrap_or_default());
++    let mut value = None;
++    while let Some((number, wire_type)) = cursor.read_tag()? {
++        if number == field as u32 && wire_type == WIRE_VARINT {
++            value = Some(cursor.read_varint()?);
++        } else {
++            cursor.skip_field(wire_type)?;
++        }
++    }
++    Ok(value)
++}
++
+ /// What [`validate_block`] found in a block it accepted.
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct BlockScan {

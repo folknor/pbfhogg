@@ -302,6 +302,33 @@ was not measured: no planet cell of extract on `altw` exists yet.
 
 ## History
 
+### Multi-extract destination queues and tail packing (bygg, `b4e65632`)
+
+The prototype used per-destination ordered queues with up to four shared
+output workers under a 64 MiB payload budget. It packed small rebuilt tails
+across input blobs, moving rebuilt block boundaries while preserving element
+content and order. The CLI and verifier contracts leave those boundaries open.
+
+Planet `region-extract --mode multi` on bygg, with `--iterations 1`
+interleaved and one fstrim at the head of the planet suite. The simple workload
+used five strips. The rows are in run order.
+
+| Strategy | Arm on bygg | Wall | Run |
+|---|---|---:|---|
+| simple | A, HEAD `b4e65632` | 52.8 s | `36c1d7f4` |
+| simple | B, working tree on `b4e65632` | 51.7 s | `852cd896` |
+| simple | A, HEAD `b4e65632` | 52.7 s | `bdbfde95` |
+| simple | B, working tree on `b4e65632` | 51.9 s | `360765da` |
+| `--strategy complete` | A, HEAD `b4e65632` | 1m11s | `3792acc1` |
+| `--strategy complete` | B, working tree on `b4e65632` | 1m08s | `ed9cad87` |
+
+The prototype stayed out of production. On bygg, B versus A at `b4e65632`
+was about 2 % faster for simple, within noise, and about 4 % faster in
+the single complete pair. Those results did not justify the byte-layout
+change on this workload. A slow or skewed destination workload, such as
+many regions with one huge region, could show a larger effect. No registered
+bench exercises that shape.
+
 ### Extract
 
 #### PASS1 schedule reuse (commits `d4ea760`, `0b085b1`, 2026-04-10/11)

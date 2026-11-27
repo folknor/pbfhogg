@@ -255,8 +255,15 @@ fn build_geocode_index_to(
     // and the previous index survives every failure. The writer is finished
     // only once the build returned with every file it wrote closed.
     let writer = output.writer()?;
-    let stats =
-        build_generation(&input, config, writer.path(), host, &scratch).map_err(building)?;
+    let stats = build_generation(
+        &input,
+        config,
+        writer.path(),
+        host,
+        &scratch,
+        pass3::StageB::Parallel,
+    )
+    .map_err(building)?;
     writer.finish();
     // The run scratch goes before publication: its removal is the run's
     // cleanup, and publication only syncs and renames the index.
@@ -269,14 +276,18 @@ fn build_geocode_index_to(
 /// device" does not say which of the index's files it was. Every path is
 /// inside the output's staging directory, so this is not a second output
 /// mechanism; the build's scratch buckets go through `crate::scratch`.
-#[allow(clippy::disallowed_methods)]
 pub(super) fn create_data_file(
     path: &std::path::Path,
 ) -> Result<std::io::BufWriter<std::fs::File>> {
+    create_index_file(path).map(|file| {
+        std::io::BufWriter::with_capacity(crate::tunables::GEOCODE_DATA_FILE_BUFFER_BYTES, file)
+    })
+}
+
+/// Open a file inside the staged index for direct or buffered writes.
+#[allow(clippy::disallowed_methods)]
+fn create_index_file(path: &std::path::Path) -> Result<std::fs::File> {
     std::fs::File::create(path)
-        .map(|file| {
-            std::io::BufWriter::with_capacity(crate::tunables::GEOCODE_DATA_FILE_BUFFER_BYTES, file)
-        })
         .map_err(|e| Error::from(e).context(format!("failed to create {}", path.display())))
 }
 
@@ -463,6 +474,7 @@ fn build_generation(
     output_dir: &std::path::Path,
     host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
+    stage_b: pass3::StageB,
 ) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
 
@@ -560,6 +572,7 @@ fn build_generation(
             output_dir,
             scratch,
             host,
+            stage_b,
         )
     })
 }
@@ -581,6 +594,7 @@ fn build_from_schedules(
     output_dir: &std::path::Path,
     scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
+    stage_b: pass3::StageB,
 ) -> Result<BuildStats> {
     let pass1_5::Schedules {
         relations: relation_schedule,
@@ -943,12 +957,7 @@ fn build_from_schedules(
             coarse_addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
             coarse_interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
             executor: &host.executor,
-            stage_b_workers: crate::host::sized_workers(
-                &*host.resources,
-                crate::tunables::DECODE_WORKERS_RESERVED,
-                crate::tunables::DECODE_WORKERS_MIN,
-                crate::tunables::DECODE_WORKERS_FALLBACK,
-            ),
+            stage_b,
             cancel: &host.invocation,
         })?;
     host.invocation.marker("GEOCODE_PASS3_CELLS_END");
@@ -1162,6 +1171,183 @@ fn checked_count(count: usize, kind: &str) -> Result<u32> {
             "{kind} count exceeds u32::MAX; widen the on-disk count and bump FORMAT_VERSION"
         ))
     })
+}
+
+#[cfg(test)]
+mod stage_b_tests {
+    use std::path::Path;
+
+    use crate::MemberId;
+    use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
+    use crate::host::Host;
+    use crate::read::input::PinnedInput;
+    use crate::scratch::RunScratch;
+    use crate::writer::{Compression, PbfWriter};
+
+    use super::*;
+
+    fn write_block(writer: &mut PbfWriter<std::fs::File>, block: &mut BlockBuilder) {
+        if let Some(bytes) = block.take().expect("encode fixture block") {
+            writer
+                .write_primitive_block(bytes)
+                .expect("write fixture block");
+        }
+    }
+
+    fn write_fixture(path: &Path, sites: i32, extra_addresses: i32) {
+        // Several S2 faces, with coincident streets, addresses and
+        // interpolation segments at each repeated site.
+        let locations = [
+            (557_000_000, 125_000_000),
+            (-338_000_000, 1_512_000_000),
+            (420_000_000, -710_000_000),
+            (352_000_000, 1_390_000_000),
+            (-341_000_000, -584_000_000),
+        ];
+        let file = std::fs::File::create(path).expect("create input");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        let header = HeaderBuilder::new().sorted().build().expect("PBF header");
+        writer.write_header(&header).expect("write PBF header");
+        let mut block = BlockBuilder::new();
+        for site in 0..sites {
+            if site % 256 == 0 {
+                write_block(&mut writer, &mut block);
+            }
+            let (lat, lon) =
+                locations[usize::try_from(site).expect("nonnegative site") % locations.len()];
+            let first = i64::from(site) * 4 + 1;
+            block.add_node(
+                first,
+                lat,
+                lon,
+                [("addr:housenumber", "10"), ("addr:street", "Main Street")],
+                None,
+            );
+            block.add_node(
+                first + 1,
+                lat,
+                lon + 80_000,
+                [("addr:housenumber", "14"), ("addr:street", "Main Street")],
+                None,
+            );
+            block.add_node(first + 2, lat + 80_000, lon + 80_000, [], None);
+            block.add_node(first + 3, lat + 80_000, lon, [], None);
+        }
+        for addr in 0..extra_addresses {
+            if addr % 2048 == 0 {
+                write_block(&mut writer, &mut block);
+            }
+            // This grid stays in one top-byte bucket at both levels, but
+            // spreads addresses across cells within it.
+            block.add_node(
+                i64::from(sites) * 4 + i64::from(addr) + 1,
+                120_000_000 + addr / 256 * 2_000,
+                120_000_000 + addr % 256 * 2_000,
+                [("addr:housenumber", "9"), ("addr:place", "West End")],
+                None,
+            );
+        }
+        write_block(&mut writer, &mut block);
+
+        block.add_way(1, [], &[1, 2, 3, 4, 1], None);
+        for site in 0..sites {
+            if site % 256 == 0 {
+                write_block(&mut writer, &mut block);
+            }
+            let first = i64::from(site) * 4 + 1;
+            let way = i64::from(site) * 2 + 2;
+            block.add_way(
+                way,
+                [("highway", "residential"), ("name", "Main Street")],
+                &[first, first + 1],
+                None,
+            );
+            block.add_way(
+                way + 1,
+                [
+                    ("addr:interpolation", "even"),
+                    ("addr:street", "Main Street"),
+                ],
+                &[first, first + 1],
+                None,
+            );
+        }
+        write_block(&mut writer, &mut block);
+        block.add_relation(
+            1,
+            [
+                ("type", "boundary"),
+                ("boundary", "administrative"),
+                ("admin_level", "8"),
+                ("name", "Fixture"),
+            ],
+            &[MemberData {
+                id: MemberId::Way(1),
+                role: "outer",
+            }],
+            None,
+        );
+        write_block(&mut writer, &mut block);
+        writer.flush().expect("flush input");
+    }
+
+    fn file_names(path: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(path)
+            .expect("read index directory")
+            .map(|entry| entry.expect("index directory entry").file_name())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn parallel_stage_b_matches_serial_for_every_index_file() {
+        for (sites, extra_addresses) in [(1, 0), (17, 0), (257, 74_000)] {
+            let dir = crate::path_guard::tests::scratch();
+            let input = dir.path().join("source.osm.pbf");
+            let parallel = dir.path().join("parallel");
+            let serial = dir.path().join("serial");
+            write_fixture(&input, sites, extra_addresses);
+
+            let config = BuildConfig::default();
+            let host = Host::for_tests();
+            let output = index_output(&parallel, crate::Overwrite::Refuse, &host.diagnostics)
+                .expect("stage output");
+            let stats = build_geocode_index(
+                &input,
+                &config,
+                output,
+                &host,
+                RunScratch::create(dir.path(), &host).expect("parallel scratch"),
+            )
+            .expect("build parallel index");
+            assert!(stats.addr_points > 0 && stats.street_ways > 0);
+            assert!(stats.interp_ways > 0 && stats.admin_polygons > 0);
+
+            std::fs::create_dir(&serial).expect("create oracle directory");
+            let pinned = PinnedInput::pin(&input, &host).expect("pin oracle input");
+            build_generation(
+                &pinned,
+                &config,
+                &serial,
+                &host.entered(),
+                &RunScratch::create(dir.path(), &host).expect("serial scratch"),
+                pass3::StageB::Serial,
+            )
+            .expect("build serial index");
+
+            let names = file_names(&serial);
+            assert_eq!(file_names(&parallel), names);
+            for name in names {
+                let actual = std::fs::read(parallel.join(&name)).expect("parallel file");
+                let expected = std::fs::read(serial.join(&name)).expect("serial file");
+                assert!(
+                    actual == expected,
+                    "{name:?} differs at {sites} sites and {extra_addresses} extra addresses"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

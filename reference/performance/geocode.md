@@ -32,6 +32,27 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Pass 3 stage B encodes and writes cell ranges in parallel (bygg, `b4e65632`)
+
+Fine and coarse buckets split at cell boundaries. Workers encode the ranges
+in parallel, then write to disjoint ranges assigned by prefix offsets. The
+serial writer remains under `cfg(test)` as a byte oracle.
+
+Germany `geocode-build` on bygg, with `--iterations 1` interleaved. The
+rows are in run order.
+
+| Arm on bygg | Wall | Run | Note |
+|---|---:|---|---|
+| A, HEAD `b4e65632` | 7.7 s | `e58f5eec` | Cold first cell, discarded |
+| B, working tree on `b4e65632` | 6.1 s | `6215952c` | |
+| A, HEAD `b4e65632` | 6.5 s | `9cd20424` | |
+| B, working tree on `b4e65632` | 6.1 s | `b51e4079` | |
+
+On bygg, B cut wall time by about 6 % versus the warm A at `b4e65632`.
+The largest bucket still sorts on one core, and pass 2 still has a single
+consumer. Germany `verify geocode` and `verify geocode-seam` passed on
+bygg with the working tree on `b4e65632`.
+
 ### Prepared admin rings in Pass 3 (bygg, 2026-11-27)
 
 Pass 3 prepares each polygon's rings once, uses the padded edge cover to

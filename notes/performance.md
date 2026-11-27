@@ -631,6 +631,23 @@ Risks: aggregate budget fairness.
 
 Kind: high conviction (as part of PERF-011); local change (output).
 
+Measurement on bygg: planet `region-extract --mode multi` with five simple
+strips was about 2 % faster (noise), and one `--strategy complete` pair
+was about 4 % faster, comparing the working tree on `b4e65632` with HEAD
+`b4e65632`. The prototype did not land. The gains on this workload did
+not justify changing rebuilt block boundaries. A retry needs a slow or
+skewed destination workload, such as many regions with one huge region.
+No registered bench has that shape. See the [multi-extract measurements](../reference/performance/extract.md#multi-extract-destination-queues-and-tail-packing-bygg-b4e65632).
+
+To resurface: the code is in
+`notes/stashed-perf-021-multi-extract-destination-queues.patch` (made against
+`b4e65632` on bygg). It edits `extract/multi.rs`, `extract/multi_fused.rs`
+and `extract/multi_dep.rs` and adds `extract/multi_output.rs`. Restore
+`mod multi_output;` in `extract/mod.rs`, which the saved patch omits.
+Restore the tunables used by the measured prototype in `tunables.rs`:
+`EXTRACT_MULTI_OUTPUT_BYTES = 64 MiB`, `EXTRACT_MULTI_OUTPUT_WORKERS = 4`
+and `EXTRACT_MULTI_PACK_BYTES = 256 KiB`.
+
 ## PERF-023 - Export should consume the ALTW join directly
 
 Reported by: spatial.
@@ -788,6 +805,13 @@ predecessor workloads and a fresh trim at its start. See the
 [external payload measurements](../reference/performance/add-locations-to-ways.md#external-packed-per-way-payloads-inconclusive-bygg-baseline-d64b3548)
 for the cells and verification results.
 
+To resurface: the code is in `notes/stashed-perf-031-external-altw-payload.patch`
+(made against `d64b3548`; it touches `altw/external/` coord_payloads, space,
+stage3 and stage4, plus the id_signs inventory count) and, on bygg only, in
+the git stash named "PERF-031 external ALTW payload experiment, inconclusive
+on planet". Its `STAGE3_SLOT_READ_CHUNK_BYTES` is a local const that moves to
+`tunables.rs` if it lands.
+
 ## PERF-032 - External ALTW scratch file fleets and shared appenders
 
 Reported by: altw-external, pipeline.
@@ -887,6 +911,15 @@ its range. On bygg, HEAD `c0ec89ca` ran in 4m22s (`50507100`) and 4m21s
 every node blob for coordinates. A retry needs a small or geographically
 concentrated change workload, which no bench currently registers, and a
 decision on the relaxed refusals for malformed contents in skipped blobs.
+
+To resurface: the code is in
+`notes/stashed-perf-034-apply-requested-node-join.patch` (made against
+`c0ec89ca`; it touches `apply_changes/` and `crates/lib/tests/fault_apply_changes.rs`)
+and, on bygg only, in the git stash named "PERF-034 apply-changes -l
+requested-node join, neutral on planet daily OSC". It carries a fix worth
+keeping in mind for any retry: requests sort zero, then negatives by
+magnitude, then positives, while blob index ranges are numeric, so a naive
+range intersection admits negative requests outside the blob.
 The prototype fixed its own intersection bug caused by sorting requests
 zero first, negatives by magnitude, then positives, while blob ranges use
 numeric order. The ordinal join and whole-way refresh redesign remain open.
@@ -977,44 +1010,22 @@ bounded memory would need scratch, which --simplify refuses).
 
 Kind: memory, unmeasured payoff.
 
-## PERF-041 - Diff decodes crossing frames per unit and builds full elements to compare
+## PERF-041 - Changed OSC output revalidates blocks and unindexed diff still decodes serially
 
 Reported by: decode, osc, merge.
 
-Mechanism: `Frame` shares compressed bytes across units but
-`BlockPairSide::decode` decompresses and builds a block per unit, plus a
-clipping walk (`clip`, metadata-free) and one positioning walk of the clipped
-prefix. After the `blobs_byte_equal` shortcut fails, full elements are built,
-dense metadata decoded though equality ignores it, tags and roles resolved per
-element. Unindexed `StreamingBlocks` decompresses, merges and emits on one
-thread (production side overlaps PERF-076). The prefix replay across merge
-rounds is gone: the merge keeps one `ElementCursor` per side across rounds
-(2026-11-25); on planet base against `20260411` it measured neutral, so
-the per-element construction, not the replay, is what remains.
+Indexed diff and derive now compare borrowed views and keep one cursor per
+side across block pairs. See the [indexed comparison measurements](../reference/performance/diff.md#borrowed-comparison-views-for-indexed-diff-and-derive-bygg-b4e65632).
 
-Redesign: crossing frames share one decoded form with seek checkpoints from
-the first scan; validation produces comparison views (IDs, normalized
-coordinates, tag boundaries, raw field spans) with metadata lazy and full
-elements only for changed output; equality via increasingly expensive proofs
-(compressed bytes, decompressed primitive bytes, columns, identical packed
-fields with same interpretation, string-table equivalence resolved once,
-semantic fallback); decode unindexed blobs in parallel and plan comparisons
-over actual ranges.
+The first full-element read for changed OSC output copies and revalidates
+the block payload. Its forward cursor walks the prefix before a clipped
+window to restore dense metadata deltas. Reuse the validated bytes for
+full reads while preserving the dense delta state.
 
-Payoff: unmeasured. The crossing decode is costed at about one blob per unit
-(`DIFF_UNIT_TARGET_BYTES` doc). The node phase runs at about 30 cores on
-planet, so the comparison decoder's payoff is per-element CPU.
-
-Risks: any comparison view must stay equal to `content.rs` (digest
-`--form content` shares it), including the `Err`-token rule and derive's
-visibility; text without `-c` needs versions of equal elements; bounded
-shared decoded frames, checkpoint state per delta stream, duplicate IDs and
-history versions at boundaries (equal IDs pair in occurrence order across
-blobs; a held boundary residual), signed ordering, equal SIDs across tables
-prove nothing, dense versus plain and noncanonical varints need semantic
-fallback, late dense metadata needs prior deltas.
-
-Kind: medium conviction, wider payoff.
+Unindexed `StreamingBlocks` still decompresses, compares full elements and
+emits on one thread. The diff changes adapt its sink actions and leave that
+execution model in place. Parallel decode and comparison planning over
+actual ranges remain open. The production side overlaps PERF-076.
 
 ## PERF-042 - Tags-count merges accepted rows through shared shards
 
@@ -1110,34 +1121,23 @@ rules at `AdminEntry`.
 
 Kind: highest-conviction query rewrite.
 
-## PERF-054 - Geocode build converges on one merge owner
+## PERF-054 - Geocode build still has a serial pass 2 consumer and a largest-bucket sort
 
 Reported by: geocode, pipeline.
 
-Mechanism: pass 2 parallelizes node processing and way resolution but one
-consumer interns strings, encodes records, assigns offsets, writes geometry,
-collects interpolation metadata and inserts admin geometry; worker hashing and a
-cloned pool reduce but keep this. Stage A materializes chunk-wide assignments,
-repartitions, writes both bucket trees and waits at chunk boundaries; stage B
-sorts and encodes in parallel but returns whole buckets to one writer; top-byte
-cell partitioning gives large regions disproportionate ownership; geometry is
-written in source order, reopened and traversed again for cell assignment.
+Pass 3 stage B now splits fine and coarse buckets at cell boundaries,
+encodes in parallel and writes at disjoint prefix offsets. The largest
+bucket still sorts on one core. Splitting that sort by record volume needs
+to keep each cell together and preserve the order used to break ties.
+See the [stage B measurements](../reference/performance/geocode.md#pass-3-stage-b-encodes-and-writes-cell-ranges-in-parallel-bygg-b4e65632).
 
-Redesign: workers emit independently writable fragments with logical identity
-from source position; local or hash-partitioned interning resolved by parallel
-remapping (compare bytes on collision); workers write geometry and generate
-spatial records while coordinates are live; prefix sums for contiguous IDs and
-offsets; partitions sized by record volume as worker-private runs, each owning
-sort, encode and output (pipeline: replace serial offset assignment with
-parallel chunks plus relocation; if first-occurrence string layout must stay
-byte-identical, record earliest occurrence and assign from that order).
-
-Risks: physical order changes can change equal-distance winners; admin
-duplicate-way replacement, interpolation identities, string-offset equality
-used in interpolation; relocation or intermediate storage traffic (pipeline:
-medium conviction on net payoff).
-
-Kind: strongest build rewrite (geocode).
+Pass 2 parallelizes node processing and way resolution, but one consumer
+still interns strings, encodes records, assigns offsets, writes geometry,
+collects interpolation metadata and inserts admin geometry. Workers could
+emit fragments keyed by source position, remap local string offsets and
+assign contiguous IDs and offsets with prefix sums. A retry needs to
+preserve equal-distance tie order, duplicate admin-way replacement and
+interpolation identities and string equality.
 
 ## PERF-055 - Geocode street lookup chases references across source-ordered files
 

@@ -23,7 +23,7 @@ shape depends on the inputs: two PBFs with byte-level blob overlap
 (e.g. one derived from the other via `apply-changes`) trigger a
 byte-equal fast-path that skips decode for unchanged blobs; two
 independent snapshots (e.g. Geofabrik planets weeks apart) have no
-byte-level overlap and require full decode on both sides. Indexed
+byte-level overlap and require reading and validating both payload streams. Indexed
 inputs run the streaming work-unit engine; inputs without indexdata take
 the sequential element stream.
 
@@ -33,6 +33,36 @@ fast-path engages. Cells recorded before the script benches name the
 former typed commands, `brokkr diff-snapshots` and `brokkr diff`.
 
 ## Current baselines
+
+### Borrowed comparison views for indexed diff and derive (bygg, `b4e65632`)
+
+Indexed diff and derive compare views borrowed from validated block bytes.
+Equality uses packed-field proofs and checks string-table equivalence once
+per block pair, with a content-token fallback. Each side keeps its cursor
+across block pairs and builds full elements only when the sink needs them.
+
+Planet `diff-pair --from base --to 20260411` on bygg, with
+`--iterations 1` interleaved and one fstrim at the head of the planet suite.
+The rows are in run order.
+
+| Format | Arm on bygg | Wall | Run |
+|---|---|---:|---|
+| text | A, HEAD `b4e65632` | 1m47s | `ef621ca5` |
+| text | B, working tree on `b4e65632` | 1m31s | `b3838e8d` |
+| text | A, HEAD `b4e65632` | 1m48s | `6fd05d60` |
+| text | B, working tree on `b4e65632` | 1m31s | `54a22ab1` |
+| `--format osc` | A, HEAD `b4e65632` | 2m05s | `5794661b` |
+| `--format osc` | B, working tree on `b4e65632` | 2m00s | `9d4a0b76` |
+
+On bygg, B cut text wall time by about 15 % and OSC wall time by about
+4 % in its single pair, both versus A at `b4e65632`. The first full-element
+read in each block needed for changed OSC output copies and revalidates the
+payload, then the full-element cursor walks the prefix to restore dense
+metadata deltas. The unindexed `StreamingBlocks` path still decodes and
+merges full elements sequentially.
+
+On bygg, the working tree on `b4e65632` passed `verify diff` on Denmark
+and on Germany with `--osc-seq 4705`.
 
 ### Indexed OSC creates written straight into the output (bygg, 2026-11-26, against `eecbc773`)
 

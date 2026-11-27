@@ -63,7 +63,7 @@ use crate::ElementKind;
 use crate::error::{Error, Result};
 use crate::ordered_pool::{Emitter, StreamConfig, StreamConsumer, run_ordered_streams_from};
 use crate::osc::merge_join::{
-    BlobCursor, BlockPairMergeStats, BlockPairSide, Frame, MergeSink, Window,
+    BlobCursor, BlockPairMergeStats, BlockPairSide, Frame, MergeDetails, MergeSink, Window,
     block_pair_merge_phase,
 };
 use crate::osm_id::OsmIdKey;
@@ -114,6 +114,8 @@ pub(super) trait UnitSink: Send {
     /// The equality the merge judges same-ID pairs by (see
     /// [`MergeSink::equality`]). No default, as there.
     fn equality(&self) -> crate::content::Equality;
+
+    fn details(&self) -> MergeDetails;
 }
 
 /// A command's side of the run, on the calling thread: it receives every
@@ -400,6 +402,10 @@ impl<S: UnitSink> MergeSink for Chunking<'_, '_, S> {
 
     fn equality(&self) -> crate::content::Equality {
         self.sink.equality()
+    }
+
+    fn details(&self) -> MergeDetails {
+        self.sink.details()
     }
 }
 

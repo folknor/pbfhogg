@@ -1,0 +1,1985 @@
+diff --git a/crates/lib/src/commands/altw/external/coord_payloads.rs b/crates/lib/src/commands/altw/external/coord_payloads.rs
+index d1d16d2b..aa2d3643 100644
+--- a/crates/lib/src/commands/altw/external/coord_payloads.rs
++++ b/crates/lib/src/commands/altw/external/coord_payloads.rs
+@@ -1,40 +1,10 @@
+-//! Blob-ordered delta-varint coord payload format.
++//! Blob-ordered coordinate payloads, produced by stage 3 for stage 4.
+ //!
+-//! Stage 3 produces `coord_payloads` inline (integrated path, the default).
+-//! Each way blob's coordinates are delta-varint encoded and stored contiguously;
+-//! stage 4 preads one payload per way blob instead of mmapping the flat
+-//! coord_slots array. Measured compression is ~1.81× vs coord_slots (37.5 GB
+-//! Europe → 20.8 GB; 99 GB planet projects to ~55 GB). The original 3-4×
+-//! estimate did not account for OSM's moderate varint widths after delta
+-//! encoding.
+-//! The integration is pursued primarily for its non-wall benefits
+-//! (scratch footprint, page faults, memory pressure), not raw compression.
+-//!
+-//! # File format
+-//!
+-//! ```text
+-//! u64            num_way_blobs         (LE)
+-//! u64            total_payload_bytes   (LE)
+-//! u64 * (N+1)    blob_offsets[0..=N]   (LE, byte offsets into payload
+-//!                                       section; blob i's payload spans
+-//!                                       offsets[i]..offsets[i+1];
+-//!                                       offsets[N] == total_payload_bytes)
+-//! bytes          payload section (concatenated per-blob delta-varint streams)
+-//! ```
+-//!
+-//! # Per-blob payload
+-//!
+-//! Walk the blob's ways in PBF order (order recorded in the per-way refcount
+-//! sidecar). For each way with N refs, read N coord slots sequentially from
+-//! the bucket's dense scatter buffer in stage 3. Emit `2*N` zigzag-varints:
+-//! (lat_delta_0, lon_delta_0, ..., lat_delta_N-1, lon_delta_N-1) where
+-//! delta_0 is the absolute value (delta from 0) and deltas reset per way.
+-//!
+-//! # Decoder contract (stage 4)
+-//!
+-//! Stage 4 knows ref_count per way from the per-way refcount sidecar.
+-//! For each way, consume `2*ref_count` varints, unzigzag, accumulate running
+-//! lat/lon. No per-way framing bytes.
++//! Each nonempty way contributes its complete length-delimited PBF fields:
++//! packed lat deltas (9), packed lon deltas (10), and the full-width pin
++//! bitmap (20) if any ref is pinned. Deltas reset at each way. Empty ways
++//! contribute no bytes. The sidecar gives the ref counts in way order;
++//! the field lengths delimit each appendable range without walking varints.
+ 
+ use super::super::Result;
+ use super::COORD_SLOT_SIZE;
+@@ -278,9 +248,8 @@ impl ConcurrentBlobLocationRouter {
+     }
+ 
+     /// Publish one half of a straddler. When the second half arrives, the
+-    /// caller's `encode_scratch` is used to inline-encode the full payload
+-    /// via `encode_blob_payload_from_record`, and the slot transitions to
+-    /// `Straddler { bytes }`.
++    /// caller's encoder processes the full coordinate slice in way order,
++    /// and the slot transitions to `Straddler { bytes }`.
+     pub(super) fn publish_straddler_half(
+         &self,
+         blob_idx: usize,
+@@ -288,7 +257,7 @@ impl ConcurrentBlobLocationRouter {
+         raw_bytes: Vec<u8>,
+         per_way_rcs: &PerWayRcs,
+         inject_prepass: bool,
+-        encode_scratch: &mut Vec<u8>,
++        encoder: &mut CoordPayloadEncoder,
+     ) -> Result<()> {
+         let mut map = self
+             .straddler_partials
+@@ -321,17 +290,16 @@ impl ConcurrentBlobLocationRouter {
+         let t_enc = crate::counters::Stopwatch::start();
+         let mut coord_bytes = left_bytes;
+         coord_bytes.extend_from_slice(&right_bytes);
+-        encode_scratch.clear();
+-        encode_blob_payload_from_record(
+-            &coord_bytes,
+-            per_way_rcs.blob_record(blob_idx),
+-            blob_idx,
+-            inject_prepass,
+-            encode_scratch,
+-        )
+-        .map_err(|e| e.context(format!("router straddler encode blob {blob_idx}")))?;
++        encoder
++            .encode_blob(
++                &coord_bytes,
++                per_way_rcs.blob_record(blob_idx),
++                blob_idx,
++                inject_prepass,
++            )
++            .map_err(|e| e.context(format!("router straddler encode blob {blob_idx}")))?;
+         let encode_ns = t_enc.elapsed_ns();
+-        let bytes = std::mem::take(encode_scratch);
++        let bytes = std::mem::take(&mut encoder.output);
+         let byte_len = bytes.len() as u64;
+         let mut slot_guard = self.slots[blob_idx]
+             .lock()
+@@ -816,157 +784,185 @@ const _: () = {
+     assert!(COORD_SLOT_SIZE == 8);
+ };
+ 
+-/// Delta-encode one blob's coord slice into `output` from a pre-decoded
+-/// `per_way_rcs` slice. Reference implementation that tests assert against
+-/// the production streaming `encode_blob_payload_from_record` path.
+-#[cfg(test)]
+-pub(super) fn encode_blob_payload(
+-    coord_bytes: &[u8],
+-    per_way_rcs: &[u32],
+-    output: &mut Vec<u8>,
+-) -> crate::Result<()> {
+-    let expected_bytes: u64 = per_way_rcs.iter().map(|&r| u64::from(r)).sum::<u64>() * 8;
+-    if coord_bytes.len() as u64 != expected_bytes {
+-        return Err(Error::internal(format!(
+-            "coord_bytes length mismatch: got {} bytes, expected {} (8 * sum(per_way_rcs))",
+-            coord_bytes.len(),
+-            expected_bytes
+-        )));
+-    }
+-    let mut cursor: usize = 0;
+-    for &rc in per_way_rcs {
+-        let mut last_lat: i32 = 0;
+-        let mut last_lon: i32 = 0;
+-        for _ in 0..rc {
+-            let off = cursor;
+-            cursor += COORD_SLOT_SIZE;
+-            let lat = i32::from_le_bytes([
+-                coord_bytes[off],
+-                coord_bytes[off + 1],
+-                coord_bytes[off + 2],
+-                coord_bytes[off + 3],
+-            ]);
+-            let lon = i32::from_le_bytes([
+-                coord_bytes[off + 4],
+-                coord_bytes[off + 5],
+-                coord_bytes[off + 6],
+-                coord_bytes[off + 7],
+-            ]);
+-            let dlat = i64::from(lat) - i64::from(last_lat);
+-            let dlon = i64::from(lon) - i64::from(last_lon);
+-            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlat));
+-            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlon));
+-            last_lat = lat;
+-            last_lon = lon;
+-        }
+-    }
+-    Ok(())
+-}
++const LAT_FIELD: u32 = 9;
++const LON_FIELD: u32 = 10;
++const PIN_FIELD: u32 = 20;
++const PIN_TAG_FIRST_BYTE: u8 = 0xa2; // First byte of the canonical LEN tag for field 20.
+ 
+-/// Delta-encode one blob's coord slice using the raw sidecar record for that
+-/// blob instead of a pre-decoded `&[u32]`.
+-#[hotpath::measure]
+-pub(super) fn encode_blob_payload_from_record(
+-    coord_bytes: &[u8],
+-    record: &[u8],
+-    blob_idx: usize,
+-    inject_prepass: bool,
+-    output: &mut Vec<u8>,
+-) -> crate::Result<()> {
+-    let mut cursor = protohoggr::Cursor::new(record);
+-    let num_ways = cursor
+-        .read_varint()
+-        .map_err(|e| Error::from(e).context(format!("per-way sidecar blob {blob_idx} num_ways")))?;
+-    #[allow(clippy::cast_possible_truncation)]
+-    let num_ways_usize = num_ways as usize;
++/// Reused across blobs by a stage 3 worker, including when completing a
++/// straddler. The packed deltas and bitmap are staged only one way at a time.
++#[derive(Default)]
++pub(super) struct CoordPayloadEncoder {
++    pub(super) output: Vec<u8>,
++    lats: Vec<u8>,
++    lons: Vec<u8>,
++    pins: Vec<u8>,
++}
+ 
+-    let mut coord_cursor: usize = 0;
+-    for way_idx in 0..num_ways_usize {
+-        let rc = cursor.read_varint().map_err(|e| {
+-            Error::from(e).context(format!("per-way sidecar blob {blob_idx} way {way_idx}"))
+-        })?;
+-        #[allow(clippy::cast_possible_truncation)]
+-        let rc_usize = rc as usize;
+-        let way_bytes = rc_usize.checked_mul(COORD_SLOT_SIZE).ok_or_else(|| {
+-            Error::internal(format!(
+-                "blob {blob_idx} way {way_idx}: refcount byte size overflow"
+-            ))
++impl CoordPayloadEncoder {
++    #[hotpath::measure]
++    pub(super) fn encode_blob(
++        &mut self,
++        coord_bytes: &[u8],
++        record: &[u8],
++        blob_idx: usize,
++        inject_prepass: bool,
++    ) -> Result<()> {
++        let mut cursor = protohoggr::Cursor::new(record);
++        let num_ways = cursor.read_varint().map_err(|e| {
++            Error::from(e).context(format!("per-way sidecar blob {blob_idx} num_ways"))
+         })?;
+-        if coord_cursor + way_bytes > coord_bytes.len() {
++        self.output.clear();
++        let mut coords = coord_bytes;
++        for way_idx in 0..num_ways {
++            let rc = cursor.read_varint().map_err(|e| {
++                Error::from(e).context(format!("per-way sidecar blob {blob_idx} way {way_idx}"))
++            })?;
++            let way_bytes = usize::try_from(rc)
++                .ok()
++                .and_then(|count| count.checked_mul(COORD_SLOT_SIZE))
++                .ok_or_else(|| {
++                    Error::internal(format!(
++                        "blob {blob_idx} way {way_idx}: refcount byte size overflow"
++                    ))
++                })?;
++            let (way, rest) = coords.split_at_checked(way_bytes).ok_or_else(|| {
++                Error::internal(format!(
++                    "coord_bytes length mismatch for blob {blob_idx}: way {way_idx} needs \
++                     {way_bytes} bytes, {} remaining",
++                    coords.len(),
++                ))
++            })?;
++            if !way.is_empty() {
++                self.encode_way(way, inject_prepass);
++            }
++            coords = rest;
++        }
++        if cursor.remaining() != 0 {
+             return Err(Error::internal(format!(
+-                "coord_bytes length mismatch for blob {blob_idx}: got {} bytes, \
+-                 need at least {} bytes by way {way_idx}",
+-                coord_bytes.len(),
+-                coord_cursor + way_bytes,
++                "per-way sidecar blob {blob_idx} has {} trailing bytes",
++                cursor.remaining()
+             )));
+         }
++        if !coords.is_empty() {
++            return Err(Error::internal(format!(
++                "coord_bytes length mismatch for blob {blob_idx}: {} trailing bytes",
++                coords.len(),
++            )));
++        }
++        Ok(())
++    }
+ 
+-        let mut last_lat: i32 = 0;
+-        let mut last_lon: i32 = 0;
+-        // This is the inverse of stage 2's private ResolvedEntry codec,
+-        // selected by the same invocation-wide flag. Keep the decode here:
+-        // stage 3 scatters opaque 8-byte slots, while stage 4 receives plain
+-        // delta-coordinate varints plus a distinct pin bitmap.
+-        // The slot bytes have no presence bit: unwritten orphans intentionally
+-        // become unpinned (0, 0) placeholders. Stage 2 counts absence from
+-        // node matches, so a resolved Null Island stays resolved; the command
+-        // rejects missing locations unless `--ignore-missing-nodes` is set.
+-        // When injecting, lat carries the pin bit in position 0; unpack it and
+-        // accumulate the per-way pin bitmap emitted after the coordinate
+-        // varints (v2 framing: 2*N varints then ceil(N/8) bitmap bytes).
+-        let mut pins = if inject_prepass {
+-            vec![0_u8; rc_usize.div_ceil(8)]
+-        } else {
+-            Vec::new()
+-        };
+-        for i in 0..rc_usize {
+-            let off = coord_cursor;
+-            coord_cursor += COORD_SLOT_SIZE;
+-            let packed_lat = i32::from_le_bytes([
+-                coord_bytes[off],
+-                coord_bytes[off + 1],
+-                coord_bytes[off + 2],
+-                coord_bytes[off + 3],
+-            ]);
+-            let lon = i32::from_le_bytes([
+-                coord_bytes[off + 4],
+-                coord_bytes[off + 5],
+-                coord_bytes[off + 6],
+-                coord_bytes[off + 7],
+-            ]);
++    fn encode_way(&mut self, way: &[u8], inject_prepass: bool) {
++        use protohoggr::{encode_bytes_field, encode_varint, zigzag_encode_64};
++
++        self.lats.clear();
++        self.lons.clear();
++        self.pins.clear();
++        let (slots, _) = way.as_chunks::<COORD_SLOT_SIZE>();
++        if inject_prepass {
++            self.pins.resize(slots.len().div_ceil(8), 0);
++        }
++        let mut last_lat = 0;
++        let mut last_lon = 0;
++        let mut has_pins = false;
++        for (i, &[a, b, c, d, e, f, g, h]) in slots.iter().enumerate() {
++            // Stage 2 uses the low latitude bit for the pin when injecting.
++            // Unwritten slots stay unpinned (0, 0). Stage 2 counts missing
++            // nodes independently, so resolved Null Island stays resolved.
++            let packed_lat = i32::from_le_bytes([a, b, c, d]);
++            let lon = i64::from(i32::from_le_bytes([e, f, g, h]));
+             let lat = if inject_prepass {
+                 if packed_lat & 1 != 0 {
+-                    pins[i / 8] |= 1 << (i % 8);
++                    self.pins[i / 8] |= 1 << (i % 8);
++                    has_pins = true;
+                 }
+                 packed_lat >> 1
+             } else {
+                 packed_lat
+             };
+-            let dlat = i64::from(lat) - i64::from(last_lat);
+-            let dlon = i64::from(lon) - i64::from(last_lon);
+-            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlat));
+-            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlon));
++            let lat = i64::from(lat);
++            encode_varint(&mut self.lats, zigzag_encode_64(lat - last_lat));
++            encode_varint(&mut self.lons, zigzag_encode_64(lon - last_lon));
+             last_lat = lat;
+             last_lon = lon;
+         }
+-        if inject_prepass {
+-            output.extend_from_slice(&pins);
++        encode_bytes_field(&mut self.output, LAT_FIELD, &self.lats);
++        encode_bytes_field(&mut self.output, LON_FIELD, &self.lons);
++        if has_pins {
++            encode_bytes_field(&mut self.output, PIN_FIELD, &self.pins);
+         }
+     }
+-    if cursor.remaining() != 0 {
+-        return Err(Error::internal(format!(
+-            "per-way sidecar blob {blob_idx} has {} trailing bytes",
+-            cursor.remaining()
+-        )));
++}
++
++pub(super) struct WayPayload<'a> {
++    pub bytes: &'a [u8],
++    pub lat_bytes: usize,
++    pub lon_bytes: usize,
++    pub pins: &'a [u8],
++}
++
++/// Take one way's appendable fields. Check their framing and size bounds;
++/// the producer checked the exact slot count before encoding the deltas.
++/// The pin tag has a different prefix from the next way's latitude tag.
++pub(super) fn take_way_payload<'a>(
++    payload: &mut &'a [u8],
++    ref_count: u64,
++    inject_prepass: bool,
++) -> Result<WayPayload<'a>> {
++    if ref_count == 0 {
++        return Ok(WayPayload {
++            bytes: &[],
++            lat_bytes: 0,
++            lon_bytes: 0,
++            pins: &[],
++        });
+     }
+-    if coord_cursor != coord_bytes.len() {
+-        return Err(Error::internal(format!(
+-            "coord_bytes length mismatch for blob {blob_idx}: got {} bytes, expected {}",
+-            coord_bytes.len(),
+-            coord_cursor,
+-        )));
++    let input = *payload;
++    let mut cursor = protohoggr::Cursor::new(input);
++    let lats = read_payload_field(&mut cursor, LAT_FIELD)?;
++    let lons = read_payload_field(&mut cursor, LON_FIELD)?;
++    // A zigzag-encoded difference between i32s occupies 1 to 5 bytes.
++    let valid_len = ref_count..=ref_count.saturating_mul(5);
++    for column in [lats, lons] {
++        if !valid_len.contains(&(column.len() as u64)) {
++            return Err(Error::internal(
++                "coord_payload: delta field length outside ref count bounds",
++            ));
++        }
++        if column.last().is_some_and(|&byte| byte >= 0x80) {
++            return Err(Error::internal("coord_payload: unterminated final delta"));
++        }
+     }
+-    Ok(())
++    let pins = if inject_prepass && input.get(cursor.position()) == Some(&PIN_TAG_FIRST_BYTE) {
++        let pins = read_payload_field(&mut cursor, PIN_FIELD)?;
++        if pins.len() as u64 != ref_count.div_ceil(8) {
++            return Err(Error::internal("coord_payload: wrong pin bitmap length"));
++        }
++        pins
++    } else {
++        &[]
++    };
++    let (bytes, rest) = input.split_at(cursor.position());
++    *payload = rest;
++    Ok(WayPayload {
++        bytes,
++        lat_bytes: lats.len(),
++        lon_bytes: lons.len(),
++        pins,
++    })
++}
++
++fn read_payload_field<'a>(cursor: &mut protohoggr::Cursor<'a>, expected: u32) -> Result<&'a [u8]> {
++    let invalid = || {
++        Error::internal(format!(
++            "coord_payload: missing or malformed field {expected}"
++        ))
++    };
++    if cursor.read_tag().map_err(|_| invalid())? != Some((expected, protohoggr::WIRE_LEN)) {
++        return Err(invalid());
++    }
++    cursor.read_len_delimited().map_err(|_| invalid())
+ }
+ 
+ #[cfg(test)]
+@@ -986,121 +982,179 @@ mod tests {
+         buf
+     }
+ 
+-    fn decode_zigzag_varints(data: &[u8], count: usize) -> Vec<i64> {
+-        let mut cursor = protohoggr::Cursor::new(data);
+-        let mut out = Vec::with_capacity(count);
+-        for _ in 0..count {
+-            let v = cursor.read_varint().expect("read varint");
+-            out.push(protohoggr::zigzag_decode_64(v));
+-        }
+-        out
+-    }
++    // The old scratch format was interleaved delta varints followed by a
++    // full-width pin bitmap in prepass mode. Model both its encoding and
++    // stage 4's old split into packed PBF fields.
++    fn legacy_way_fields(coords: &[(i32, i32)], pins: &[u8]) -> Vec<u8> {
++        use protohoggr::{Cursor, encode_bytes_field, encode_varint, zigzag_encode_64};
+ 
+-    fn reconstruct_coords(output: &[u8], per_way_rcs: &[u32]) -> Vec<(i32, i32)> {
+-        let total_refs: usize = per_way_rcs.iter().map(|&r| r as usize).sum();
+-        let deltas = decode_zigzag_varints(output, total_refs * 2);
+-        let mut result = Vec::with_capacity(total_refs);
+-        let mut delta_idx = 0;
+-        for &rc in per_way_rcs {
+-            let mut last_lat: i64 = 0;
+-            let mut last_lon: i64 = 0;
+-            for _ in 0..rc {
+-                let lat = last_lat + deltas[delta_idx];
+-                let lon = last_lon + deltas[delta_idx + 1];
+-                delta_idx += 2;
+-                #[allow(clippy::cast_possible_truncation)]
+-                result.push((lat as i32, lon as i32));
+-                last_lat = lat;
+-                last_lon = lon;
++        if coords.is_empty() {
++            return Vec::new();
++        }
++        let mut scratch = Vec::new();
++        let (mut prev_lat, mut prev_lon) = (0, 0);
++        for &(lat, lon) in coords {
++            encode_varint(&mut scratch, zigzag_encode_64(i64::from(lat) - prev_lat));
++            encode_varint(&mut scratch, zigzag_encode_64(i64::from(lon) - prev_lon));
++            prev_lat = i64::from(lat);
++            prev_lon = i64::from(lon);
++        }
++        scratch.extend_from_slice(pins);
++
++        let mut reader = Cursor::new(&scratch);
++        let mut lats = Vec::new();
++        let mut lons = Vec::new();
++        for _ in coords {
++            for column in [&mut lats, &mut lons] {
++                let start = reader.position();
++                reader.skip_varint().expect("legacy coordinate delta");
++                column.extend_from_slice(&scratch[start..reader.position()]);
+             }
+         }
+-        result
+-    }
+-
+-    #[test]
+-    fn encode_blob_payload_single_way_single_ref() {
+-        let coords = [(12345_i32, 67890_i32)];
+-        let cb = make_coord_bytes(&coords);
+-        let rcs = [1u32];
+-        let mut out = Vec::new();
+-        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+-        let reconstructed = reconstruct_coords(&out, &rcs);
+-        assert_eq!(reconstructed, coords);
++        let pins = &scratch[reader.position()..];
++        let mut fields = Vec::new();
++        encode_bytes_field(&mut fields, 9, &lats);
++        encode_bytes_field(&mut fields, 10, &lons);
++        if pins.iter().any(|&byte| byte != 0) {
++            encode_bytes_field(&mut fields, 20, pins);
++        }
++        fields
+     }
+ 
+-    #[test]
+-    fn encode_blob_payload_single_way_multi_ref() {
+-        let coords = [(100_i32, 200_i32), (150_i32, 250_i32), (90_i32, 180_i32)];
+-        let cb = make_coord_bytes(&coords);
+-        let rcs = [3u32];
+-        let mut out = Vec::new();
+-        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+-        let reconstructed = reconstruct_coords(&out, &rcs);
+-        assert_eq!(reconstructed, coords);
++    const GENERATED_COUNTS: &[u32] = &[0, 1, 0, 9, 3, 8, 127, 0, 128, 512, 0, 1025, 0];
++
++    fn generated_ways(inject_prepass: bool) -> (Vec<u8>, Vec<Vec<u8>>) {
++        let mut bytes = Vec::new();
++        let mut expected = Vec::new();
++        for (way, &count) in GENERATED_COUNTS.iter().enumerate() {
++            let mut coords = Vec::new();
++            let mut pins = vec![
++                0;
++                if inject_prepass {
++                    (count as usize).div_ceil(8)
++                } else {
++                    0
++                }
++            ];
++            for i in 0..count {
++                let j = i32::try_from(i).expect("test index");
++                let missing = i % 13 == 4;
++                let (lat, lon) = if missing {
++                    (0, 0)
++                } else {
++                    match (i + 1) % 7 {
++                        0 => (0, 0), // Resolved Null Island, potentially pinned.
++                        1 => (1, -1),
++                        2 => (500 + j, 40 - j),
++                        3 => (-80_000 + j, 999_999 - j),
++                        4 => (8_000_000 + j, -1_999_999 - j),
++                        5 => (900_000_000, -1_800_000_000),
++                        _ => (-900_000_000, 1_800_000_000),
++                    }
++                };
++                let pinned =
++                    inject_prepass && !missing && way % 2 == 1 && (i % 7 == 6 || i == 0 || i == 7);
++                let storage_lat = if inject_prepass {
++                    if pinned {
++                        pins[(i / 8) as usize] |= 1 << (i % 8);
++                    }
++                    (lat << 1) | i32::from(pinned)
++                } else {
++                    lat
++                };
++                bytes.extend_from_slice(&storage_lat.to_le_bytes());
++                bytes.extend_from_slice(&lon.to_le_bytes());
++                coords.push((lat, lon));
++            }
++            expected.push(legacy_way_fields(&coords, &pins));
++        }
++        (bytes, expected)
+     }
+ 
+-    #[test]
+-    fn encode_blob_payload_multiple_ways() {
+-        // Three ways of 2/3/1 refs; deltas reset at way boundaries.
+-        let coords = [
+-            (10_i32, 20_i32),
+-            (30_i32, 40_i32), // way 0
+-            (500_i32, 600_i32),
+-            (510_i32, 610_i32),
+-            (490_i32, 590_i32),    // way 1
+-            (9999_i32, -9999_i32), // way 2
+-        ];
+-        let cb = make_coord_bytes(&coords);
+-        let rcs = [2u32, 3u32, 1u32];
+-        let mut out = Vec::new();
+-        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+-        let reconstructed = reconstruct_coords(&out, &rcs);
+-        assert_eq!(reconstructed, coords);
++    fn assert_legacy_fields(mut payload: &[u8], expected: &[Vec<u8>], inject_prepass: bool) {
++        for (&count, expected) in GENERATED_COUNTS.iter().zip(expected) {
++            let actual = take_way_payload(&mut payload, u64::from(count), inject_prepass)
++                .expect("read way fields");
++            assert_eq!(actual.bytes, expected.as_slice());
++        }
++        assert!(payload.is_empty());
+     }
+ 
+     #[test]
+-    fn encode_blob_payload_empty_blob() {
+-        let cb: Vec<u8> = Vec::new();
+-        let rcs: &[u32] = &[];
+-        let mut out = vec![0xAAu8, 0xBBu8];
+-        encode_blob_payload(&cb, rcs, &mut out).expect("encode");
+-        // Output unchanged - only the sentinel bytes we put in.
+-        assert_eq!(out, [0xAAu8, 0xBBu8]);
++    fn appendable_payload_matches_legacy_splice_on_generated_ways() {
++        let pwr = make_per_way_rcs(&[GENERATED_COUNTS, &[0, 0]]);
++        let mut encoder = CoordPayloadEncoder::default();
++        for inject_prepass in [false, true] {
++            let (coords, expected) = generated_ways(inject_prepass);
++            encoder
++                .encode_blob(&coords, pwr.blob_record(0), 0, inject_prepass)
++                .expect("encode");
++            assert_legacy_fields(&encoder.output, &expected, inject_prepass);
++            encoder
++                .encode_blob(&[], pwr.blob_record(1), 1, inject_prepass)
++                .expect("encode empty ways");
++            assert!(encoder.output.is_empty());
++        }
+     }
+ 
+     #[test]
+-    fn encode_blob_payload_zero_coords() {
+-        let coords = [(0_i32, 0_i32), (0_i32, 0_i32)];
+-        let cb = make_coord_bytes(&coords);
+-        let rcs = [2u32];
+-        let mut out = Vec::new();
+-        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+-        let reconstructed = reconstruct_coords(&out, &rcs);
+-        assert_eq!(reconstructed, coords);
++    fn straddler_payload_matches_legacy_splice_in_both_arrival_orders() {
++        let pwr = make_per_way_rcs(&[GENERATED_COUNTS]);
++        let (coords, expected) = generated_ways(true);
++        // This boundary falls inside a pinned way, so deltas and pin bit
++        // positions must continue across the slot-bucket boundary.
++        let (left, right) = coords.split_at(8 * COORD_SLOT_SIZE);
++        let mut encoder = CoordPayloadEncoder::default();
++        for halves in [
++            [(StraddlerSide::Left, left), (StraddlerSide::Right, right)],
++            [(StraddlerSide::Right, right), (StraddlerSide::Left, left)],
++        ] {
++            let router =
++                ConcurrentBlobLocationRouter::new(&pwr, vec![], &crate::host::Call::detached())
++                    .expect("router");
++            for (side, bytes) in halves {
++                router
++                    .publish_straddler_half(0, side, bytes.to_vec(), &pwr, true, &mut encoder)
++                    .expect("publish half");
++            }
++            let mut payload = Vec::new();
++            router
++                .pread_blob_payload(0, &mut payload)
++                .expect("straddler");
++            assert_legacy_fields(&payload, &expected, true);
++        }
+     }
+ 
+     #[test]
+-    fn encode_blob_payload_negative_coords() {
+-        let coords = [(-1_000_000_i32, -1_000_000_i32), (0_i32, 0_i32)];
+-        let cb = make_coord_bytes(&coords);
+-        let rcs = [2u32];
+-        let mut out = Vec::new();
+-        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+-        let reconstructed = reconstruct_coords(&out, &rcs);
+-        assert_eq!(reconstructed, coords);
++    fn encode_blob_payload_length_mismatch() {
++        let mut encoder = CoordPayloadEncoder::default();
++        for len in [15, 17] {
++            assert_err_kind!(
++                encoder.encode_blob(&vec![0; len], &[1, 2], 0, false),
++                crate::ErrorKind::Internal { msg, .. } if msg.contains("coord_bytes length mismatch"),
++            );
++        }
+     }
+ 
+     #[test]
+-    fn encode_blob_payload_length_mismatch() {
+-        // per_way_rcs = [2] expects 16 bytes; we pass 15.
+-        let cb = vec![0u8; 15];
+-        let rcs = [2u32];
+-        let result = encode_blob_payload(&cb, &rcs, &mut Vec::new());
+-        assert_err_kind!(
+-            result,
+-            crate::ErrorKind::Internal { msg, .. } if msg.contains("coord_bytes length mismatch"),
+-            "expected Err for length mismatch",
+-        );
++    fn payload_fields_check_tags_lengths_and_pin_width() {
++        let fields = [0x4a, 1, 0, 0x52, 1, 0];
++        let mut bad_pins = fields.to_vec();
++        protohoggr::encode_bytes_field(&mut bad_pins, 20, &[1, 0]);
++        let unterminated = [0x4a, 1, 0, 0x52, 1, 0x80];
++
++        for (mut payload, refs, prepass, why) in [
++            (&fields[..], 2, false, "outside ref count bounds"),
++            (&fields[..5], 1, false, "malformed field 10"),
++            (&fields[3..], 1, false, "malformed field 9"),
++            (bad_pins.as_slice(), 1, true, "wrong pin bitmap length"),
++            (&unterminated[..], 1, false, "unterminated final delta"),
++        ] {
++            assert_err_kind!(
++                take_way_payload(&mut payload, refs, prepass),
++                crate::ErrorKind::Internal { msg, .. } if msg.contains(why),
++            );
++        }
+     }
+ 
+     /// Build a minimal per-way refcount sidecar in memory for `num_way_blobs`
+@@ -1150,33 +1204,6 @@ mod tests {
+         );
+     }
+ 
+-    #[test]
+-    fn encode_blob_payload_from_record_matches_decoded_path() {
+-        let coords = [
+-            (10_i32, 20_i32),
+-            (30_i32, 40_i32),
+-            (500_i32, 600_i32),
+-            (510_i32, 610_i32),
+-            (490_i32, 590_i32),
+-            (9999_i32, -9999_i32),
+-        ];
+-        let cb = make_coord_bytes(&coords);
+-        let pwr = make_per_way_rcs(&[&[2u32, 3u32, 1u32]]);
+-        let mut from_record = Vec::new();
+-        let mut from_decoded = Vec::new();
+-        let mut scratch: Vec<u32> = Vec::new();
+-
+-        encode_blob_payload_from_record(&cb, pwr.blob_record(0), 0, false, &mut from_record)
+-            .expect("encode from record");
+-        let decoded = pwr
+-            .decode_blob_into(0, &mut scratch)
+-            .expect("decode 0")
+-            .to_vec();
+-        encode_blob_payload(&cb, &decoded, &mut from_decoded).expect("encode decoded");
+-
+-        assert_eq!(from_record, from_decoded);
+-    }
+-
+     /// A published slot does not mask an abort: the readiness wait and the
+     /// boundary check both return the recorded error.
+     #[test]
+@@ -1221,7 +1248,7 @@ mod tests {
+                         0 => router.publish_worker(0, 0, 0, 1).expect("worker"),
+                         1 => {
+                             let coords = make_coord_bytes(&[(10, 20)]);
+-                            let mut scratch = Vec::new();
++                            let mut scratch = CoordPayloadEncoder::default();
+                             router
+                                 .publish_straddler_half(
+                                     0,
+diff --git a/crates/lib/src/commands/altw/external/space.rs b/crates/lib/src/commands/altw/external/space.rs
+index fd3c1834..a4a37c37 100644
+--- a/crates/lib/src/commands/altw/external/space.rs
++++ b/crates/lib/src/commands/altw/external/space.rs
+@@ -17,18 +17,26 @@ use std::path::Path;
+ 
+ use super::super::Result;
+ 
++/// Worst-case stage 3 payload size per reference when only the total ref
++/// count is known. For a way with N >= 1 refs, fields 9 and 10 use up to
++/// 5*N bytes each for zigzag deltas between i32s. Field 20 uses up to N
++/// bytes for its ceil(N/8) pin bitmap. Each of the three length prefixes
++/// fits in N bytes because a varint of N bytes can represent at least 5*N.
++/// The tags take 1, 1, and 2 bytes, at most 4*N in total. That gives
++/// 10*N + N + 3*N + 4*N = 18*N bytes. A pinned singleton can reach this
++/// bound. Empty ways contribute zero bytes.
++const MAX_PAYLOAD_BYTES_PER_REF: u64 = 18;
++
+ /// Scratch still to be written after stage 1, in bytes.
+ ///
+ /// Stage 2 writes one 12-byte resolved record per ref into the slot buckets
+-/// while the ID shards are still live. Stage 3 writes payload files: two
+-/// differences of i32 coordinates take at most ten varint bytes per ref, plus
+-/// at most one pin-bitmap byte per ref. ID shards are removed between stage 2
+-/// and stage 3, but that removal is best effort, so it is not credited. The
+-/// sidecars and ID shards already exist and are reflected in free space. Add
+-/// per-file allocation slack for every slot bucket and payload file. The
+-/// final PBF is separate.
++/// while the ID shards are still live. Stage 3 writes the packed way fields
++/// bounded by [`MAX_PAYLOAD_BYTES_PER_REF`]. The estimate takes no credit for
++/// best-effort ID shard removal between stages 2 and 3. Sidecars and ID shards
++/// already exist and are reflected in free space. The estimate includes
++/// allocation slack per slot bucket and payload file. The final PBF is separate.
+ fn remaining_scratch_bytes(refs: u64, slot_buckets: usize, payload_files: usize) -> Result<u64> {
+-    let record_bytes = super::RESOLVED_ENTRY_SIZE as u64 + 11;
++    let record_bytes = super::RESOLVED_ENTRY_SIZE as u64 + MAX_PAYLOAD_BYTES_PER_REF;
+     refs.checked_mul(record_bytes)
+         .and_then(|n| {
+             let files = (slot_buckets as u64).checked_add(payload_files as u64)?;
+@@ -89,13 +97,45 @@ mod tests {
+     #[test]
+     fn estimate_covers_slot_records_payloads_and_file_slack() {
+         let needed = remaining_scratch_bytes(100, 2, 1).expect("estimate");
+-        assert_eq!(needed, 100 * 23 + 3 * 65536);
++        assert_eq!(needed, 100 * 30 + 3 * 65536);
+         assert_err_kind!(
+             remaining_scratch_bytes(u64::MAX, 0, 0),
+             crate::ErrorKind::Internal { msg, .. } if msg.contains("estimate overflow"),
+         );
+     }
+ 
++    #[test]
++    fn estimate_covers_payload_fields_at_length_prefix_boundaries() {
++        use super::super::{RESOLVED_ENTRY_SIZE, coord_payloads::CoordPayloadEncoder};
++
++        let mut encoder = CoordPayloadEncoder::default();
++        for refs in [1_u64, 25, 26, 1016, 1017] {
++            let mut coords = Vec::new();
++            for i in 0..refs {
++                let sign = if i.is_multiple_of(2) { 1 } else { -1 };
++                let pinned_lat = ((sign * 900_000_000_i32) << 1) | 1;
++                let lon = sign * 1_800_000_000_i32;
++                coords.extend_from_slice(&pinned_lat.to_le_bytes());
++                coords.extend_from_slice(&lon.to_le_bytes());
++            }
++            let mut record = vec![1]; // one way
++            protohoggr::encode_varint(&mut record, refs);
++            encoder
++                .encode_blob(&coords, &record, 0, true)
++                .expect("encode pinned way");
++
++            let needed = remaining_scratch_bytes(refs, 0, 0).expect("estimate");
++            let actual = refs * RESOLVED_ENTRY_SIZE as u64 + encoder.output.len() as u64;
++            assert!(
++                actual <= needed,
++                "{refs} refs need {actual}, estimated {needed}"
++            );
++            if refs == 1 {
++                assert_eq!(actual, needed, "the pinned singleton reaches the bound");
++            }
++        }
++    }
++
+     #[test]
+     fn refusal_names_bytes_and_filesystem_path() {
+         let error = require_space(Path::new("scratch-dir"), 100, 99)
+diff --git a/crates/lib/src/commands/altw/external/stage3.rs b/crates/lib/src/commands/altw/external/stage3.rs
+index a8d837ad..7eab7e1d 100644
+--- a/crates/lib/src/commands/altw/external/stage3.rs
++++ b/crates/lib/src/commands/altw/external/stage3.rs
+@@ -6,10 +6,9 @@ use crate::error::Error;
+ 
+ use super::blob_bucket_index::{BlobBucketIntersection, classify_blobs_in_bucket};
+ use super::coord_payloads::{
+-    AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs, StraddlerSide,
+-    encode_blob_payload_from_record,
++    AbortOnDrop, ConcurrentBlobLocationRouter, CoordPayloadEncoder, PerWayRcs, StraddlerSide,
+ };
+-use super::{COORD_SLOT_SIZE, RE_OFF_LAT, RE_OFF_LOCAL_SLOT_POS, RE_OFF_LON, RESOLVED_ENTRY_SIZE};
++use super::{COORD_SLOT_SIZE, RE_OFF_LAT, RE_OFF_LOCAL_SLOT_POS, RESOLVED_ENTRY_SIZE};
+ 
+ use super::stage2::SlotBucketManifest;
+ 
+@@ -49,54 +48,89 @@ crate::counters::counter_set! {
+     }
+ }
+ 
+-/// Read slot bucket `path` into `data_buf`, which must come back exactly
+-/// `expected_len` bytes long: the length the stage 2 manifest committed.
+-/// The manifest, not the file, sizes the read, so a file grown past it
+-/// cannot drive the allocation; a short or long file is refused, never
+-/// read as fewer or more entries. I/O errors keep their kind.
+-///
+-/// This holds the file to its length, not its contents. The run's scratch
+-/// directory is trusted (ADR-0018): a same-length file whose records were
+-/// altered (one slot's entry overwritten with another's, say) is not
+-/// detected, because catching it would take a per-entry presence check in
+-/// the scatter loop, a hot-path cost that defends only against corrupt
+-/// scratch. The guard here is against our own code turning a failure it
+-/// observed into an answer, as a failed `stat` read as an empty bucket once
+-/// did.
+-fn read_slot_bucket(
++// Uncommitted experiment: moves to tunables.rs if this change lands. Bounds
++// the stage 3 input buffer and batches scratch reads; whole records per chunk.
++const STAGE3_SLOT_READ_CHUNK_BYTES: usize = 1 << 20;
++const SLOT_READ_CHUNK: usize =
++    STAGE3_SLOT_READ_CHUNK_BYTES / RESOLVED_ENTRY_SIZE * RESOLVED_ENTRY_SIZE;
++const _: () = assert!(RESOLVED_ENTRY_SIZE - RE_OFF_LAT == COORD_SLOT_SIZE);
++
++/// Read the manifest's exact byte count in chunks, scattering directly
++/// from each chunk into the destination array. A one-byte probe rejects
++/// longer files without allocating from their length. The scratch file's
++/// contents are trusted (ADR-0018), as before.
++fn read_and_scatter_slot_bucket(
+     file: &crate::scratch::ScratchFile,
+     path: &crate::scratch::ScratchPath,
++    bucket_idx: usize,
+     expected_len: usize,
+-    data_buf: &mut Vec<u8>,
+-) -> crate::Result<()> {
++    read_buf: &mut Vec<u8>,
++    scatter_buf: &mut [u8],
++    counters: &Stage3Counters,
++) -> Result<()> {
++    use crate::counters::Stopwatch;
+     use std::io::Read;
++    use std::sync::atomic::Ordering::Relaxed;
++
++    let mut reader = file;
+     let read_error = |e: std::io::Error| {
+         Error::from(e).context(format!("failed to read slot bucket {}", path.display()))
+     };
+-    data_buf.clear();
+-    data_buf.reserve_exact(expected_len);
+-    (&mut &*file)
+-        .take(expected_len as u64)
+-        .read_to_end(data_buf)
+-        .map_err(read_error)?;
+-    let mut probe = [0u8; 1];
+-    // loop-ends: retries only an interrupted read; any result or other
+-    // error leaves.
+-    let extra = loop {
+-        match (&mut &*file).read(&mut probe) {
+-            Ok(n) => break n,
+-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+-            Err(e) => return Err(read_error(e)),
++    let mut read = |buf: &mut [u8]| {
++        // loop-ends: retry only interrupted reads; any other result returns
++        loop {
++            match reader.read(buf) {
++                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
++                result => return result.map_err(read_error),
++            }
+         }
+     };
+-    if data_buf.len() != expected_len || extra != 0 {
+-        return Err(Error::internal(format!(
+-            "slot bucket {} holds {}{} bytes, but stage 2 wrote {expected_len}",
++    let wrong_len = |actual_len, suffix| {
++        Error::internal(format!(
++            "slot bucket {} holds {actual_len}{suffix} bytes, but stage 2 wrote {expected_len}",
+             path.display(),
+-            data_buf.len(),
+-            if extra == 0 { "" } else { " or more" },
+-        )));
++        ))
++    };
++
++    let t_resize = Stopwatch::start();
++    read_buf.resize(expected_len.min(SLOT_READ_CHUNK), 0);
++    let mut read_ns = t_resize.elapsed_ns();
++    let mut scatter_ns = 0;
++    let mut read_len = 0;
++    let mut stores = 0;
++    // loop-ends: each successful chunk advances read_len; errors return
++    while read_len < expected_len {
++        let chunk_len = read_buf.len().min(expected_len - read_len);
++        let chunk = &mut read_buf[..chunk_len];
++        let t_read = Stopwatch::start();
++        let mut filled = 0;
++        // loop-ends: each read advances filled or returns on EOF or error
++        while filled < chunk_len {
++            let n = read(&mut chunk[filled..])?;
++            if n == 0 {
++                return Err(wrong_len(read_len + filled, ""));
++            }
++            filled += n;
++        }
++        read_ns += t_read.elapsed_ns();
++        read_len += chunk_len;
++
++        let t_scatter = Stopwatch::start();
++        stores += scatter_bucket_entries(chunk, bucket_idx, scatter_buf)?;
++        scatter_ns += t_scatter.elapsed_ns();
++    }
++
++    let t_probe = Stopwatch::start();
++    if read(&mut [0])? != 0 {
++        return Err(wrong_len(read_len, " or more"));
+     }
++    read_ns += t_probe.elapsed_ns();
++    counters.read_ms.fetch_add(read_ns / 1_000_000, Relaxed);
++    counters
++        .scatter_ms
++        .fetch_add(scatter_ns / 1_000_000, Relaxed);
++    counters.bytes_read.fetch_add(read_len as u64, Relaxed);
++    counters.scatter_stores.fetch_add(stores, Relaxed);
+     Ok(())
+ }
+ 
+@@ -114,8 +148,7 @@ fn scatter_bucket_entries(
+         )));
+     }
+ 
+-    let bucket_slots = scatter_buf.len() / COORD_SLOT_SIZE;
+-    let mut stores: u64 = 0;
++    let (slots, _) = scatter_buf.as_chunks_mut::<COORD_SLOT_SIZE>();
+     let (chunks, _rem) = data_buf.as_chunks::<RESOLVED_ENTRY_SIZE>();
+     for chunk in chunks {
+         let local_slot_pos = u32::from_le_bytes([
+@@ -124,23 +157,18 @@ fn scatter_bucket_entries(
+             chunk[RE_OFF_LOCAL_SLOT_POS + 2],
+             chunk[RE_OFF_LOCAL_SLOT_POS + 3],
+         ]) as usize;
+-        if local_slot_pos >= bucket_slots {
+-            return Err(Error::internal(format!(
++        let bucket_slots = slots.len();
++        let slot = slots.get_mut(local_slot_pos).ok_or_else(|| {
++            Error::internal(format!(
+                 "slot bucket {bucket_idx} local_pos {local_slot_pos} outside bucket slot span {bucket_slots}"
+-            )));
+-        }
+-        let offset = local_slot_pos * COORD_SLOT_SIZE;
+-        // Preserve the private ResolvedEntry latitude/pin encoding verbatim.
+-        // Zero-filled unwritten slots deliberately yield unpinned (0, 0)
+-        // orphan vertices. Presence/missing counts come from the stage-2
+-        // join, not a test of these bytes, so Null Island remains resolved.
+-        scatter_buf[offset..offset + 4].copy_from_slice(&chunk[RE_OFF_LAT..RE_OFF_LON]);
+-        scatter_buf[offset + 4..offset + 8]
+-            .copy_from_slice(&chunk[RE_OFF_LON..RESOLVED_ENTRY_SIZE]);
+-        stores += 1;
++            ))
++        })?;
++        // Preserve the private latitude/pin encoding verbatim. Unwritten
++        // slots stay zero-filled, yielding unpinned (0, 0) orphan vertices.
++        slot.copy_from_slice(&chunk[RE_OFF_LAT..]);
+     }
+ 
+-    Ok(stores)
++    Ok(chunks.len() as u64)
+ }
+ 
+ /// Scatters each slot bucket into a zero-filled buffer and emits the way
+@@ -224,9 +252,9 @@ pub(super) fn stage3_slot_reorder(
+                 // worker would leave stage 4 blocked indefinitely.
+                 let abort_guard = AbortOnDrop::new(router, "stage 3 worker");
+ 
+-                let mut data_buf: Vec<u8> = Vec::new();
++                let mut read_buf = Vec::new();
+                 let mut scatter_buf: Vec<u8> = Vec::new();
+-                let mut encode_scratch: Vec<u8> = Vec::new();
++                let mut encoder = CoordPayloadEncoder::default();
+                 let mut tmp_byte_pos: u64 = 0;
+ 
+                 let tmp_file = router.worker_file(worker_id);
+@@ -254,9 +282,9 @@ pub(super) fn stage3_slot_reorder(
+                     // trips each worker finishes the bucket in hand, so the
+                     // stop latency is that bucket's work, which depends on
+                     // its population (buckets can be skewed, and there may
+-                    // be fewer than 256). A check inside would be per element
+-                    // in the hot loop; if a stop proves too slow, split the
+-                    // bucket and check per chunk, with a matched A/B.
++                    // be fewer than 256). The read chunks bound input-buffer
++                    // size only. A way blob can need slots from several chunks,
++                    // so emission still runs after the complete scatter.
+                     if let Err(e) = cancel.check() {
+                         err_ref
+                             .lock()
+@@ -294,115 +322,62 @@ pub(super) fn stage3_slot_reorder(
+                     } else {
+                         ((bucket_idx as u64 + 1) * range_size).min(total_slots)
+                     };
+-                    // `validate_slot_layout` checked before stage 2 that the
+-                    // widest bucket's slot count, times `COORD_SLOT_SIZE` (the
+-                    // scatter buffer) and times `RESOLVED_ENTRY_SIZE` (at most
+-                    // one entry per slot, the bucket file `data_buf` reads), is
+-                    // a representable allocation, so the `usize` casts below
+-                    // and the local-slot offsets into the scatter buffer cannot
+-                    // wrap.
++                    // The caller checked that the widest bucket's scatter
++                    // buffer and its manifest byte length are representable.
+                     let bucket_slots = bucket_end - bucket_start;
+-
+                     let (bucket_path, bucket_entries) = &buckets[bucket_idx];
+-                    if *bucket_entries == 0 {
+-                        // No resolved entries landed in this bucket, but blobs
+-                        // can still overlap its slot range (all-zero coords).
+-                        // Classify intersections and emit matching zero-coord
+-                        // bytes so the FullyContained and straddler paths stay
+-                        // consistent with what the per-blob coord slice looked
+-                        // like under the pre-integration coord_slots reader.
+-                        let result: crate::Result<()> = (|| {
+-                            let intersections = classify_blobs_in_bucket(
+-                                bucket_start, bucket_end,
+-                                ctx.way_slot_starts, total_slots,
+-                            ).map_err(|e| e.context(format!("classify bucket {bucket_idx}")))?;
+-                            let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
+-                            scatter_buf.clear();
+-                            scatter_buf.resize(bucket_bytes, 0);
+-                            emit_integrated_intersections(
+-                                &intersections, &scatter_buf, bucket_start,
+-                                total_slots, ctx, &mut encode_scratch,
+-                                #[allow(clippy::cast_possible_truncation)]
+-                                { worker_id as u32 },
+-                                &mut tmp_byte_pos, tmp_file, c,
+-                            )?;
+-                            Ok(())
+-                        })();
+-                        if let Err(e) = result {
+-                            err_ref
+-                                .lock()
+-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+-                                .get_or_insert_with(|| e.clone());
+-                            router.abort(e.clone().context(format!("stage 3 worker {worker_id} error")));
+-                            abort_guard.disarm();
+-                            return Err(e);
+-                        }
+-                        continue;
+-                    }
+-
+                     let result: crate::Result<()> = (|| {
+                         let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
+                         scatter_buf.clear();
+                         scatter_buf.resize(bucket_bytes, 0);
+ 
+-                        // At most one entry per slot, so a count above the
+-                        // span is a stage 2 bug; within it, the byte length
+-                        // is representable (`validate_slot_layout`).
+-                        let expected_len = (*bucket_entries <= bucket_slots)
+-                            .then(|| bucket_entries.checked_mul(RESOLVED_ENTRY_SIZE as u64))
+-                            .flatten()
+-                            .and_then(|n| usize::try_from(n).ok())
+-                            .ok_or_else(|| Error::internal(format!(
+-                                "slot bucket {bucket_idx} manifest count {bucket_entries} \
+-                                 exceeds its {bucket_slots} slots"
+-                            )))?;
+-                        let t_open = crate::counters::Stopwatch::start();
+-                        data_buf.clear();
+-                        let bucket_file =
+-                            crate::scratch::open(bucket_path).map_err(|e| {
+-                                Error::from(e).context(format!(
+-                                    "failed to open slot bucket {}",
+-                                    bucket_path.display()
+-                                ))
+-                            })?;
+-                        t_open.record_ms(&c.open_ms);
+-                        // Test-only: the stage 3 and 4 peak rendezvous,
+-                        // held with this bucket's file open.
+-                        #[cfg(pbfhogg_test_hooks)]
+-                        cancel.faults().on_altw_stage34_peak(
+-                            crate::test_hooks::FleetParty::Stage3Worker(worker_id),
+-                            || cancel.is_cancelled() || router.is_aborted(),
+-                        );
+-
+-                        let t_read = crate::counters::Stopwatch::start();
+-                        read_slot_bucket(
+-                            &bucket_file, bucket_path, expected_len, &mut data_buf,
+-                        )?;
+-                        if crate::fadvise::evict_scratch(&bucket_file, cancel) {
+-                            c.fadvise_calls.fetch_add(1, Relaxed);
+-                            c.fadvise_bytes.fetch_add(data_buf.len() as u64, Relaxed);
+-                        }
+-                        t_read.record_ms(&c.read_ms);
+-                        c.bytes_read.fetch_add(data_buf.len() as u64, Relaxed);
+-
+-                        // Direct scatter from raw bytes. This removes the
+-                        // bucket-local Vec<ResolvedEntry> materialization and
+-                        // its extra memory traffic; parsing happens in lockstep
+-                        // with the scatter stores.
+-                        let t_scatter = crate::counters::Stopwatch::start();
+-                        let stores =
+-                            scatter_bucket_entries(&data_buf, bucket_idx, &mut scatter_buf)?;
+-                        t_scatter.record_ms(&c.scatter_ms);
+-                        c.scatter_stores.fetch_add(stores, Relaxed);
+-
+-                        // Track max live buffer bytes for this worker.
+-                        {
+-                            let worker_bytes = data_buf.capacity() as u64
+-                                + scatter_buf.capacity() as u64;
+-                            crate::counters::record_max(&c.max_worker_buf_bytes, worker_bytes);
++                        if *bucket_entries != 0 {
++                            // At most one entry per slot, so a count above the
++                            // span is a stage 2 bug; within it, the byte length
++                            // is representable (`validate_slot_layout`).
++                            let expected_len = (*bucket_entries <= bucket_slots)
++                                .then(|| bucket_entries.checked_mul(RESOLVED_ENTRY_SIZE as u64))
++                                .flatten()
++                                .and_then(|n| usize::try_from(n).ok())
++                                .ok_or_else(|| Error::internal(format!(
++                                    "slot bucket {bucket_idx} manifest count {bucket_entries} \
++                                     exceeds its {bucket_slots} slots"
++                                )))?;
++                            let t_open = crate::counters::Stopwatch::start();
++                            let bucket_file =
++                                crate::scratch::open(bucket_path).map_err(|e| {
++                                    Error::from(e).context(format!(
++                                        "failed to open slot bucket {}",
++                                        bucket_path.display()
++                                    ))
++                                })?;
++                            t_open.record_ms(&c.open_ms);
++                            // Test-only: the stage 3 and 4 peak rendezvous,
++                            // held with this bucket's file open.
++                            #[cfg(pbfhogg_test_hooks)]
++                            cancel.faults().on_altw_stage34_peak(
++                                crate::test_hooks::FleetParty::Stage3Worker(worker_id),
++                                || cancel.is_cancelled() || router.is_aborted(),
++                            );
++
++                            read_and_scatter_slot_bucket(
++                                &bucket_file, bucket_path, bucket_idx, expected_len,
++                                &mut read_buf, &mut scatter_buf, c,
++                            )?;
++                            let t_evict = crate::counters::Stopwatch::start();
++                            if crate::fadvise::evict_scratch(&bucket_file, cancel) {
++                                c.fadvise_calls.fetch_add(1, Relaxed);
++                                c.fadvise_bytes.fetch_add(expected_len as u64, Relaxed);
++                            }
++                            t_evict.record_ms(&c.read_ms);
++                            c.buckets_loaded.fetch_add(1, Relaxed);
+                         }
+ 
+-                        c.buckets_loaded.fetch_add(1, Relaxed);
++                        // Track live slot assembly buffers, including when
++                        // a bucket has no resolved entries.
++                        let worker_bytes = read_buf.capacity() as u64
++                            + scatter_buf.capacity() as u64;
++                        crate::counters::record_max(&c.max_worker_buf_bytes, worker_bytes);
+ 
+                         // Classify blobs in this bucket and encode/stage them
+                         // into worker temp files + straddler staging.
+@@ -412,7 +387,7 @@ pub(super) fn stage3_slot_reorder(
+                         ).map_err(|e| e.context(format!("classify bucket {bucket_idx}")))?;
+                         emit_integrated_intersections(
+                             &intersections, &scatter_buf, bucket_start,
+-                            total_slots, ctx, &mut encode_scratch,
++                            total_slots, ctx, &mut encoder,
+                             #[allow(clippy::cast_possible_truncation)]
+                             { worker_id as u32 },
+                             &mut tmp_byte_pos, tmp_file, c,
+@@ -504,7 +479,7 @@ fn emit_integrated_intersections(
+     bucket_start: u64,
+     total_slots: u64,
+     ctx: &IntegratedInputs<'_>,
+-    encode_scratch: &mut Vec<u8>,
++    encoder: &mut CoordPayloadEncoder,
+     worker_id: u32,
+     tmp_byte_pos: &mut u64,
+     tmp_file: &crate::scratch::ScratchFile,
+@@ -533,22 +508,21 @@ fn emit_integrated_intersections(
+                 let slice = &scatter_buf[local_start..local_end];
+ 
+                 let t_enc = crate::counters::Stopwatch::start();
+-                encode_scratch.clear();
+-                encode_blob_payload_from_record(
+-                    slice,
+-                    ctx.per_way_rcs.blob_record(blob_idx),
+-                    blob_idx,
+-                    ctx.inject_prepass,
+-                    encode_scratch,
+-                )
+-                .map_err(|e| e.context(format!("encode blob {blob_idx}")))?;
++                encoder
++                    .encode_blob(
++                        slice,
++                        ctx.per_way_rcs.blob_record(blob_idx),
++                        blob_idx,
++                        ctx.inject_prepass,
++                    )
++                    .map_err(|e| e.context(format!("encode blob {blob_idx}")))?;
+                 t_enc.record_ms(&counters.encode_ms);
+ 
+                 let byte_offset = *tmp_byte_pos;
+-                let byte_length = encode_scratch.len() as u64;
++                let byte_length = encoder.output.len() as u64;
+                 let t_pw = crate::counters::Stopwatch::start();
+                 tmp_file
+-                    .write_all_at(encode_scratch, byte_offset)
++                    .write_all_at(&encoder.output, byte_offset)
+                     .map_err(|e| {
+                         Error::from(e).context(format!(
+                             "failed to write way blob {blob_idx}'s payload to {}",
+@@ -584,7 +558,7 @@ fn emit_integrated_intersections(
+                         bytes,
+                         ctx.per_way_rcs,
+                         ctx.inject_prepass,
+-                        encode_scratch,
++                        encoder,
+                     )
+                     .map_err(|e| e.context(format!("straddler left blob {blob_idx}")))?;
+             }
+@@ -609,7 +583,7 @@ fn emit_integrated_intersections(
+                         bytes,
+                         ctx.per_way_rcs,
+                         ctx.inject_prepass,
+-                        encode_scratch,
++                        encoder,
+                     )
+                     .map_err(|e| e.context(format!("straddler right blob {blob_idx}")))?;
+             }
+@@ -620,7 +594,11 @@ fn emit_integrated_intersections(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{IntegratedInputs, stage3_slot_reorder};
++    use super::{
++        COORD_SLOT_SIZE, IntegratedInputs, RESOLVED_ENTRY_SIZE, SLOT_READ_CHUNK, Stage3Counters,
++        read_and_scatter_slot_bucket, stage3_slot_reorder,
++    };
++    use crate::commands::altw::external::ResolvedEntry;
+     use crate::commands::altw::external::coord_payloads::{
+         ConcurrentBlobLocationRouter, PayloadFile, parse_per_way_refcount_sidecar_bytes,
+     };
+@@ -692,14 +670,38 @@ mod tests {
+         )
+         .expect("run scratch");
+         let path = scratch.file("slots-0").expect("name");
+-        std::fs::write(path.as_path(), [7u8; 24]).expect("write bucket");
++        let mut records = Vec::new();
++        for (slot_pos, lat, lon) in [(2, -7, 21), (0, 7, -21)] {
++            let mut bytes = [0; RESOLVED_ENTRY_SIZE];
++            ResolvedEntry { slot_pos, lat, lon }.write_to(0, &mut bytes);
++            records.extend_from_slice(&bytes);
++        }
++        std::fs::write(path.as_path(), &records).expect("write bucket");
+         let read = |expected: usize| {
+             let file = crate::scratch::open(&path).expect("open bucket");
+-            let mut buf = Vec::new();
+-            super::read_slot_bucket(&file, &path, expected, &mut buf).map(|()| buf)
++            let mut scatter = [0; 3 * COORD_SLOT_SIZE];
++            read_and_scatter_slot_bucket(
++                &file,
++                &path,
++                0,
++                expected,
++                &mut Vec::new(),
++                &mut scatter,
++                &Stage3Counters::new(),
++            )?;
++            Ok::<_, crate::Error>(scatter)
+         };
+ 
+-        assert_eq!(read(24).expect("exact length"), vec![7u8; 24]);
++        let scatter = read(24).expect("exact length");
++        assert_eq!(
++            scatter[..8],
++            [7i32.to_le_bytes(), (-21i32).to_le_bytes()].concat()
++        );
++        assert_eq!(scatter[8..16], [0; 8]);
++        assert_eq!(
++            scatter[16..],
++            [(-7i32).to_le_bytes(), 21i32.to_le_bytes()].concat()
++        );
+         let short = read(36).expect_err("a short file must be refused");
+         assert!(
+             short
+@@ -713,4 +715,51 @@ mod tests {
+             "{long}"
+         );
+     }
++
++    #[test]
++    fn slot_bucket_scatter_across_multiple_chunks() {
++        let temp = crate::path_guard::tests::scratch();
++        let scratch = crate::scratch::RunScratch::create(
++            temp.path(),
++            &crate::host::Host::for_tests().entered(),
++        )
++        .expect("run scratch");
++        let path = scratch.file("slots-0").expect("name");
++        let count = SLOT_READ_CHUNK / RESOLVED_ENTRY_SIZE + 2;
++        let mut records = Vec::new();
++        for i in (0..count).rev() {
++            let mut bytes = [0; RESOLVED_ENTRY_SIZE];
++            let lat = i32::try_from(i).expect("test index") + 1;
++            ResolvedEntry {
++                slot_pos: i as u64,
++                lat,
++                lon: -lat,
++            }
++            .write_to(0, &mut bytes);
++            records.extend_from_slice(&bytes);
++        }
++        std::fs::write(path.as_path(), &records).expect("write bucket");
++        let file = crate::scratch::open(&path).expect("open bucket");
++        let mut scatter = vec![0; (count + 1) * COORD_SLOT_SIZE];
++        let mut read_buf = Vec::new();
++        read_and_scatter_slot_bucket(
++            &file,
++            &path,
++            0,
++            records.len(),
++            &mut read_buf,
++            &mut scatter,
++            &Stage3Counters::new(),
++        )
++        .expect("scatter");
++        assert_eq!(read_buf.len(), SLOT_READ_CHUNK);
++        let (slots, _) = scatter.as_chunks::<COORD_SLOT_SIZE>();
++        assert_eq!(slots[count], [0; COORD_SLOT_SIZE]);
++        for (slot, record) in slots
++            .iter()
++            .zip(records.as_chunks::<RESOLVED_ENTRY_SIZE>().0.iter().rev())
++        {
++            assert_eq!(slot, &record[super::RE_OFF_LAT..]);
++        }
++    }
+ }
+diff --git a/crates/lib/src/commands/altw/external/stage4.rs b/crates/lib/src/commands/altw/external/stage4.rs
+index 06bd8907..7402c5e8 100644
+--- a/crates/lib/src/commands/altw/external/stage4.rs
++++ b/crates/lib/src/commands/altw/external/stage4.rs
+@@ -5,9 +5,13 @@
+ //! P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
+ //! Way blobs use wire-format reframe (no full decode); non-way blobs use BlockBuilder.
+ 
++use std::ops::Range;
+ use std::path::Path;
+ 
++use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT, encode_tag, encode_varint};
++
+ use crate::block_builder::{BlockBuilder, OwnedBlock};
++use crate::commands::split::varint_len;
+ use crate::write::WriteOptions;
+ use crate::{Element, PrimitiveBlock};
+ 
+@@ -23,7 +27,7 @@ use crate::idset::IdSet;
+ use crate::owned::{dense_node_metadata, element_metadata};
+ 
+ use super::blob_meta::BlobMeta;
+-use super::coord_payloads::AbortOnDrop;
++use super::coord_payloads::{AbortOnDrop, take_way_payload};
+ 
+ /// Blob descriptor for the stage 4 pre-scan schedule.
+ ///
+@@ -986,12 +990,10 @@ crate::counters::counter_set! {
+     /// Sub-phase counters for the way reframe hot path.
+     ///
+     /// Timing is captured per blob (parse_block), per PrimitiveGroup
+-    /// (group_reframe) and per non-way field inside a group
+-    /// (unknown_field_copy), never per
+-    /// way. The earlier per-way timers were stripped after they confirmed
+-    /// the way path is not the wall-critical segment; per-way
+-    /// `Instant::now()` samples were a measurable cost at 1.16B ways/planet
+-    /// and provided no actionable signal beyond the blob-level attribution.
++    /// (group_reframe, emission) and per non-way field inside a group
++    /// (unknown_field_copy, source range discovery). Timing each way was
++    /// a measurable cost at 1.16B ways/planet and provided no actionable
++    /// signal beyond the blob-level attribution.
+     /// Nanosecond accumulators, emitted in milliseconds.
+     struct WayReframeCounters {
+         parse_block_ns => "s4_way_parse_block_ms" / 1_000_000,
+@@ -1024,12 +1026,9 @@ impl WayReframeCounters {
+ struct WayReframeScratch {
+     group_ranges: Vec<(usize, usize)>,
+     scalar_fields: Vec<u8>,
+-    reframed_way: Vec<u8>,
+-    packed_lats: Vec<u8>,
+-    packed_lons: Vec<u8>,
+-    pins: Vec<u8>,
++    group_fields: Vec<GroupField>,
++    stripped_ways: Vec<u8>,
+     member_ways: Vec<bool>,
+-    group_out: Vec<u8>,
+     /// This blob's field-20 tally under `--inject-prepass`; reset at the
+     /// start of every reframe, read by the worker once it succeeds.
+     pin_tally: PinTally,
+@@ -1040,33 +1039,126 @@ impl WayReframeScratch {
+         Self {
+             group_ranges: Vec::new(),
+             scalar_fields: Vec::new(),
+-            reframed_way: Vec::new(),
+-            packed_lats: Vec::new(),
+-            packed_lons: Vec::new(),
+-            pins: Vec::new(),
++            group_fields: Vec::new(),
++            stripped_ways: Vec::new(),
+             member_ways: Vec::new(),
+-            group_out: Vec::new(),
+             pin_tally: PinTally::default(),
+         }
+     }
+ }
+ 
+-/// Wire-format reframe: splice LocationsOnWays fields (9, 10) into way
+-/// messages without full PrimitiveBlock decode. Copies string table, node
+-/// groups, relation groups, and all way fields verbatim. Per-way refcounts
+-/// come from the stage-1 sidecar record for this blob, so the hot path no
+-/// longer re-counts field-8 ref varints just to know how many coordinate
+-/// pairs to splice.
++/// A group field's source bytes and the framing needed to emit it directly
++/// into the output block. Ways consume coordinate bytes in group order.
++enum GroupField {
++    Way {
++        body: Range<usize>,
++        stripped: bool,
++        coords_len: usize,
++    },
++    Other {
++        field: u32,
++        wire_type: u32,
++        raw: Range<usize>,
++    },
++}
++
++impl GroupField {
++    fn encoded_len(&self) -> usize {
++        match self {
++            Self::Way {
++                body, coords_len, ..
++            } => {
++                let len = body.len() + *coords_len;
++                1 + varint_len(len) + len
++            }
++            Self::Other {
++                field,
++                wire_type,
++                raw,
++            } => varint_len(((*field << 3) | *wire_type) as usize) + raw.len(),
++        }
++    }
++
++    fn append(&self, output: &mut Vec<u8>, group: &[u8], stripped_ways: &[u8], coords: &mut &[u8]) {
++        match self {
++            Self::Way {
++                body,
++                stripped,
++                coords_len,
++            } => {
++                let source = if *stripped { stripped_ways } else { group };
++                let (fields, rest) = coords.split_at(*coords_len);
++                *coords = rest;
++                encode_tag(output, 3, WIRE_LEN);
++                encode_varint(output, (body.len() + fields.len()) as u64);
++                output.extend_from_slice(&source[body.clone()]);
++                output.extend_from_slice(fields);
++            }
++            Self::Other {
++                field,
++                wire_type,
++                raw,
++            } => {
++                encode_tag(output, *field, *wire_type);
++                output.extend_from_slice(&group[raw.clone()]);
++            }
++        }
++    }
++}
++
++// Strip both wire forms, including an unpacked stale lat or lon that
++// would otherwise be concatenated with the fresh packed values.
++fn is_way_location(field: u32, wire_type: u32) -> bool {
++    matches!((field, wire_type), (9 | 10 | 20, WIRE_LEN | WIRE_VARINT))
++}
++
++fn scan_way(way: &[u8]) -> Result<(i64, bool)> {
++    let mut cursor = Cursor::new(way);
++    let mut way_id = 0;
++    let mut has_locations = false;
++    while let Some((field, wire_type)) = cursor
++        .read_tag()
++        .map_err(|e| Error::from(e).context("reframe wfield"))?
++    {
++        if (field, wire_type) == (1, WIRE_VARINT) {
++            way_id = cursor
++                .read_varint_i64()
++                .map_err(|e| Error::from(e).context("reframe id"))?;
++        } else {
++            has_locations |= is_way_location(field, wire_type);
++            cursor
++                .skip_field(wire_type)
++                .map_err(|e| Error::from(e).context("reframe wskip"))?;
++        }
++    }
++    Ok((way_id, has_locations))
++}
++
++fn strip_way_locations(way: &[u8], out: &mut Vec<u8>) -> Result<Range<usize>> {
++    let start = out.len();
++    let mut cursor = Cursor::new(way);
++    while let Some((field, wire_type)) = cursor
++        .read_tag()
++        .map_err(|e| Error::from(e).context("reframe copy tag"))?
++    {
++        let raw = cursor
++            .read_raw_field(wire_type)
++            .map_err(|e| Error::from(e).context("reframe copy field"))?;
++        if !is_way_location(field, wire_type) {
++            encode_tag(out, field, wire_type);
++            out.extend_from_slice(raw);
++        }
++    }
++    Ok(start..out.len())
++}
++
++/// Splice the complete fields staged for each way (lat 9, lon 10 and
++/// optional pins 20). The stage 1 sidecar supplies the ref counts in PBF
++/// order. Stage 4 reads field lengths and copies each way's appendable
++/// range without inspecting any of the packed varints.
+ ///
+ /// Returns `(way_count, min_way_id, max_way_id)`.
+ ///
+-/// `coord_payload` is the per-blob delta-varint payload produced by stage 3.
+-/// Each way consumes `2*ref_count` varints, interleaved (lat, lon, lat,
+-/// lon, ...) with deltas reset per way. Because the raw varint encoding
+-/// matches PBF's packed field 9/10 byte-for-byte, we de-interleave by
+-/// copying raw varint bytes into `packed_lats` and `packed_lons` without
+-/// zigzag-decoding or re-encoding.
+-///
+ /// The whole-pipeline missing-location count is computed once in
+ /// `external_join_in`, after stage 2, from the total and resolved slot
+ /// counts, and a strict run is refused there before this stage starts. Stage 3 has
+@@ -1086,7 +1178,6 @@ fn reframe_way_blob_with_locations(
+     member_way_ids: Option<&IdSet>,
+     inject_prepass: bool,
+ ) -> crate::Result<(u64, i64, i64)> {
+-    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+     use std::sync::atomic::Ordering::Relaxed;
+ 
+     scratch.member_ways.clear();
+@@ -1130,27 +1221,27 @@ fn reframe_way_blob_with_locations(
+     // ~57K atomic publishes instead of 4× that per way × 6 contending
+     // workers. The atomics were previously a real chunk of the
+     // "unaccounted" time inside s4_way_reframe_ms.
+-    let mut blob_refs_present: u64 = 0;
+     let mut blob_max_refs_per_way: u64 = 0;
+     let mut blob_lat_bytes: u64 = 0;
+     let mut blob_lon_bytes: u64 = 0;
+ 
+-    // Payload cursor: position in `coord_payload` for the current way.
+-    // Advances as we consume varints across ways within this blob.
+-    let mut payload_pos: usize = 0;
++    let mut remaining_payload = coord_payload;
+ 
+-    // Level 2: process each PrimitiveGroup.
++    // Plan the group length before writing its prefix. The plan holds byte
++    // ranges; only ways that had stale locations need a rewritten body.
+     for &(gr_offset, gr_len) in &scratch.group_ranges {
+         let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
+-        scratch.group_out.clear();
++        let group_payload = remaining_payload;
++        scratch.group_fields.clear();
++        scratch.stripped_ways.clear();
++        let mut group_len = 0;
+ 
+         let mut gr_cursor = Cursor::new(group_bytes);
+         while let Some((field, wire_type)) = gr_cursor
+             .read_tag()
+             .map_err(|e| Error::from(e).context("reframe gfield"))?
+         {
+-            if field == 3 && wire_type == WIRE_LEN {
+-                // Way submessage - splice locations.
++            let entry = if (field, wire_type) == (3, WIRE_LEN) {
+                 let way_bytes = gr_cursor
+                     .read_len_delimited()
+                     .map_err(|e| Error::from(e).context("reframe way"))?;
+@@ -1167,166 +1258,64 @@ fn reframe_way_blob_with_locations(
+                 })?;
+                 sidecar_way_idx += 1;
+ 
+-                let mut way_id: i64 = 0;
+-                let mut has_existing_way_locations = false;
+-
+-                let mut way_cursor = Cursor::new(way_bytes);
+-                while let Some((wf, wt)) = way_cursor
+-                    .read_tag()
+-                    .map_err(|e| Error::from(e).context("reframe wfield"))?
+-                {
+-                    match (wf, wt) {
+-                        (1, WIRE_VARINT) => {
+-                            way_id = way_cursor
+-                                .read_varint_i64()
+-                                .map_err(|e| Error::from(e).context("reframe id"))?;
+-                        }
+-                        // Both wire forms, as the sparse splice strips them:
+-                        // matching only the packed form let an unpacked stale
+-                        // lat / lon through the whole-way copy below, beside
+-                        // the fresh packed fields this reframe appends.
+-                        (9 | 10 | 20, WIRE_LEN | WIRE_VARINT) => {
+-                            has_existing_way_locations = true;
+-                            way_cursor
+-                                .skip_field(wt)
+-                                .map_err(|e| Error::from(e).context("reframe wskip"))?;
+-                        }
+-                        _ => {
+-                            way_cursor
+-                                .skip_field(wt)
+-                                .map_err(|e| Error::from(e).context("reframe wskip"))?;
+-                        }
+-                    }
+-                }
+-
+-                if way_id < min_way_id {
+-                    min_way_id = way_id;
+-                }
+-                if way_id > max_way_id {
+-                    max_way_id = way_id;
+-                }
++                let (way_id, stripped) = scan_way(way_bytes)?;
++                min_way_id = min_way_id.min(way_id);
++                max_way_id = max_way_id.max(way_id);
+                 scratch
+                     .member_ways
+                     .push(inject_prepass && member_way_ids.is_some_and(|ids| ids.get(way_id)));
+ 
+-                // De-interleave pre-encoded varints from coord_payload into
+-                // PBF packed fields 9/10. The raw varint bytes match PBF's
+-                // packed sint32 wire format 1:1, so we copy bytes without
+-                // zigzag decode + re-encode.
+-                scratch.packed_lats.clear();
+-                scratch.packed_lons.clear();
+-                scratch.pins.clear();
+-                for _ in 0..ref_count {
+-                    let lat_start = payload_pos;
+-                    while payload_pos < coord_payload.len()
+-                        && (coord_payload[payload_pos] & 0x80) != 0
+-                    {
+-                        payload_pos += 1;
+-                    }
+-                    if payload_pos >= coord_payload.len() {
+-                        return Err(Error::internal("coord_payload: truncated lat varint"));
+-                    }
+-                    payload_pos += 1;
+-                    scratch
+-                        .packed_lats
+-                        .extend_from_slice(&coord_payload[lat_start..payload_pos]);
+-                    let lon_start = payload_pos;
+-                    while payload_pos < coord_payload.len()
+-                        && (coord_payload[payload_pos] & 0x80) != 0
+-                    {
+-                        payload_pos += 1;
+-                    }
+-                    if payload_pos >= coord_payload.len() {
+-                        return Err(Error::internal("coord_payload: truncated lon varint"));
+-                    }
+-                    payload_pos += 1;
+-                    scratch
+-                        .packed_lons
+-                        .extend_from_slice(&coord_payload[lon_start..payload_pos]);
+-                }
+-                if inject_prepass {
+-                    let pin_ref_count = usize::try_from(ref_count)
+-                        .map_err(|_| Error::internal("coord_payload: ref count exceeds usize"))?;
+-                    let pin_bytes = pin_ref_count.div_ceil(8);
+-                    if payload_pos + pin_bytes > coord_payload.len() {
+-                        return Err(Error::internal("coord_payload: truncated pin bitmap"));
+-                    }
+-                    scratch
+-                        .pins
+-                        .extend_from_slice(&coord_payload[payload_pos..payload_pos + pin_bytes]);
+-                    payload_pos += pin_bytes;
+-                    scratch.pin_tally.record_way(&scratch.pins);
+-                }
+-                blob_refs_present += ref_count;
+-                if ref_count > blob_max_refs_per_way {
+-                    blob_max_refs_per_way = ref_count;
++                let locations = take_way_payload(&mut remaining_payload, ref_count, inject_prepass)
++                    .map_err(|e| {
++                        e.context(format!("blob {way_blob_idx} way {}", sidecar_way_idx - 1))
++                    })?;
++                if !locations.pins.is_empty() {
++                    scratch.pin_tally.record_way(locations.pins);
+                 }
+-                blob_lat_bytes += scratch.packed_lats.len() as u64;
+-                blob_lon_bytes += scratch.packed_lons.len() as u64;
++                blob_max_refs_per_way = blob_max_refs_per_way.max(ref_count);
++                blob_lat_bytes += locations.lat_bytes as u64;
++                blob_lon_bytes += locations.lon_bytes as u64;
+                 blob_refs += ref_count;
+ 
+-                // Build reframed way: original bytes + appended fields 9, 10.
+-                scratch.reframed_way.clear();
+-                if !has_existing_way_locations {
+-                    scratch.reframed_way.extend_from_slice(way_bytes);
++                let body = if stripped {
++                    strip_way_locations(way_bytes, &mut scratch.stripped_ways)?
+                 } else {
+-                    let mut copy_cursor = Cursor::new(way_bytes);
+-                    while let Some((wf, wt)) = copy_cursor
+-                        .read_tag()
+-                        .map_err(|e| Error::from(e).context("reframe copy tag"))?
+-                    {
+-                        let raw = copy_cursor
+-                            .read_raw_field(wt)
+-                            .map_err(|e| Error::from(e).context("reframe copy field"))?;
+-                        if !matches!((wf, wt), (9 | 10 | 20, WIRE_LEN | WIRE_VARINT)) {
+-                            protohoggr::encode_tag(&mut scratch.reframed_way, wf, wt);
+-                            scratch.reframed_way.extend_from_slice(raw);
+-                        }
+-                    }
+-                }
+-                if ref_count > 0 {
+-                    protohoggr::encode_bytes_field(
+-                        &mut scratch.reframed_way,
+-                        9,
+-                        &scratch.packed_lats,
+-                    );
+-                    protohoggr::encode_bytes_field(
+-                        &mut scratch.reframed_way,
+-                        10,
+-                        &scratch.packed_lons,
+-                    );
+-                    // Field order matches the sparse reframe (9, 10, 20) so the
+-                    // two backends produce byte-identical way payloads.
+-                    if inject_prepass && scratch.pins.iter().any(|&bit| bit != 0) {
+-                        protohoggr::encode_bytes_field(
+-                            &mut scratch.reframed_way,
+-                            20,
+-                            &scratch.pins,
+-                        );
+-                    }
+-                }
+-
+-                // Always written: an empty input way body is kept, not dropped.
+-                protohoggr::encode_bytes_field_always(
+-                    &mut scratch.group_out,
+-                    3,
+-                    &scratch.reframed_way,
+-                );
++                    let end = gr_cursor.position();
++                    end - way_bytes.len()..end
++                };
+                 total_ways += 1;
++                GroupField::Way {
++                    body,
++                    stripped,
++                    coords_len: locations.bytes.len(),
++                }
+             } else {
+-                // Non-way field in the group - copy verbatim.
+                 let t_copy = crate::counters::Stopwatch::start();
+-                let raw = gr_cursor
+-                    .read_raw_field(wire_type)
++                let start = gr_cursor.position();
++                gr_cursor
++                    .skip_field(wire_type)
+                     .map_err(|e| Error::from(e).context("reframe gskip"))?;
+-                protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
+-                scratch.group_out.extend_from_slice(raw);
+                 t_copy.record_ns(&counters.unknown_field_copy_ns);
+-            }
++                GroupField::Other {
++                    field,
++                    wire_type,
++                    raw: start..gr_cursor.position(),
++                }
++            };
++            group_len += entry.encoded_len();
++            scratch.group_fields.push(entry);
+         }
+ 
+         let t_group = crate::counters::Stopwatch::start();
+-        protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
++        if group_len != 0 {
++            output.reserve(1 + varint_len(group_len) + group_len);
++            encode_tag(output, 2, WIRE_LEN);
++            encode_varint(output, group_len as u64);
++            let mut coords = &group_payload[..group_payload.len() - remaining_payload.len()];
++            for entry in &scratch.group_fields {
++                entry.append(output, group_bytes, &scratch.stripped_ways, &mut coords);
++            }
++        }
+         t_group.record_ns(&counters.group_reframe_ns);
+     }
+ 
+@@ -1350,7 +1339,7 @@ fn reframe_way_blob_with_locations(
+     // needs a CAS loop because multiple blobs publish concurrently,
+     // but now only once per blob.
+     counters.refs_total.fetch_add(blob_refs, Relaxed);
+-    counters.refs_present.fetch_add(blob_refs_present, Relaxed);
++    counters.refs_present.fetch_add(blob_refs, Relaxed);
+     counters.lat_bytes.fetch_add(blob_lat_bytes, Relaxed);
+     counters.lon_bytes.fetch_add(blob_lon_bytes, Relaxed);
+     counters.ways_total.fetch_add(total_ways, Relaxed);
+@@ -1358,9 +1347,10 @@ fn reframe_way_blob_with_locations(
+         record_max(&counters.max_refs_per_way, blob_max_refs_per_way);
+     }
+ 
+-    if payload_pos != coord_payload.len() {
++    if !remaining_payload.is_empty() {
++        let consumed = coord_payload.len() - remaining_payload.len();
+         return Err(Error::internal(format!(
+-            "coord_payload: consumed {payload_pos} of {} bytes (trailing bytes indicate stage 3 over-production or version skew)",
++            "coord_payload: consumed {consumed} of {} bytes (trailing bytes indicate stage 3 over-production or version skew)",
+             coord_payload.len()
+         )));
+     }
+@@ -1408,26 +1398,110 @@ mod reframe_tests {
+         block
+     }
+ 
+-    fn reframe(block: &[u8]) -> Vec<u8> {
+-        // One way with one ref; its coordinate pair as stage 3 encodes it.
+-        let refcounts = [1_u8, 1];
+-        let payload = [0x02_u8, 0x04]; // zigzag(1), zigzag(2)
++    fn try_reframe(
++        block: &[u8],
++        payload: &[u8],
++        refcounts: &[u8],
++        inject_prepass: bool,
++    ) -> crate::Result<Vec<u8>> {
+         let mut out = Vec::new();
+         let mut scratch = WayReframeScratch::new();
+         let counters = WayReframeCounters::new();
+         reframe_way_blob_with_locations(
+             block,
+-            &payload,
+-            &refcounts,
++            payload,
++            refcounts,
+             0,
+             &mut out,
+             &mut scratch,
+             &counters,
+             None,
+-            false,
+-        )
+-        .unwrap();
+-        out
++            inject_prepass,
++        )?;
++        Ok(out)
++    }
++
++    fn reframe(block: &[u8]) -> Vec<u8> {
++        let payload = [0x4a, 1, 0x02, 0x52, 1, 0x04]; // fields 9 and 10
++        try_reframe(block, &payload, &[1, 1], false).expect("reframe")
++    }
++
++    #[test]
++    fn splices_way_and_group_lengths_in_place() {
++        let mut way_one = vec![0x08, 42];
++        len_delimited(8, &[18; 80], &mut way_one);
++        let mut way_three = vec![0x08, 44];
++        len_delimited(8, &[20], &mut way_three);
++
++        let mut first_fields = Vec::new();
++        len_delimited(9, &[1; 80], &mut first_fields);
++        len_delimited(10, &[2; 80], &mut first_fields);
++        len_delimited(20, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut first_fields);
++        let last_fields = [0x4a, 1, 3, 0x52, 1, 4];
++        let payload = [first_fields.as_slice(), &last_fields].concat();
++
++        let mut input = Vec::new();
++        len_delimited(1, &[], &mut input);
++        let mut group = Vec::new();
++        // Legal overlong encoding of field 4's tag. Stage 4 canonicalizes
++        // tags of copied group fields, so its size changes as well.
++        group.extend_from_slice(&[0xa2, 0, 0]);
++        len_delimited(3, &way_one, &mut group);
++        len_delimited(3, &[], &mut group);
++        len_delimited(2, &group, &mut input);
++        len_delimited(2, &[], &mut input);
++        let mut stale_way = way_three.clone();
++        len_delimited(20, &[1], &mut stale_way);
++        group.clear();
++        len_delimited(3, &stale_way, &mut group);
++        len_delimited(2, &group, &mut input);
++        // Legal, non-default granularity is dropped. Date granularity stays.
++        input.extend_from_slice(&[0x88, 1, 1, 0x90, 1, 1]);
++
++        let mut expected = Vec::new();
++        len_delimited(1, &[], &mut expected);
++        group.clear();
++        len_delimited(4, &[], &mut group);
++        way_one.extend_from_slice(&first_fields);
++        len_delimited(3, &way_one, &mut group);
++        len_delimited(3, &[], &mut group);
++        len_delimited(2, &group, &mut expected);
++        group.clear();
++        way_three.extend_from_slice(&last_fields);
++        len_delimited(3, &way_three, &mut group);
++        len_delimited(2, &group, &mut expected);
++        expected.extend_from_slice(&[0x90, 1, 1]);
++
++        assert_eq!(
++            try_reframe(&input, &payload, &[3, 80, 0, 1], true).expect("reframe"),
++            expected,
++        );
++    }
++
++    #[test]
++    fn reframe_refuses_payload_and_sidecar_misalignment() {
++        let block = way_block(&[]);
++        let payload = [0x4a, 1, 2, 0x52, 1, 4];
++        for (payload, counts, why) in [
++            (&payload[..], &[0][..], "encountered more way messages"),
++            (&payload[..], &[2, 1, 0][..], "declared 2 ways"),
++            (
++                &payload[..],
++                &[1, 1, 0][..],
++                "sidecar blob 0 has 1 trailing bytes",
++            ),
++            (&payload[..5], &[1, 1][..], "malformed field 10"),
++            (
++                &payload[..],
++                &[1, 0][..],
++                "coord_payload: consumed 0 of 6 bytes",
++            ),
++        ] {
++            crate::test_support::assert_err_kind!(
++                try_reframe(&block, payload, counts, false),
++                crate::ErrorKind::Internal { msg, .. } if msg.contains(why),
++            );
++        }
+     }
+ 
+     /// Existing location fields are the reframe's to replace, in either wire
+diff --git a/crates/source-policy/src/rules/id_signs.rs b/crates/source-policy/src/rules/id_signs.rs
+index 95301669..e4cf32ae 100644
+--- a/crates/source-policy/src/rules/id_signs.rs
++++ b/crates/source-policy/src/rules/id_signs.rs
+@@ -429,7 +429,7 @@ pub const INVENTORY: &[Entry] = &[
+         "crates/lib/src/commands/altw/external/stage3.rs",
+         "stage3_slot_reorder",
+         "worker_id as u32",
+-        2,
++        1,
+         NOT_AN_ID,
+     ),
+     e(

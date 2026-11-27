@@ -663,6 +663,11 @@
 
 ### Changed
 
+- **Text `diff` is faster on independent indexed planet snapshots.**
+  On bygg, the working tree on `b4e65632` cut wall time by about 15 %
+  versus HEAD `b4e65632` when comparing the base and April 11, 2026
+  snapshots.
+
 - **Repack is faster when growing blocks or using `--force` on
   unindexed input.**
   On bygg, the working tree on `31d469b5` versus HEAD `31d469b5` ran

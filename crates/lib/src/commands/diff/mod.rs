@@ -17,12 +17,15 @@
 pub mod derive;
 mod seq;
 mod units;
+pub(crate) mod view;
 
 use super::Result;
 use crate::Element;
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
-use crate::osc::merge_join::{BlockMergeAction, MergeSink, StreamingBlocks, stream_merge_phase};
+use crate::osc::merge_join::{
+    BlockMergeAction, ElementDetail, MergeDetails, MergeSink, StreamingBlocks, stream_merge_phase,
+};
 use crate::owned::TypeFilter;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::text_quote::{MemberLabel, Quoted};
@@ -447,13 +450,30 @@ impl<'a> DiffState<'a> {
         }
     }
 
+    fn details(&self, text: bool) -> MergeDetails {
+        let compact = if text {
+            ElementDetail::Version
+        } else {
+            ElementDetail::Id
+        };
+        let modified = if text && self.options.verbose {
+            ElementDetail::Full
+        } else {
+            compact
+        };
+        MergeDetails {
+            common_version: text && !self.options.suppress_common,
+            modified: [modified; 2],
+            only: [compact; 2],
+        }
+    }
+
     fn record(
         &mut self,
         output: Option<&mut impl Write>,
         kind: ElementKind,
         action: BlockMergeAction<'_>,
     ) -> Result<()> {
-        use crate::osc::merge_join::{element_id, element_version};
         let type_char = kind.type_char();
         match action {
             BlockMergeAction::BlobEqual { count, .. } => {
@@ -465,35 +485,32 @@ impl<'a> DiffState<'a> {
             BlockMergeAction::BlobOldOnly(run) => {
                 self.stats.deleted += run.count;
                 if let Some(out) = output {
-                    for elem in run.elements() {
-                        let ver = element_version(&elem);
-                        write_compact_line(out, '-', type_char, element_id(&elem), ver)?;
-                    }
+                    run.try_for_each(ElementDetail::Version, |elem| {
+                        write_compact_line(out, '-', type_char, elem.id(), elem.version())
+                    })?;
                 }
             }
             BlockMergeAction::BlobNewOnly(run) => {
                 self.stats.created += run.count;
                 if let Some(out) = output {
-                    for elem in run.elements() {
-                        let ver = element_version(&elem);
-                        write_compact_line(out, '+', type_char, element_id(&elem), ver)?;
-                    }
+                    run.try_for_each(ElementDetail::Version, |elem| {
+                        write_compact_line(out, '+', type_char, elem.id(), elem.version())
+                    })?;
                 }
             }
-            BlockMergeAction::ElementEqual(e) => {
+            BlockMergeAction::ElementEqual { id, version } => {
                 if !self.options.suppress_common
                     && let Some(out) = output
                 {
-                    write_compact_line(out, ' ', type_char, element_id(e), element_version(e))?;
+                    write_compact_line(out, ' ', type_char, id, version)?;
                 }
                 self.stats.common += 1;
             }
             BlockMergeAction::ElementModified { old, new } => {
                 if let Some(out) = output {
-                    let old_ver = element_version(old);
-                    let new_ver = element_version(new);
-                    write_modified_line(out, type_char, element_id(old), old_ver, new_ver)?;
+                    write_modified_line(out, type_char, old.id(), old.version(), new.version())?;
                     if self.options.verbose {
+                        let (old, new) = (old.full()?, new.full()?);
                         write_modified_details_borrowed(out, old, new)?;
                         if self.options.locations
                             && let (Element::Way(ow), Element::Way(nw)) = (old, new)
@@ -506,13 +523,13 @@ impl<'a> DiffState<'a> {
             }
             BlockMergeAction::ElementOldOnly(o) => {
                 if let Some(out) = output {
-                    write_compact_line(out, '-', type_char, element_id(o), element_version(o))?;
+                    write_compact_line(out, '-', type_char, o.id(), o.version())?;
                 }
                 self.stats.deleted += 1;
             }
             BlockMergeAction::ElementNewOnly(n) => {
                 if let Some(out) = output {
-                    write_compact_line(out, '+', type_char, element_id(n), element_version(n))?;
+                    write_compact_line(out, '+', type_char, n.id(), n.version())?;
                 }
                 self.stats.created += 1;
             }
@@ -533,6 +550,10 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
 
     fn equality(&self) -> crate::content::Equality {
         crate::content::Equality::Relation(self.state.options.relation())
+    }
+
+    fn details(&self) -> MergeDetails {
+        self.state.details(self.output.is_some())
     }
 }
 
@@ -712,6 +733,10 @@ impl units::UnitSink for TextUnitSink<'_> {
 
     fn equality(&self) -> crate::content::Equality {
         crate::content::Equality::Relation(self.state.options.relation())
+    }
+
+    fn details(&self) -> MergeDetails {
+        self.state.details(self.pieces.is_some())
     }
 
     fn record_into(

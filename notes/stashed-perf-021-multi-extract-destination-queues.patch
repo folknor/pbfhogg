@@ -1,0 +1,1699 @@
+diff --git a/crates/lib/src/commands/extract/multi.rs b/crates/lib/src/commands/extract/multi.rs
+index 774435d9..38353c6d 100644
+--- a/crates/lib/src/commands/extract/multi.rs
++++ b/crates/lib/src/commands/extract/multi.rs
+@@ -26,6 +26,10 @@ use super::{ExtractStats, Region};
+ 
+ use crate::owned::{dense_node_metadata, element_metadata};
+ 
++#[path = "multi_output.rs"]
++pub(super) mod output;
++use output::{RegionBatch, RegionOutput};
++
+ /// Try single-pass multi-extract: one run over the input for all N regions
+ /// rather than one extract per region. A kind whose blobs all carry ID
+ /// ranges the planner admits (`fused::components`) is read once
+@@ -37,15 +41,9 @@ use crate::owned::{dense_node_metadata, element_metadata};
+ /// Simple strategy only: complete-ways and smart need dependency passes,
+ /// which `multi_dep::try_extract_multi_dependent` runs. `clean` is applied
+ /// to every element written; a raw node blob carries its metadata, so
+-/// cleaning turns raw passthrough off. The pool workers compress and frame
+-/// each region's blocks
+-/// (`RegionFraming`); the consumer copies the frames into N sync-mode
+-/// PbfWriters (no per-writer thread).
+-#[allow(
+-    clippy::too_many_arguments,
+-    clippy::too_many_lines,
+-    clippy::cognitive_complexity
+-)]
++/// cleaning turns raw passthrough off. All the phases feed one shared
++/// output scheduler with a FIFO per destination.
++#[allow(clippy::too_many_arguments)]
+ #[cfg_attr(feature = "hotpath", hotpath::measure)]
+ pub(super) fn try_extract_multi_single_pass(
+     input: &PinnedInput,
+@@ -72,6 +70,34 @@ pub(super) fn try_extract_multi_single_pass(
+         "[multi-extract] single-pass: {n} regions, simple strategy"
+     );
+ 
++    let (writers, framing) = open_region_writers(
++        &header,
++        regions,
++        outputs,
++        set_bounds,
++        coords,
++        compression,
++        overrides,
++        host,
++    )?;
++    let stats = output::run(writers, &framing, coords, &host.invocation, |output| {
++        extract_simple(input, regions, clean, coords, &framing, output, host)
++    })?;
++    host.invocation.marker("MULTI_EXTRACT_END");
++    Ok(Some(stats))
++}
++
++#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
++fn extract_simple(
++    input: &PinnedInput,
++    regions: &[Region],
++    clean: &crate::cat::CleanAttrs,
++    coords: crate::owned::WayCoords,
++    framing: &RegionFraming<'_>,
++    output: &mut RegionOutput<'_>,
++    host: &crate::host::Entered<'_>,
++) -> Result<Vec<ExtractStats>> {
++    let n = regions.len();
+     // Precompute per-region integer bboxes.
+     let bbox_ints: Vec<BboxInt> = regions
+         .iter()
+@@ -85,17 +111,6 @@ pub(super) fn try_extract_multi_single_pass(
+     // Union bbox for blob-level spatial skip.
+     let spatial_filter = spatial_blob_filter(&union_bbox(&bbox_ints));
+ 
+-    let (mut writers, framing) = open_region_writers(
+-        &header,
+-        regions,
+-        outputs,
+-        set_bounds,
+-        coords,
+-        compression,
+-        overrides,
+-        host,
+-    )?;
+-
+     // One shared membership per kind: each answers which regions hold an ID
+     // with one lookup, and stores each member once with its region mask
+     // rather than once per region (membership.rs has the representation and
+@@ -293,8 +308,8 @@ pub(super) fn try_extract_multi_single_pass(
+             &select,
+             n,
+             clean,
+-            &framing,
+-            &mut writers,
++            framing,
++            output,
+             &mut stats,
+             |s| &mut s.nodes_in_bbox,
+             Some(&mut node_members),
+@@ -302,6 +317,7 @@ pub(super) fn try_extract_multi_single_pass(
+         )?;
+         drop(classifier);
+         node_members.freeze();
++        output.end_kind()?;
+         host.invocation.marker("MULTI_NODE_FUSED_END");
+     } else {
+         host.invocation.marker("MULTI_NODE_CLASSIFY_START");
+@@ -520,11 +536,12 @@ pub(super) fn try_extract_multi_single_pass(
+                 }
+                 Ok(counts)
+             },
+-            &framing,
+-            &mut writers,
++            framing,
++            output,
+             &mut stats,
+             host,
+         )?;
++        output.end_kind()?;
+         host.invocation.marker("MULTI_NODE_WRITE_END");
+     }
+ 
+@@ -564,14 +581,15 @@ pub(super) fn try_extract_multi_single_pass(
+             &select,
+             n,
+             clean,
+-            &framing,
+-            &mut writers,
++            framing,
++            output,
+             &mut stats,
+             |s| &mut s.ways_written,
+             Some(&mut way_members),
+             host,
+         )?;
+         way_members.freeze();
++        output.end_kind()?;
+         host.invocation.marker("MULTI_WAY_FUSED_END");
+     } else {
+         host.invocation.marker("MULTI_WAY_CLASSIFY_START");
+@@ -629,12 +647,13 @@ pub(super) fn try_extract_multi_single_pass(
+                 }
+                 Ok(counts)
+             },
+-            &framing,
+-            &mut writers,
++            framing,
++            output,
+             &mut stats,
+             |s| &mut s.ways_written,
+             host,
+         )?;
++        output.end_kind()?;
+         host.invocation.marker("MULTI_WAY_WRITE_END");
+     }
+ 
+@@ -667,13 +686,14 @@ pub(super) fn try_extract_multi_single_pass(
+             &select,
+             n,
+             clean,
+-            &framing,
+-            &mut writers,
++            framing,
++            output,
+             &mut stats,
+             |s| &mut s.relations_written,
+             None,
+             host,
+         )?;
++        output.end_kind()?;
+         host.invocation.marker("MULTI_REL_FUSED_END");
+     } else {
+         host.invocation.marker("MULTI_REL_CLASSIFY_START");
+@@ -736,23 +756,16 @@ pub(super) fn try_extract_multi_single_pass(
+                 }
+                 Ok(counts)
+             },
+-            &framing,
+-            &mut writers,
++            framing,
++            output,
+             &mut stats,
+             |s| &mut s.relations_written,
+             host,
+         )?;
++        output.end_kind()?;
+         host.invocation.marker("MULTI_REL_WRITE_END");
+     }
+ 
+-    // Flush all writers (workers already flushed their BlockBuilders per blob).
+-    for (writer, output) in writers.iter_mut().zip(outputs.iter()) {
+-        let display_path = output.destination();
+-        writer
+-            .flush()
+-            .map_err(|e| e.context(format!("failed to flush {}", display_path.display())))?;
+-    }
+-
+     // Counters: schedule sizes + cross-region totals. Parallels the single-region
+     // `extract()` wrapper at the bottom of `pub fn extract` - the single-pass
+     // path bypasses that wrapper, so without this block `brokkr sidecar
+@@ -773,9 +786,7 @@ pub(super) fn try_extract_multi_single_pass(
+         .counter("multi_extract_ways_written", total_ways);
+     host.invocation
+         .counter("multi_extract_relations_written", total_relations);
+-    host.invocation.marker("MULTI_EXTRACT_END");
+-
+-    Ok(Some(stats))
++    Ok(stats)
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -881,13 +892,9 @@ pub(super) fn node_blob_regions(
+ ///
+ /// Each owns a 256 KiB buffer; publication syncs each staged output after
+ /// the final flush. The writers only copy frames: compression runs inside
+-/// the ordered pool's tasks (`RegionFraming`), so all N regions share the
+-/// pool's one task window and its ordinal order is each region's block
+-/// order. Compressing on the consumer thread made every write phase run at
+-/// 2-3 cores with the workers parked on result send (planet 5-region: 613 s
+-/// of write phases, 608 s of it compression). N pipelined writers would
+-/// instead give each region its own permits, delivery window and writer
+-/// thread - N buffering allowances for one stream of tasks.
++/// the ordered pool's tasks for full blocks, and on the shared output
++/// scheduler for packs of small tails. The scheduler moves each writer
++/// between its workers, keeping one active write per destination.
+ #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+ pub(super) fn open_region_writers<'a>(
+     header: &crate::HeaderBlock,
+@@ -1099,7 +1106,7 @@ fn multi_extract_pread_write_nodes<F>(
+     n: usize,
+     block_fn: F,
+     framing: &RegionFraming<'_>,
+-    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++    output: &mut RegionOutput<'_>,
+     stats: &mut [ExtractStats],
+     host: &crate::host::Entered<'_>,
+ ) -> Result<()>
+@@ -1144,7 +1151,7 @@ where
+         blobs,
+         input,
+         frame_buf: crate::read::read_buf::ReadBuf::default(),
+-        writers,
++        output,
+         stats,
+         cancel: &host.invocation,
+     };
+@@ -1169,7 +1176,7 @@ where
+         &mut consumer,
+     )?;
+     for position in consumer.interleaved.rest() {
+-        consumer.passthrough(position)?;
++        consumer.passthrough(position, None)?;
+     }
+     Ok(())
+ }
+@@ -1255,15 +1262,15 @@ impl MultiLocal {
+         }
+         let mut frames = Vec::with_capacity(n);
+         for (i, blocks) in self.output.iter_mut().enumerate() {
+-            frames.push(framing.frame_region(i, blocks.drain(..))?);
++            frames.push(framing.prepare_region(i, blocks)?);
+         }
+         Ok((frames, counts))
+     }
+ }
+ 
+-/// One task's output: each region's framed blobs, in region order and
+-/// block order within a region, and each region's element count.
+-pub(super) type RegionFrames = (Vec<Vec<Vec<u8>>>, Vec<u64>);
++/// One task's output: each region's framed blobs and optional packable
++/// tail, in block order within each region, and each region's element count.
++pub(super) type RegionFrames = (Vec<RegionBatch>, Vec<u64>);
+ 
+ /// Compression and framing of the regions' blocks inside the pool's tasks.
+ ///
+@@ -1271,10 +1278,9 @@ pub(super) type RegionFrames = (Vec<Vec<Vec<u8>>>, Vec<u64>);
+ /// core with the block's given index, tagdata and way members. A frame
+ /// travels as one whole owned buffer, the pipelined framing's shape.
+ ///
+-/// The pool's window is the regions' one shared bound: a task carries every
+-/// region's frames for its input blob and returns its credit only once the
+-/// consumer has handed all of them to the writers. It counts tasks, not
+-/// bytes; a slot holds that blob's whole framed fanout.
++/// The ordered decode window bounds results ahead of the consumer. After
++/// that handoff the scheduler charges frames and pack fragments to one
++/// output byte budget until their jobs write.
+ pub(super) struct RegionFraming<'a> {
+     compression: Compression,
+     destinations: Vec<&'a std::path::Path>,
+@@ -1282,6 +1288,23 @@ pub(super) struct RegionFraming<'a> {
+ }
+ 
+ impl RegionFraming<'_> {
++    pub(super) fn prepare_region(
++        &self,
++        region: usize,
++        blocks: &mut Vec<OwnedBlock>,
++    ) -> Result<RegionBatch> {
++        let tail = if blocks.last().is_some_and(|block| {
++            block.index.count < crate::block_builder::DEFAULT_ELEMENT_CAP.get() as u64
++                && block.bytes.len() <= crate::tunables::EXTRACT_MULTI_PACK_BYTES
++        }) {
++            blocks.pop()
++        } else {
++            None
++        };
++        let frames = self.frame_region(region, blocks.drain(..))?;
++        Ok(RegionBatch { frames, tail })
++    }
++
+     /// Frame region `region`'s blocks, consuming each as it is framed so a
+     /// task never holds the uncompressed and framed copies of all its
+     /// blocks at once. Checks cancellation before each frame; a framing
+@@ -1355,21 +1378,29 @@ impl RegionFraming<'_> {
+     }
+ }
+ 
+-/// Write one decoded blob's per-region frames to the N writers, adding each
+-/// region's count through `stat_field`.
++/// Advance each region's output frontier for an input blob and account for
++/// the rebuilt elements. The caller accounts for its verified raw copies.
+ pub(super) fn write_regions(
+-    (region_frames, counts): RegionFrames,
+-    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++    rebuilt: Option<RegionFrames>,
++    raw: Option<(Vec<u8>, &[u64])>,
++    output: &mut RegionOutput<'_>,
+     stats: &mut [ExtractStats],
+     stat_field: fn(&mut ExtractStats) -> &mut u64,
+ ) -> Result<()> {
+-    for (i, frames) in region_frames.into_iter().enumerate() {
+-        *stat_field(&mut stats[i]) += counts[i];
+-        for frame in frames {
+-            writers[i].write_raw_owned(frame)?;
++    let batches = if let Some((batches, counts)) = rebuilt {
++        if stats.len() != counts.len() {
++            return Err(crate::error::Error::internal(
++                "multi-extract: wrong number of destination counts",
++            ));
+         }
+-    }
+-    Ok(())
++        for (stat, count) in stats.iter_mut().zip(counts) {
++            *stat_field(stat) += count;
++        }
++        Some(batches)
++    } else {
++        None
++    };
++    output.write_blob(batches, raw)
+ }
+ 
+ /// The node pass's consumer: decoded per-region blocks and verified
+@@ -1379,21 +1410,21 @@ pub(super) fn write_regions(
+ /// passthrough proved region membership, not that the header is true, so a
+ /// false `count` or ID range carries into every region's output (see the
+ /// matching note in `common::pread_execute`).
+-struct MultiNodeConsumer<'a> {
++struct MultiNodeConsumer<'a, 's> {
+     interleaved: crate::ordered_pool::Interleaved<'a>,
+     decode_at: &'a crate::ordered_pool::DecodeSchedule,
+     blobs: &'a [NodeBlob],
+     input: &'a InputFile,
+     frame_buf: crate::read::read_buf::ReadBuf,
+-    writers: &'a mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++    output: &'a mut RegionOutput<'s>,
+     stats: &'a mut [ExtractStats],
+     cancel: &'a crate::host::Recorder,
+ }
+ 
+-impl MultiNodeConsumer<'_> {
++impl MultiNodeConsumer<'_, '_> {
+     /// Copy the verified raw frame at schedule position `position` to each
+     /// region it verified for.
+-    fn passthrough(&mut self, position: usize) -> Result<()> {
++    fn passthrough(&mut self, position: usize, rebuilt: Option<RegionFrames>) -> Result<()> {
+         self.cancel.check()?;
+         let blob = &self.blobs[position];
+         let Some(raw) = &blob.raw else {
+@@ -1413,26 +1444,28 @@ impl MultiNodeConsumer<'_> {
+         // candidate of the kind across the classify-to-write boundary, and a
+         // recheck would only cover part of the frame or cost a per-byte hash.
+         let frame_start = blob.entry.frame_start();
+-        let frame = self
++        let _read = self
+             .frame_buf
+             .read_exact_at(&**self.input.file(), frame_start, blob.entry.frame_size())
+             .map_err(|e| self.input.locate_at(frame_start, e.into()))?;
++        let frame = self.frame_buf.take();
+         for region in regions_of(&raw.mask) {
+-            self.cancel.check()?;
+-            self.writers[region].write_raw(frame)?;
+             self.stats[region].nodes_in_bbox += raw.nodes;
+         }
+-        // Every region has its copy; the frame buffer follows its retention
+-        // limit (read/read_buf.rs).
+-        self.frame_buf.release_outlier(self.cancel);
+-        Ok(())
++        write_regions(
++            rebuilt,
++            Some((frame, &raw.mask)),
++            self.output,
++            self.stats,
++            |s| &mut s.nodes_in_bbox,
++        )
+     }
+ }
+ 
+-impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_> {
++impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_, '_> {
+     fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+         for position in self.interleaved.before(ordinal) {
+-            self.passthrough(position)?;
++            self.passthrough(position, None)?;
+         }
+         Ok(())
+     }
+@@ -1443,9 +1476,11 @@ impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_
+         // The rebuild skipped those regions, so each writer gets one form.
+         let position = self.decode_at.position(ordinal);
+         if self.blobs[position].raw.is_some() {
+-            self.passthrough(position)?;
++            return self.passthrough(position, Some(item));
+         }
+-        write_regions(item, self.writers, self.stats, |s| &mut s.nodes_in_bbox)
++        write_regions(Some(item), None, self.output, self.stats, |s| {
++            &mut s.nodes_in_bbox
++        })
+     }
+ }
+ 
+@@ -1453,9 +1488,8 @@ impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_
+ ///
+ /// Workers pread blob data, decompress, parse into PrimitiveBlock, then call
+ /// the provided closure to classify elements against N regions and produce
+-/// N × `Vec<OwnedBlock>`, then compress and frame those blocks
+-/// (`RegionFraming`). The consumer copies each region's frames to its
+-/// writer in sequence order.
++/// N lists of output blocks (`RegionFraming` frames the full blocks).
++/// The consumer advances each destination's queue in sequence order.
+ #[allow(clippy::too_many_lines)]
+ #[cfg_attr(feature = "hotpath", hotpath::measure)]
+ #[allow(clippy::too_many_arguments)]
+@@ -1465,7 +1499,7 @@ fn multi_extract_pread_write<F>(
+     n: usize,
+     block_fn: F,
+     framing: &RegionFraming<'_>,
+-    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++    output: &mut RegionOutput<'_>,
+     stats: &mut [ExtractStats],
+     stat_field: fn(&mut ExtractStats) -> &mut u64,
+     host: &crate::host::Entered<'_>,
+@@ -1498,7 +1532,259 @@ where
+         None,
+         || MultiLocal::new(n, &host.invocation),
+         |block, local: &mut MultiLocal| local.classify(block, None, n, &block_fn, framing),
+-        |_position, item| write_regions(item, writers, stats, stat_field),
++        |_position, item| write_regions(Some(item), None, output, stats, stat_field),
+         host,
+     )
+ }
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used)]
++mod tests {
++    use std::path::Path;
++
++    use crate::block_builder::{Metadata, PartialMetadata};
++    use crate::cat::CleanAttrs;
++    use crate::commands::digest::{Form, digest};
++    use crate::host::Host;
++    use crate::output::{Output, OutputSet, Overwrite};
++    use crate::write::WriteOptions;
++    use crate::write::header_builder::HeaderBuilder;
++    use crate::{BlobReader, MemberId};
++
++    use super::super::{ExtractStrategy, extract, extract_multi, parse_bbox};
++    use super::*;
++
++    const BLOBS: i64 = 5;
++    const NODES_PER_BLOB: i64 = 2_000;
++    const OUTSIDE: i32 = 40_000_000;
++    const SINGLETON: i32 = 80_000_000;
++
++    fn fixture(path: &Path, indexed: bool) {
++        let mut writer = PbfWriter::new(std::fs::File::create(path).unwrap(), Compression::None);
++        let header = HeaderBuilder::new()
++            .sorted()
++            .optional_feature(crate::HeaderBlock::LOCATIONS_ON_WAYS)
++            .build()
++            .unwrap();
++        writer.write_header(&header).unwrap();
++        let mut flush = |builder: &mut BlockBuilder| {
++            let block = builder.take_owned().unwrap().unwrap();
++            if indexed {
++                writer.write_primitive_block_owned(block).unwrap();
++            } else {
++                writer
++                    .write_primitive_block_owned_no_indexdata(block)
++                    .unwrap();
++            }
++        };
++        let mut builder = BlockBuilder::new();
++        for blob in 0..BLOBS {
++            let base = 1 + blob * NODES_PER_BLOB;
++            for offset in 0..NODES_PER_BLOB {
++                let lon = match (blob, offset) {
++                    (_, 0) => 0,
++                    (0, 2) => SINGLETON,
++                    _ => OUTSIDE,
++                };
++                let tags = [("name", "repeat")];
++                if blob == 1 && offset == 0 {
++                    builder.add_node_partial(
++                        base,
++                        0,
++                        lon,
++                        tags,
++                        Some(&PartialMetadata {
++                            version: Some(0),
++                            timestamp: Some(0),
++                            ..PartialMetadata::default()
++                        }),
++                    );
++                } else {
++                    builder.add_node(
++                        base + offset,
++                        0,
++                        lon,
++                        tags,
++                        Some(&Metadata {
++                            version: 2,
++                            timestamp: 17,
++                            changeset: 0,
++                            uid: 0,
++                            user: "",
++                            visible: true,
++                        }),
++                    );
++                }
++            }
++            flush(&mut builder);
++        }
++        for blob in 0..BLOBS {
++            let base = 1 + blob * NODES_PER_BLOB;
++            builder.add_way_with_locations_partial(
++                2 * blob + 1,
++                [("name", "matched")],
++                &[base, base + 1],
++                &[(0, 0), (0, OUTSIDE)],
++                None,
++            );
++            builder.add_way_with_locations_partial(
++                2 * blob + 2,
++                [("name", "extra")],
++                &[base + 3],
++                &[(0, OUTSIDE)],
++                None,
++            );
++            flush(&mut builder);
++        }
++        for blob in 0..BLOBS {
++            let members = [
++                MemberData {
++                    id: MemberId::Way(2 * blob + 1),
++                    role: "outer",
++                },
++                MemberData {
++                    id: MemberId::Way(2 * blob + 2),
++                    role: "inner",
++                },
++            ];
++            builder.add_relation(blob + 1, [("type", "multipolygon")], &members, None);
++            flush(&mut builder);
++        }
++        writer.flush().unwrap();
++    }
++
++    fn node_frames(path: &Path, host: &Host) -> Vec<(u64, Vec<u8>)> {
++        let bytes = std::fs::read(path).unwrap();
++        let host = host.entered();
++        BlobReader::open_in(path, false, &host)
++            .unwrap()
++            .filter_map(|blob| {
++                let blob = blob.unwrap();
++                let crate::blob::BlobDecode::OsmData(block) = blob.decode().unwrap() else {
++                    return None;
++                };
++                if !matches!(
++                    block.elements().next(),
++                    Some(Element::Node(_) | Element::DenseNode(_))
++                ) {
++                    return None;
++                }
++                let start = usize::try_from(blob.offset().unwrap().0).unwrap();
++                Some((
++                    block.element_count(),
++                    bytes[start..start + blob.frame_len()].to_vec(),
++                ))
++            })
++            .collect()
++    }
++
++    fn parity(indexed: bool, clean: &CleanAttrs) {
++        let scratch = pbfhogg_test_scratch::scratch();
++        let input = scratch.child("input.pbf");
++        fixture(&input, indexed);
++        let regions = ["-1,-1,1,1", "30,30,31,31", "7,-1,9,1", "-10,-10,10,10"]
++            .map(|bbox| Region::Bbox(parse_bbox(bbox).unwrap()));
++        let host = Host::for_tests();
++        let options = WriteOptions {
++            compression: Compression::None,
++            force: true,
++            ..WriteOptions::default()
++        };
++        let overrides = HeaderOverrides::default();
++        for strategy in [
++            ExtractStrategy::Simple,
++            ExtractStrategy::CompleteWays,
++            ExtractStrategy::Smart,
++        ] {
++            let paths = std::array::from_fn::<_, 4, _>(|i| {
++                scratch.child(format!("multi-{strategy:?}-{i}.pbf"))
++            });
++            let outputs = OutputSet::files(&paths, Overwrite::Refuse, &host.diagnostics).unwrap();
++            let stats = extract_multi(
++                input.as_path(),
++                &regions,
++                outputs,
++                strategy,
++                true,
++                clean,
++                &options,
++                &overrides,
++                &host,
++            )
++            .unwrap();
++            assert_eq!(stats[0].nodes_in_bbox, u64::try_from(BLOBS).unwrap());
++            assert_eq!(stats[1].nodes_in_bbox, 0);
++            assert_eq!(stats[2].nodes_in_bbox, 1);
++            assert_eq!(
++                stats[3].nodes_in_bbox,
++                u64::try_from(BLOBS * NODES_PER_BLOB).unwrap()
++            );
++            assert_eq!(
++                node_frames(&paths[0], &host).len(),
++                1,
++                "packed sparse nodes for {strategy:?}"
++            );
++            let wide = node_frames(&paths[3], &host);
++            if indexed && !clean.any() && strategy == ExtractStrategy::Simple {
++                let source = node_frames(&input, &host);
++                assert_eq!(wide.len(), source.len());
++                for i in [0, 2, 3, 4] {
++                    assert_eq!(wide[i], source[i], "verified raw frame {i}");
++                }
++            } else {
++                assert!((2..usize::try_from(BLOBS).unwrap()).contains(&wide.len()));
++                assert!(wide.iter().all(|(count, _)| {
++                    *count <= crate::block_builder::DEFAULT_ELEMENT_CAP.get() as u64
++                }));
++            }
++            for (i, (region, path)) in regions.iter().zip(&paths).enumerate() {
++                let reference = scratch.child(format!("serial-{strategy:?}-{i}.pbf"));
++                let output = Output::new(&reference, Overwrite::Refuse, &host.diagnostics).unwrap();
++                let reference_stats = extract(
++                    input.as_path(),
++                    output,
++                    region,
++                    strategy,
++                    true,
++                    clean,
++                    &options,
++                    &overrides,
++                    &host,
++                )
++                .unwrap();
++                let mut summary = Vec::new();
++                let mut reference_summary = Vec::new();
++                stats[i].write_summary(&mut summary).unwrap();
++                reference_stats
++                    .write_summary(&mut reference_summary)
++                    .unwrap();
++                assert_eq!(summary, reference_summary);
++                let actual = digest(path.as_path(), Form::Full, false, &host).unwrap();
++                let expected = digest(reference.as_path(), Form::Full, false, &host).unwrap();
++                assert_eq!(actual, expected, "{strategy:?} region {i}");
++                if i == 1 || i == 2 {
++                    assert_eq!(
++                        std::fs::read(path).unwrap(),
++                        std::fs::read(reference).unwrap()
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn indexed_multi_extract_keeps_contents_across_packed_blobs() {
++        parity(true, &CleanAttrs::default());
++    }
++
++    #[test]
++    fn unindexed_multi_extract_keeps_cleaned_contents_across_packed_blobs() {
++        parity(
++            false,
++            &CleanAttrs {
++                version: true,
++                ..CleanAttrs::default()
++            },
++        );
++    }
++}
+diff --git a/crates/lib/src/commands/extract/multi_dep.rs b/crates/lib/src/commands/extract/multi_dep.rs
+index 5f9c73a3..5b042b04 100644
+--- a/crates/lib/src/commands/extract/multi_dep.rs
++++ b/crates/lib/src/commands/extract/multi_dep.rs
+@@ -53,7 +53,7 @@
+ //! pass reads each physical blob once, as the single-region engines do.
+ 
+ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+-use crate::writer::{Compression, PbfWriter};
++use crate::writer::Compression;
+ use crate::{Element, ElementKind, PrimitiveBlock};
+ 
+ use super::super::{
+@@ -71,7 +71,9 @@ use super::membership::{
+     BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of,
+ };
+ use super::multi::{
+-    RegionFraming, node_blob_regions, open_region_writers, probe_sorted_header, union_bbox,
++    RegionFraming, node_blob_regions, open_region_writers,
++    output::{self, RegionBatch, RegionOutput},
++    probe_sorted_header, union_bbox,
+ };
+ use super::polygon::RegionClassifier;
+ use super::smart::{CompletionMember, completion_members, push_parent_edges};
+@@ -577,7 +579,7 @@ pub(super) fn try_extract_multi_dependent(
+     // --- Write pass ---
+     host.invocation.marker("MULTI_DEP_WRITE_START");
+     let coords = crate::owned::WayCoords::of_input(&header);
+-    let (mut writers, framing) = open_region_writers(
++    let (writers, framing) = open_region_writers(
+         &header,
+         regions,
+         outputs,
+@@ -613,21 +615,17 @@ pub(super) fn try_extract_multi_dependent(
+         &way_sets,
+         &[&relation_members],
+     )?;
+-    write_pass(
+-        input,
+-        &write_schedule,
+-        &sets,
+-        &framing,
+-        &mut writers,
+-        &mut stats,
+-        host,
+-    )?;
+-    for (writer, output) in writers.iter_mut().zip(outputs.iter()) {
+-        let display_path = output.destination();
+-        writer
+-            .flush()
+-            .map_err(|e| e.context(format!("failed to flush {}", display_path.display())))?;
+-    }
++    output::run(writers, &framing, coords, &host.invocation, |output| {
++        write_pass(
++            input,
++            &write_schedule,
++            &sets,
++            &framing,
++            output,
++            &mut stats,
++            host,
++        )
++    })?;
+     host.invocation.marker("MULTI_DEP_WRITE_END");
+ 
+     host.invocation.counter("multi_extract_region_count", n);
+@@ -817,27 +815,26 @@ struct WriteLocal {
+ }
+ 
+ /// One write task's output: each region's framed blobs and its stats.
+-type RegionWrite = (Vec<Vec<Vec<u8>>>, Vec<ExtractStats>);
++type RegionWrite = (Vec<RegionBatch>, Vec<ExtractStats>);
+ 
+ /// The write pass: every OsmData blob in file order, decoded once by the
+ /// pool workers, each element written to every region of its kind's mask
+-/// union, the per-region blocks framed on the workers and copied to the N
+-/// writers in schedule order. The shape of `common::pread_execute`, the
+-/// single-region engines' write pass, fanned out to N regions.
++/// union, then enqueued in each destination's order. The shared scheduler
++/// packs tails across input blocks and writes each destination independently.
+ #[allow(clippy::too_many_arguments)]
+ fn write_pass(
+     input: &PinnedInput,
+     schedule: &[BlobDesc],
+     sets: &WriteSets<'_>,
+     framing: &RegionFraming<'_>,
+-    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++    output: &mut RegionOutput<'_>,
+     stats: &mut [ExtractStats],
+     host: &crate::host::Entered<'_>,
+ ) -> Result<()> {
+     if schedule.is_empty() {
+         return host.invocation.check();
+     }
+-    let n = writers.len();
++    let n = stats.len();
+     let file = input.open()?;
+     let file = &file;
+     let source: std::sync::Arc<std::path::Path> = std::sync::Arc::from(input.path());
+@@ -851,13 +848,15 @@ fn write_pass(
+     let mut workers = vec![(); decode_threads];
+     let mut consumer =
+         crate::ordered_pool::ConsumeFn(|_task, (frames, counts): RegionWrite| -> Result<()> {
+-            for (i, (frames, count)) in frames.into_iter().zip(&counts).enumerate() {
+-                super::common::merge_extract_stats(&mut stats[i], count);
+-                for frame in frames {
+-                    writers[i].write_raw_owned(frame)?;
+-                }
++            if stats.len() != counts.len() {
++                return Err(crate::error::Error::internal(
++                    "multi-extract: wrong number of destination counts",
++                ));
++            }
++            for (stat, count) in stats.iter_mut().zip(&counts) {
++                super::common::merge_extract_stats(stat, count);
+             }
+-            Ok(())
++            output.write_blob(Some(frames), None)
+         });
+     crate::ordered_pool::run_ordered(
+         schedule.len(),
+@@ -900,7 +899,7 @@ fn write_pass(
+                 let mut frames = Vec::with_capacity(n);
+                 for i in 0..n {
+                     flush_local(&mut local.bbs[i], &mut local.output[i])?;
+-                    frames.push(framing.frame_region(i, local.output[i].drain(..))?);
++                    frames.push(framing.prepare_region(i, &mut local.output[i])?);
+                 }
+                 Ok((frames, counts))
+             })()
+diff --git a/crates/lib/src/commands/extract/multi_fused.rs b/crates/lib/src/commands/extract/multi_fused.rs
+index 63ee9da7..c1e1b00a 100644
+--- a/crates/lib/src/commands/extract/multi_fused.rs
++++ b/crates/lib/src/commands/extract/multi_fused.rs
+@@ -51,7 +51,6 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+ use crate::read::columnar::DenseNodeColumns;
+ use crate::read::input::InputFile;
+ use crate::scan::classify::ScheduledBlob;
+-use crate::writer::PbfWriter;
+ use crate::{Element, ElementKind};
+ 
+ use super::super::{
+@@ -64,7 +63,7 @@ use super::common::{
+     warn_passthrough_demotions,
+ };
+ use super::membership::{BatchBuilder, Membership, PageBatch, admits, regions_of};
+-use super::multi::{RegionFraming, write_regions};
++use super::multi::{RegionFraming, output::RegionOutput, write_regions};
+ use super::polygon::RegionClassifier;
+ use crate::owned::{dense_node_metadata, element_metadata};
+ 
+@@ -173,7 +172,7 @@ pub(super) fn multi_fused_pass(
+     n: usize,
+     clean: &crate::cat::CleanAttrs,
+     framing: &RegionFraming<'_>,
+-    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++    output: &mut RegionOutput<'_>,
+     stats: &mut [ExtractStats],
+     stat_field: fn(&mut ExtractStats) -> &mut u64,
+     members: Option<&mut Membership>,
+@@ -188,7 +187,7 @@ pub(super) fn multi_fused_pass(
+     );
+     let mw = super::membership::mask_words(n);
+     let mut consumer = Consumer {
+-        writers,
++        output,
+         stats,
+         stat_field,
+         members,
+@@ -756,7 +755,7 @@ fn finish(
+     }
+     let mut frames = Vec::with_capacity(n);
+     for (i, blocks) in local.output.iter_mut().enumerate() {
+-        frames.push(framing.frame_region(i, blocks.drain(..))?);
++        frames.push(framing.prepare_region(i, blocks)?);
+     }
+     Ok(Fused {
+         frames: Some((frames, counts)),
+@@ -843,10 +842,10 @@ impl Cursors {
+     }
+ }
+ 
+-/// The ordered consumer: membership pages installed and region frames (or a
+-/// verified raw frame) written in schedule order.
+-struct Consumer<'a> {
+-    writers: &'a mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
++/// The ordered consumer installs membership pages and advances each
++/// destination's output frontier in schedule order.
++struct Consumer<'a, 's> {
++    output: &'a mut RegionOutput<'s>,
+     stats: &'a mut [ExtractStats],
+     stat_field: fn(&mut ExtractStats) -> &mut u64,
+     members: Option<&'a mut Membership>,
+@@ -855,7 +854,7 @@ struct Consumer<'a> {
+     cancel: &'a crate::host::Recorder,
+ }
+ 
+-impl crate::ordered_pool::OrderedConsumer<Vec<Fused>> for Consumer<'_> {
++impl crate::ordered_pool::OrderedConsumer<Vec<Fused>> for Consumer<'_, '_> {
+     fn consume(&mut self, _task: usize, items: Vec<Fused>) -> crate::Result<()> {
+         for item in items {
+             self.consume_blob(item)?;
+@@ -864,7 +863,7 @@ impl crate::ordered_pool::OrderedConsumer<Vec<Fused>> for Consumer<'_> {
+     }
+ }
+ 
+-impl Consumer<'_> {
++impl Consumer<'_, '_> {
+     fn consume_blob(&mut self, item: Fused) -> crate::Result<()> {
+         let Fused {
+             frames,
+@@ -880,13 +879,16 @@ impl Consumer<'_> {
+             self.cancel.check()?;
+             self.verified += 1;
+             for region in regions_of(&mask) {
+-                self.writers[region].write_raw(&frame)?;
+                 *(self.stat_field)(&mut self.stats[region]) += nodes;
+             }
++            return write_regions(
++                frames,
++                Some((frame, &mask)),
++                self.output,
++                self.stats,
++                self.stat_field,
++            );
+         }
+-        match frames {
+-            Some(frames) => write_regions(frames, self.writers, self.stats, self.stat_field),
+-            None => Ok(()),
+-        }
++        write_regions(frames, None, self.output, self.stats, self.stat_field)
+     }
+ }
+diff --git a/crates/lib/src/commands/extract/multi_output.rs b/crates/lib/src/commands/extract/multi_output.rs
+new file mode 100644
+index 00000000..61e3c34f
+--- /dev/null
++++ b/crates/lib/src/commands/extract/multi_output.rs
+@@ -0,0 +1,748 @@
++//! Ordered multi-extract output. A ready entry represents one destination's
++//! head job. The worker owns that writer until the job ends, then puts the
++//! destination at the back of the ready list if it has more work.
++//!
++//! The producer admits jobs in input order for each destination. Framing of
++//! full blocks stays on the decode workers. Small terminal blocks can be
++//! grouped across input blobs, then packed and framed on the output workers.
++//! Raw frames fence a pack only for the destinations that receive them.
++
++use std::collections::VecDeque;
++use std::io::Write;
++use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
++
++use crate::block_builder::{BlockBuilder, DEFAULT_ELEMENT_CAP, OwnedBlock};
++use crate::error::{Error, Result};
++use crate::host::Recorder;
++use crate::owned::{WayCoords, WayScratch, dense_node_metadata, element_metadata};
++use crate::tunables::{
++    EXTRACT_MULTI_OUTPUT_BYTES, EXTRACT_MULTI_OUTPUT_WORKERS, EXTRACT_MULTI_PACK_BYTES,
++};
++use crate::writer::PbfWriter;
++use crate::{Element, ElementKind, PrimitiveBlock};
++
++use super::RegionFraming;
++
++pub(in crate::commands::extract) struct RegionBatch {
++    pub(super) frames: Vec<Vec<u8>>,
++    pub(super) tail: Option<OwnedBlock>,
++}
++
++pub(in crate::commands::extract) type RegionOutput<'a> =
++    Producer<'a, std::io::BufWriter<std::fs::File>>;
++
++pub(in crate::commands::extract) fn run<T>(
++    writers: Vec<PbfWriter<std::io::BufWriter<std::fs::File>>>,
++    framing: &RegionFraming<'_>,
++    coords: WayCoords,
++    cancel: &Recorder,
++    produce: impl FnOnce(&mut RegionOutput<'_>) -> Result<T>,
++) -> Result<T> {
++    run_with(
++        writers,
++        cancel,
++        EXTRACT_MULTI_OUTPUT_BYTES,
++        produce,
++        |writer, region, action, scratch| match action {
++            Action::Frame(frame) => writer.write_raw_owned(frame),
++            Action::Raw(frame) => writer.write_raw(&frame),
++            Action::Pack(pack) => {
++                let block = pack
++                    .build(coords, scratch)
++                    .map_err(|e| e.writing(framing.destinations[region]))?;
++                for frame in framing.frame_region(region, std::iter::once(block))? {
++                    writer.write_raw_owned(frame)?;
++                }
++                Ok(())
++            }
++            Action::Flush => writer.flush().map_err(|e| {
++                e.context(format!(
++                    "failed to flush {}",
++                    framing.destinations[region].display()
++                ))
++            }),
++        },
++    )
++}
++
++fn run_with<T, W: Write + Send>(
++    writers: Vec<PbfWriter<W>>,
++    cancel: &Recorder,
++    budget: usize,
++    produce: impl FnOnce(&mut Producer<'_, W>) -> Result<T>,
++    execute: impl Fn(&mut PbfWriter<W>, usize, Action, &mut PackScratch) -> Result<()> + Sync,
++) -> Result<T> {
++    let regions = writers.len();
++    let owned_scheduler = Scheduler::new(writers, budget);
++    let execute = &execute;
++    let scheduler = &owned_scheduler;
++    let result = crate::threads::scope(cancel, |scope| {
++        // On every early return, including a refused spawn or unwind, wake
++        // workers before the scope joins them.
++        let stop = StopOnDrop(scheduler);
++        for _ in 0..regions.min(EXTRACT_MULTI_OUTPUT_WORKERS) {
++            scope.spawn(|| {
++                let _stop_on_exit = StopOnDrop(scheduler);
++                let mut scratch = PackScratch::default();
++                while let Some((region, mut writer, job)) = scheduler.take() {
++                    let result = cancel
++                        .check()
++                        .and_then(|()| execute(&mut writer, region, job.action, &mut scratch));
++                    scheduler.complete(region, writer, job.bytes, result);
++                }
++            })?;
++        }
++        let mut output = Producer {
++            scheduler,
++            pending: (0..regions).map(|_| Pack::default()).collect(),
++            budget_wait: std::time::Duration::ZERO,
++        };
++        let value = produce(&mut output)?;
++        output.finish()?;
++        let peak = scheduler.lock().peak;
++        let wait_ns = u64::try_from(output.budget_wait.as_nanos()).unwrap_or(u64::MAX);
++        cancel.counter("multi_extract_output_peak_payload_bytes", peak);
++        cancel.counter("multi_extract_output_budget_wait_ns", wait_ns);
++        drop(stop);
++        cancel.check()?;
++        Ok(value)
++    });
++    if result.is_err() {
++        owned_scheduler.abandon();
++    }
++    result
++}
++
++enum Action {
++    Frame(Vec<u8>),
++    Raw(Arc<Vec<u8>>),
++    Pack(Pack),
++    Flush,
++}
++
++struct Job {
++    bytes: usize,
++    action: Action,
++}
++
++struct Destination<W: Write> {
++    writer: Option<PbfWriter<W>>,
++    queue: VecDeque<Job>,
++}
++
++struct State<W: Write> {
++    destinations: Vec<Destination<W>>,
++    ready: VecDeque<usize>,
++    bytes: usize,
++    peak: usize,
++    jobs: usize,
++    stopped: bool,
++    error: Option<Error>,
++}
++
++struct Scheduler<W: Write> {
++    state: Mutex<State<W>>,
++    changed: Condvar,
++    budget: usize,
++}
++
++impl<W: Write> Scheduler<W> {
++    fn new(writers: Vec<PbfWriter<W>>, budget: usize) -> Self {
++        Self {
++            state: Mutex::new(State {
++                destinations: writers
++                    .into_iter()
++                    .map(|writer| Destination {
++                        writer: Some(writer),
++                        queue: VecDeque::new(),
++                    })
++                    .collect(),
++                ready: VecDeque::new(),
++                bytes: 0,
++                peak: 0,
++                jobs: 0,
++                stopped: false,
++                error: None,
++            }),
++            changed: Condvar::new(),
++            budget,
++        }
++    }
++
++    fn lock(&self) -> MutexGuard<'_, State<W>> {
++        self.state.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    fn wait<'a>(&self, state: MutexGuard<'a, State<W>>) -> MutexGuard<'a, State<W>> {
++        self.changed
++            .wait(state)
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++
++    fn check(state: &State<W>) -> Result<()> {
++        if let Some(error) = &state.error {
++            return Err(error.clone());
++        }
++        if state.stopped {
++            return Err(Error::internal("multi-extract: output scheduler stopped"));
++        }
++        Ok(())
++    }
++
++    fn fits(&self, used: usize, bytes: usize) -> bool {
++        used == 0 || bytes <= self.budget.saturating_sub(used)
++    }
++
++    fn reserve(&self, bytes: usize) -> Result<bool> {
++        let mut state = self.lock();
++        Self::check(&state)?;
++        if !self.fits(state.bytes, bytes) {
++            return Ok(false);
++        }
++        state.bytes += bytes;
++        state.peak = state.peak.max(state.bytes);
++        Ok(true)
++    }
++
++    fn wait_for_space(&self, bytes: usize) -> Result<()> {
++        let mut state = self.lock();
++        loop {
++            Self::check(&state)?;
++            if self.fits(state.bytes, bytes) {
++                return Ok(());
++            }
++            state = self.wait(state);
++        }
++    }
++
++    /// The producer has already charged the job, including any time it spent
++    /// in a pending pack. Enqueuing never waits on a destination.
++    fn submit(&self, region: usize, job: Job) -> Result<()> {
++        let mut state = self.lock();
++        Self::check(&state)?;
++        let destination = &mut state.destinations[region];
++        let ready = destination.writer.is_some() && destination.queue.is_empty();
++        destination.queue.push_back(job);
++        state.jobs += 1;
++        if ready {
++            state.ready.push_back(region);
++            self.changed.notify_all();
++        }
++        Ok(())
++    }
++
++    fn take(&self) -> Option<(usize, PbfWriter<W>, Job)> {
++        let mut state = self.lock();
++        while !state.stopped {
++            if let Some(region) = state.ready.pop_front() {
++                let destination = &mut state.destinations[region];
++                if let (Some(writer), Some(job)) =
++                    (destination.writer.take(), destination.queue.pop_front())
++                {
++                    return Some((region, writer, job));
++                }
++                state.error = Some(Error::internal("multi-extract: invalid ready destination"));
++                state.stopped = true;
++                self.changed.notify_all();
++                return None;
++            }
++            state = self.wait(state);
++        }
++        None
++    }
++
++    fn complete(&self, region: usize, writer: PbfWriter<W>, bytes: usize, result: Result<()>) {
++        let mut state = self.lock();
++        assert!(
++            state.bytes >= bytes && state.jobs != 0,
++            "multi-extract: uncharged output job"
++        );
++        let destination = &mut state.destinations[region];
++        assert!(
++            destination.writer.is_none(),
++            "multi-extract: destination already has its writer"
++        );
++        destination.writer = Some(writer);
++        let more = !destination.queue.is_empty();
++        state.bytes -= bytes;
++        state.jobs -= 1;
++        match result {
++            Err(error) if !state.stopped => {
++                state.error = Some(error);
++                state.stopped = true;
++            }
++            Ok(()) if more && !state.stopped => state.ready.push_back(region),
++            _ => {}
++        }
++        self.changed.notify_all();
++    }
++
++    fn drain(&self) -> Result<()> {
++        let mut state = self.lock();
++        loop {
++            Self::check(&state)?;
++            if state.jobs == 0 {
++                return Ok(());
++            }
++            state = self.wait(state);
++        }
++    }
++
++    fn stop(&self) {
++        self.lock().stopped = true;
++        self.changed.notify_all();
++    }
++
++    fn abandon(self) {
++        let state = self
++            .state
++            .into_inner()
++            .unwrap_or_else(PoisonError::into_inner);
++        for destination in state.destinations {
++            if let Some(writer) = destination.writer {
++                // End the staged writer's session without certifying its
++                // partial output. The error that stopped the run wins.
++                let _abandoned = writer.into_inner();
++            }
++        }
++    }
++}
++
++struct StopOnDrop<'a, W: Write>(&'a Scheduler<W>);
++
++impl<W: Write> Drop for StopOnDrop<'_, W> {
++    fn drop(&mut self) {
++        self.0.stop();
++    }
++}
++
++pub(in crate::commands::extract) struct Producer<'a, W: Write> {
++    scheduler: &'a Scheduler<W>,
++    pending: Vec<Pack>,
++    budget_wait: std::time::Duration,
++}
++
++struct ReadyBatch {
++    region: usize,
++    raw: Option<Arc<Vec<u8>>>,
++    frames: std::vec::IntoIter<Vec<u8>>,
++    tail: Option<OwnedBlock>,
++}
++
++impl ReadyBatch {
++    fn has_work(&self) -> bool {
++        self.raw.is_some() || !self.frames.as_slice().is_empty() || self.tail.is_some()
++    }
++}
++
++impl<W: Write> Producer<'_, W> {
++    pub(in crate::commands::extract) fn write_blob(
++        &mut self,
++        batches: Option<Vec<RegionBatch>>,
++        raw: Option<(Vec<u8>, &[u64])>,
++    ) -> Result<()> {
++        if batches
++            .as_ref()
++            .is_some_and(|b| b.len() != self.pending.len())
++        {
++            return Err(Error::internal(
++                "multi-extract: wrong number of destination batches",
++            ));
++        }
++        let raw = raw.map(|(frame, mask)| (Arc::new(frame), mask));
++        let mut batches = batches.into_iter().flatten();
++        // A large fan-out can fill the shared budget. Offer each destination
++        // a frame before offering the same destination its next frame, raw
++        // or rebuilt. A head too big for the remaining credit waits its turn
++        // while smaller heads can still be admitted.
++        let mut ready: VecDeque<_> = (0..self.pending.len())
++            .map(|region| {
++                let (frames, tail) = batches
++                    .next()
++                    .map_or_else(|| (Vec::new(), None), |batch| (batch.frames, batch.tail));
++                let raw = raw.as_ref().and_then(|(frame, mask)| {
++                    super::super::membership::admits(Some(mask), region).then(|| Arc::clone(frame))
++                });
++                ReadyBatch {
++                    region,
++                    raw,
++                    frames: frames.into_iter(),
++                    tail,
++                }
++            })
++            .filter(ReadyBatch::has_work)
++            .collect();
++        while !ready.is_empty() {
++            let mut next_credit = usize::MAX;
++            let mut advanced = false;
++            for _ in 0..ready.len() {
++                let Some(mut batch) = ready.pop_front() else {
++                    return Err(Error::internal("multi-extract: missing ready batch"));
++                };
++                match self.advance(&mut batch)? {
++                    Some(bytes) => next_credit = next_credit.min(bytes),
++                    None => advanced = true,
++                }
++                if batch.has_work() {
++                    ready.push_back(batch);
++                }
++            }
++            if !advanced && !ready.is_empty() {
++                self.wait_for_credit(next_credit)?;
++            }
++        }
++        Ok(())
++    }
++
++    /// Submit one head if there is credit, or leave it in place and report
++    /// how much credit would let it advance.
++    fn advance(&mut self, batch: &mut ReadyBatch) -> Result<Option<usize>> {
++        let region = batch.region;
++        let frame = batch
++            .raw
++            .as_deref()
++            .or_else(|| batch.frames.as_slice().first());
++        let bytes = if let Some(frame) = frame {
++            self.flush_pack(region)?;
++            frame.capacity()
++        } else if let Some(block) = &batch.tail {
++            if !self.pending[region].fits(block) {
++                self.flush_pack(region)?;
++            }
++            pack_bytes(block)
++        } else {
++            return Err(Error::internal("multi-extract: empty ready batch"));
++        };
++        if !self.scheduler.reserve(bytes)? {
++            return Ok(Some(bytes));
++        }
++        if let Some(frame) = batch.raw.take() {
++            self.scheduler.submit(
++                region,
++                Job {
++                    bytes,
++                    action: Action::Raw(frame),
++                },
++            )?;
++        } else if let Some(frame) = batch.frames.next() {
++            self.scheduler.submit(
++                region,
++                Job {
++                    bytes,
++                    action: Action::Frame(frame),
++                },
++            )?;
++        } else if let Some(block) = batch.tail.take() {
++            self.stage(region, block, bytes)?;
++        }
++        Ok(None)
++    }
++
++    fn wait_for_credit(&mut self, bytes: usize) -> Result<()> {
++        // A pending pack already owns its credit. Give those jobs to the
++        // workers, so no inactive pack can prevent an eligible head from
++        // being admitted (including an oversized job that needs an empty
++        // budget). Then wait on global credit, independent of any writer.
++        for region in 0..self.pending.len() {
++            self.flush_pack(region)?;
++        }
++        let start = std::time::Instant::now();
++        let result = self.scheduler.wait_for_space(bytes);
++        self.budget_wait += start.elapsed();
++        result
++    }
++
++    fn stage(&mut self, region: usize, block: OwnedBlock, bytes: usize) -> Result<()> {
++        let pack = &mut self.pending[region];
++        pack.bytes += bytes;
++        pack.payload += block.bytes.len();
++        pack.count += block.index.count;
++        pack.blocks.push(block);
++        if pack.count == DEFAULT_ELEMENT_CAP.get() as u64 {
++            self.flush_pack(region)?;
++        }
++        Ok(())
++    }
++
++    fn flush_pack(&mut self, region: usize) -> Result<()> {
++        let pack = std::mem::take(&mut self.pending[region]);
++        if pack.blocks.is_empty() {
++            return Ok(());
++        }
++        self.scheduler.submit(
++            region,
++            Job {
++                bytes: pack.bytes,
++                action: Action::Pack(pack),
++            },
++        )
++    }
++
++    fn finish(&mut self) -> Result<()> {
++        self.end_kind()?;
++        for region in 0..self.pending.len() {
++            self.scheduler.submit(
++                region,
++                Job {
++                    bytes: 0,
++                    action: Action::Flush,
++                },
++            )?;
++        }
++        self.scheduler.drain()
++    }
++
++    pub(in crate::commands::extract) fn end_kind(&mut self) -> Result<()> {
++        for region in 0..self.pending.len() {
++            self.flush_pack(region)?;
++        }
++        Ok(())
++    }
++}
++
++fn pack_bytes(block: &OwnedBlock) -> usize {
++    std::mem::size_of::<OwnedBlock>()
++        + block.bytes.capacity()
++        + block.tagdata.as_ref().map_or(0, Vec::capacity)
++        + block.way_members.as_ref().map_or(0, Vec::capacity)
++}
++
++#[derive(Default)]
++struct Pack {
++    blocks: Vec<OwnedBlock>,
++    bytes: usize,
++    payload: usize,
++    count: u64,
++}
++
++#[derive(Default)]
++struct PackScratch {
++    builder: Option<BlockBuilder>,
++    way: WayScratch,
++    strings: Vec<(u32, u32)>,
++    groups: Vec<(u32, u32)>,
++}
++
++impl Pack {
++    fn fits(&self, block: &OwnedBlock) -> bool {
++        self.blocks
++            .first()
++            .is_none_or(|first| first.index.kind == block.index.kind)
++            && self.count + block.index.count <= DEFAULT_ELEMENT_CAP.get() as u64
++            && self.payload + block.bytes.len() <= EXTRACT_MULTI_PACK_BYTES
++    }
++
++    /// A single fragment will frame exactly as it did at its input cut.
++    /// Multiple fragments have already been normalized by the original
++    /// emission walk (including cleaning and LocationsOnWays). Read that
++    /// canonical representation without cleaning it again, into one
++    /// builder, in order.
++    fn build(mut self, coords: WayCoords, scratch: &mut PackScratch) -> Result<OwnedBlock> {
++        if self.blocks.len() == 1 {
++            return self
++                .blocks
++                .pop()
++                .ok_or_else(|| Error::internal("multi-extract: empty pack"));
++        }
++        let builder = scratch.builder.get_or_insert_with(BlockBuilder::new);
++        for fragment in self.blocks {
++            let block = PrimitiveBlock::from_vec_with_scratch(
++                fragment.bytes,
++                &mut scratch.strings,
++                &mut scratch.groups,
++            )?;
++            append(&block, builder, &mut scratch.way, coords)?;
++        }
++        builder
++            .take_owned()?
++            .ok_or_else(|| Error::internal("multi-extract: empty pack"))
++    }
++}
++
++fn append(
++    block: &PrimitiveBlock,
++    builder: &mut BlockBuilder,
++    way: &mut WayScratch,
++    coords: WayCoords,
++) -> Result<()> {
++    let mut members = Vec::new();
++    for element in block.elements() {
++        match &element {
++            Element::DenseNode(node) => {
++                let (lat, lon) = super::super::common::dense_coords(node)?;
++                let meta = dense_node_metadata(node)?;
++                builder.add_node_dense(node.id(), lat, lon, node.tags(), meta.as_ref());
++            }
++            Element::Node(node) => {
++                let (lat, lon) = super::super::common::plain_coords(node)?;
++                let meta = element_metadata(ElementKind::Node, node.id(), &node.info())?;
++                builder.add_node_partial(node.id(), lat, lon, node.tags(), meta.as_ref());
++            }
++            Element::Way(element) => {
++                way.prepare(element, coords)?;
++                let meta = element_metadata(ElementKind::Way, element.id(), &element.info())?;
++                way.write(builder, element.tags(), meta.as_ref());
++            }
++            Element::Relation(relation) => {
++                relation.members_into(&mut members)?;
++                let meta =
++                    element_metadata(ElementKind::Relation, relation.id(), &relation.info())?;
++                builder.add_relation_partial(
++                    relation.id(),
++                    relation.tags(),
++                    &members,
++                    meta.as_ref(),
++                );
++            }
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used)]
++mod tests {
++    use std::io;
++    use std::sync::Barrier;
++
++    use crate::host::Host;
++    use crate::tunables::{TEST_HANG_BOUND, TEST_HANG_REPORT_GRACE};
++    use crate::writer::Compression;
++    use pbfhogg_test_scratch::HangBound;
++
++    use super::*;
++
++    #[test]
++    fn slow_writer_does_not_block_another_destinations_frontier() {
++        let _bound = HangBound::arm(TEST_HANG_BOUND, TEST_HANG_REPORT_GRACE, "output FIFO");
++        let owner = Host::for_tests();
++        let host = owner.entered();
++        let rendezvous = Barrier::new(2);
++        let writes = Mutex::new(Vec::new());
++        let writers: Vec<_> = (0..3)
++            .map(|_| PbfWriter::new(io::sink(), Compression::None))
++            .collect();
++        run_with(
++            writers,
++            &host.invocation,
++            3,
++            |output| {
++                output.write_blob(
++                    Some(
++                        [vec![vec![1, 0]], vec![], vec![]]
++                            .into_iter()
++                            .map(|frames| RegionBatch { frames, tail: None })
++                            .collect(),
++                    ),
++                    None,
++                )?;
++                output.write_blob(
++                    Some(
++                        [vec![vec![2, 0]], vec![vec![3], vec![4]], vec![]]
++                            .into_iter()
++                            .map(|frames| RegionBatch { frames, tail: None })
++                            .collect(),
++                    ),
++                    None,
++                )
++            },
++            |writer, region, action, _scratch| match action {
++                Action::Frame(frame) => {
++                    if frame[0] == 1 {
++                        rendezvous.wait();
++                        rendezvous.wait();
++                    } else if frame[0] == 3 {
++                        rendezvous.wait();
++                    }
++                    writes.lock().unwrap().push((region, frame[0]));
++                    if frame[0] == 3 {
++                        rendezvous.wait();
++                    }
++                    writer.write_raw_owned(frame)
++                }
++                Action::Flush => writer.flush(),
++                Action::Raw(_) | Action::Pack(_) => panic!("unexpected job"),
++            },
++        )
++        .unwrap();
++        let writes = writes.into_inner().unwrap();
++        assert_eq!(writes[0], (1, 3));
++        for (region, expected) in [(0, vec![1, 2]), (1, vec![3, 4]), (2, vec![])] {
++            let frames: Vec<_> = writes
++                .iter()
++                .filter(|(r, _)| *r == region)
++                .map(|&(_, f)| f)
++                .collect();
++            assert_eq!(frames, expected);
++        }
++    }
++
++    #[test]
++    fn write_credit_lasts_until_the_active_job_completes() {
++        let writers = vec![PbfWriter::new(io::sink(), Compression::None)];
++        let scheduler = Scheduler::new(writers, 8);
++        assert!(scheduler.reserve(8).unwrap());
++        scheduler
++            .submit(
++                0,
++                Job {
++                    bytes: 8,
++                    action: Action::Frame(vec![0; 8]),
++                },
++            )
++            .unwrap();
++        let (region, writer, Job { bytes, action }) = scheduler.take().unwrap();
++        assert!(!scheduler.reserve(1).unwrap());
++        drop(action);
++        scheduler.complete(region, writer, bytes, Ok(()));
++        assert!(
++            scheduler.reserve(9).unwrap(),
++            "one oversized job can advance"
++        );
++        assert!(!scheduler.reserve(1).unwrap());
++        assert_eq!(scheduler.lock().peak, 9);
++    }
++
++    #[test]
++    fn pending_packs_can_release_credit_without_changing_single_fragments() {
++        let _bound = HangBound::arm(TEST_HANG_BOUND, TEST_HANG_REPORT_GRACE, "pending output");
++        let owner = Host::for_tests();
++        let host = owner.entered();
++        let mut builder = BlockBuilder::new();
++        let blocks = [1, 2].map(|id| {
++            builder.add_node(id, 0, 0, [], None);
++            builder.take_owned().unwrap().unwrap()
++        });
++        let expected = blocks.each_ref().map(|block| block.bytes.clone());
++        let budget = blocks.iter().map(pack_bytes).max().unwrap();
++        let actual = Mutex::new(Vec::new());
++        run_with(
++            vec![PbfWriter::new(io::sink(), Compression::None)],
++            &host.invocation,
++            budget,
++            |output| {
++                for block in blocks {
++                    output.write_blob(
++                        Some(vec![RegionBatch {
++                            frames: Vec::new(),
++                            tail: Some(block),
++                        }]),
++                        None,
++                    )?;
++                }
++                Ok(())
++            },
++            |writer, _, action, scratch| match action {
++                Action::Pack(pack) => {
++                    let block = pack.build(WayCoords::Drop, scratch)?;
++                    actual.lock().unwrap().push(block.bytes);
++                    Ok(())
++                }
++                Action::Flush => writer.flush(),
++                Action::Frame(_) | Action::Raw(_) => panic!("unexpected frame"),
++            },
++        )
++        .unwrap();
++        assert_eq!(actual.into_inner().unwrap(), expected);
++    }
++}

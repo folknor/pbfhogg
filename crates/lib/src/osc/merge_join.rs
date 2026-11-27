@@ -12,6 +12,7 @@
 //! an element prints the same way whichever path found it.
 
 use crate::ElementKind;
+use crate::commands::diff::view::{BlockView, MetadataCursor, Pair, Row, Rows};
 use crate::osm_id::OsmIdKey;
 use crate::{Element, PrimitiveBlock};
 
@@ -317,6 +318,7 @@ pub(crate) fn stream_merge_phase(
     sink: &mut impl MergeSink,
 ) -> Result<()> {
     let equality = sink.equality();
+    let common_version = sink.details().common_version;
     let mut on_action = |action: BlockMergeAction<'_>| sink.record(kind, action);
     let mut old_block: Option<PrimitiveBlock> = None;
     let mut new_block: Option<PrimitiveBlock> = None;
@@ -336,22 +338,28 @@ pub(crate) fn stream_merge_phase(
         }
         match (old_head.take(), new_head.take()) {
             (None, None) => return Ok(()),
-            (Some(o), None) => on_action(BlockMergeAction::ElementOldOnly(&o))?,
-            (None, Some(n)) => on_action(BlockMergeAction::ElementNewOnly(&n))?,
+            (Some(o), None) => on_action(BlockMergeAction::ElementOldOnly(ChangeElement::Full(o)))?,
+            (None, Some(n)) => on_action(BlockMergeAction::ElementNewOnly(ChangeElement::Full(n)))?,
             (Some(o), Some(n)) => match crate::osm_id::osm_id_cmp(element_id(&o), element_id(&n)) {
                 std::cmp::Ordering::Less => {
-                    on_action(BlockMergeAction::ElementOldOnly(&o))?;
+                    on_action(BlockMergeAction::ElementOldOnly(ChangeElement::Full(o)))?;
                     new_head = Some(n);
                 }
                 std::cmp::Ordering::Greater => {
-                    on_action(BlockMergeAction::ElementNewOnly(&n))?;
+                    on_action(BlockMergeAction::ElementNewOnly(ChangeElement::Full(n)))?;
                     old_head = Some(o);
                 }
                 std::cmp::Ordering::Equal => {
                     if equality.equal(&o, &n)? {
-                        on_action(BlockMergeAction::ElementEqual(&o))?;
+                        on_action(BlockMergeAction::ElementEqual {
+                            id: element_id(&o),
+                            version: common_version.then(|| element_version(&o)).flatten(),
+                        })?;
                     } else {
-                        on_action(BlockMergeAction::ElementModified { old: &o, new: &n })?;
+                        on_action(BlockMergeAction::ElementModified {
+                            old: ChangeElement::Full(o),
+                            new: ChangeElement::Full(n),
+                        })?;
                     }
                 }
             },
@@ -402,19 +410,61 @@ pub(crate) enum BlockMergeAction<'a> {
     BlobOldOnly(BlockRun<'a>),
     /// Every element of the run exists only in new.
     BlobNewOnly(BlockRun<'a>),
-    /// Single element unchanged (the old side's copy). A sink that prints
-    /// it reads the version from it; one that ignores equal elements pays
-    /// nothing for them.
-    ElementEqual(&'a Element<'a>),
+    /// Single element unchanged. Only common text requests the old version.
+    ElementEqual { id: i64, version: Option<i32> },
     /// Single element modified (different content, same ID).
     ElementModified {
-        old: &'a Element<'a>,
-        new: &'a Element<'a>,
+        old: ChangeElement<'a>,
+        new: ChangeElement<'a>,
     },
     /// Single element only in old.
-    ElementOldOnly(&'a Element<'a>),
+    ElementOldOnly(ChangeElement<'a>),
     /// Single element only in new.
-    ElementNewOnly(&'a Element<'a>),
+    ElementNewOnly(ChangeElement<'a>),
+}
+
+/// The material a sink requests for an element it will report.
+#[derive(Clone, Copy)]
+pub(crate) enum ElementDetail {
+    Id,
+    Version,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MergeDetails {
+    pub(crate) common_version: bool,
+    /// One detail per side, in old and new order.
+    pub(crate) modified: [ElementDetail; 2],
+    pub(crate) only: [ElementDetail; 2],
+}
+
+pub(crate) enum ChangeElement<'a> {
+    Compact { id: i64, version: Option<i32> },
+    Full(Element<'a>),
+}
+
+impl<'a> ChangeElement<'a> {
+    pub(crate) fn id(&self) -> i64 {
+        match self {
+            Self::Compact { id, .. } => *id,
+            Self::Full(element) => element_id(element),
+        }
+    }
+
+    pub(crate) fn version(&self) -> Option<i32> {
+        match self {
+            Self::Compact { version, .. } => *version,
+            Self::Full(element) => element_version(element),
+        }
+    }
+
+    pub(crate) fn full(&self) -> Result<&Element<'a>> {
+        match self {
+            Self::Full(element) => Ok(element),
+            Self::Compact { .. } => Err(crate::Error::internal("diff sink needs a full element")),
+        }
+    }
 }
 
 /// A single-sided run of a decoded block: the rest of its window part, as
@@ -427,77 +477,129 @@ pub(crate) struct BlockRun<'a> {
 }
 
 impl<'a> BlockRun<'a> {
-    /// The run's elements. A sink iterates exactly these, so an element
-    /// past the unit's window is never printed by the unit below it. A
-    /// sink that only counts never walks them.
-    pub(crate) fn elements(self) -> ElementCursor<'a> {
-        self.cursor
+    /// Walk only this window's remaining elements, starting at the
+    /// cursor left by the merge. A sink that only counts never calls this.
+    pub(crate) fn try_for_each(
+        self,
+        detail: ElementDetail,
+        mut record: impl FnMut(ChangeElement<'a>) -> Result<()>,
+    ) -> Result<()> {
+        let mut cursor = self.cursor;
+        if matches!(detail, ElementDetail::Full) {
+            for slot in cursor.next..cursor.end {
+                record(ChangeElement::Full(cursor.full_at(slot)?))?;
+            }
+            return Ok(());
+        }
+        while let Some(row) = cursor.take()? {
+            record(cursor.change(&row, detail)?)?;
+        }
+        Ok(())
     }
 }
 
 /// A resumable position in a decoded block's window part.
 ///
 /// The merge keeps one per side across its rounds, so a block that outlives
-/// several of the peer's blocks is walked once, not rebuilt from its start
-/// each round: [`BlockElementsIter`](crate::BlockElementsIter) has no seek,
-/// and passing over an element rebuilds it (dense IDs, coordinates, tag
-/// boundaries and metadata deltas alike). The head an earlier round peeked
-/// past its boundary is kept, not decoded again. Elements before the window
-/// are passed over once, and only when the cursor is first read, so a run
-/// that is only counted never walks them.
-pub(crate) struct ElementCursor<'a> {
-    iter: crate::BlockElementsIter<'a>,
+/// several of the peer's blocks is walked once. The comparison walk has
+/// no full metadata. When output wants a full element, a separate forward
+/// walk preserves the dense metadata delta state, including the prefix
+/// before a clipped window. Neither walk restarts at a peer block boundary.
+struct ElementCursor<'a> {
+    block: &'a BlockState,
+    view: BlockView<'a>,
+    rows: Rows<'a>,
+    metadata: MetadataCursor<'a>,
+    full: Option<Box<crate::BlockElementsIter<'a>>>,
+    full_next: usize,
     /// Leading elements still to pass over before the first yield.
     skip: usize,
-    /// Elements left in the window part, the peeked head included.
-    remaining: usize,
-    head: Option<Element<'a>>,
+    next: usize,
+    end: usize,
+    head: Option<Row<'a>>,
 }
 
 impl<'a> ElementCursor<'a> {
-    /// The elements of `block` from `skip` up to `end` (its end when
-    /// `None`).
-    fn new(block: &'a PrimitiveBlock, skip: usize, end: Option<usize>) -> Self {
-        let len =
-            end.unwrap_or_else(|| usize::try_from(block.element_count()).unwrap_or(usize::MAX));
+    fn new(block: &'a BlockState) -> Self {
+        let view = block.view();
         Self {
-            iter: block.elements(),
-            skip,
-            remaining: len.saturating_sub(skip),
+            rows: view.rows(),
+            block,
+            view,
+            metadata: MetadataCursor::default(),
+            full: None,
+            full_next: 0,
+            skip: block.skip,
+            next: block.skip,
+            end: block.end,
             head: None,
         }
     }
 
     /// The next element, left in place.
-    fn peek(&mut self) -> Option<&Element<'a>> {
-        if self.head.is_none() && self.remaining > 0 {
-            if self.skip > 0 {
-                self.iter.nth(self.skip - 1);
-                self.skip = 0;
-            }
-            self.head = self.iter.next();
-            if self.head.is_none() {
-                self.remaining = 0;
-            }
+    fn peek_id(&mut self) -> Result<Option<i64>> {
+        if self.head.is_none() && self.next < self.end {
+            let skip = std::mem::take(&mut self.skip);
+            self.head = Some(self.rows.nth(skip).ok_or_else(short_comparison_block)?);
         }
-        self.head.as_ref()
+        Ok(self.head.as_ref().map(|row| row.id))
     }
 
     /// Elements left, the peeked head included.
     fn len(&self) -> usize {
-        self.remaining
+        self.end - self.next
+    }
+
+    fn take(&mut self) -> Result<Option<Row<'a>>> {
+        if self.peek_id()?.is_none() {
+            return Ok(None);
+        }
+        self.take_head().map(Some)
+    }
+
+    fn take_head(&mut self) -> Result<Row<'a>> {
+        let row = self.head.take().ok_or_else(short_comparison_block)?;
+        self.next += 1;
+        Ok(row)
+    }
+
+    fn full_at(&mut self, slot: usize) -> Result<Element<'a>> {
+        let skip = slot
+            .checked_sub(self.full_next)
+            .ok_or_else(|| crate::Error::internal("diff full-element cursor moved backwards"))?;
+        let block = self.block;
+        let iter = match self.full {
+            Some(ref mut iter) => iter,
+            None => self.full.insert(Box::new(block.full()?.elements())),
+        };
+        let element = iter.nth(skip).ok_or_else(short_comparison_block)?;
+        self.full_next = slot + 1;
+        Ok(element)
+    }
+
+    fn change(&mut self, row: &Row<'a>, detail: ElementDetail) -> Result<ChangeElement<'a>> {
+        let version = match detail {
+            ElementDetail::Id => None,
+            ElementDetail::Version => row.version(&mut self.metadata),
+            ElementDetail::Full => {
+                let element = self.full_at(self.next - 1)?;
+                if element_id(&element) != row.id {
+                    return Err(crate::Error::internal(
+                        "diff cursor element ID disagrees with its row",
+                    ));
+                }
+                return Ok(ChangeElement::Full(element));
+            }
+        };
+        Ok(ChangeElement::Compact {
+            id: row.id,
+            version,
+        })
     }
 }
 
-impl<'a> Iterator for ElementCursor<'a> {
-    type Item = Element<'a>;
-
-    fn next(&mut self) -> Option<Element<'a>> {
-        self.peek();
-        let head = self.head.take()?;
-        self.remaining -= 1;
-        Some(head)
-    }
+fn short_comparison_block() -> crate::Error {
+    crate::Error::internal("diff cursor ended before the validated block count")
 }
 
 /// Where a merge's actions go: diff's text and counts, or derive's OSC
@@ -512,6 +614,9 @@ pub(crate) trait MergeSink {
     /// The equality a same-ID pair is judged "equal" or "modified" by. No
     /// default: every sink names its own (see [`crate::content::Equality`]).
     fn equality(&self) -> crate::content::Equality;
+
+    /// The metadata and full elements the indexed cursor must prepare.
+    fn details(&self) -> MergeDetails;
 }
 
 /// One OsmData blob's provenance and index metadata, from its frame header.
@@ -577,11 +682,15 @@ impl Window {
 /// A decoded block of one side and its window part. The merge reads it
 /// through an [`ElementCursor`] borrowing it.
 struct BlockState {
-    block: PrimitiveBlock,
+    bytes: Vec<u8>,
+    strings: Vec<(u32, u32)>,
+    groups: Vec<(u32, u32)>,
+    scan: crate::read::block::BlockScan,
+    full: std::cell::OnceCell<PrimitiveBlock>,
     /// Elements before the window part (an earlier unit owns them).
     skip: usize,
-    /// Exclusive bound of the window part; `None` when unclipped.
-    end: Option<usize>,
+    /// Exclusive bound of the window part.
+    end: usize,
     /// For a clipped block, the ID of the last element inside the window:
     /// the furthest the block can still offer this unit.
     clip_last: Option<i64>,
@@ -591,12 +700,29 @@ struct BlockState {
 impl BlockState {
     /// Nothing of the block is left in the window.
     fn spent(&self) -> bool {
-        self.end.is_some_and(|end| self.skip >= end)
+        self.skip >= self.end
     }
 
     /// A cursor at the start of the window part.
     fn cursor(&self) -> ElementCursor<'_> {
-        ElementCursor::new(&self.block, self.skip, self.end)
+        ElementCursor::new(self)
+    }
+
+    fn view(&self) -> BlockView<'_> {
+        BlockView::new(&self.bytes, &self.groups, &self.strings, self.scan.fields)
+    }
+
+    /// The full reader owns its backing buffer. Build it once, only when
+    /// a writer requests a changed element, while the comparison walk
+    /// continues to borrow the original validated bytes.
+    fn full(&self) -> Result<&PrimitiveBlock> {
+        if let Some(block) = self.full.get() {
+            return Ok(block);
+        }
+        let block = PrimitiveBlock::from_vec(self.bytes.clone()).map_err(|err| {
+            crate::Error::internal_with("diff could not rebuild a validated block", err)
+        })?;
+        Ok(self.full.get_or_init(|| block))
     }
 }
 
@@ -946,8 +1072,6 @@ pub(crate) struct BlockPairSide<'a> {
     held: bool,
     path: &'a std::sync::Arc<std::path::Path>,
     window: Window,
-    st: Vec<(u32, u32)>,
-    gr: Vec<(u32, u32)>,
     ids: crate::read::project_ids::IdScratch,
 }
 
@@ -966,8 +1090,6 @@ impl<'a> BlockPairSide<'a> {
             held: false,
             path,
             window,
-            st: Vec::new(),
-            gr: Vec::new(),
             ids: crate::read::project_ids::IdScratch::default(),
         }
     }
@@ -1012,21 +1134,9 @@ impl<'a> BlockPairSide<'a> {
     /// range crosses it. Every [`BlockState`] is built here, so every block
     /// the merge reads, emits or residualises has passed that check.
     ///
-    /// Each block gets a fresh buffer, as the block-pair workers always
-    /// did, and that is kept for now on the default path of a measured
-    /// planet command. A fresh buffer arrives at the parse exactly full, so
-    /// appending the inline metadata reallocates it (see
-    /// `WireBlock::inline_tables`). A per-worker pool shared
-    /// by both sides could reuse that grown capacity, avoiding repeated
-    /// growth when later blocks fit; both sides hold a live block at once,
-    /// a larger block still grows, and a buffer past the pool's retain cap
-    /// is dropped. Allocation and free stay on the worker's thread either
-    /// way. What the append costs here today is measured: on planet
-    /// diff-snapshots (bygg, `d7d4f967`) `inline_tables` took 3.79 core-s
-    /// over 107,701 blocks against 1,113 core-s in this function, its
-    /// P95 168 us tail consistent with the payload moving. What a pool
-    /// would save of that, and its memory effect, are unmeasured, so this
-    /// allocation policy stays pending a measured comparison.
+    /// Keep the already-validated payload and its offset tables for the
+    /// comparison cursor. No inline reader tables are needed until a
+    /// writer requests a full element.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn decode(&mut self, desc: BlobDesc) -> Result<BlockState> {
         let mut decompressed: Vec<u8> = Vec::new();
@@ -1037,32 +1147,31 @@ impl<'a> BlockPairSide<'a> {
         // another kind would be merged against the wrong file's blobs of
         // that kind (spurious created/deleted) or dropped: the claimed kind
         // is refused by validation itself.
-        let buffer = crate::read::block::BlockBuffer::new(
-            decompressed,
-            None,
-            &mut self.st,
-            &mut self.gr,
-            Some(desc.index.kind),
-        );
+        let (mut strings, mut groups) = (Vec::new(), Vec::new());
         let path = self.path;
         let ids = &mut self.ids;
-        let (_, accepted) = match buffer
-            .project(|_, _| crate::read::project_ids::KindIds::of(desc.index.kind, ids))
-        {
-            Ok(projected) => projected,
-            Err(e) => return Err(locate_in(path, &desc, e)),
-        };
-        let block = match hold_decoded_claim(&self.ids, accepted.bytes(), &desc) {
-            Ok(()) => accepted.into_block(),
-            Err(e) => return Err(locate_in(path, &desc, e)),
-        };
+        let (_, scan) = crate::read::block::validate_in_place(
+            &decompressed,
+            &mut strings,
+            &mut groups,
+            Some(desc.index.kind),
+            |_, _| crate::read::project_ids::KindIds::of(desc.index.kind, ids),
+        )
+        .map_err(|e| locate_in(path, &desc, e))?;
+        hold_decoded_claim(&self.ids, &decompressed, &desc).map_err(|e| self.locate(&desc, e))?;
+        let count = usize::try_from(scan.element_count)
+            .map_err(|_| crate::Error::internal("diff block count does not fit in usize"))?;
         let (skip, end, clip_last) = if self.window.crosses(&desc) {
-            clip(&block, self.window)
+            clip(&self.ids, &decompressed, self.window, count).map_err(|e| self.locate(&desc, e))?
         } else {
-            (0, None, None)
+            (0, count, None)
         };
         Ok(BlockState {
-            block,
+            bytes: decompressed,
+            strings,
+            groups,
+            scan,
+            full: std::cell::OnceCell::new(),
             skip,
             end,
             clip_last,
@@ -1087,28 +1196,33 @@ impl<'a> BlockPairSide<'a> {
 /// leading elements before the window's start (an earlier unit owns them),
 /// the index of the first element at or past its end (the block's length
 /// when none is), and the ID of the last element inside. Counted from the
-/// elements, so a clipped run's count is exact. The block's order and claim
-/// were checked when it was decoded. It reads only IDs but walks the
-/// built block on purpose: the merge runs over that block next, and only
-/// the blocks a window edge crosses are clipped.
-fn clip(block: &PrimitiveBlock, window: Window) -> (usize, Option<usize>, Option<i64>) {
+/// elements, so a clipped run's count is exact. The validated ID
+/// projection is in the same element order as the comparison cursor.
+fn clip(
+    ids: &crate::read::project_ids::IdScratch,
+    bytes: &[u8],
+    window: Window,
+    count: usize,
+) -> Result<(usize, usize, Option<i64>)> {
     let mut skip = 0usize;
-    let mut len = 0usize;
+    let mut end = count;
+    let mut slot = 0usize;
     let mut last_inside = None;
-    for (i, element) in block.elements_skip_metadata().enumerate() {
-        let id = element_id(&element);
-        let key = crate::osm_id::osm_id_key(id);
-        if window.end.is_some_and(|end| key >= end) {
-            return (skip.min(i), Some(i), last_inside);
+    ids.each(bytes, |_, id| {
+        if slot < end {
+            let key = crate::osm_id::osm_id_key(id);
+            if window.end.is_some_and(|bound| key >= bound) {
+                end = slot;
+            } else if window.start.is_some_and(|start| key < start) {
+                skip = slot + 1;
+            } else {
+                last_inside = Some(id);
+            }
         }
-        if window.start.is_some_and(|start| key < start) {
-            skip = i + 1;
-        } else {
-            last_inside = Some(id);
-        }
-        len = i + 1;
-    }
-    (skip.min(len), Some(len), last_inside)
+        slot += 1;
+        Ok(())
+    })?;
+    Ok((skip, end, last_inside))
 }
 
 /// `err` located at blob `desc` of the input at `path`.
@@ -1431,7 +1545,7 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                     let os = old.decode(op)?;
                     let ns = new.decode(np)?;
                     stats.elements_overlapping_decoded +=
-                        os.block.element_count() + ns.block.element_count();
+                        os.scan.element_count + ns.scan.element_count;
                     old_state = Some(os).filter(|bs| !bs.spent());
                     old_cur = old_state.as_ref().map(BlockState::cursor);
                     new_state = Some(ns).filter(|bs| !bs.spent());
@@ -1546,14 +1660,14 @@ fn element_merge_pair<S: MergeSink>(
     // `osm_id_cmp`, not raw `<=`: every ordering decision below already
     // uses it, and for negative IDs the two disagree - a raw boundary test
     // would cut the streams somewhere the merge order does not.
-    let in_range = |e: &Element<'_>| crate::osm_id::osm_id_cmp(element_id(e), merge_up_to).is_le();
+    let in_range = |&id: &i64| crate::osm_id::osm_id_cmp(id, merge_up_to).is_le();
+    let pair = Pair::new(&old_iter.view, &new_iter.view);
+    let equality = sink.equality();
+    let details = sink.details();
 
     loop {
-        // Which side's head goes next, from the in-range heads alone; the
-        // element is then taken from the iterator it was peeked on, so the
-        // `if let`s below always match.
-        let old_head = old_iter.peek().filter(|e| in_range(e)).map(element_id);
-        let new_head = new_iter.peek().filter(|e| in_range(e)).map(element_id);
+        let old_head = old_iter.peek_id()?;
+        let new_head = new_iter.peek_id()?;
         // Equal IDs pair in the order they occur on each side, as on the
         // element stream, wherever the blobs happen to end. An ID may repeat
         // in canonical order, and a block that has run out may be followed
@@ -1564,16 +1678,16 @@ fn element_merge_pair<S: MergeSink>(
         // blob. A head below the boundary cannot meet that next blob, and a
         // peer still holding an element (necessarily past the boundary)
         // has no more of the ID, so both are decided here.
-        let order = match (old_head, new_head) {
+        let order = match (old_head.filter(in_range), new_head.filter(in_range)) {
             (None, None) => break,
             (Some(o_id), None) => {
-                if o_id == merge_up_to && new_iter.peek().is_none() {
+                if o_id == merge_up_to && new_head.is_none() {
                     break;
                 }
                 std::cmp::Ordering::Less
             }
             (None, Some(n_id)) => {
-                if n_id == merge_up_to && old_iter.peek().is_none() {
+                if n_id == merge_up_to && old_head.is_none() {
                     break;
                 }
                 std::cmp::Ordering::Greater
@@ -1582,30 +1696,46 @@ fn element_merge_pair<S: MergeSink>(
         };
         match order {
             std::cmp::Ordering::Less => {
-                if let Some(o) = old_iter.next() {
-                    sink.record(kind, BlockMergeAction::ElementOldOnly(&o))?;
-                }
+                let row = old_iter.take_head()?;
+                let old = old_iter.change(&row, details.only[0])?;
+                sink.record(kind, BlockMergeAction::ElementOldOnly(old))?;
             }
             std::cmp::Ordering::Greater => {
-                if let Some(n) = new_iter.next() {
-                    sink.record(kind, BlockMergeAction::ElementNewOnly(&n))?;
-                }
+                let row = new_iter.take_head()?;
+                let new = new_iter.change(&row, details.only[1])?;
+                sink.record(kind, BlockMergeAction::ElementNewOnly(new))?;
             }
             std::cmp::Ordering::Equal => {
-                if let (Some(o), Some(n)) = (old_iter.next(), new_iter.next()) {
-                    if sink.equality().equal(&o, &n)? {
-                        sink.record(kind, BlockMergeAction::ElementEqual(&o))?;
-                    } else {
-                        sink.record(kind, BlockMergeAction::ElementModified { old: &o, new: &n })?;
+                let old = old_iter.take_head()?;
+                let new = new_iter.take_head()?;
+                let action = if pair.equal(
+                    (&old_iter.view, &new_iter.view),
+                    &old,
+                    &new,
+                    equality,
+                    (&mut old_iter.metadata, &mut new_iter.metadata),
+                )? {
+                    BlockMergeAction::ElementEqual {
+                        id: old.id,
+                        version: details
+                            .common_version
+                            .then(|| old.version(&mut old_iter.metadata))
+                            .flatten(),
                     }
-                }
+                } else {
+                    BlockMergeAction::ElementModified {
+                        old: old_iter.change(&old, details.modified[0])?,
+                        new: new_iter.change(&new, details.modified[1])?,
+                    }
+                };
+                sink.record(kind, action)?;
             }
         }
     }
 
     Ok(MergePairOutcome {
-        old_has_more: old_iter.peek().is_some(),
-        new_has_more: new_iter.peek().is_some(),
+        old_has_more: old_iter.peek_id()?.is_some(),
+        new_has_more: new_iter.peek_id()?.is_some(),
     })
 }
 

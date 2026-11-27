@@ -118,9 +118,8 @@ pub(crate) enum Token<'a> {
     },
 }
 
-/// Something with element content. Only borrowed [`Element`]s implement it:
-/// every diff and derive path compares elements straight from their
-/// decoded blocks.
+/// An element's canonical content as a stream of tokens.
+/// Diff comparisons and content digests share this contract.
 pub(crate) trait Content {
     fn content_kind(&self) -> ElementKind;
     /// The element's tokens. The outer error is a node coordinate that does

@@ -1,0 +1,2495 @@
+diff --git a/crates/lib/src/commands/apply_changes/drain.rs b/crates/lib/src/commands/apply_changes/drain.rs
+index 097071e6..b0d7379a 100644
+--- a/crates/lib/src/commands/apply_changes/drain.rs
++++ b/crates/lib/src/commands/apply_changes/drain.rs
+@@ -41,12 +41,12 @@
+ //!
+ //! Under `--locations-on-ways` the barrier is separate from item processing:
+ //! once the scanner's [`DrainMessage::NodeBoundary`] has arrived and every
+-//! seq below it is processed, the drain merges per-worker [`CoordSlots`]
+-//! into the published `Arc<loc_map>` and signals the scanner over
++//! seq below it is processed, the drain publishes the filled coordinate
++//! table and signals the scanner over
+ //! `barrier_tx`; the scanner, waiting at its first way or relation
+ //! descriptor, then dispatches way and relation work as it walks. No way or
+ //! relation item can arrive before that. The missing-node
+-//! refusal is taken there too, before publication: the merged map is final,
++//! refusal is taken there too, before publication: the table is final,
+ //! so an OSC way reference it cannot resolve fails the run at the barrier
+ //! rather than after the way phase.
+ //!
+@@ -77,50 +77,35 @@ use crate::writer::PbfWriter;
+ 
+ use super::descriptor::{DrainItem, DrainMessage, RewrittenFrames, Route, StreamMsg};
+ use super::failure::FailureSlot;
+-use super::loc_mode::{LocMap, LocMode};
++use super::loc_mode::LocMode;
++use super::node_locations::WayLocations;
+ use super::stats::MergeStats;
+ use super::stream_output::{CreateEncoder, emit_gap_creates, emit_rest, has_gap_creates};
+-use super::streaming::CoordSlots;
+ use super::upsert_cursors::UpsertCursors;
+ use super::window::WindowReturn;
+ 
+-/// Drain → workers post-barrier `loc_map` handle. The drain calls
+-/// `set` exactly once at the node→way barrier; way-phase workers read
+-/// the published `Arc<FxHashMap>` to resolve OSC way refs.
+-pub(super) type LocMapHandle = Arc<OnceLock<Arc<LocMap>>>;
++/// Set once by the drain at the node-to-way barrier. Way workers then
++/// use the published table to resolve OSC way refs.
++pub(super) type LocationHandle = Arc<OnceLock<Arc<WayLocations>>>;
+ 
+-/// The drain's share of `--locations-on-ways`, everything the node→way
+-/// barrier consumes. Built with the scanner's and the workers' shares by
+-/// `rewrite::wire_locations`, so either all of it is there or the mode is
+-/// off. [`DrainLocations::publish`] consumes it at the barrier.
++/// The drain's share of location mode, consumed at the node-to-way barrier.
+ pub(super) struct DrainLocations {
+-    /// Clones of every worker's coordinate slot, merged at the barrier.
+-    pub coord_slots: CoordSlots,
+-    /// OSC-pre-seeded coords (`NodeLocationIndex::build_from_diff`), the
+-    /// seed the worker slots are merged into.
+-    pub seeded: LocMap,
+-    /// Drain → scanner barrier signal: one unit value after the map is
+-    /// published. Kept until the drain returns (see [`PublishedLocations`]).
++    /// The shared coordinate table, including OSC seeds.
++    pub slots: Arc<WayLocations>,
++    /// Signal the scanner after publishing. Kept until the drain returns.
+     pub barrier_tx: mpsc::SyncSender<()>,
+-    /// Where the merged map is published for way-phase workers.
+-    pub loc_map_out: LocMapHandle,
+-    /// The distinct node IDs the OSC's ways reference
+-    /// (`NodeLocationIndex::total_referenced`). The merged map at the barrier
+-    /// holds only such IDs, so its size against this is the run's unresolved
+-    /// count, final at the barrier: nothing resolves later.
+-    pub nodes_needed: u64,
+-    /// Publish a map with unresolved references (they are written as
+-    /// `(0, 0)`) instead of refusing at the barrier.
++    pub published: LocationHandle,
++    /// Allow unresolved references to be written as (0, 0).
+     pub ignore_missing_nodes: bool,
+ }
+ 
+-/// What survives the barrier: the published map, for the drain's own create
++/// What survives the barrier: the published table, for the drain's own create
+ /// runs, and the barrier sender. The sender is held until the drain returns
+ /// because the scanner's poll after each dispatch reads a closed barrier
+ /// channel as a failed drain; dropping it at publication would fail every
+ /// run.
+ struct PublishedLocations {
+-    map: Arc<LocMap>,
++    map: Arc<WayLocations>,
+     _barrier_tx: mpsc::SyncSender<()>,
+ }
+ 
+@@ -207,12 +192,6 @@ crate::counters::counter_set! {
+         pub reorder_buffer_high_water_count => "merge_drain_reorder_buffer_high_water_count",
+         pub reorder_buffer_high_water_bytes => "merge_drain_reorder_buffer_high_water_bytes",
+         pub barrier_loc_map_size => "merge_drain_barrier_loc_map_size",
+-        /// Estimated bytes of the workers' coordinate slot tables the
+-        /// barrier merge consumed and freed (a table moved whole into the
+-        /// published map stays live and is not counted). Source storage
+-        /// released, not a net saving: the published map grows as it takes
+-        /// their entries.
+-        pub barrier_slot_bytes_freed => "merge_drain_barrier_slot_bytes_freed",
+         /// Cumulative time the drain spent in a receive that ended with the
+         /// reorder buffer empty. Waits with later seqs buffered behind a
+         /// missing head are not counted, so this is not a head-of-line stall
+@@ -506,9 +485,9 @@ struct DrainState<'a> {
+     passthrough_chunks: Vec<Vec<u8>>,
+     rewrites: RewriteGroup,
+     /// `--locations-on-ways` state, `None` with the mode off: pending until
+-    /// the node→way barrier, then the published map, which the drain's own
++    /// the node-to-way barrier, then the published table, which the drain's own
+     /// gap, transition and trailing creates are written against (workers
+-    /// read it through their `LocMapHandle`).
++    /// read it through their `LocationHandle`).
+     loc: Option<DrainLoc>,
+     /// Running (kind, `osm_id_key`) high-water mark across every item
+     /// already dispatched. Drives [`check_output_order`]; see there for
+@@ -822,7 +801,7 @@ fn process_item(
+     let item_kind = placement.kind;
+     let (min_id, max_id) = placement.id_range;
+ 
+-    // Before the coordinate map is published only node items can reach the
++    // Before the coordinate table is published only node items can reach the
+     // drain: the scanner dispatches no way or relation descriptor until it
+     // has the barrier signal, on both routes. A way or relation here would be
+     // written with no map to resolve against, so the protocol is broken.
+@@ -1092,10 +1071,9 @@ fn flush_copy_range(
+ }
+ 
+ impl DrainLocations {
+-    /// Merge per-worker `CoordSlots` into the published `Arc<FxHashMap>`,
+-    /// then signal the scanner over `barrier_tx`, or refuse the run when the
+-    /// map leaves OSC way references unresolved. Called once under
+-    /// `--locations-on-ways`, from the barrier check in `run_drain`, once every
++    /// Check the filled slots and publish the coordinate table, then signal
++    /// the scanner, or refuse the run if OSC way references are unresolved.
++    /// Called under `--locations-on-ways` from the barrier check in `run_drain`, once every
+     /// seq below the scanner's node boundary is processed; it consumes the
+     /// pending state, so it cannot run twice. On an error the barrier sender
+     /// drops unsignalled with `self`, which stops a scanner waiting at the
+@@ -1109,78 +1087,23 @@ impl DrainLocations {
+         invocation.marker("MERGE_DRAIN_BARRIER_START");
+ 
+         let Self {
+-            coord_slots,
+-            seeded,
++            slots,
+             barrier_tx,
+-            loc_map_out,
+-            nodes_needed,
++            published,
+             ignore_missing_nodes,
+         } = self;
+ 
+         #[cfg(pbfhogg_test_hooks)]
+         invocation.faults().before_apply_changes_coord_merge();
+ 
+-        // Seed with OSC pre-seeded coords (from
+-        // `NodeLocationIndex::build_from_diff`'s `locations`) before
+-        // extending with per-worker accumulators. A worker slot recovered from
+-        // poison does not validate its contents: see `flush_local_coords` for
+-        // why a panicking worker still fails the run.
+-        //
+-        // Each slot's table is taken whole, leaving the slot an empty map
+-        // with no allocation, and consumed outside its lock, so its storage
+-        // is freed here. The workers keep the slots to the end of the run,
+-        // and a drained table would otherwise hold its node-phase capacity
+-        // (the worker's share of every kept coordinate) beside the published
+-        // map through the whole way phase. No coordinate is lost: every node
+-        // item flushed before it was sent, and only a node of a base lying
+-        // about its order can flush after this, which the order guard
+-        // refuses.
+-        let mut merged: LocMap = seeded;
+-        let mut freed_bytes = 0u64;
+-        for slot in &coord_slots {
+-            let local = std::mem::take(
+-                &mut *slot
+-                    .lock()
+-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+-            );
+-            if merged.is_empty() {
+-                merged = local;
+-            } else {
+-                freed_bytes += super::streaming::map_table_bytes(&local) as u64;
+-                // Not a bare `extend`: a base node duplicated across blobs held
+-                // by different workers would otherwise take whichever
+-                // slot comes last. The OSC seed never collides, since
+-                // `needed` holds no OSC-upserted node.
+-                // Ranked like the missing-node refusal below: an already
+-                // published producer failure or a cancellation outranks it.
+-                if let Err(conflict) = super::streaming::merge_coords(&mut merged, local) {
+-                    if let Some(e) = failure.take() {
+-                        return Err(e);
+-                    }
+-                    invocation.check()?;
+-                    return Err(conflict);
+-                }
+-            }
+-        }
+-        counters
+-            .barrier_slot_bytes_freed
+-            .store(freed_bytes, Ordering::Relaxed);
+-
++        // Every completed node item was sent after its worker populated
++        // the slots. The channel receive orders those writes before the
++        // loads here; publishing the table makes them visible to way workers.
++        let resolved = slots.resolved();
+         counters
+             .barrier_loc_map_size
+-            .store(merged.len() as u64, Ordering::Relaxed);
+-
+-        // The missing-node refusal, at the earliest point the count is known:
+-        // every node item is processed, nothing resolves after this merge, and
+-        // no way has been written. Leaving through the drain's error exit drops
+-        // the barrier sender unsignalled, so the scanner stops in its barrier
+-        // wait (at the first way or relation, or at EOF), the workers are
+-        // released, and `merge`
+-        // publishes nothing. A producer failure already published, or a
+-        // cancellation already requested, outranks the refusal: both are
+-        // checked here, at the decision, since the drain's own checks ran
+-        // before this receive's advance and merge.
+-        let missing = nodes_needed.saturating_sub(merged.len() as u64);
++            .store(resolved, Ordering::Relaxed);
++        let missing = slots.len() - resolved;
+         if missing != 0 && !ignore_missing_nodes {
+             // Test-only: a producer failure or a cancellation landing after the
+             // drain's per-receive checks, which the checks below must rank.
+@@ -1214,12 +1137,11 @@ impl DrainLocations {
+             ));
+         }
+ 
+-        let map = Arc::new(merged);
+         // Only this consuming call sets the handle, and only once; another
+         // value there means something outside the barrier published a map.
+-        if loc_map_out.set(Arc::clone(&map)).is_err() {
++        if published.set(Arc::clone(&slots)).is_err() {
+             return Err(Error::internal(
+-                "drain: the coordinate map was published before the barrier",
++                "drain: the coordinate table was published before the barrier",
+             ));
+         }
+ 
+@@ -1242,7 +1164,7 @@ impl DrainLocations {
+ 
+         invocation.marker("MERGE_DRAIN_BARRIER_END");
+         Ok(PublishedLocations {
+-            map,
++            map: slots,
+             _barrier_tx: barrier_tx,
+         })
+     }
+diff --git a/crates/lib/src/commands/apply_changes/element_writes.rs b/crates/lib/src/commands/apply_changes/element_writes.rs
+index e627ee97..27fb0b18 100644
+--- a/crates/lib/src/commands/apply_changes/element_writes.rs
++++ b/crates/lib/src/commands/apply_changes/element_writes.rs
+@@ -15,7 +15,8 @@ use crate::commands::{
+ };
+ 
+ use super::Result;
+-use super::loc_mode::{LocMap, LocMode};
++use super::loc_mode::LocMode;
++use super::node_locations::WayLocations;
+ use super::refresh::{CoordFraming, StaleProbe, evaluate_way, refreshed_locations};
+ 
+ // ---------------------------------------------------------------------------
+@@ -67,34 +68,24 @@ pub(super) fn add_osc_node_bare_plain(
+     );
+ }
+ 
+-/// Add an OSC way to `bb`, with inline locations when `locs` is present.
+-///
+-/// An id absent from `locs` gets `(0, 0)`. That is only reachable when the
+-/// run allows it: `rewrite::merge` counts unresolved references against the
+-/// merged map and fails the command unless `--ignore-missing-nodes` asked
+-/// for this fallback.
+-///
+-/// The `refs` and `locations` vectors (and `members` in
+-/// [`add_osc_relation`]) are kept on purpose: replacing them with iterator
+-/// inputs to the builder was proposed and refused (2026-11-26). These run
+-/// once per OSC create or modify, a diff's worth of elements against a
+-/// planet's worth of base elements, so the allocations cannot show in wall.
++/// Add an OSC way, resolving any inline coordinates in its ref order.
++/// The two vectors feed the builder's existing slice API, used only for
++/// OSC way upserts.
+ pub(super) fn add_osc_way(
+     bb: &mut BlockBuilder,
+     way: &crate::osc::CompactWayRef<'_>,
+-    locs: Option<&LocMap>,
+-) {
++    way_index: usize,
++    locs: Option<&WayLocations>,
++) -> Result<()> {
+     let refs: Vec<i64> = way.refs().collect();
+     let meta = way.metadata();
+     if let Some(locs) = locs {
+-        let locations: Vec<(i32, i32)> = refs
+-            .iter()
+-            .map(|node_id| locs.get(node_id).copied().unwrap_or((0, 0)))
+-            .collect();
++        let locations = locs.for_way(way_index, refs.len())?;
+         bb.add_way_with_locations_partial(way.id(), way.tags(), &refs, &locations, meta.as_ref());
+     } else {
+         bb.add_way_partial(way.id(), way.tags(), &refs, meta.as_ref());
+     }
++    Ok(())
+ }
+ 
+ pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactRelationRef<'_>) {
+@@ -566,12 +557,12 @@ pub(super) fn write_osc_way_local<O: BlockSink + ?Sized>(
+     bb: &mut BlockBuilder,
+     output: &mut O,
+     way: &crate::osc::CompactWayRef<'_>,
++    way_index: usize,
+     loc: LocMode<'_>,
+ ) -> Result<()> {
+     let locs = loc.for_way(way.id())?;
+     ensure_way_capacity_local(bb, output)?;
+-    add_osc_way(bb, way, locs);
+-    Ok(())
++    add_osc_way(bb, way, way_index, locs)
+ }
+ 
+ pub(super) fn write_base_relation_local<O: BlockSink + ?Sized>(
+diff --git a/crates/lib/src/commands/apply_changes/loc_mode.rs b/crates/lib/src/commands/apply_changes/loc_mode.rs
+index 75cf53b4..68e95c91 100644
+--- a/crates/lib/src/commands/apply_changes/loc_mode.rs
++++ b/crates/lib/src/commands/apply_changes/loc_mode.rs
+@@ -3,52 +3,47 @@
+ //! Every way emission site - surviving base ways in a rewritten blob, OSC
+ //! way creates and modifications from workers, gap and trailing creates
+ //! from the drain - takes a [`LocMode`] rather than an optional coordinate
+-//! map. An `Option` made "LocationsOnWays is on but the map is missing"
+-//! indistinguishable from "LocationsOnWays is off", so a missing map
++//! table. An `Option` made "LocationsOnWays is on but the table is missing"
++//! indistinguishable from "LocationsOnWays is off", so a missing table
+ //! silently wrote ways without their inline coordinates under a header
+ //! that still advertised `LocationsOnWays`. With the enum that state has
+ //! its own name, `LocMode::Pending`, and writing a way in it is an error.
+ 
+-use rustc_hash::FxHashMap;
+-
+ use super::Result;
+-
+-/// Merged node-id to `(lat, lon)` decimicrodegree map published at the
+-/// node-to-way barrier.
+-pub(super) type LocMap = FxHashMap<i64, (i32, i32)>;
++use super::node_locations::WayLocations;
+ 
+ #[derive(Clone, Copy)]
+ pub(super) enum LocMode<'a> {
+     /// The output carries no LocationsOnWays: ways are written refs-only.
+     Off,
+     /// `--locations-on-ways` is on, but the node-to-way barrier has not
+-    /// published the merged coordinate map yet. That is the normal state
++    /// published the coordinate table yet. That is the normal state
+     /// while node blobs are processed; a way reaching a writer in this
+     /// state means a routing invariant broke (for example a blob whose
+     /// indexdata labels it as nodes but which holds ways).
+     Pending,
+-    /// `--locations-on-ways` is on and the merged map is published.
+-    Required(&'a LocMap),
++    /// `--locations-on-ways` is on and the table is published.
++    Required(&'a WayLocations),
+ }
+ 
+ impl<'a> LocMode<'a> {
+-    /// The mode of a run with `--locations-on-ways` on: whatever map the
++    /// The mode of a run with `--locations-on-ways` on: whatever table the
+     /// barrier has published, or `Pending` before it. A run with the mode off
+     /// is plain [`LocMode::Off`].
+-    pub(super) fn on(map: Option<&'a LocMap>) -> Self {
+-        map.map_or(Self::Pending, Self::Required)
++    pub(super) fn on(locations: Option<&'a WayLocations>) -> Self {
++        locations.map_or(Self::Pending, Self::Required)
+     }
+ 
+     /// Gate one way write. `Ok(None)` means write it refs-only,
+-    /// `Ok(Some(map))` means write it with locations, and `Pending` is a
++    /// `Ok(Some(locations))` means write it with locations, and `Pending` is a
+     /// hard error naming the way.
+-    pub(super) fn for_way(self, way_id: i64) -> Result<Option<&'a LocMap>> {
++    pub(super) fn for_way(self, way_id: i64) -> Result<Option<&'a WayLocations>> {
+         match self {
+             Self::Off => Ok(None),
+-            Self::Required(map) => Ok(Some(map)),
++            Self::Required(locations) => Ok(Some(locations)),
+             Self::Pending => Err(crate::Error::internal(format!(
+                 "apply-changes with locations_on_ways: way {way_id} reached the writer before \
+-                 the node coordinate map was published; refusing to write it without its \
++                 the node coordinate table was published; refusing to write it without its \
+                  LocationsOnWays coordinates"
+             ))),
+         }
+diff --git a/crates/lib/src/commands/apply_changes/node_coords.rs b/crates/lib/src/commands/apply_changes/node_coords.rs
+index 5fc142fb..62acfff2 100644
+--- a/crates/lib/src/commands/apply_changes/node_coords.rs
++++ b/crates/lib/src/commands/apply_changes/node_coords.rs
+@@ -1,7 +1,7 @@
+ //! Checked node-coordinate extraction for `--locations-on-ways`.
+ //!
+-//! Under `--locations-on-ways` every base node blob is decompressed so the
+-//! worker pool can collect the coordinates OSC ways reference. This module
++//! Under `--locations-on-ways` the worker pool uses decoded node blobs to
++//! collect the coordinates OSC ways reference. This module
+ //! is apply-changes' entry point to that extractor, which is the shared node
+ //! scanner in `crate::scan::node`. It reads the decompressed `PrimitiveBlock` bytes
+ //! directly (no string table, no `PrimitiveBlock` construction) and covers
+@@ -15,7 +15,7 @@
+ //! Reading in the element iterator's order (a group's dense nodes, then its
+ //! plain nodes) makes the extracted node set the same set the
+ //! rewrite path sees and writes. A duplicated id has no winner: the location
+-//! path refuses one whose records disagree (`streaming::merge_coords`).
++//! path refuses one whose records disagree (`WayLocations::record_base`).
+ //!
+ //! All coordinate scaling is checked: granularity is any `int32`, as every
+ //! reader takes it, and the exact `offset + granularity * raw`, computed
+diff --git a/crates/lib/src/commands/apply_changes/node_locations.rs b/crates/lib/src/commands/apply_changes/node_locations.rs
+index e3db160b..9c15099a 100644
+--- a/crates/lib/src/commands/apply_changes/node_locations.rs
++++ b/crates/lib/src/commands/apply_changes/node_locations.rs
+@@ -1,87 +1,257 @@
+-//! Sparse node location index for `--locations-on-ways`.
+-//!
+-//! Now a setup-only helper: produces the OSC-pre-seeded `locations`
+-//! map (handed to the drain as `DrainLocations::seeded`) and the
+-//! still-needed `needed_set` (handed to the worker pool as
+-//! `WorkerLocations::needed`, a coord-extraction filter). The base-PBF prefill phase no longer exists - it has been
+-//! fused into the streaming worker pool's node phase, where workers
+-//! opportunistically extract coords for `needed_set` IDs as they
+-//! decompress node blobs.
+-
+-use rustc_hash::{FxHashMap, FxHashSet};
+-
+-use crate::ElementKind;
++//! The location join for OSC ways. Each distinct referenced node has one
++//! coordinate slot. Only references that need a base coordinate appear in
++//! the sorted request list used to route and scan base node blobs.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use crate::coord_pack;
+ use crate::osc::sorted::{Seek, SortedDiff};
++use crate::osm_id::{blob_osm_first_id, blob_osm_last_id, osm_id_le, osm_id_ordinal};
++use crate::{ElementKind, Error, Result};
+ 
+-/// Sparse node coordinate index for maintaining LocationsOnWays through
+-/// merges. Built once from the OSC overlay; the drain takes ownership of
+-/// `locations` (consumed at the node→way barrier as the seed for the
+-/// merged `loc_map`) and the worker pool takes a shared `Arc` reference
+-/// to `needed_set` (it keeps only the coordinates `extract_node_coords`
+-/// reports for IDs in the set).
+ pub(super) struct NodeLocationIndex {
+-    /// Coordinates pre-seeded from OSC node creates/modifications.
+-    pub(super) locations: FxHashMap<i64, (i32, i32)>,
+-    /// Node IDs still required from the base PBF (not present in OSC,
+-    /// not deleted by it).
+-    pub(super) needed_set: FxHashSet<i64>,
+-    /// Unique node IDs referenced by OSC ways. At least
+-    /// `locations.len() + needed_set.len()`: a referenced node the diff
+-    /// deletes is in neither map but still counts here, so it is reported
+-    /// as unresolved rather than silently satisfied.
+-    pub(super) total_referenced: u64,
++    pub requests: Arc<BaseRequests>,
++    pub ways: Arc<WayLocations>,
++    pub seeded: u64,
+ }
+ 
+ impl NodeLocationIndex {
+-    /// Build the index from an already-parsed OSC diff.
+-    ///
+-    /// 1. Collects all node IDs referenced by OSC ways
+-    /// 2. Seeds coordinates from OSC nodes (creates/modifications)
+-    /// 3. Remaining needed IDs stored for base PBF extraction in the
+-    ///    worker pool's node phase.
+     #[cfg_attr(feature = "hotpath", hotpath::measure)]
+-    pub(super) fn build_from_diff(diff: &SortedDiff) -> Self {
+-        // Every node ID referenced by a surviving OSC way, sorted and
+-        // unique, so it can be joined against the diff's sorted node lists.
++    pub(super) fn build_from_diff(diff: &SortedDiff) -> Result<Self> {
+         let way_count = diff.upserts(ElementKind::Way).len();
+-        let mut all_needed: Vec<i64> = Vec::new();
++        let mut ids = Vec::new();
+         for i in 0..way_count {
+-            all_needed.extend(diff.way(i).refs());
++            ids.extend(diff.way(i).refs());
+         }
+-        all_needed.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
+-        all_needed.dedup();
+-
+-        let mut locations: FxHashMap<i64, (i32, i32)> =
+-            FxHashMap::with_capacity_and_hasher(all_needed.len(), Default::default());
+-        let mut still_needed: FxHashSet<i64> = FxHashSet::default();
+-
+-        // Load-bearing: the node upserts are both created AND modified OSC
+-        // nodes. Way refs pointing to modified base nodes need the fresh
+-        // coords; a narrower list (creates only) would silently propagate
+-        // stale base-PBF coords to the rewritten ways.
+-        //
+-        // A node the diff deletes is not taken from the base either: it is
+-        // absent from the merged output, so an OSC way referencing it has
+-        // an unresolved reference. Fetching its pre-deletion base coords
+-        // would satisfy the missing-node guard with a node that no longer
+-        // exists.
++        ids.sort_unstable_by_key(|&id| osm_id_ordinal(id));
++        ids.dedup();
++
++        let mut requests = Vec::new();
++        let mut coords = Vec::with_capacity(ids.len());
++        let mut seeded = 0;
+         let upserts = diff.upserts(ElementKind::Node);
+         let deleted = diff.deleted(ElementKind::Node);
+         let mut in_upserts = Seek::default();
+         let mut in_deleted = Seek::default();
+-        for &node_id in &all_needed {
+-            if let Some(i) = in_upserts.find(upserts, node_id) {
++        for (ordinal, &id) in ids.iter().enumerate() {
++            let packed = if let Some(i) = in_upserts.find(upserts, id) {
++                // Both creates and modifications supply the new coordinate.
+                 let node = diff.node(i);
+-                locations.insert(node_id, (node.decimicro_lat(), node.decimicro_lon()));
+-            } else if in_deleted.find(deleted, node_id).is_none() {
+-                still_needed.insert(node_id);
++                seeded += 1;
++                coord_pack::pack(node.decimicro_lat(), node.decimicro_lon()).ok_or_else(|| {
++                    Error::internal(format!(
++                        "apply-changes: invalid parsed OSC coordinate for node {id}"
++                    ))
++                })?
++            } else {
++                // A deleted node stays absent even when its base record exists.
++                if in_deleted.find(deleted, id).is_none() {
++                    requests.push(NodeRequest { id, ordinal });
++                }
++                0
++            };
++            coords.push(AtomicU64::new(packed));
++        }
++
++        let mut way_ordinals = Vec::new();
++        let mut way_offsets = Vec::with_capacity(way_count + 1);
++        for i in 0..way_count {
++            way_offsets.push(way_ordinals.len());
++            for id in diff.way(i).refs() {
++                let ordinal = ids
++                    .binary_search_by_key(&osm_id_ordinal(id), |&x| osm_id_ordinal(x))
++                    .map_err(|_| {
++                        Error::internal(format!("apply-changes: no coordinate slot for node {id}"))
++                    })?;
++                way_ordinals.push(ordinal);
++            }
++        }
++        way_offsets.push(way_ordinals.len());
++
++        Ok(Self {
++            requests: Arc::new(BaseRequests { nodes: requests }),
++            ways: Arc::new(WayLocations {
++                coords,
++                way_ordinals,
++                way_offsets,
++            }),
++            seeded,
++        })
++    }
++}
++
++pub(super) struct NodeRequest {
++    pub id: i64,
++    pub ordinal: usize,
++}
++
++/// Canonically sorted by OSM ID, including zero and signed IDs.
++pub(super) struct BaseRequests {
++    nodes: Vec<NodeRequest>,
++}
++
++impl BaseRequests {
++    pub(super) fn len(&self) -> usize {
++        self.nodes.len()
++    }
++
++    /// Indexdata stores numeric bounds, while requests follow canonical
++    /// order: zero, negatives by increasing magnitude, then positives.
++    /// A range spanning zero into the positives needs two slices. The
++    /// first runs from zero through min (only zero when min is zero), and
++    /// the second runs from one through max. Neither contains the more
++    /// negative IDs between the slices.
++    pub(super) fn in_blob(&self, range: Option<(i64, i64)>) -> impl Iterator<Item = &NodeRequest> {
++        let (first, second) = match range {
++            None => (&self.nodes[..], &[][..]),
++            Some((min, max)) if min <= 0 && max > 0 => {
++                (self.in_order(0, min), self.in_order(1, max))
+             }
++            Some((min, max)) => (
++                self.in_order(blob_osm_first_id(min, max), blob_osm_last_id(min, max)),
++                &[][..],
++            ),
++        };
++        first.iter().chain(second)
++    }
++
++    fn in_order(&self, first: i64, last: i64) -> &[NodeRequest] {
++        let start = self.nodes.partition_point(|r| !osm_id_le(first, r.id));
++        let len = self.nodes[start..].partition_point(|r| osm_id_le(r.id, last));
++        &self.nodes[start..start + len]
++    }
++}
++
++/// Shared coordinate slots and the ordinals for each OSC way, in ref order.
++/// Node workers fill slots before sending their drain items. The barrier
++/// publishes the table after those items have been processed. Workers and
++/// the drain then use it to encode OSC ways.
++pub(super) struct WayLocations {
++    coords: Vec<AtomicU64>,
++    way_ordinals: Vec<usize>,
++    way_offsets: Vec<usize>,
++}
++
++impl WayLocations {
++    pub(super) fn len(&self) -> u64 {
++        self.coords.len() as u64
++    }
++
++    pub(super) fn resolved(&self) -> u64 {
++        self.coords
++            .iter()
++            .filter(|slot| slot.load(Ordering::Relaxed) != 0)
++            .count() as u64
++    }
++
++    /// The caller checks the coordinate before packing it. An identical
++    /// duplicate counts once, and conflicting records have no winner.
++    pub(super) fn record_base(&self, request: &NodeRequest, packed: u64) -> Result<()> {
++        match self.coords[request.ordinal].compare_exchange(
++            0,
++            packed,
++            Ordering::Relaxed,
++            Ordering::Relaxed,
++        ) {
++            Ok(_) => Ok(()),
++            Err(prev) if prev == packed => Ok(()),
++            Err(prev) => Err(conflicting_node(request.id, prev, packed)),
++        }
++    }
++
++    pub(super) fn for_way(&self, way: usize, ref_count: usize) -> Result<Vec<(i32, i32)>> {
++        let ordinals = &self.way_ordinals[self.way_offsets[way]..self.way_offsets[way + 1]];
++        if ordinals.len() != ref_count {
++            return Err(Error::internal(
++                "apply-changes: OSC way refs and coordinate slots differ",
++            ));
+         }
++        Ok(ordinals
++            .iter()
++            .map(|&ordinal| {
++                coord_pack::unpack(self.coords[ordinal].load(Ordering::Relaxed)).unwrap_or((0, 0))
++            })
++            .collect())
++    }
++}
++
++#[cold]
++fn conflicting_node(id: i64, previous: u64, incoming: u64) -> Error {
++    let (Some((lat_a, lon_a)), Some((lat_b, lon_b))) =
++        (coord_pack::unpack(previous), coord_pack::unpack(incoming))
++    else {
++        return Error::internal("apply-changes: conflicting coordinate slots must both be present");
++    };
++    Error::invalid_data(format!(
++        "node {id} occurs more than once in the base with different \
++         coordinates (lat {lat_a}, lon {lon_a} and lat {lat_b}, lon {lon_b} in decimicrodegrees). \
++         Refusing to choose one as an inline way location."
++    ))
++}
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used)]
++mod tests {
++    use super::*;
+ 
+-        Self {
+-            locations,
+-            needed_set: still_needed,
+-            total_referenced: all_needed.len() as u64,
++    #[test]
++    fn request_slices_intersect_numeric_ranges_in_canonical_order() {
++        let ids = [0, -1, -3, -4, i64::MIN, 2, 8, i64::MAX];
++        let requests = BaseRequests {
++            nodes: ids
++                .into_iter()
++                .enumerate()
++                .map(|(ordinal, id)| NodeRequest { id, ordinal })
++                .collect(),
++        };
++        for range in [
++            None,
++            Some((-3, 2)),
++            Some((-4, -1)),
++            Some((-2, 0)),
++            Some((i64::MIN, 0)),
++            Some((i64::MIN, i64::MIN)),
++            Some((i64::MIN, i64::MAX)),
++            Some((0, 0)),
++            Some((0, 1)),
++            Some((0, 2)),
++            Some((1, 2)),
++            Some((3, 6)),
++            Some((i64::MAX, i64::MAX)),
++        ] {
++            let expected: Vec<_> = ids
++                .into_iter()
++                .enumerate()
++                .filter(|&(_, id)| range.is_none_or(|(min, max)| (min..=max).contains(&id)))
++                .collect();
++            let actual: Vec<_> = requests.in_blob(range).map(|r| (r.ordinal, r.id)).collect();
++            assert_eq!(actual, expected, "{range:?}");
+         }
+     }
++
++    #[test]
++    fn duplicate_records_do_not_resolve_another_ordinal() {
++        let locations = WayLocations {
++            coords: vec![AtomicU64::new(0), AtomicU64::new(0)],
++            way_ordinals: vec![0, 1, 0],
++            way_offsets: vec![0, 3],
++        };
++        let request = NodeRequest { id: -1, ordinal: 0 };
++        let at_origin = coord_pack::pack(0, 0).unwrap();
++        locations.record_base(&request, at_origin).unwrap();
++        locations.record_base(&request, at_origin).unwrap();
++        assert_eq!(locations.resolved(), 1);
++        assert_eq!(locations.for_way(0, 3).unwrap(), [(0, 0); 3]);
++
++        let conflict = locations.record_base(&request, coord_pack::pack(10, 20).unwrap());
++        assert!(
++            conflict
++                .unwrap_err()
++                .to_string()
++                .contains("different coordinates")
++        );
++        assert_eq!(locations.resolved(), 1);
++        assert_eq!(locations.for_way(0, 3).unwrap(), [(0, 0); 3]);
++    }
+ }
+diff --git a/crates/lib/src/commands/apply_changes/rewrite.rs b/crates/lib/src/commands/apply_changes/rewrite.rs
+index ddeeb38e..8ca16ed0 100644
+--- a/crates/lib/src/commands/apply_changes/rewrite.rs
++++ b/crates/lib/src/commands/apply_changes/rewrite.rs
+@@ -2,9 +2,7 @@
+ //! pipeline, join scanner and workers with the drain, and surface stats.
+ 
+ use std::path::Path;
+-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+-
+-use rustc_hash::FxHashMap;
++use std::sync::{Arc, OnceLock, mpsc};
+ 
+ use crate::write::WriteOptions;
+ 
+@@ -14,15 +12,15 @@ use crate::commands::{HeaderOverrides, writer_from_header_bytes};
+ use crate::read::input::InputSource;
+ 
+ use super::descriptor::{DrainMessage, Route};
+-use super::drain::{self, DrainChannels, DrainConfig, DrainCounters, DrainLocations, LocMapHandle};
++use super::drain::{
++    self, DrainChannels, DrainConfig, DrainCounters, DrainLocations, LocationHandle,
++};
+ use super::failure::FailureSlot;
+ use super::node_locations::NodeLocationIndex;
+ use super::refresh::StaleProbe;
+ use super::scanner::{self, ScannerChannels, ScannerConfig, ScannerLocations};
+ use super::stats::MergeStats;
+-use super::streaming::{
+-    self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters, WorkerLocations,
+-};
++use super::streaming::{self, StreamingChannels, StreamingConfig, WorkerCounters, WorkerLocations};
+ 
+ use super::Result;
+ 
+@@ -176,41 +174,33 @@ struct LocationsSetup {
+     probe: StaleProbe,
+ }
+ 
+-/// Split one run's `--locations-on-ways` resources into the three stages'
+-/// shares. The barrier channel's two ends, the coordinate slots (one per
+-/// worker, the drain holding clones) and the map handle are created here
+-/// together, so no stage can hold part of the mode without the rest. The
+-/// caller moves each share into its stage before any thread starts and keeps
+-/// none of them: the scanner's boundary sender and the drain's barrier sender
+-/// signal by dropping with their stage.
++/// Wire the location table and both ends of the node-to-way barrier.
+ fn wire_locations(
+     setup: LocationsSetup,
+-    worker_count: usize,
+     drain_tx: &super::descriptor::DrainTx,
++    #[cfg(test)] decode_all_nodes: bool,
+ ) -> (ScannerLocations, WorkerLocations, DrainLocations) {
+     let LocationsSetup { mode, index, probe } = setup;
+     let (barrier_tx, barrier_rx) = mpsc::sync_channel::<()>(1);
+-    let coord_slots: CoordSlots = (0..worker_count)
+-        .map(|_| Arc::new(Mutex::new(FxHashMap::default())))
+-        .collect();
+-    let loc_map: LocMapHandle = Arc::new(OnceLock::new());
++    let published: LocationHandle = Arc::new(OnceLock::new());
+     let scanner = ScannerLocations {
++        requests: Arc::clone(&index.requests),
++        #[cfg(test)]
++        decode_all_nodes,
+         refresh_ways: probe.has_upserts(),
+         barrier_rx,
+         boundary_tx: Arc::clone(drain_tx),
+     };
+     let drain = DrainLocations {
+-        coord_slots: coord_slots.iter().map(Arc::clone).collect(),
+-        seeded: index.locations,
++        slots: Arc::clone(&index.ways),
+         barrier_tx,
+-        loc_map_out: Arc::clone(&loc_map),
+-        nodes_needed: index.total_referenced,
++        published: Arc::clone(&published),
+         ignore_missing_nodes: mode.ignore_missing_nodes,
+     };
+     let workers = WorkerLocations {
+-        coord_slots,
+-        loc_map,
+-        needed: Arc::new(index.needed_set),
++        requests: index.requests,
++        slots: index.ways,
++        published,
+         probe: Arc::new(probe),
+     };
+     (scanner, workers, drain)
+@@ -227,10 +217,9 @@ fn wire_locations(
+ /// and writes the output PBF, coalescing contiguous `copy_file_range`
+ /// runs.
+ ///
+-/// Under `--locations-on-ways`, workers extract node coords during the
+-/// node phase into per-worker `Arc<Mutex<FxHashMap>>` slots; the drain
+-/// merges them at the node→way barrier and publishes the
+-/// `Arc<FxHashMap>` for way-phase workers via `LocMapHandle`.
++/// Under `--locations-on-ways`, workers fill the coordinate slots that
++/// OSC ways need. The drain publishes the completed table for way-phase
++/// workers at the node-to-way barrier.
+ ///
+ /// # Errors
+ ///
+@@ -263,19 +252,40 @@ pub fn merge<'a>(
+ }
+ 
+ /// [`merge`] writing to a borrowed output it does not publish.
++#[cfg_attr(feature = "hotpath", hotpath::measure)]
++pub(crate) fn merge_to<'a>(
++    base_pbf: impl Into<InputSource<'a>>,
++    osc_file: &Path,
++    output_pbf: &crate::output::BoundOutput,
++    opts: &MergeOptions,
++    overrides: &HeaderOverrides,
++    host: &crate::host::Entered<'_>,
++) -> Result<MergeStats> {
++    merge_to_inner(
++        base_pbf,
++        osc_file,
++        output_pbf,
++        opts,
++        overrides,
++        host,
++        #[cfg(test)]
++        false,
++    )
++}
++
+ #[allow(
+     clippy::too_many_lines,
+     clippy::cognitive_complexity,
+     clippy::cast_precision_loss
+ )]
+-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+-pub(crate) fn merge_to<'a>(
++fn merge_to_inner<'a>(
+     base_pbf: impl Into<InputSource<'a>>,
+     osc_file: &Path,
+     output_pbf: &crate::output::BoundOutput,
+     opts: &MergeOptions,
+     overrides: &HeaderOverrides,
+     host: &crate::host::Entered<'_>,
++    #[cfg(test)] decode_all_nodes: bool,
+ ) -> Result<MergeStats> {
+     // Option refusals first: none of them needs the input.
+     opts.validate()?;
+@@ -314,7 +324,7 @@ pub(crate) fn merge_to<'a>(
+     // `validate` refused `force` with `locations_on_ways`: under force the
+     // scanner tags every unindexed blob as a placeholder `Node` (its real
+     // kind is not known until decompress), which defeats the node-to-way
+-    // barrier that gates the worker pool until the node-coord loc_map is
++    // barrier that gates the worker pool until the coordinate table is
+     // published. So with `-l` an unindexed base is always refused here.
+     //
+     // The base is read through several open file descriptions (the front
+@@ -417,19 +427,11 @@ pub(crate) fn merge_to<'a>(
+     host.invocation
+         .counter("merge_diff_arena_len_bytes", diff.arena_len_bytes());
+ 
+-    // --locations-on-ways setup. The descriptor-first pipeline fuses
+-    // prefill into the worker pool, so we no longer call
+-    // `prefill_from_base` here. Build_from_diff still produces the
+-    // OSC-pre-seeded coords (`locations`) and the still-needed-from-base
+-    // ID set (`needed_set`).
+-    let loc_setup = locations.map(|mode| {
+-        let index = NodeLocationIndex::build_from_diff(&diff);
+-        // Counted separately from the two maps: a referenced node the diff
+-        // deletes is in neither, and must still count as needed so that it
+-        // shows up as missing.
+-        let total_needed = index.total_referenced;
+-        let seeded = index.locations.len();
+-        let still_needed = index.needed_set.len();
++    let loc_setup = if let Some(mode) = locations {
++        let index = NodeLocationIndex::build_from_diff(&diff)?;
++        let total_needed = index.ways.len();
++        let seeded = index.seeded;
++        let still_needed = index.requests.len();
+         crate::host::diag!(
+             host.diagnostics,
+             Progress,
+@@ -438,8 +440,7 @@ pub(crate) fn merge_to<'a>(
+         );
+         // The refresh probe for surviving base ways (`refresh.rs`): every
+         // node the OSC upserts or deletes, a filter over the diff's sorted
+-        // node lists, kept apart from the coordinate map published at the
+-        // barrier, whose size `loc_missing` is computed from.
++        // node lists, independent of the slots for changed ways.
+         let probe = StaleProbe::from_diff(&diff);
+         let probe_bytes = probe.heap_bytes();
+         host.invocation
+@@ -452,19 +453,13 @@ pub(crate) fn merge_to<'a>(
+             "apply_changes.refresh_probe",
+             "  inline location refresh probe: {probe_mb:.1} MB"
+         );
+-        LocationsSetup {
+-            mode,
+-            index,
+-            probe,
+-        }
+-    });
+-    let loc_stats_pre = loc_setup.as_ref().map_or((0, 0, 0), |s| {
+-        (
+-            s.index.total_referenced,
+-            s.index.locations.len() as u64,
+-            s.index.needed_set.len() as u64,
+-        )
+-    });
++        Some(LocationsSetup { mode, index, probe })
++    } else {
++        None
++    };
++    let loc_stats_pre = loc_setup
++        .as_ref()
++        .map_or((0, 0), |s| (s.index.ways.len(), s.index.seeded));
+ 
+     let writer_setup_start = crate::counters::Stopwatch::start();
+     // Apply-changes' output pass is writer-bound at default compression, so
+@@ -526,7 +521,7 @@ pub(crate) fn merge_to<'a>(
+     // A failed worker's pool leaves its
+     // scope and drops the candidate receiver, releasing a scanner blocked in
+     // send. Barrier progress rests on the scanner's boundary message, the
+-    // drain's barrier check after each receive, and workers flushing coord
++    // drain's barrier check after each receive, and workers filling coordinate
+     // slots before sending node outputs, none of which needs a second
+     // worker. `crates/lib/tests/fault_apply_changes.rs` runs a late boundary, empty,
+     // node-only and way-only inputs, and failures while dispatch or the
+@@ -573,7 +568,12 @@ pub(crate) fn merge_to<'a>(
+     // the stage configs below, so nothing here keeps a channel end alive.
+     let (scanner_locations, worker_locations, drain_locations) = match loc_setup {
+         Some(setup) => {
+-            let (scanner, workers, drain) = wire_locations(setup, worker_count, &drain_tx);
++            let (scanner, workers, drain) = wire_locations(
++                setup,
++                &drain_tx,
++                #[cfg(test)]
++                decode_all_nodes,
++            );
+             (Some(scanner), Some(workers), Some(drain))
+         }
+         None => (None, None, None),
+@@ -710,14 +710,7 @@ pub(crate) fn merge_to<'a>(
+     if locations_on_ways {
+         final_stats.loc_nodes_needed = loc_stats_pre.0;
+         final_stats.loc_nodes_from_diff = loc_stats_pre.1;
+-        // Resolution is counted from the merged map's UNIQUE KEYS, never
+-        // from the worker tuple counter. `coord_pairs_extracted` increments
+-        // once per extracted tuple, including when `local_coords.insert`
+-        // replaces an id already seen - so a base PBF carrying two records
+-        // for one required node would inflate the count and let it cover a
+-        // genuinely absent id, silently reinstating the (0,0) fallback that
+-        // the drain's barrier refusal exists to refuse. Reaching here with a
+-        // nonzero `loc_missing` means `ignore_missing_nodes` let it through.
++        // Each filled slot counts once even if several records supplied it.
+         let resolved = drain_counters
+             .barrier_loc_map_size
+             .load(std::sync::atomic::Ordering::Relaxed);
+@@ -811,6 +804,227 @@ pub(crate) fn merge_to<'a>(
+ #[allow(clippy::unwrap_used)]
+ mod tests {
+     use super::*;
++    use crate::block_builder::{BlockBuilder, HeaderBuilder};
++    use crate::read::block::Feature;
++    use crate::writer::{Compression, PbfWriter};
++
++    fn nodes(ids: &[i64]) -> Vec<u8> {
++        let mut bb = BlockBuilder::new();
++        for &id in ids {
++            let (lat, lon) = coord(id);
++            bb.add_node(id, lat, lon, std::iter::empty(), None);
++        }
++        bb.take().unwrap().unwrap().to_vec()
++    }
++
++    fn coord(id: i64) -> (i32, i32) {
++        let lat = i32::try_from(id).unwrap() * 10;
++        (lat, -lat)
++    }
++
++    fn write_base(path: &Path, node_blobs: &[Vec<u8>], indexed: bool) {
++        let mut writer = PbfWriter::new(std::fs::File::create(path).unwrap(), Compression::None);
++        let header = HeaderBuilder::new()
++            .sorted()
++            .optional_feature(Feature::LOCATIONS_ON_WAYS)
++            .build()
++            .unwrap();
++        writer.write_header(&header).unwrap();
++        let mut bb = BlockBuilder::new();
++        bb.add_way_with_locations(10, std::iter::empty(), &[1, 2], &[coord(1), coord(2)], None);
++        let way_blob = bb.take().unwrap().unwrap();
++        for bytes in node_blobs
++            .iter()
++            .map(Vec::as_slice)
++            .chain(std::iter::once(way_blob))
++        {
++            if indexed {
++                writer.write_primitive_block(bytes).unwrap();
++            } else {
++                writer.write_primitive_block_no_indexdata(bytes).unwrap();
++            }
++        }
++        writer.flush().unwrap();
++    }
++
++    fn write_osc(path: &Path, body: &str) {
++        std::fs::write(
++            path,
++            format!("<osmChange version=\"0.6\">{body}</osmChange>"),
++        )
++        .unwrap();
++    }
++
++    fn way(id: i64, refs: &[i64]) -> String {
++        use std::fmt::Write;
++        let mut xml = format!("<way id=\"{id}\" version=\"2\">");
++        for node in refs {
++            write!(xml, "<nd ref=\"{node}\"/>").unwrap();
++        }
++        xml.push_str("</way>");
++        xml
++    }
++
++    fn test_options(locations: bool) -> MergeOptions {
++        MergeOptions {
++            write: WriteOptions {
++                compression: Compression::None,
++                ..WriteOptions::default()
++            },
++            locations_on_ways: locations.then(LocationsOnWays::default),
++            parallelism: crate::host::Parallelism::from_jobs(2),
++            ..MergeOptions::default()
++        }
++    }
++
++    fn apply_fixture(
++        base: &Path,
++        osc: &Path,
++        dest: &Path,
++        opts: &MergeOptions,
++        eager: bool,
++    ) -> Result<MergeStats> {
++        let host = crate::host::Host::for_tests();
++        let output = crate::output::Output::new(
++            dest,
++            crate::output::Overwrite::Replace,
++            &crate::host::Diagnostics::discard(),
++        )?;
++        let overrides = HeaderOverrides::default();
++        if !eager {
++            return merge(base, osc, output, opts, &overrides, &host);
++        }
++        let host = host.entered();
++        let output = crate::output::bind_unissued(output, &host.invocation)?;
++        let stats = merge_to_inner(base, osc, &output, opts, &overrides, &host, true)?;
++        output.publish()?;
++        Ok(stats)
++    }
++
++    fn read_way_coords(path: &Path, id: i64) -> Vec<(i32, i32)> {
++        let mut coords = None;
++        crate::ElementReader::open_in(path, false, &crate::host::Host::for_tests().entered())
++            .unwrap()
++            .for_each(|element| {
++                if let crate::Element::Way(way) = element
++                    && way.id() == id
++                {
++                    coords = Some(
++                        way.node_locations()
++                            .map(|loc| (loc.decimicro_lat().unwrap(), loc.decimicro_lon().unwrap()))
++                            .collect(),
++                    );
++                }
++            })
++            .unwrap();
++        coords.unwrap()
++    }
++
++    #[test]
++    fn location_requests_keep_eager_output_bytes() {
++        let dir = crate::path_guard::tests::scratch();
++        let base = dir.path().join("base.pbf");
++        let osc = dir.path().join("diff.osc");
++        let eager = dir.path().join("eager.pbf");
++        let output = dir.path().join("output.pbf");
++        write_base(
++            &base,
++            &[
++                nodes(&[-1, -2]),
++                nodes(&[-3, 1, 2]),
++                nodes(&[3, 4]),
++                nodes(&[5, 6]),
++            ],
++            true,
++        );
++
++        let opts = test_options(true);
++        for (name, refs, distinct, scanned) in [
++            ("concentrated", &[4, 3, 4][..], 2, 1),
++            ("spread", &[6, 3, 1, -2], 4, 4),
++            ("none", &[], 0, 0),
++            ("negative", &[-3, -1, -3], 2, 2),
++        ] {
++            let body = format!(
++                "<modify>{}</modify><create>{}</create>",
++                way(10, refs),
++                way(20, refs)
++            );
++            write_osc(&osc, &body);
++            let reference = apply_fixture(&base, &osc, &eager, &opts, true).unwrap();
++            let routed = apply_fixture(&base, &osc, &output, &opts, false).unwrap();
++            assert_eq!(reference.loc_node_blobs_scanned, 4, "{name}");
++            assert_eq!(routed.loc_node_blobs_scanned, scanned, "{name}");
++            assert_eq!(routed.loc_nodes_from_base, distinct, "{name}");
++            assert_eq!(routed.loc_missing, 0, "{name}");
++            assert_eq!(
++                std::fs::read(&output).unwrap(),
++                std::fs::read(&eager).unwrap(),
++                "{name}"
++            );
++            let expected: Vec<_> = refs.iter().copied().map(coord).collect();
++            assert_eq!(read_way_coords(&output, 10), expected, "{name}");
++            assert_eq!(read_way_coords(&output, 20), expected, "{name}");
++        }
++    }
++
++    #[test]
++    fn node_changes_route_even_without_base_coordinate_requests() {
++        let dir = crate::path_guard::tests::scratch();
++        let base = dir.path().join("base.pbf");
++        let osc = dir.path().join("diff.osc");
++        let eager = dir.path().join("eager.pbf");
++        let output = dir.path().join("output.pbf");
++        write_base(
++            &base,
++            &[nodes(&[1, 2]), nodes(&[3, 5]), nodes(&[6]), nodes(&[7])],
++            true,
++        );
++        write_osc(
++            &osc,
++            "<modify><node id=\"2\" version=\"2\" lat=\"0\" lon=\"0\"/></modify>\
++             <create><node id=\"4\" version=\"1\" lat=\"1\" lon=\"2\"/></create>\
++             <delete><node id=\"6\" version=\"2\"/></delete>",
++        );
++
++        let opts = test_options(true);
++        apply_fixture(&base, &osc, &eager, &opts, true).unwrap();
++        let stats = apply_fixture(&base, &osc, &output, &opts, false).unwrap();
++        assert_eq!(stats.loc_node_blobs_scanned, 3);
++        assert_eq!((stats.diff_nodes, stats.deleted), (2, 1));
++        assert_eq!(read_way_coords(&output, 10), [coord(1), (0, 0)]);
++        assert_eq!(
++            std::fs::read(&output).unwrap(),
++            std::fs::read(&eager).unwrap()
++        );
++    }
++
++    #[test]
++    fn unindexed_node_blobs_still_use_the_decode_fallback() {
++        let dir = crate::path_guard::tests::scratch();
++        let indexed = dir.path().join("indexed.pbf");
++        let raw = dir.path().join("raw.pbf");
++        let osc = dir.path().join("diff.osc");
++        let reference = dir.path().join("reference.pbf");
++        let output = dir.path().join("output.pbf");
++        let blobs = [nodes(&[1, 2]), nodes(&[3, 4])];
++        write_base(&indexed, &blobs, true);
++        write_base(&raw, &blobs, false);
++        write_osc(&osc, "<delete><node id=\"4\" version=\"2\"/></delete>");
++
++        let mut opts = test_options(false);
++        apply_fixture(&indexed, &osc, &reference, &opts, false).unwrap();
++        opts.write.force = true;
++        let stats = apply_fixture(&raw, &osc, &output, &opts, false).unwrap();
++        assert_eq!(stats.blobs_index_hit, 0);
++        assert_eq!(
++            std::fs::read(&output).unwrap(),
++            std::fs::read(&reference).unwrap()
++        );
++
++        let refused = apply_fixture(&raw, &osc, &output, &test_options(true), false);
++        crate::test_support::assert_err_kind!(refused, crate::ErrorKind::MissingIndexdata { .. });
++    }
+ 
+     #[test]
+     fn merge_refuses_output_equal_to_base_before_reading_inputs() {
+diff --git a/crates/lib/src/commands/apply_changes/rewrite_block.rs b/crates/lib/src/commands/apply_changes/rewrite_block.rs
+index 1b262ada..81fdd14c 100644
+--- a/crates/lib/src/commands/apply_changes/rewrite_block.rs
++++ b/crates/lib/src/commands/apply_changes/rewrite_block.rs
+@@ -241,7 +241,7 @@ fn write_osc_local<O: BlockSink + ?Sized>(
+             stats.diff_nodes += 1;
+         }
+         ElementKind::Way => {
+-            write_osc_way_local(bb, output, &diff.way(i), loc)?;
++            write_osc_way_local(bb, output, &diff.way(i), i, loc)?;
+             stats.diff_ways += 1;
+         }
+         ElementKind::Relation => {
+diff --git a/crates/lib/src/commands/apply_changes/scanner.rs b/crates/lib/src/commands/apply_changes/scanner.rs
+index 80e28096..dce2f2ab 100644
+--- a/crates/lib/src/commands/apply_changes/scanner.rs
++++ b/crates/lib/src/commands/apply_changes/scanner.rs
+@@ -17,26 +17,25 @@
+ //!
+ //! Workers extract coords from node blobs opportunistically during the
+ //! node phase. At the first way or relation descriptor the scanner sends
+-//! the drain its node boundary and blocks until the drain has merged the
+-//! per-worker coord maps into `Arc<loc_map>`, published it and signalled
+-//! back over the barrier channel; it then dispatches that descriptor and
+-//! every later one as it walks, so way work starts at publication and
+-//! nothing is buffered. A drain that closes the channel instead (it refused
++//! the drain its node boundary and blocks until the drain has published the
++//! coordinate table and signalled back over the barrier channel. It then
++//! dispatches that descriptor and every later one as it walks, so way work
++//! starts at publication and nothing is buffered. A drain that closes the channel instead (it refused
+ //! the run at the barrier, or failed) ends the walk there. Barrier
+ //! ownership is **scanner-side** (not drain-side) so that no way descriptor
+ //! reaches a worker before every node blob before it has been processed and
+-//! its coordinates merged into the published map. (A worker may still be
++//! its coordinates recorded in the published table. (A worker may still be
+ //! returning from sending its last node item, and a late node, below, can
+-//! run beside way workers; neither adds to the map.)
++//! run beside way workers. Both leave the table as published.)
+ //!
+ //! A node descriptor walked after the boundary (a base whose header claims
+ //! sorted order but has a node blob after a way) is only ever walked after
+-//! publication, so it never contributes to the map: either the drain's
++//! publication, so it never contributes coordinates. Either the drain's
+ //! missing-node refusal has already failed the run at the barrier, or the
+ //! drain's output-order guard refuses the node when it reaches it, since
+ //! its seq follows the way or relation item that triggered the boundary.
+ 
+-use std::sync::mpsc;
++use std::sync::{Arc, mpsc};
+ 
+ use crate::ElementKind;
+ use crate::blob::BlobKind;
+@@ -45,6 +44,7 @@ use crate::read::header_walker::{HeaderWalker, Positional};
+ use crate::read::input::PinnedInput;
+ 
+ use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
++use super::node_locations::BaseRequests;
+ use super::window::WindowAdmit;
+ use crate::osc::sorted::SortedDiff;
+ 
+@@ -69,24 +69,45 @@ pub(super) struct ScannerChannels {
+ /// drain's shares by `rewrite::wire_locations`, so either all of it is there
+ /// or the mode is off.
+ pub(super) struct ScannerLocations {
++    /// The IDs of nodes whose base coordinate an OSC way needs.
++    pub requests: Arc<BaseRequests>,
++    /// Test oracle: route every node through decoding, as before.
++    #[cfg(test)]
++    pub decode_all_nodes: bool,
+     /// The OSC creates or modifies a node, so any way may hold a stale
+     /// inline coordinate: every indexed way blob goes to the workers to be
+     /// searched (`refresh.rs`), not only those whose range meets the diff.
+     pub refresh_ways: bool,
+     /// Drain → scanner signal. The drain sends one unit value after it has
+-    /// processed the last node blob and published the merged `Arc<loc_map>`,
++    /// processed the last node blob and published the coordinate table,
+     /// and keeps its sender until it returns, so a closed channel means the
+     /// drain has failed.
+     pub barrier_rx: mpsc::Receiver<()>,
+     /// The scanner's own sender on the drain channel, for its one
+     /// [`DrainMessage::NodeBoundary`], on both routes. Sent at the first
+-    /// non-node descriptor or at EOF, so the drain knows when to merge
+-    /// `CoordSlots` and publish `Arc<loc_map>` without needing a way item to
++    /// non-node descriptor or at EOF, so the drain knows when to
++    /// publish the coordinate table without needing a way item to
+     /// trigger the transition. Owned by the scanner and dropped with it, so
+     /// it never keeps the drain channel open past the scanner's exit.
+     pub boundary_tx: super::descriptor::DrainTx,
+ }
+ 
++impl ScannerLocations {
++    fn needs_blob(&self, kind: ElementKind, range: Option<(i64, i64)>) -> bool {
++        match kind {
++            ElementKind::Node => {
++                #[cfg(test)]
++                if self.decode_all_nodes {
++                    return true;
++                }
++                self.requests.in_blob(range).next().is_some()
++            }
++            ElementKind::Way => self.refresh_ways,
++            ElementKind::Relation => false,
++        }
++    }
++}
++
+ /// Scanner configuration + I/O channels.
+ pub(super) struct ScannerConfig<'a> {
+     /// The run's pinned base; the walker opens its own description of it.
+@@ -101,7 +122,7 @@ pub(super) struct ScannerConfig<'a> {
+     pub diff: &'a SortedDiff,
+     /// `Some` under `--locations-on-ways`, which enables the node→way
+     /// barrier: at the first way or relation descriptor the scanner sends its
+-    /// node boundary, waits for the drain's signal that `Arc<loc_map>` is
++    /// node boundary, waits for the drain's signal that the table is
+     /// published, then dispatches it and every later descriptor.
+     pub locations: Option<ScannerLocations>,
+     pub channels: ScannerChannels,
+@@ -153,7 +174,6 @@ fn scan<P: Positional>(
+         channels,
+         mut window,
+     } = cfg;
+-    let refresh_ways = locations.as_ref().is_some_and(|l| l.refresh_ways);
+     // The fast-path sender, present exactly on the splice route. Borrowed by
+     // each `ScannerEmit::Drain` so an item can only be built where there is a
+     // drain channel to send it on.
+@@ -237,81 +257,24 @@ fn scan<P: Positional>(
+             index: meta.index,
+         };
+ 
+-        // Routing decision: fast-path only available when we have
+-        // indexdata AND the range doesn't overlap the diff. Otherwise
+-        // slow-path. Under `--direct-io`, the splice fast-path is
+-        // unavailable and passthroughs are routed through workers.
+-        //
+-        // Under `--locations-on-ways`, Node blobs CANNOT take the
+-        // splice fast-path: workers must decompress them to extract
+-        // coord tuples for the barrier merge, even when the blob
+-        // doesn't overlap the diff. Relation blobs are still eligible for
+-        // the splice fast-path under LOW, and way blobs are when the OSC
+-        // changes no node (see the last paragraph).
+-        //
+-        // "Node" here is an indexdata claim, not an observed payload kind.
+-        // A node blob mislabelled Way/Relation can bypass extraction (via
+-        // CopyRange or owned passthrough) and is placed after the coordinate
+-        // barrier. Pending location mode only guards rewritten ways; it
+-        // cannot validate these routes. Checking just candidate workers
+-        // would leave both passthrough routes unchecked. Rejecting dishonest
+-        // kinds requires payload verification before scanner routing and
+-        // barrier placement, including non-overlapping way/relation claims.
+-        // Keep that a deliberate indexdata trust-policy change: the measured
+-        // descriptor-first path avoids reading/decompressing those bodies,
+-        // and kind verification alone would still trust forged ID ranges.
+-        //
+-        // The range is believed the same way: an indexed blob whose claimed
+-        // range misses the diff is spliced unchanged, so an understated
+-        // range carries the blob past a modify or delete aimed at one of its
+-        // elements. Claims are believed, not verified, and a file whose
+-        // claims lie is outside the contract (reference/indexdata-trust.md);
+-        // `check --index` is the verifier.
+-        //
+-        // Under `--locations-on-ways` with node creates or modifies in the OSC, way blobs
+-        // cannot be spliced unseen either: a moved node makes stale every way
+-        // using it, and the OSC need not touch the way. Workers decompress
+-        // each one and pass it through unchanged unless a way in it is stale
+-        // (`refresh.rs`). Like the node rule, this rests on the kind claim; a
+-        // way blob labelled otherwise is not searched.
+-        let low_must_decompress = (locations.is_some() && matches!(kind, ElementKind::Node))
+-            || (refresh_ways && matches!(kind, ElementKind::Way));
+-        let item = if let Some(drain_tx) = splice_tx
+-            && has_indexdata
+-            && !low_must_decompress
+-            && !diff.range_overlaps(
+-                kind,
+-                id_range.map_or(0, |r| r.0),
+-                id_range.map_or(0, |r| r.1),
+-            ) {
+-            // Convert directly to a DrainItem for the splice channel.
+-            // `into_drain_copy_range` requires indexdata, which we just
+-            // verified.
+-            ScannerEmit::Drain(
++        // Indexdata is trusted for passthrough, including node kind and
++        // range (reference/indexdata-trust.md). A skipped node payload is
++        // copied unchanged, so its framing, coordinates and order within
++        // the blob are only checked if a worker has reason to open it.
++        let passthrough = has_indexdata
++            && !locations
++                .as_ref()
++                .is_some_and(|loc| loc.needs_blob(kind, id_range))
++            && id_range.is_some_and(|(min, max)| !diff.range_overlaps(kind, min, max));
++        let item = match (passthrough, splice_tx) {
++            (true, Some(drain_tx)) => ScannerEmit::Drain(
+                 drain_tx,
+                 descriptor.into_drain_copy_range().ok_or_else(|| {
+-                    crate::Error::internal(
+-                        "scanner: fast-path descriptor missing indexdata - \
+-                         should be unreachable",
+-                    )
++                    crate::Error::internal("scanner: fast-path descriptor missing indexdata")
+                 })?,
+-            )
+-        } else if !low_must_decompress
+-            && has_indexdata
+-            && !diff.range_overlaps(
+-                kind,
+-                id_range.map_or(0, |r| r.0),
+-                id_range.map_or(0, |r| r.1),
+-            )
+-        {
+-            // No-overlap indexed blob under --direct-io: route through
+-            // the worker pool so a worker can pread the full frame and
+-            // emit `DrainItem::OwnedBytes`. Skipped for Node blobs under
+-            // LOW, and way blobs under a refresh - those route as
+-            // `Candidate` below so workers decompress them.
+-            ScannerEmit::Candidate(ScannedBlob::Passthrough(descriptor))
+-        } else {
+-            ScannerEmit::Candidate(ScannedBlob::Candidate(descriptor))
++            ),
++            (true, None) => ScannerEmit::Candidate(ScannedBlob::Passthrough(descriptor)),
++            (false, _) => ScannerEmit::Candidate(ScannedBlob::Candidate(descriptor)),
+         };
+ 
+         // Track the largest descriptor estimate, not channel occupancy.
+@@ -319,8 +282,8 @@ fn scan<P: Positional>(
+ 
+         // Node→way barrier. Under --locations-on-ways, the first way or
+         // relation descriptor sends the drain its node boundary (how many
+-        // node outputs to expect before it merges CoordSlots) and waits for
+-        // the signal that loc_map is published; it and every later
++        // node outputs to expect before it publishes the coordinate table)
++        // and waits for the publication signal; it and every later
+         // descriptor are then dispatched directly. Every node descriptor
+         // before it is already dispatched, which is all the drain needs to
+         // reach the barrier.
+@@ -393,7 +356,7 @@ fn scan<P: Positional>(
+ 
+     // End of input. If --locations-on-ways and we never sent the node
+     // boundary (i.e., the file had no Way/Relation blobs at all), send it
+-    // now and wait for the signal, so the drain publishes `loc_map` for the
++    // now and wait for the signal, so the drain publishes the table for the
+     // trailing-creates path before the scanner exits.
+     //
+     // The boundary travels on the drain channel, so the drain sees it even
+@@ -508,14 +471,14 @@ fn poll_barrier(
+             Err(crate::Error::internal(if signalled {
+                 "drain stopped after the node-to-way barrier"
+             } else {
+-                "drain closed barrier channel before signalling loc_map ready"
++                "drain closed barrier channel before signalling the coordinate table is ready"
+             }))
+         }
+     }
+ }
+ 
+-/// Block until the drain signals that `loc_map` is published, after the
+-/// node boundary has been sent: at the first way or relation descriptor, or
++/// Wait for the drain to publish the coordinate table after the node
++/// boundary has been sent at the first way or relation descriptor, or
+ /// at end of input (`at_eof`) when there is none. A closed channel means the
+ /// drain has returned an error (the missing-node refusal at the barrier, a
+ /// producer failure, a cancellation), so the walk stops with an error of
+@@ -537,7 +500,7 @@ fn wait_for_barrier(
+                 .store(true, std::sync::atomic::Ordering::SeqCst);
+         }
+         return Err(crate::Error::internal(
+-            "drain closed barrier channel before signalling loc_map ready",
++            "drain closed barrier channel before signalling the coordinate table is ready",
+         ));
+     }
+     host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_END");
+diff --git a/crates/lib/src/commands/apply_changes/stats.rs b/crates/lib/src/commands/apply_changes/stats.rs
+index a65ecc4b..9d9b28a9 100644
+--- a/crates/lib/src/commands/apply_changes/stats.rs
++++ b/crates/lib/src/commands/apply_changes/stats.rs
+@@ -71,8 +71,8 @@ pub struct MergeStats {
+     /// deletes. Non-zero fails the merge unless `--ignore-missing-nodes`
+     /// asked for the (0,0) fallback.
+     pub loc_missing: u64,
+-    /// Base node blobs decompressed for coordinate extraction (every node
+-    /// blob, whether it was then passed through or rewritten).
++    /// Base node blobs checked for coordinates after routing on a request
++    /// or node change.
+     pub loc_node_blobs_scanned: u64,
+     /// Way blobs with no merge work of their own, searched for surviving
+     /// base ways whose inline coordinates the OSC makes stale. Most were
+diff --git a/crates/lib/src/commands/apply_changes/stream_output.rs b/crates/lib/src/commands/apply_changes/stream_output.rs
+index 869261a9..2c12daea 100644
+--- a/crates/lib/src/commands/apply_changes/stream_output.rs
++++ b/crates/lib/src/commands/apply_changes/stream_output.rs
+@@ -312,18 +312,11 @@ fn encode_and_frame(
+             ElementKind::Node => add_osc_node(bb, &diff.node(i)),
+             ElementKind::Way => {
+                 let osc = diff.way(i);
+-                // Fails only on `LocMode::Pending`, a way reaching the
+-                // writer before the coordinate map was published: a routing
+-                // invariant, not an input condition. A way create whose node
+-                // is missing never gets here failing: the drain refuses
+-                // missing nodes at the node-to-way barrier, before any way
+-                // create run, unless `--ignore-missing-nodes` asked for the
+-                // `(0, 0)` fallback `add_osc_way` gives. The block failure
+-                // input can reach in a create run is the frame's size
+-                // refusal below (a block over the PBF blob limit), which
+-                // `write_run` answers by cutting the block smaller.
++                // The barrier has enforced the missing-node policy. From
++                // here the OSC way uses its prepared ref ordinals, and the
++                // block-size retry below can split the run as before.
+                 let locs = loc.for_way(osc.id())?;
+-                add_osc_way(bb, &osc, locs);
++                add_osc_way(bb, &osc, i, locs)?;
+             }
+             ElementKind::Relation => add_osc_relation(bb, &diff.relation(i)),
+         }
+diff --git a/crates/lib/src/commands/apply_changes/streaming.rs b/crates/lib/src/commands/apply_changes/streaming.rs
+index bbd59e1b..02d56c59 100644
+--- a/crates/lib/src/commands/apply_changes/streaming.rs
++++ b/crates/lib/src/commands/apply_changes/streaming.rs
+@@ -5,9 +5,8 @@
+ //! [`DrainItem`]s to the drain over `drain_tx`. Each worker owns a
+ //! thread-local [`BlockBuilder`] (a `WorkerBuilder`, kept for the run),
+ //! decompress and parse scratch buffers,
+-//! and (under `--locations-on-ways`) a private `FxHashMap` accumulator
+-//! published into a per-worker `Arc<Mutex<_>>` slot for the drain to
+-//! merge at the node→way barrier.
++//! and, under `--locations-on-ways`, fills shared coordinate slots before
++//! sending each node item to the drain.
+ //!
+ //! ## Per-blob worker logic
+ //!
+@@ -60,8 +59,6 @@ use std::path::Path;
+ use std::sync::atomic::Ordering;
+ use std::sync::{Arc, Mutex, mpsc};
+ 
+-use rustc_hash::{FxHashMap, FxHashSet};
+-
+ use crate::ElementKind;
+ use crate::blob::decompress_blob_raw;
+ use crate::block_builder::BlockBuilder;
+@@ -73,43 +70,26 @@ use super::classify::{blob_walk, block_overlaps_diff};
+ use super::descriptor::{
+     BlobDescriptor, DrainItem, DrainMessage, RewrittenFrames, Route, ScannedBlob,
+ };
+-use super::drain::LocMapHandle;
++use super::drain::LocationHandle;
+ use super::element_writes::RefreshScratch;
+ use super::failure::FailureSlot;
+ use super::loc_mode::LocMode;
+ use super::node_coords::extract_node_coords;
++use super::node_locations::{BaseRequests, WayLocations};
+ use super::overflow::{StreamSlot, StreamTx};
+ use super::refresh::{StaleProbe, detect_stale_block, detect_stale_wire};
+ use super::rewrite_block::rewrite_block_parallel;
+ 
+ use crate::osc::sorted::SortedDiff;
+ 
+-/// One worker's shared coord accumulator. Workers hold their own; the
+-/// drain holds clones of every slot.
+-pub(super) type CoordSlot = Arc<Mutex<FxHashMap<i64, (i32, i32)>>>;
+-
+-/// Per-worker shared coord accumulator slots. The drain holds clones of
+-/// every slot; each worker writes only into its own. At the node→way
+-/// barrier the drain acquires every mutex, takes each map whole, merges into
+-/// `Arc<loc_map>`, and signals the scanner.
+-pub(super) type CoordSlots = Vec<CoordSlot>;
+-
+ /// The worker pool's share of `--locations-on-ways`. Built with the
+ /// scanner's and the drain's shares by `rewrite::wire_locations`, so either
+ /// all of it is there or the mode is off.
+ pub(super) struct WorkerLocations {
+-    /// One slot per worker, sized to the pool's `worker_count`. Each worker
+-    /// writes into `coord_slots[worker_id]`; the drain holds clones of every
+-    /// slot and merges them at the node→way barrier.
+-    pub coord_slots: CoordSlots,
+-    /// Drain → workers post-barrier `loc_map`. Workers reading way/relation
+-    /// blobs check `get()` on this; the scanner barrier protocol guarantees
+-    /// the lock is set before any way descriptor is dispatched.
+-    pub loc_map: LocMapHandle,
+-    /// Node IDs the workers extract coordinates for: `extract_node_coords`
+-    /// output is filtered against it so a worker's map does not grow with
+-    /// every coordinate in the file.
+-    pub needed: Arc<FxHashSet<i64>>,
++    pub requests: Arc<BaseRequests>,
++    pub slots: Arc<WayLocations>,
++    /// Set by the drain once the node phase is complete.
++    pub published: LocationHandle,
+     /// The OSC's node upserts and deletes, for refreshing surviving base
+     /// ways' inline coordinates (`refresh.rs`). Empty when the OSC changes
+     /// no node; whether the mode is on is this payload's presence, never the
+@@ -117,13 +97,12 @@ pub(super) struct WorkerLocations {
+     pub probe: Arc<StaleProbe>,
+ }
+ 
+-/// One worker's view of [`WorkerLocations`]: its own coordinate slot and the
+-/// shared resources.
++/// Borrowed locations state for a worker.
+ #[derive(Clone, Copy)]
+ struct WorkerLoc<'a> {
+-    slot: &'a CoordSlot,
+-    loc_map: &'a LocMapHandle,
+-    needed: &'a FxHashSet<i64>,
++    requests: &'a BaseRequests,
++    slots: &'a WayLocations,
++    published: &'a LocationHandle,
+     probe: &'a StaleProbe,
+ }
+ 
+@@ -302,20 +281,6 @@ pub(super) fn run_workers(
+         drain_tx,
+     } = channels;
+ 
+-    // Setup failures publish while `drain_tx` is still bound here; it is
+-    // dropped by the return that follows. The slots are built for this pool
+-    // by `rewrite::wire_locations`, so a mismatch is a broken wiring, refused
+-    // before any worker indexes its slot.
+-    if let Some(loc) = locations.as_ref()
+-        && loc.coord_slots.len() != worker_count
+-    {
+-        failure.publish(Error::internal(format!(
+-            "streaming: {worker_count} workers but {} coordinate slots",
+-            loc.coord_slots.len()
+-        )));
+-        return;
+-    }
+-
+     cancel.marker("MERGE_STREAMING_START");
+ 
+     // One plain description of the pinned base for the whole pool, kept
+@@ -347,9 +312,9 @@ pub(super) fn run_workers(
+         for worker_id in 0..worker_count {
+             let drain_tx = Arc::clone(&drain_tx);
+             let loc = locations.as_ref().map(|l| WorkerLoc {
+-                slot: &l.coord_slots[worker_id],
+-                loc_map: &l.loc_map,
+-                needed: &l.needed,
++                requests: &l.requests,
++                slots: &l.slots,
++                published: &l.published,
+                 probe: &l.probe,
+             });
+             let file = &shared_file;
+@@ -529,7 +494,7 @@ fn worker_loop(
+                     .map_err(|e| blob_err(&desc, source, e))?;
+             }
+         }
+-        scratch.between_tasks(counters, cancel)?;
++        scratch.between_tasks(counters, cancel);
+     }
+ 
+     Ok(())
+@@ -543,9 +508,8 @@ fn worker_loop(
+ /// rest of the run. The decode buffer follows the decode pool's own limit;
+ /// everything else follows `MAX_RETAINED_SCRATCH_CAPACITY`, the limit the
+ /// block builder applies to itself. The small scratch is sized by a block's
+-/// string table, its groups, one way's refs or one node blob's kept
+-/// coordinates, so on real data that limit never engages for it. The read
+-/// buffer is different: it holds an input frame, and under
++/// string table, its groups, or one way's refs, so on real data that limit
++/// never engages for it. The read buffer holds an input frame, and under
+ /// `--locations-on-ways` ordinary way frames exceed the limit, so it is
+ /// released after about every way blob and regrown by the next. That was
+ /// measured at planet against a line that kept every frame, and the churn
+@@ -562,10 +526,6 @@ struct WorkerScratch {
+     decompress_buf: Vec<u8>,
+     st_scratch: Vec<(u32, u32)>,
+     gr_scratch: Vec<(u32, u32)>,
+-    /// Per-worker coord accumulator: one node blob's kept coordinates, flushed
+-    /// into the worker's shared slot before the blob's item is sent. Empty
+-    /// without `--locations-on-ways`.
+-    local_coords: FxHashMap<i64, (i32, i32)>,
+     node_groups_scratch: Vec<(usize, usize)>,
+     refresh_scratch: RefreshScratch,
+     /// The largest `kept_bytes` seen, the share already added to
+@@ -575,29 +535,9 @@ struct WorkerScratch {
+ 
+ impl WorkerScratch {
+     /// Apply the retention limits after a blob's handler returned.
+-    ///
+-    /// Refuses a coordinate accumulator still holding entries. Every node
+-    /// candidate flushes before it sends its item, so a leftover means that
+-    /// rule broke; once the scanner has taken the barrier signal the drain has
+-    /// merged every slot, so coordinates flushed later would never reach the
+-    /// published map, and the run fails rather than silently losing them. (A
+-    /// late node on a base that lies about its order flushes into a slot
+-    /// after the merge; the drain's order guard refuses it, so those
+-    /// coordinates are never needed.)
+-    fn between_tasks(
+-        &mut self,
+-        counters: &WorkerCounters,
+-        invocation: &crate::host::Recorder,
+-    ) -> Result<()> {
++    fn between_tasks(&mut self, counters: &WorkerCounters, invocation: &crate::host::Recorder) {
+         use crate::retention::release_scratch;
+ 
+-        if !self.local_coords.is_empty() {
+-            return Err(Error::internal(format!(
+-                "streaming: {} node coordinates were extracted but never flushed \
+-                 before their blob's item was sent",
+-                self.local_coords.len()
+-            )));
+-        }
+         let kept = self.kept_bytes();
+         if kept > self.scratch_peak {
+             counters
+@@ -622,10 +562,6 @@ impl WorkerScratch {
+         release_scratch(&mut self.gr_scratch);
+         release_scratch(&mut self.node_groups_scratch);
+         self.refresh_scratch.release_outliers();
+-        if map_table_bytes(&self.local_coords) > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY {
+-            self.local_coords = FxHashMap::default();
+-        }
+-        Ok(())
+     }
+ 
+     /// Bytes of capacity the small scratch holds (everything but the read and
+@@ -635,7 +571,6 @@ impl WorkerScratch {
+         (self.st_scratch.capacity() + self.gr_scratch.capacity()) * pair
+             + self.node_groups_scratch.capacity() * std::mem::size_of::<(usize, usize)>()
+             + self.refresh_scratch.capacity_bytes()
+-            + map_table_bytes(&self.local_coords)
+     }
+ }
+ 
+@@ -678,24 +613,6 @@ impl BaseRead {
+     }
+ }
+ 
+-/// Estimated bytes of a hash table's allocation from its capacity: hashbrown
+-/// keeps a power-of-two bucket count at most seven-eighths full (below eight
+-/// buckets, one bucket short of full), with one control byte per bucket plus
+-/// one trailing group of control bytes. An estimate for the retention rule
+-/// and the peak counter, not an allocator figure.
+-pub(super) fn map_table_bytes<K, V>(map: &FxHashMap<K, V>) -> usize {
+-    let capacity = map.capacity();
+-    if capacity == 0 {
+-        return 0;
+-    }
+-    let buckets = if capacity < 8 {
+-        (capacity + 1).next_power_of_two()
+-    } else {
+-        (capacity.saturating_mul(8) / 7).next_power_of_two()
+-    };
+-    buckets.saturating_mul(std::mem::size_of::<(K, V)>() + 1) + 16
+-}
+-
+ /// Slow-path candidate: pread body, decompress, coord extraction
+ /// (Node + LOW), parse, precise check, false-positive or rewrite.
+ #[allow(clippy::too_many_arguments)]
+@@ -726,7 +643,6 @@ fn handle_candidate(
+         decompress_buf,
+         st_scratch,
+         gr_scratch,
+-        local_coords,
+         node_groups_scratch,
+         refresh_scratch,
+         scratch_peak: _,
+@@ -827,66 +743,13 @@ fn handle_candidate(
+         None
+     };
+ 
++    // A node after the barrier is out of order and the drain will refuse
++    // it. It cannot add coordinates while way readers use the table.
+     if let Some(loc) = loc
+         && desc.kind == ElementKind::Node
++        && loc.published.get().is_none()
+     {
+-        let needed = loc.needed;
+-        let t_extract = crate::counters::Stopwatch::start();
+-        let mut hits = 0u64;
+-        // Every node is decoded and validated; only the ones an OSC way
+-        // references are kept, so the per-worker map doesn't grow with
+-        // the whole base PBF's coord population. An extraction error is
+-        // fatal: dropping this blob's coordinates would surface later
+-        // only as an unexplained count of unresolved references.
+-        //
+-        // A kept node is about to become an inline way location this
+-        // command writes, so it must lie in the geographic domain, the
+-        // rule the altw sparse and external stores apply to the nodes
+-        // they join. It is judged here, on the kept nodes only, not in
+-        // the scanner, so the per-node cost of the scan is unchanged; an
+-        // unreferenced out-of-domain node is passed through like any
+-        // other node content. Like the altw stores, it judges the
+-        // truncated decimicrodegree, so a value within 100 nanodegrees
+-        // past a limit is accepted at the limit (`check --locations`
+-        // judges the exact value and reports it). OSC node coordinates
+-        // are domain-checked at OSC parse and replace base ones in the
+-        // drain; `needed` holds no OSC-upserted node.
+-        //
+-        // A base node can occur more than once. Identical records are
+-        // harmless; records at different coordinates are refused here, at
+-        // the worker flush and at the drain merge - every point where one
+-        // value could replace another - so no coordinate is chosen by blob
+-        // order or by worker assignment.
+-        let mut out_of_domain: Option<(i64, i32, i32)> = None;
+-        let mut conflict: Option<Conflict> = None;
+-        extract_node_coords(decompress_buf, node_groups_scratch, |id, lat, lon| {
+-            if !needed.contains(&id) {
+-                return;
+-            }
+-            if !crate::coord_pack::in_domain(lat, lon) {
+-                out_of_domain.get_or_insert((id, lat, lon));
+-                return;
+-            }
+-            if let Some(prev) = local_coords.insert(id, (lat, lon))
+-                && prev != (lat, lon)
+-            {
+-                conflict.get_or_insert((id, prev, (lat, lon)));
+-            }
+-            hits += 1;
+-        })?;
+-        if let Some((id, lat, lon)) = out_of_domain {
+-            return Err(out_of_domain_node_err(id, lat, lon));
+-        }
+-        if let Some((id, a, b)) = conflict {
+-            return Err(conflicting_base_node_err(id, a, b));
+-        }
+-        counters
+-            .loc_node_blobs_scanned
+-            .fetch_add(1, Ordering::Relaxed);
+-        counters
+-            .coord_pairs_extracted
+-            .fetch_add(hits, Ordering::Relaxed);
+-        t_extract.record_ns(&counters.coord_extract_ns);
++        extract_requested_coords(desc, decompress_buf, node_groups_scratch, loc, counters)?;
+     }
+ 
+     let t_parse = crate::counters::Stopwatch::start();
+@@ -937,19 +800,6 @@ fn handle_candidate(
+         .first()
+         .ok_or_else(|| Error::internal("streaming: a decoded candidate without an element"))?;
+ 
+-    // Sync per-worker coords into the shared slot before emitting the
+-    // DrainItem. This guarantees the drain's barrier merge (which fires
+-    // once it has processed every seq below the scanner's node boundary)
+-    // sees coords for every node blob
+-    // whose output has been processed - the `local_coords` map is
+-    // private and the drain reads only the shared `CoordSlot`s. For
+-    // non-Node blobs `local_coords` is empty so this is a no-op.
+-    if let Some(loc) = loc
+-        && !local_coords.is_empty()
+-    {
+-        flush_local_coords(loc.slot, local_coords)?;
+-    }
+-
+     // On the --force path the scanner fills `desc` with a placeholder
+     // `kind=Node` and `id_range=None` because it can't distinguish blob
+     // kinds without decompressing. The payload's own values replace them
+@@ -1068,16 +918,16 @@ fn handle_candidate(
+             .fetch_add(1, Ordering::Relaxed);
+     }
+ 
+-    // The drain publishes `loc_map` at the node→way barrier; the scanner
++    // The drain publishes the table at the node-to-way barrier; the scanner
+     // barrier protocol guarantees it is set before any way/relation
+     // descriptor is dispatched to workers. Node blobs run before it, so
+     // they see `LocMode::Pending`, under which writing a way is an error:
+     // a way in a blob routed as nodes must never be written stripped of
+     // its coordinates under a LocationsOnWays header.
+-    let loc_arc = loc.and_then(|l| l.loc_map.get().cloned());
++    let way_locations = loc.and_then(|l| l.published.get());
+     let loc_mode = match loc {
+         None => LocMode::Off,
+-        Some(_) => LocMode::on(loc_arc.as_deref()),
++        Some(_) => LocMode::on(way_locations.map(Arc::as_ref)),
+     };
+ 
+     let t_rewrite = crate::counters::Stopwatch::start();
+@@ -1319,15 +1169,58 @@ fn upsert_slice(
+     )
+ }
+ 
+-/// Drain `local` into the worker's shared coord slot. Acquires the mutex
+-/// for the duration of the merge; the drain reads via the same Arc so
+-/// the publish is atomic from its perspective.
+-///
+-/// A poisoned slot is recovered, but its contents are not evidence of a
+-/// complete node phase: a worker panic invalidates the run. The panicking
+-/// worker publishes its caught panic shortly after unwinding, and never
+-/// delivers the node item it was processing, so the drain cannot publish a
+-/// map built without it; the failure is checked again at shutdown.
++/// Merge this blob's nodes with its request slice. A found request remains
++/// current until a larger ID arrives, so duplicate records are compared
++/// even when a duplicate spans blobs or workers. The complete blob walk
++/// checks sort order before the worker's item can reach the drain.
++fn extract_requested_coords(
++    desc: &BlobDescriptor,
++    bytes: &[u8],
++    groups: &mut Vec<(usize, usize)>,
++    loc: WorkerLoc<'_>,
++    counters: &WorkerCounters,
++) -> Result<()> {
++    let timer = crate::counters::Stopwatch::start();
++    let mut requests = loc.requests.in_blob(desc.id_range);
++    let mut current = requests.next();
++    let mut hits = 0;
++    let mut invalid = None;
++    let mut conflict = None;
++    extract_node_coords(bytes, groups, |id, lat, lon| {
++        while current.is_some_and(|r| !crate::osm_id::osm_id_le(id, r.id)) {
++            current = requests.next();
++        }
++        let Some(request) = current.filter(|r| r.id == id) else {
++            return;
++        };
++        // Geographic validation is required for coordinates we will write
++        // inline. The shared extractor also checks scaling for every node
++        // in this decoded blob.
++        let Some(packed) = crate::coord_pack::pack(lat, lon) else {
++            invalid.get_or_insert((id, lat, lon));
++            return;
++        };
++        if let Err(err) = loc.slots.record_base(request, packed) {
++            conflict.get_or_insert(err);
++        }
++        hits += 1;
++    })?;
++    if let Some((id, lat, lon)) = invalid {
++        return Err(out_of_domain_node_err(id, lat, lon));
++    }
++    if let Some(err) = conflict {
++        return Err(err);
++    }
++    counters
++        .loc_node_blobs_scanned
++        .fetch_add(1, Ordering::Relaxed);
++    counters
++        .coord_pairs_extracted
++        .fetch_add(hits, Ordering::Relaxed);
++    timer.record_ns(&counters.coord_extract_ns);
++    Ok(())
++}
++
+ /// Refusal for a base node an OSC way references whose coordinates lie
+ /// outside the geographic domain. Out of line: normal input never reaches it.
+ #[cold]
+@@ -1341,56 +1234,6 @@ fn out_of_domain_node_err(node_id: i64, lat: i32, lon: i32) -> Error {
+     ))
+ }
+ 
+-/// A node id and the two coordinates its base records disagree on.
+-type Conflict = (i64, (i32, i32), (i32, i32));
+-
+-/// Two base records for one needed node at different coordinates. Neither
+-/// is evidence the other is wrong, so no winner is picked.
+-#[cold]
+-#[inline(never)]
+-fn conflicting_base_node_err(node_id: i64, a: (i32, i32), b: (i32, i32)) -> Error {
+-    Error::invalid_data(format!(
+-        "node {node_id} occurs more than once in the base with different \
+-         coordinates (lat {}, lon {} and lat {}, lon {} in decimicrodegrees). \
+-         Refusing to choose one as an inline way location.",
+-        a.0, a.1, b.0, b.1
+-    ))
+-}
+-
+-/// Move `src` into `dst`, refusing a node both hold at different
+-/// coordinates. Merge order then cannot decide a coordinate.
+-pub(super) fn merge_coords(
+-    dst: &mut FxHashMap<i64, (i32, i32)>,
+-    src: impl IntoIterator<Item = (i64, (i32, i32))>,
+-) -> crate::error::Result<()> {
+-    for (id, coord) in src {
+-        if let Some(prev) = dst.insert(id, coord)
+-            && prev != coord
+-        {
+-            return Err(conflicting_base_node_err(id, prev, coord));
+-        }
+-    }
+-    Ok(())
+-}
+-
+-fn flush_local_coords(
+-    slot: &Arc<Mutex<FxHashMap<i64, (i32, i32)>>>,
+-    local: &mut FxHashMap<i64, (i32, i32)>,
+-) -> crate::error::Result<()> {
+-    if local.is_empty() {
+-        return Ok(());
+-    }
+-    let mut shared = slot
+-        .lock()
+-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+-    if shared.is_empty() {
+-        std::mem::swap(&mut *shared, local);
+-        Ok(())
+-    } else {
+-        merge_coords(&mut shared, local.drain())
+-    }
+-}
+-
+ /// Send to the drain. Fails only once the drain has dropped its receiver,
+ /// which it does on its own error or cancellation; the worker propagates
+ /// this error, which ends it, and the drain's cause is what the run reports.
+@@ -1484,27 +1327,17 @@ mod tests {
+         scratch.st_scratch = Vec::with_capacity(pairs + 1);
+         scratch.gr_scratch = Vec::with_capacity(16);
+         scratch.decompress_buf = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY + 1);
+-        scratch.local_coords = FxHashMap::with_capacity_and_hasher(
+-            MAX_RETAINED_SCRATCH_CAPACITY / std::mem::size_of::<(i64, (i32, i32))>(),
+-            Default::default(),
+-        );
+-
+         let call = crate::host::Call::detached();
+-        scratch
+-            .between_tasks(&counters, &call)
+-            .expect("between tasks");
++        scratch.between_tasks(&counters, &call);
+         assert_eq!(scratch.st_scratch.capacity(), 0);
+         assert!(scratch.gr_scratch.capacity() >= 16);
+         assert_eq!(scratch.decompress_buf.capacity(), 0);
+-        assert_eq!(scratch.local_coords.capacity(), 0);
+-        assert!(load(&counters.scratch_peak_bytes) > 2 * MAX_RETAINED_SCRATCH_CAPACITY as u64);
++        assert!(load(&counters.scratch_peak_bytes) > MAX_RETAINED_SCRATCH_CAPACITY as u64);
+         // Counted as the decode pool counts the buffers it drops.
+         assert_eq!(load(&call.metrics().decompress.oversize_drops), 1);
+ 
+         scratch.decompress_buf = Vec::with_capacity(DECOMPRESS_POOL_MAX_RETAINED_CAPACITY);
+-        scratch
+-            .between_tasks(&counters, &call)
+-            .expect("between tasks");
++        scratch.between_tasks(&counters, &call);
+         assert_eq!(
+             scratch.decompress_buf.capacity(),
+             DECOMPRESS_POOL_MAX_RETAINED_CAPACITY
+@@ -1529,49 +1362,17 @@ mod tests {
+             .read
+             .read_at(&file, 0, MAX_RETAINED_SCRATCH_CAPACITY, &counters)
+             .expect("read");
+-        scratch
+-            .between_tasks(&counters, &call)
+-            .expect("between tasks");
++        scratch.between_tasks(&counters, &call);
+         assert_eq!(scratch.read.buf.capacity(), MAX_RETAINED_SCRATCH_CAPACITY);
+ 
+         scratch
+             .read
+             .read_at(&file, 0, frame, &counters)
+             .expect("read");
+-        scratch
+-            .between_tasks(&counters, &call)
+-            .expect("between tasks");
++        scratch.between_tasks(&counters, &call);
+         assert_eq!(scratch.read.buf.capacity(), 0);
+         let metrics = &call.metrics().decompress;
+         assert_eq!(load(&metrics.read_buf_releases), 1);
+         assert_eq!(load(&metrics.read_buf_release_capacity_bytes), frame as u64);
+     }
+-
+-    /// Coordinates still in the accumulator after a blob's handler returned
+-    /// were never flushed, and fail the run.
+-    #[test]
+-    fn between_tasks_refuses_unflushed_coordinates() {
+-        let counters = WorkerCounters::new();
+-        let mut scratch = WorkerScratch::default();
+-        scratch.local_coords.insert(7, (1, 2));
+-        crate::test_support::assert_err_kind!(
+-            scratch.between_tasks(&counters, &crate::host::Call::detached()),
+-            crate::ErrorKind::Internal { msg, .. } if msg.contains("never flushed")
+-        );
+-    }
+-
+-    /// The merge every coordinate map goes through (worker flush and drain
+-    /// publish) accepts identical duplicates and refuses differing ones,
+-    /// whichever map holds which.
+-    #[test]
+-    fn merge_coords_refuses_only_differing_duplicates() {
+-        let mut dst = FxHashMap::default();
+-        dst.insert(1, (10, 20));
+-        assert!(super::merge_coords(&mut dst, [(1, (10, 20)), (2, (30, 40))]).is_ok());
+-        assert_eq!(dst.len(), 2);
+-        let Err(err) = super::merge_coords(&mut dst, [(2, (30, 41))]) else {
+-            panic!("a differing duplicate must be refused");
+-        };
+-        assert!(err.to_string().contains("different coordinates"), "{err}");
+-    }
+ }
+diff --git a/crates/lib/tests/fault_apply_changes.rs b/crates/lib/tests/fault_apply_changes.rs
+index c97e5330..7285def1 100644
+--- a/crates/lib/tests/fault_apply_changes.rs
++++ b/crates/lib/tests/fault_apply_changes.rs
+@@ -87,8 +87,9 @@ mod apply_changes {
+             write_multi_block_test_pbf(&base, &nodes, &[], &[], 5);
+         }
+ 
+-        // OSC that creates node candidates overlapping every base blob.
+-        // The scanner will route every node blob to the worker pool.
++        // The four node edits route seqs 0, 1, 3 and 5 to the workers.
++        // In particular node 20 keeps the armed seq 3 a candidate in both
++        // modes, even when the OSC has no way references.
+         write_osc(
+             &osc,
+             r#"<?xml version="1.0" encoding="UTF-8"?>
+@@ -102,15 +103,11 @@ mod apply_changes {
+ </osmChange>"#,
+         );
+ 
+-        // Snapshot the tempdir before the run. The three input files are
+-        // already present; the output file is not. After the panic we
+-        // compare and assert nothing beyond those + the output file
+-        // changed.
++        // Snapshot the two input files before the run to check cleanup
++        // after the panic.
+         let before = common::snapshot_dir(dir.path());
+ 
+-        // Arm the hook (below, on the run's token) at blob seq 3 (an
+-        // arbitrary early-middle blob that
+-        // corresponds to a Candidate dispatched to the worker pool).
++        // Arm the hook at candidate seq 3, the blob holding node 20.
+         //
+         // Two workers, so the panic lands while another worker is alive;
+         // the barrier tests below cover one worker. FailureSlot publication
+@@ -664,6 +661,8 @@ mod apply_changes {
+             ("bytes_rewritten", s.bytes_rewritten),
+             ("frames_created", s.frames_created),
+             ("bytes_created", s.bytes_created),
++            ("loc_nodes_needed", s.loc_nodes_needed),
++            ("loc_nodes_from_diff", s.loc_nodes_from_diff),
+             ("loc_nodes_from_base", s.loc_nodes_from_base),
+             ("loc_missing", s.loc_missing),
+             ("loc_node_blobs_scanned", s.loc_node_blobs_scanned),
+@@ -671,6 +670,7 @@ mod apply_changes {
+             ("loc_refresh_only_blobs", s.loc_refresh_only_blobs),
+             ("loc_refreshed_ways", s.loc_refreshed_ways),
+             ("loc_refreshed_refs", s.loc_refreshed_refs),
++            ("loc_deleted_node_refs", s.loc_deleted_node_refs),
+         ]
+     }
+ 
+@@ -860,17 +860,17 @@ mod apply_changes {
+             "a reframed unindexed blob is not an index hit: {figures:?}"
+         );
+ 
+-        // --locations-on-ways: node blobs [1, 3], [5, 7], [9, 11], one blob
+-        // per way, a relation blob. Node 1 moves, so way 100's blob is
+-        // rewritten only for that; way 101 is modified; way 102's blob misses
+-        // the way diff and holds no stale way, so a refresh scan passes it
+-        // through. Node 6 is deleted inside the second node blob's range (a
+-        // false positive), and the third node blob is decompressed only for
+-        // its coordinates. Four blobs pass through.
++        // --locations-on-ways: node blobs [1, 3], [5, 7], [9, 11],
++        // [13, 15], one blob per way and a relation blob. Node 1 moves,
++        // making way 100 stale, and way 101 is modified. Way 102 passes
++        // its refresh scan. The delete of node 6 hits the second node
++        // blob's range. Way 101 needs node 9, so the third node blob is a
++        // candidate solely for its coordinates. The fourth is untouched
++        // and has no requests, so it takes the scanner's passthrough.
+         let low = dir.path().join("low.osm.pbf");
+         write_low_base(
+             &low,
+-            &[1, 3, 5, 7, 9, 11],
++            &[1, 3, 5, 7, 9, 11, 13, 15],
+             2,
+             &[(100, vec![1, 3]), (101, vec![5, 7]), (102, vec![9, 11])],
+             &[(500, 100)],
+@@ -881,23 +881,25 @@ mod apply_changes {
+             &format!(
+                 "<modify><node id=\"1\" lat=\"1.5\" lon=\"2.5\" version=\"2\"/>{}</modify>\
+                  <delete><node id=\"6\" version=\"2\"/></delete>",
+-                osc_way(101, 2, &[5, 7]),
++                osc_way(101, 2, &[5, 7, 9]),
+             ),
+         );
+-        // Splice: the three node blobs and three way blobs are candidates,
+-        // two node blobs false positives (the refresh-clean way blob is not
+-        // counted as one). Owned: also the relation blob, and four blobs
+-        // leave as the frames read.
++        // Splice: workers see three node blobs and three way blobs,
++        // including two node false positives. Owned: workers also read the
++        // untouched node and relation frames. Five blobs pass through,
++        // including the way the refresh scan found clean.
+         let figures = merge_on_both_routes(
+             &low,
+             &low_osc,
+             &low_options(2),
+             "locations",
+-            [[6, 6, 2, 0], [7, 7, 2, 4]],
++            [[6, 6, 2, 0], [8, 8, 2, 5]],
+         );
+         assert_eq!(figure(&figures, "blobs_rewritten"), 3, "{figures:?}");
+-        assert_eq!(figure(&figures, "blobs_passthrough"), 4, "{figures:?}");
+-        assert_eq!(figure(&figures, "blobs_index_hit"), 4, "{figures:?}");
++        assert_eq!(figure(&figures, "blobs_passthrough"), 5, "{figures:?}");
++        assert_eq!(figure(&figures, "blobs_index_hit"), 5, "{figures:?}");
++        assert_eq!(figure(&figures, "loc_nodes_from_base"), 3, "{figures:?}");
++        assert_eq!(figure(&figures, "loc_node_blobs_scanned"), 3, "{figures:?}");
+         assert_eq!(figure(&figures, "loc_refresh_only_blobs"), 1, "{figures:?}");
+         assert_eq!(
+             figure(&figures, "loc_refresh_blobs_scanned"),
+@@ -1052,7 +1054,9 @@ mod apply_changes {
+         use std::sync::atomic::Ordering::SeqCst;
+         for &jobs in JOBS {
+             for owned in [false, true] {
+-                for refs in [&[1, 4][..], &[1, 999]] {
++                // Seq 1 holds only node 2. Request it so both routes
++                // dispatch the armed blob to a worker.
++                for refs in [&[2, 4][..], &[2, 999]] {
+                     let label = format!("jobs={jobs} owned={owned} refs={refs:?}");
+                     let host = assert_barrier_failure(
+                         &label,
+@@ -1086,13 +1090,19 @@ mod apply_changes {
+     #[test]
+     fn a_worker_panic_while_the_scanner_is_blocked_dispatching_fails_the_run() {
+         use std::sync::atomic::Ordering::SeqCst;
++
++        const NODE_BLOBS: i64 = 120;
++        // Each requested node is in its own blob. All 120 are candidates
++        // on both routes, more than the 64 channel slots plus any workers
++        // parked after dequeue. Seq 0 holds the first requested node.
++        let refs: Vec<_> = (1..=NODE_BLOBS).collect();
+         for &jobs in JOBS {
+             for owned in [false, true] {
+                 let label = format!("jobs={jobs} owned={owned}");
+                 let host = assert_barrier_failure(
+                     &label,
+-                    120,
+-                    &[1, 4],
++                    NODE_BLOBS,
++                    &refs,
+                     jobs,
+                     owned,
+                     |f| {
+@@ -1203,14 +1213,15 @@ mod apply_changes {
+     // ---------------------------------------------------------------------
+ 
+     /// A change whose ways reference nodes neither file supplies, with the
+-    /// distinct count the refusal must report and the number of node blobs
+-    /// in its base (the only blobs a refusal at the barrier lets a worker
+-    /// see).
++    /// distinct count the refusal must report, the total node blobs, and
++    /// how many reach workers on the splice route. The owned route sends
++    /// every node blob to a worker, including passthroughs.
+     struct RefusalShape {
+         name: &'static str,
+         write: fn(&Path, &Path),
+         missing: u64,
+         node_blobs: u64,
++        splice_node_blobs: u64,
+     }
+ 
+     const REFUSAL_SHAPES: &[RefusalShape] = &[
+@@ -1243,6 +1254,7 @@ mod apply_changes {
+             },
+             missing: 2,
+             node_blobs: 6,
++            splice_node_blobs: 3, // edit 1, requests 5, 6 and 7
+         },
+         // A node the change deletes, though the base holds it.
+         RefusalShape {
+@@ -1265,6 +1277,7 @@ mod apply_changes {
+             },
+             missing: 1,
+             node_blobs: 3,
++            splice_node_blobs: 2, // request 3 and delete 5
+         },
+         // No base blobs: the boundary is the empty one, at end of input.
+         RefusalShape {
+@@ -1282,6 +1295,7 @@ mod apply_changes {
+             },
+             missing: 1,
+             node_blobs: 0,
++            splice_node_blobs: 0,
+         },
+         // Nodes only: the boundary is sent at end of input and the scanner
+         // is in its barrier wait when the drain refuses.
+@@ -1296,6 +1310,7 @@ mod apply_changes {
+             },
+             missing: 2,
+             node_blobs: 3,
++            splice_node_blobs: 1, // only request 2 meets a base blob
+         },
+         // Ways only: the empty boundary, sent at the first way.
+         RefusalShape {
+@@ -1313,6 +1328,7 @@ mod apply_changes {
+             },
+             missing: 1,
+             node_blobs: 0,
++            splice_node_blobs: 0,
+         },
+     ];
+ 
+@@ -1340,12 +1356,48 @@ mod apply_changes {
+         );
+     }
+ 
++    /// A refusal advances the whole node phase, including any splice
++    /// passthroughs. The dispatch flag covers both routes, since a way
++    /// spliced straight to the drain would not move the worker counter.
++    fn assert_refusal_routing(
++        label: &str,
++        faults: &pbfhogg::test_hooks::FaultPlan,
++        node_blobs: u64,
++        worker_node_blobs: u64,
++    ) {
++        use std::sync::atomic::Ordering::SeqCst;
++
++        assert_eq!(
++            faults.apply_changes_worker_counter("merge_streaming_blobs_processed"),
++            Some(worker_node_blobs),
++            "{label}: exactly the routed node blobs must reach workers"
++        );
++        assert_eq!(
++            faults.apply_changes_drain_next_seq.load(SeqCst),
++            node_blobs,
++            "{label}: the drain must advance through every node blob before refusing"
++        );
++        assert!(
++            !faults.apply_changes_non_node_dispatched.load(SeqCst),
++            "{label}: the scanner must dispatch no way or relation before refusal"
++        );
++        assert!(
++            !faults.apply_changes_drain_past_nodes.load(SeqCst),
++            "{label}: the drain must refuse before writing any way, relation or trailing create"
++        );
++        assert!(
++            !faults.apply_changes_barrier_signalled.load(SeqCst),
++            "{label}: the refusal must come before the barrier signal is sent"
++        );
++    }
++
+     /// Every refusal shape, at every worker count, on both routes, with the
+     /// boundary on time and held past the last node item: the run refuses
+     /// with the distinct count, publishes nothing, leaves no scratch, and
+     /// refuses at the barrier: the map is never published, the drain
+     /// handles nothing past the node phase (no way or relation item, no
+-    /// trailing create), and the workers process exactly the node blobs.
++    /// trailing create), and the workers process exactly the node blobs
++    /// routed to them.
+     #[test]
+     fn missing_nodes_are_refused_at_the_barrier_however_it_lands() {
+         use std::sync::atomic::Ordering::SeqCst;
+@@ -1384,20 +1436,12 @@ mod apply_changes {
+                                 "{label}: the boundary must arrive after the last node item"
+                             );
+                         }
+-                        assert_eq!(
+-                            faults.apply_changes_worker_counter("merge_streaming_blobs_processed"),
+-                            Some(shape.node_blobs),
+-                            "{label}: no way or relation blob may reach a worker"
+-                        );
+-                        assert!(
+-                            !faults.apply_changes_drain_past_nodes.load(SeqCst),
+-                            "{label}: the drain must refuse before writing any way, \
+-                             relation or trailing create"
+-                        );
+-                        assert!(
+-                            !faults.apply_changes_barrier_signalled.load(SeqCst),
+-                            "{label}: the refusal must come before the barrier signal is sent"
+-                        );
++                        let worker_node_blobs = if owned {
++                            shape.node_blobs
++                        } else {
++                            shape.splice_node_blobs
++                        };
++                        assert_refusal_routing(&label, faults, shape.node_blobs, worker_node_blobs);
+                     }
+                 }
+             }
+@@ -1453,9 +1497,10 @@ mod apply_changes {
+         }
+     }
+ 
+-    /// One blob of a hand-laid base, for bases whose order lies.
++    /// One blob of a hand-laid base, including adversarial fixtures.
+     enum Blob {
+         Nodes(&'static [i64]),
++        NodeWithCoordinateOverflow(i64),
+         Way(i64, &'static [i64]),
+         Relation(i64, i64),
+     }
+@@ -1480,6 +1525,13 @@ mod apply_changes {
+                         bb.add_node(id, lat, lon, std::iter::empty(), None);
+                     }
+                 }
++                Blob::NodeWithCoordinateOverflow(id) => {
++                    // 300 * 2,000,000,000 / 100 exceeds i32::MAX.
++                    let bytes =
++                        common::groups::framed_node_block(*id, false, 300, Some(2_000_000_000), 0);
++                    writer.write_primitive_block(&bytes).expect("write block");
++                    continue;
++                }
+                 Blob::Way(id, refs) => {
+                     let locations: Vec<(i32, i32)> = refs.iter().map(|&r| coord(r)).collect();
+                     bb.add_way_with_locations(*id, [("highway", "road")], refs, &locations, None);
+@@ -1498,6 +1550,64 @@ mod apply_changes {
+         writer.flush().expect("flush base");
+     }
+ 
++    /// Exercise the public merge error path in the integration build. On a
++    /// producer error it abandons the staged writer, which a unit-test
++    /// build's forgotten-flush assertion would turn into a panic.
++    #[test]
++    fn only_unopened_node_blobs_skip_coordinate_validation() {
++        let dir = common::test_scratch();
++        let base = dir.path().join("base.osm.pbf");
++        let osc = dir.path().join("diff.osc.gz");
++        let output = dir.path().join("output.osm.pbf");
++        write_blobs(
++            &base,
++            &[
++                Blob::Nodes(&[1, 2]),
++                Blob::NodeWithCoordinateOverflow(30),
++                Blob::Way(10, &[1, 2]),
++            ],
++        );
++
++        let untouched = format!("<modify>{}</modify>", osc_way(10, 2, &[1, 2]));
++        let requested = format!("<modify>{}</modify>", osc_way(10, 2, &[1, 30]));
++        let changed = format!(
++            "<modify>{}{}</modify>",
++            osc_node(30, 2),
++            osc_way(10, 2, &[1, 2])
++        );
++        for owned in [false, true] {
++            write_osc_body(&osc, &untouched);
++            let (result, host) = run_low(&base, &osc, &output, 2, owned, |_| {});
++            result.unwrap_or_else(|err| panic!("owned={owned}: {err}"));
++            assert_eq!(
++                host.invocation
++                    .faults()
++                    .apply_changes_worker_counter("merge_streaming_coord_pairs_extracted"),
++                Some(2),
++                "owned={owned}: only the two requested coordinates must be extracted"
++            );
++            assert_eq!(way_locations(&output), [(10, vec![coord(1), coord(2)])]);
++            std::fs::remove_file(&output).expect("remove successful output");
++
++            // A way request and a node edit each independently route the
++            // malformed blob to a decoder. The edit case requests only
++            // nodes 1 and 2, so it also checks validation of unneeded nodes.
++            for (case, body) in [("requested", &requested), ("changed", &changed)] {
++                write_osc_body(&osc, body);
++                let before = common::snapshot_dir(dir.path());
++                let (result, _) = run_low(&base, &osc, &output, 2, owned, |_| {});
++                let err = result.expect_err("a decoded coordinate overflow must fail the merge");
++                assert!(
++                    matches!(err.kind(), pbfhogg::ErrorKind::WireFormat { .. })
++                        && err.to_string().contains("does not fit in an i32"),
++                    "{case} owned={owned}: {err}"
++                );
++                assert!(!output.exists(), "{case} owned={owned}: published output");
++                common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
++            }
++        }
++    }
++
+     /// A late node: a base that claims sorted order but has a node blob
+     /// after a way or relation blob. The scanner waits at the first non-node
+     /// blob, so the late node is only walked after the map is published and
+@@ -1625,10 +1735,12 @@ mod apply_changes {
+                 .map(|_| ());
+                 if missing {
+                     assert_refusal(&label, result, 1);
+-                    assert_eq!(
+-                        faults.apply_changes_worker_counter("merge_streaming_blobs_processed"),
+-                        Some(1),
+-                        "{label}: only the first node blob may reach a worker"
++                    // The first blob supplies node 1 on both routes.
++                    // The requested late node (seq 2) must never complete.
++                    assert_refusal_routing(&label, faults, 1, 1);
++                    assert!(
++                        !faults.apply_changes_candidate_marked.load(SeqCst),
++                        "{label}: the late node must never reach the map"
+                     );
+                     assert!(
+                         faults.apply_changes_scanner_stopped_before_eof.load(SeqCst),
+@@ -1716,11 +1828,8 @@ mod apply_changes {
+                     6,
+                     "{label}: the scanner must walk no header past the first way"
+                 );
+-                assert_eq!(
+-                    faults.apply_changes_worker_counter("merge_streaming_blobs_processed"),
+-                    Some(5),
+-                    "{label}: only the node blobs may reach a worker"
+-                );
++                // Only the blob holding node 4 is a splice candidate.
++                assert_refusal_routing(&label, faults, 5, if owned { 5 } else { 1 });
+             }
+         }
+     }

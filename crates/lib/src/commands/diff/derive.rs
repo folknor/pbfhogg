@@ -17,7 +17,8 @@ use crate::ElementKind;
 use crate::commands::input_front::sorted_and_indexed;
 use crate::error::{Error, Result};
 use crate::osc::merge_join::{
-    BlockMergeAction, MergeSink, StreamingBlocks, element_id, stream_merge_phase,
+    BlockMergeAction, ChangeElement, ElementDetail, MergeDetails, MergeSink, StreamingBlocks,
+    stream_merge_phase,
 };
 use crate::osc::write::{ElementXmlScratch, OwnedMetadata, write_element_xml};
 use crate::read::input::{InputSource, PinnedInput};
@@ -511,15 +512,25 @@ impl<W: Write> ChangeWriters<W> {
     }
 
     /// A create of `elem`, which only the new input holds.
-    fn created(&mut self, kind: ElementKind, elem: &crate::Element<'_>) -> Result<()> {
-        self.repeats.observe(kind, element_id(elem), 0, 1, true)?;
-        self.write_create(elem)
+    fn created(&mut self, kind: ElementKind, elem: &ChangeElement<'_>) -> Result<()> {
+        self.repeats.observe(kind, elem.id(), 0, 1, true)?;
+        self.write_create(elem.full()?)
     }
 
     /// A delete of `elem`, which only the old input holds.
-    fn deleted(&mut self, kind: ElementKind, elem: &crate::Element<'_>) -> Result<()> {
-        self.repeats.observe(kind, element_id(elem), 1, 0, true)?;
-        self.write_delete(elem, kind)
+    fn deleted(&mut self, kind: ElementKind, elem: &ChangeElement<'_>) -> Result<()> {
+        self.repeats.observe(kind, elem.id(), 1, 0, true)?;
+        let meta = elem.version().map(OwnedMetadata::version_only);
+        write_delete_element(
+            &mut self.deletes,
+            kind.as_str(),
+            elem.id(),
+            meta.as_ref(),
+            self.increment_version,
+            self.timestamp,
+        )?;
+        self.delete_count += 1;
+        Ok(())
     }
 
     fn write_create(&mut self, elem: &crate::Element<'_>) -> Result<()> {
@@ -531,21 +542,6 @@ impl<W: Write> ChangeWriters<W> {
     fn write_modify(&mut self, elem: &crate::Element<'_>) -> Result<()> {
         write_element_xml(self.modifies.get_mut(), elem, &mut self.xml_scratch)?;
         self.modify_count += 1;
-        Ok(())
-    }
-
-    fn write_delete(&mut self, elem: &crate::Element<'_>, kind: ElementKind) -> Result<()> {
-        if let Some((tag, id, meta)) = extract_delete_info(elem, kind) {
-            write_delete_element(
-                &mut self.deletes,
-                tag,
-                id,
-                meta.as_ref(),
-                self.increment_version,
-                self.timestamp,
-            )?;
-            self.delete_count += 1;
-        }
         Ok(())
     }
 
@@ -571,25 +567,21 @@ impl<W: Write> MergeSink for ChangeWriters<W> {
                     self.repeats.observe(kind, last, 1, 1, false)?;
                 }
             }
-            BlockMergeAction::ElementEqual(e) => {
-                self.repeats.observe(kind, element_id(e), 1, 1, false)?;
+            BlockMergeAction::ElementEqual { id, .. } => {
+                self.repeats.observe(kind, id, 1, 1, false)?;
             }
             BlockMergeAction::BlobOldOnly(run) => {
-                for elem in run.elements() {
-                    self.deleted(kind, &elem)?;
-                }
+                run.try_for_each(ElementDetail::Version, |elem| self.deleted(kind, &elem))?;
             }
             BlockMergeAction::BlobNewOnly(run) => {
-                for elem in run.elements() {
-                    self.created(kind, &elem)?;
-                }
+                run.try_for_each(ElementDetail::Full, |elem| self.created(kind, &elem))?;
             }
             BlockMergeAction::ElementModified { new, .. } => {
-                self.repeats.observe(kind, element_id(new), 1, 1, true)?;
-                self.write_modify(new)?;
+                self.repeats.observe(kind, new.id(), 1, 1, true)?;
+                self.write_modify(new.full()?)?;
             }
-            BlockMergeAction::ElementOldOnly(o) => self.deleted(kind, o)?,
-            BlockMergeAction::ElementNewOnly(n) => self.created(kind, n)?,
+            BlockMergeAction::ElementOldOnly(o) => self.deleted(kind, &o)?,
+            BlockMergeAction::ElementNewOnly(n) => self.created(kind, &n)?,
         }
         Ok(())
     }
@@ -599,6 +591,14 @@ impl<W: Write> MergeSink for ChangeWriters<W> {
     /// an unhide restores the object. The text diff keeps content alone.
     fn equality(&self) -> crate::content::Equality {
         crate::content::Equality::ContentVisibility
+    }
+
+    fn details(&self) -> MergeDetails {
+        MergeDetails {
+            common_version: false,
+            modified: [ElementDetail::Id, ElementDetail::Full],
+            only: [ElementDetail::Version, ElementDetail::Full],
+        }
     }
 }
 
@@ -729,6 +729,10 @@ impl super::units::UnitSink for UnitWriters<'_> {
         self.w.equality()
     }
 
+    fn details(&self) -> MergeDetails {
+        self.w.details()
+    }
+
     fn record_into(
         &mut self,
         kind: ElementKind,
@@ -737,19 +741,15 @@ impl super::units::UnitSink for UnitWriters<'_> {
     ) -> Result<()> {
         match action {
             BlockMergeAction::BlobOldOnly(run) => {
-                for elem in run.elements() {
+                run.try_for_each(ElementDetail::Version, |elem| {
                     self.w.deleted(kind, &elem)?;
-                    self.poll(out)?;
-                }
-                Ok(())
+                    self.poll(out)
+                })
             }
-            BlockMergeAction::BlobNewOnly(run) => {
-                for elem in run.elements() {
-                    self.w.created(kind, &elem)?;
-                    self.poll(out)?;
-                }
-                Ok(())
-            }
+            BlockMergeAction::BlobNewOnly(run) => run.try_for_each(ElementDetail::Full, |elem| {
+                self.w.created(kind, &elem)?;
+                self.poll(out)
+            }),
             _ => {
                 self.w.record(kind, action)?;
                 self.poll(out)
@@ -991,42 +991,6 @@ impl<'a, W: DocSink> super::units::UnitConsumer for IndexedConsumer<'a, W> {
     #[cfg(pbfhogg_test_hooks)]
     fn panic_message(idx: usize) -> String {
         format!("test-hooks: derive unit {idx} panicking")
-    }
-}
-
-/// Extract just id + metadata from a borrowed element for delete output.
-/// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
-/// The version is passed raw; `write_delete_element` decides whether it is
-/// a claim. An element of another kind than the phase's yields `None` and
-/// is neither written nor counted.
-fn extract_delete_info(
-    elem: &crate::Element<'_>,
-    kind: ElementKind,
-) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
-    match (kind, elem) {
-        (ElementKind::Node, crate::Element::DenseNode(dn)) => Some((
-            "node",
-            dn.id(),
-            dn.info()
-                .map(crate::dense::DenseNodeInfo::version)
-                .map(OwnedMetadata::version_only),
-        )),
-        (ElementKind::Node, crate::Element::Node(n)) => Some((
-            "node",
-            n.id(),
-            n.info().version().map(OwnedMetadata::version_only),
-        )),
-        (ElementKind::Way, crate::Element::Way(w)) => Some((
-            "way",
-            w.id(),
-            w.info().version().map(OwnedMetadata::version_only),
-        )),
-        (ElementKind::Relation, crate::Element::Relation(r)) => Some((
-            "relation",
-            r.id(),
-            r.info().version().map(OwnedMetadata::version_only),
-        )),
-        _ => None,
     }
 }
 

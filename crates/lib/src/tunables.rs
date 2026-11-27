@@ -191,6 +191,24 @@ pub(crate) const ORDERED_POOL_WINDOW_PER_WORKER: usize = 8;
 /// Floor of the ordered pool's default result window.
 pub(crate) const ORDERED_POOL_WINDOW_MIN: usize = 32;
 
+/// Maximum number of repack input results in the classify window. The
+/// planner has a separate byte budget for sources it takes out of this
+/// window. A depth of 64 gives a 32-worker decoder room to run ahead.
+pub(crate) const REPACK_DECODE_WINDOW: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::MIN.saturating_add(63);
+
+/// Repack grow partitions that trigger a parallel encode batch, in
+/// addition to the source byte budget. A mixed blob can close a partition
+/// per kind, so the queue can cross the threshold by two. Two tasks per
+/// core on a 32-core host allow for uneven encoding and compression costs.
+pub(crate) const REPACK_GROW_BATCH_BLOCKS: usize = 64;
+
+/// Decoded source bytes retained by the repack grow planner. Charged once
+/// per source, including its inline lookup tables, until its last slice
+/// drops. 128 MiB leaves room for many normal input blobs while keeping
+/// the planner's working set separate from the decoder and writer queues.
+pub(crate) const REPACK_RETAINED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Read path
 // ---------------------------------------------------------------------------
@@ -695,6 +713,17 @@ pub(crate) const DESCRIPTOR_OVERHEAD: usize = 64;
 /// see `reference/performance/add-locations-to-ways.md` for the supporting measurements.
 pub(crate) const AUTO_STORE_BUDGET_PCT: u64 = 80;
 
+/// Admit ALTW's all-node store when its raw coordinate pairs fit within
+/// this share of the existing page-cache budget. The presence/rank data
+/// costs at most another eight bytes per node. Keep both under the auto
+/// threshold with room for the directory and per-blob metadata.
+pub(crate) const ALTW_EAGER_STORE_BUDGET_PCT: u64 = 35;
+
+/// Cap the all-node lookup directory at 64K entries. Smaller files use
+/// roughly one entry per node blob. This keeps the top-level candidate
+/// ranges cheap to build and cacheable even for widely spaced IDs.
+pub(crate) const ALTW_EAGER_DIRECTORY_BITS: u32 = 16;
+
 /// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
 /// buffers, writer queues). Subtracted from available memory before applying
 /// [`AUTO_STORE_BUDGET_PCT`], so the budget reflects what the page cache can
@@ -1063,6 +1092,29 @@ pub(crate) const EXTRACT_SIMPLE_BATCH_SIZE: usize = 64;
 /// reached, and the pool window is divided by the kind's largest component
 /// so the blobs admitted at once never exceed the plain window.
 pub(crate) const EXTRACT_FUSED_COMPONENT_MAX: usize = 8;
+
+/// Maximum local region hits in a node blob considered for speculative
+/// framing in single-region complete-ways and smart extract. Extra versions
+/// of those IDs count toward the same cap when written. At this size the
+/// ordinary node builder can hold the selected occurrences in one block.
+pub(crate) const EXTRACT_NODE_FRAME_HITS: usize = 1_024;
+
+/// Cumulative speculative work per extract, in units of one selected node
+/// or one scan quantum. This caps duplicated work even when most frames
+/// fit the byte budget but later need a reread for completion.
+pub(crate) const EXTRACT_NODE_FRAME_WORK: usize = 8_000_000;
+
+/// Decompressed input bytes charged as one unit of speculative work, to
+/// account for walking the input even when very few nodes will be written.
+pub(crate) const EXTRACT_NODE_FRAME_SCAN_QUANTUM: usize = 64 * 1024;
+
+/// Shared budget for retained frames, including reservations on workers
+/// and frames in the classify result channel.
+pub(crate) const EXTRACT_NODE_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// Bytes reserved before starting a speculative node walk. A frame whose
+/// compression bound cannot fit falls back to the ordinary write pass.
+pub(crate) const EXTRACT_NODE_FRAME_RESERVATION: usize = 256 * 1024;
 
 /// Region count from which multi-extract builds a `RegionGrid` to prune
 /// candidates instead of testing every region linearly.

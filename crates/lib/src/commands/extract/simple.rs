@@ -652,6 +652,7 @@ fn simple_nodes_two_phase(
         pread_execute(
             input,
             &node_descs,
+            None,
             writer,
             stats,
             |block, bb, output| {
@@ -753,6 +754,7 @@ fn simple_ways_two_phase(
         pread_execute(
             input,
             &way_descs,
+            None,
             writer,
             stats,
             |block, bb, output| {
@@ -837,6 +839,7 @@ fn simple_relations_two_phase(
         pread_execute(
             input,
             &rel_descs,
+            None,
             writer,
             stats,
             |block, bb, output| {

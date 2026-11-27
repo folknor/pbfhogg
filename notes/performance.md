@@ -506,49 +506,23 @@ partial metadata semantics.
 
 Kind: high-conviction encoder rewrite.
 
-## PERF-014 - Repack grow and degrade unsort funnel elements through one central encoder
+## PERF-014 - Degrade unsort still funnels elements through one central encoder
 
 Reported by: copy, decode, encoding.
 
-Mechanism: `worker_split_blob` encodes blobs with at least `cap` elements on
-the worker but turns smaller ones into `Vec<OwnedNode/Way/Relation>`;
-`run_kind_phase` feeds every owned element to one central `BlockBuilder`. Owned
-conversions allocate tag strings, ref vectors, member roles and user strings
-(`owned.rs` read helpers; relation output allocates another member vector).
-Degrade unsort (`worker_decode_kind`) sends every selected element owned
-because one adjacent pair per kind swaps. OSC already has an arena
-representation (`osc/compact.rs`), yet `add_osc_way` / `add_osc_relation`
-collect vectors again.
+`worker_decode_kind` sends selected elements as owned records to the central
+builder for the adjacent swap in each kind. Settle the swap and its boundary
+records in a small coordinator and encode the resulting partitions on workers.
+`--unsort-intra` can keep input boundaries away from the splice. `--unsort`
+needs a prefix-count plan for continuous packing to the cap.
 
-Redesign: after actual per-kind counts, plan output blocks as ordered slices of
-retained decoded source buffers (one output block may span inputs); each output
-partition goes to a worker that encodes and compresses completely; the
-ordered writer receives frames; buffers live until their last slice finishes;
-admission bounded by retained bytes; dictionaries translated once per source
-table. Degrade's swap becomes part of the partition description. Existing
-packing policy (flush a grow run before a shrink blob, keep shrink remainders
-separate) can be kept. When sparse tails must be evacuated, use a batch arena
-with ranges and dictionary IDs rather than individual allocations.
+Per-source string ID (SID) caching also remains open in repack grow. Cache
+translations from each source string table within the output partition's
+dictionary so repeated source IDs can reuse their translations.
 
-Payoff: removes per-element ownership allocation and a serial encoder.
-
-Risks: ordering across partitions; a large source pinned for a small residual;
-duplicated inflation if tasks share sources; SID translation as the next
-bottleneck; partitioning must use actual counts, not unverified claims;
-metadata or location handling changes when replacing owned conversions.
-
-Kind: high-conviction rewrite.
-
-2026-11-21 verifier hunt (heavy-codex, other-codex): the same funnel is what
-`verify degrade` and `verify check-ids` pay for, since both unsort modes build
-dataset-sized fixtures through it although the perturbation touches only the
-first two ID runs or the first output boundary per kind. Their proposal: a
-small coordinator settles the swap and its boundary records while workers
-encode the settled blocks. `--unsort-intra` keeps input boundaries away from
-the splice, and `--unsort` needs a prefix-count plan for continuous packing to
-the cap. They also report that forced repack decodes each unindexed blob in
-all three kind phases; one decode dispatching its actual kinds removes that
-while still exercising `--force`.
+2026-11-21 verifier hunt (heavy-codex, other-codex): `verify degrade` and
+`verify check-ids` still pay for the unsort funnel when building
+dataset-sized fixtures for a local swap.
 
 ## PERF-015 - Sort and blob merge serialize each overlap component on one worker
 
@@ -609,38 +583,16 @@ that the retained records and framing match the sweep's output. Indexdata
 alone cannot prove uniqueness. See the
 [self-dedupe measurements](../reference/performance/cat.md).
 
-## PERF-019 - Complete-ways and smart extract decode the same payloads repeatedly
+## PERF-019 - Multi-region and unindexed extract still decode selected node blobs twice
 
-Reported by: spatial, framing. Narrowed 2026-11-26: smart's extra-way pass
-and the write pass (single region and `multi_dep.rs`) now read only blobs
-whose span may hold a needed ID (observed extents for ways and relations,
-claimed ranges for nodes); see reference/performance/extract.md.
+Reported by: spatial, framing.
 
-Residue: the node write. At a small region (planet, Berlin box) the write
-pass is still 37.6 s of 70 s and reads 48,487 of 50,816 blobs, because the
-node blobs (about 270,000 nodes each) nearly all hold a region node: IDs are
-chronological. Only 6,720 of the 32,826 node blobs may hold a way- or
-relation-completion node. Every other node blob is decoded a second time
-only to re-emit the in-region nodes node classify already found.
-
-Candidate (sparred, not built): node classify, for a blob with in-region
-hits, also encodes and frames that blob's output (every occurrence whose ID
-is in the blob's local in-region set, in `block.elements()` order, through
-the existing node writer, metadata cleaning and block caps) and retains it;
-the write pass copies the retained frames at the blob's slot (the
-`Passthrough::Verified` interleave in `pread_execute`) when no completion
-node may lie in the blob's extent and the extent overlaps no other node
-blob's (otherwise duplicates elsewhere change the output), and rereads it
-otherwise. Required: gate speculation before the metadata walk and
-compression (per-blob hit limit plus a shared work and byte reservation,
-counting frames held by workers and queued results), since a large box would
-otherwise move encode work into classify and pay it again in the write;
-count frames encoded, admitted and reused; judge on node classify plus write
-wall, not write alone; keep unindexed input and multi-region on the current
-path until single-region pays. Isolation must be proved against every node
-extent, including spatially skipped blobs (claimed ranges there).
-
-Kind: workload-specific rewrite; strongest for small extracts.
+The retained-node-frame path covers indexed single-region smart and
+complete-ways extract. Multi-region and unindexed input remain open. For
+multi-region, work and byte admission would have to account for frames
+retained for multiple destinations. For unindexed input, establish isolation
+against every node extent before reusing a frame. Reuse in either case also
+requires ruling out completion IDs for the destination.
 
 ## PERF-020 - Polygon extract measurement and coordinate-column classification
 
@@ -724,40 +676,21 @@ needs occupancy-driven chunks with parallel insertion.
 
 Kind: high conviction.
 
-## PERF-027 - Sparse ALTW collects references even when an all-node store fits
-
-Reported by: altw-sparse.
-
-Mechanism: sparse decompresses ways, decodes refs, builds and freezes the
-referenced set before nodes, then decompresses ways again for output; the first
-traversal exists only to save coordinate storage.
-
-Redesign: when an all-node store fits comfortably, build an immutable
-coordinate dictionary from node ingestion (ID-range segments with presence and
-compact coordinates, populated by workers without a global owner, small
-directory); execution becomes relation deps, node ingest and output, way lookup
-and reframe, relation copy; ways decoded once.
-
-Payoff: grows with R; removes a way decompression pass and O(R) accumulation;
-costs about 8(N - U) extra bytes.
-
-Risks: node-heavy files favour reference selection; `inject_prepass` still
-needs shared-reference data; current sparse checks the geographic domain only
-for referenced nodes, so an eager store must store raw pairs and judge on
-consumption.
-
-Kind: high conviction in the fitting-memory regime.
-
 ## PERF-028 - ALTW routing models only sparse's page-cache store
 
 Reported by: altw-sparse.
+
+Sparse already skips reference collection when its all-node store fits.
+Germany peak anonymous memory rose from 3.36 GB at HEAD `31d469b5` to
+7.27 GB on the working tree on `31d469b5`, on bygg. See
+[the sparse all-node measurement](../reference/performance/add-locations-to-ways.md#sparse-all-node-store-skips-reference-collection-when-it-fits-bygg).
 
 Mechanism: auto charges only sparse's file-backed store (8N up front, 8U on
 the recheck) against available memory minus a fixed 3 GiB anon allowance.
 Neither backend's input-dependent anon is modelled: external grows with
 reference occurrences per bucket at capped concurrency (peak anon about
 3 GB germany, 6.9 GB europe, 11.6 GB planet, sidecars 975f18d9, 36c31139,
-d9bdc5d7, no host budget), and sparse pass 0 grows with the referenced-ID
+d9bdc5d7, no host budget), and reference-selected sparse pass 0 grows with the referenced-ID
 set's shape (scattered negative IDs promote 4 MiB bitmap chunks before any
 recheck; below the allowance no recheck is armed). Until both footprints
 are modelled the below-allowance fallback to sparse stays (a monotone rule
@@ -766,12 +699,11 @@ sorted file with many standalone nodes and some ways still routes external
 on 8N far above 8U (a no-way file now stays sparse; up-front pass 0 refused,
 reasoning at `store_estimate_bytes`).
 
-Redesign: regime choice - all-node store fits: actual-node dictionary, skip
-collection; only reference-selected fits: sharded collection and compact store;
-far over memory: partitioned join with sequential scratch; near the boundary or
-skewed: hybrid, resident partitions plus a bounded spill join publishing into
-one ordered assembly. Sparse and external converge in lifecycle and assembly,
-keeping different physical joins.
+Redesign: account for each regime's anonymous memory in routing, including
+the resident all-node store and the reference-selected sparse path. Near the
+boundary or with skewed input, consider resident partitions plus a bounded
+spill join publishing into one ordered assembly. Sparse and external converge
+in lifecycle and assembly, keeping different physical joins.
 
 Risks: the hybrid is medium-confidence (duplicates, skew, scratch lifetime,
 backpressure, keeping resident and spilled results in sync); choosing resident

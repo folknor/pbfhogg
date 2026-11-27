@@ -1546,6 +1546,92 @@ fn auto_rechecks_the_exact_store_and_never_routes_to_a_refusal() {
     });
 }
 
+/// A mid-write refusal discards the staged output. Exercise it here where
+/// the library's unit-test-only assertion on unflushed writer drops is off.
+#[test]
+fn all_node_sparse_defers_the_same_coordinate_and_missing_refusals() {
+    use crate::common::{TestNode, TestWay};
+    use pbfhogg::altw::{AltwOptions, IndexType, add_locations_to_ways};
+
+    let dir = crate::common::test_scratch();
+    // The first duplicate must fail on its domain. The second duplicate
+    // spans a blob boundary and must fail on its conflicting coordinates.
+    let nodes =
+        [(1, 1), (5, 910_000_000), (5, 500), (20, 900), (20, 700)].map(|(id, lat)| TestNode {
+            id,
+            lat,
+            lon: 100,
+            tags: vec![],
+            meta: None,
+        });
+    for (id, message) in [
+        (5, Some("outside the geographic domain")),
+        (20, Some("different coordinates")),
+        (-6, None),
+    ] {
+        let input = dir.path().join(format!("fixture-{id}.pbf"));
+        let way = TestWay {
+            id: 100,
+            refs: vec![id],
+            tags: vec![],
+            meta: None,
+        };
+        crate::common::write_multi_block_test_pbf(&input, &nodes, &[way], &[], 2);
+        let before = crate::common::snapshot_dir(dir.path());
+        for (memory, all_nodes) in [(Some(8 << 30), 1), (None, 0)] {
+            let sink = Arc::new(RecordingSink::default());
+            let mut host = crate::common::test_host();
+            host.resources = Arc::new(pbfhogg::host::Fixed {
+                memory_available: memory,
+                ..crate::common::fixed_resources()
+            });
+            host.invocation = pbfhogg::host::Invocation::with_sink(Arc::clone(&sink) as _);
+            let output = dir.path().join("refused.pbf");
+            let Err(error) = add_locations_to_ways(
+                &input,
+                crate::common::out(&output),
+                &AltwOptions {
+                    keep_untagged_nodes: true,
+                    write: Default::default(),
+                    index_type: IndexType::Sparse,
+                    inject_prepass: false,
+                    ignore_missing_nodes: false,
+                },
+                &Default::default(),
+                &host,
+                crate::common::scratch_in(dir.path()),
+            ) else {
+                panic!("referenced coordinates or missing location must refuse");
+            };
+            assert!(
+                sink.counters
+                    .lock()
+                    .expect("sink")
+                    .iter()
+                    .any(|(name, value)| name == "altw_sparse_all_nodes" && *value == all_nodes),
+                "expected all-node mode {all_nodes}"
+            );
+            if let Some(message) = message {
+                assert!(matches!(
+                    error.kind(),
+                    pbfhogg::ErrorKind::InvalidData { .. }
+                ));
+                assert!(error.to_string().contains(message), "{error}");
+            } else {
+                assert!(matches!(
+                    error.kind(),
+                    pbfhogg::ErrorKind::MissingNodeLocations { count: 1, .. }
+                ));
+            }
+            assert!(!output.exists());
+            crate::common::assert_scratch_unchanged(
+                &before,
+                &crate::common::snapshot_dir(dir.path()),
+            );
+        }
+    }
+}
+
 /// Every scratch-producing backend works in the run directory it is handed
 /// and leaves its parent exactly as it found it.
 #[test]
@@ -1629,10 +1715,9 @@ fn diff_writes_no_scratch_at_any_worker_count() {
     assert_eq!(crate::common::snapshot_dir(dir.path()), before);
 }
 
-/// The backends write their scratch into the run directory they are given
-/// and nowhere else. A run directory that cannot be written to makes each
-/// fail naming a path inside it, which a backend creating its files beside
-/// the input or output (as before) would not.
+/// Scratch-producing modes put their files inside the supplied run
+/// directory. Deny writes after creating the directory to exercise those
+/// file opens and require a failure naming a path inside it.
 #[test]
 fn scratch_backends_write_inside_the_run_directory() {
     let dir = crate::common::test_scratch();
@@ -1655,7 +1740,7 @@ fn scratch_backends_write_inside_the_run_directory() {
         let host = crate::common::test_host();
         let result = run_scratch_backend(command, jobs, &base, &changed, &output, &host, scratch);
         drop(denial);
-        let err = result.expect_err("a run directory that cannot be written must fail the run");
+        let err = result.expect_err("creating scratch in the locked run directory must fail");
         assert!(
             err.contains(&run_dir.display().to_string()),
             "{command} jobs {jobs}: {err}"
@@ -1691,7 +1776,8 @@ fn run_scratch_backend(
                 keep_untagged_nodes: true,
                 write: Default::default(),
                 index_type: pbfhogg::altw::IndexType::Sparse,
-                inject_prepass: false,
+                // Exercise the reference-selected mode's scratch file.
+                inject_prepass: true,
                 ignore_missing_nodes: false,
             };
             pbfhogg::altw::add_locations_to_ways(

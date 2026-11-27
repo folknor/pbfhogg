@@ -1,8 +1,8 @@
 //! The indexed output path (indexdata present): the node pass and the way
 //! pass, on one schedule and one writer.
 //!
-//! The node pass decompresses each node blob once, stores its referenced
-//! coordinates in the sparse store and, for node blobs before the first way
+//! The node pass decompresses each node blob once, fills the sparse
+//! coordinate store and, for node blobs before the first way
 //! blob (every node blob on sorted input), writes its output from the same
 //! bytes: rebuilt with untagged non-member nodes dropped, or copied raw under
 //! `--keep-untagged-nodes`. Node blobs after the first way blob (unsorted
@@ -36,6 +36,7 @@
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, OnceLock};
 
 use crate::ElementKind;
 use crate::blob::{BlobKind, DecompressPool, decompress_blob_raw};
@@ -50,6 +51,7 @@ use crate::writer::PbfWriter;
 use crate::commands::{HeaderOverrides, flush_local, writer_from_header_bytes};
 
 use super::Result;
+use super::eager;
 use super::inject_metrics::InjectMetrics;
 use super::reframe::{WayReframeScratch, reframe_way_blob_with_locations};
 use super::{NodeIndex, Stats, process_block};
@@ -114,10 +116,9 @@ crate::counters::counter_set! {
 /// Walk all blob headers and build the schedule. The OsmHeader blob (the
 /// walker refuses a second one) is used to build the output header bytes.
 ///
-/// On the indexed sparse path this is the third header walk (pass 0, the
-/// relation-member scan, this one; the node pass runs on this schedule, so
-/// the separate pass-1 walk is gone), and it runs before the node pass, right
-/// after the relation scan's walk. The marker keeps its old `PASS2` name so
+/// The node pass and way pass share this walk. It follows the reference
+/// pass or the all-node estimate and, when needed, the relation-member
+/// scan. The marker keeps its old `PASS2` name so
 /// its recorded measurements stay comparable. The pair
 /// exists because its cost is invisible otherwise and swings enormously:
 /// a walk is ~50 us/blob cold and near free warm, decided entirely by
@@ -253,6 +254,34 @@ enum NodeTask {
     IndexOnly,
 }
 
+#[derive(Clone, Copy)]
+enum NodeSink<'a> {
+    Referenced(&'a super::sparse::StoreSink<'a>),
+    AllNodes(&'a OnceLock<eager::Segment>),
+}
+
+impl NodeSink<'_> {
+    fn store(
+        self,
+        desc: &BlobDescriptor,
+        tuples: &mut Vec<crate::scan::node::NodeTuple>,
+    ) -> Result<()> {
+        match self {
+            Self::Referenced(sink) => sink.store_blob(tuples, desc.claim.as_ref()),
+            Self::AllNodes(slot) => {
+                let claim = desc.claim.as_ref().ok_or_else(|| {
+                    crate::Error::internal("all-node segment has no indexdata claim")
+                })?;
+                let segment =
+                    eager::Segment::from_blob(tuples, claim, desc.blob_index, desc.frame_offset)?;
+                slot.set(segment).map_err(|_| {
+                    crate::Error::internal("node task filled its all-node segment twice")
+                })
+            }
+        }
+    }
+}
+
 /// One node blob of the node pass: decompressed once, its coordinates stored
 /// and, where it is in the output prefix, its output produced from the same
 /// bytes.
@@ -267,7 +296,7 @@ fn node_task(
     desc: &BlobDescriptor,
     task: NodeTask,
     file: &std::fs::File,
-    sink: &super::sparse::StoreSink<'_>,
+    sink: NodeSink<'_>,
     relation_member_node_ids: Option<&IdSet>,
     scratch: &mut WorkerScratch,
     counters: &Pass2Counters,
@@ -324,7 +353,7 @@ fn node_task(
         &mut scratch.group_starts,
     )?;
     kinds.refuse_under(desc.kind)?;
-    sink.store_blob(&scratch.tuples, desc.claim.as_ref())?;
+    sink.store(desc, &mut scratch.tuples)?;
 
     match task {
         NodeTask::IndexOnly => Ok(NodeOut::IndexOnly),
@@ -374,6 +403,48 @@ fn node_task(
     }
 }
 
+/// Reframe already decoded the ref deltas, but pass 0 also required
+/// WireWay's field rules and checked foreign kinds the reframe copies raw.
+/// Check those from the existing group ranges without decoding any refs.
+fn validate_eager_way_blob(
+    decompressed: &[u8],
+    groups: &[(usize, usize)],
+    kind: Option<ElementKind>,
+) -> Result<()> {
+    use crate::read::wire::{Cursor, WIRE_LEN, WireWay};
+
+    let mut kinds = crate::element_kind::ElementKindSet::default();
+    for &(offset, len) in groups {
+        let mut cursor = Cursor::new(&decompressed[offset..offset + len]);
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            if (field, wire_type) == (3, WIRE_LEN) {
+                WireWay::parse(cursor.read_len_delimited()?)?;
+            } else {
+                crate::scan::way::skip_recording_kind(&mut cursor, field, wire_type, &mut kinds)?;
+            }
+        }
+    }
+    kinds.refuse_under(kind)
+}
+
+/// Recover the old scanner's refusal on a failed reframe. Good blobs
+/// only take the field/kind check above.
+#[cold]
+fn eager_reframe_error(
+    error: crate::Error,
+    scratch: &mut WorkerScratch,
+    kind: Option<ElementKind>,
+) -> crate::Error {
+    let scan = crate::scan::way::scan_way_refs(
+        &scratch.decompress_buf,
+        &mut scratch.refs_buf,
+        &mut scratch.group_starts,
+        |_, _| {},
+    )
+    .and_then(|kinds| kinds.refuse_under(kind));
+    scan.err().unwrap_or(error)
+}
+
 /// Decode one descriptor. Way blobs go through the wire-format
 /// reframe; everything else (Node decode, Unknown decode) goes through
 /// the existing `PrimitiveBlock` + `BlockBuilder` path.
@@ -382,7 +453,7 @@ fn node_task(
 fn decode_one(
     desc: &BlobDescriptor,
     file: &std::sync::Arc<std::fs::File>,
-    node_index: &NodeIndex,
+    node_index: &mut NodeIndex<'_>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     relation_member_way_ids: Option<&IdSet>,
@@ -409,7 +480,7 @@ fn decode_one(
         decompress_blob_raw(scratch.read_buf.bytes(), &mut scratch.decompress_buf)?;
         t_dc.record_ns(&counters.decompress_ns);
         let t_reframe = crate::counters::Stopwatch::start();
-        let stats = reframe_way_blob_with_locations(
+        let reframe = reframe_way_blob_with_locations(
             &scratch.decompress_buf,
             node_index,
             &mut scratch.reframe_output,
@@ -417,12 +488,24 @@ fn decode_one(
             shared_node_ids,
             relation_member_way_ids,
             inject_prepass,
-        )?;
+        );
+        let stats = if let NodeIndex::Eager(index) = node_index {
+            let stats = reframe.map_err(|err| eager_reframe_error(err, scratch, desc.kind))?;
+            validate_eager_way_blob(
+                &scratch.decompress_buf,
+                &scratch.way_scratch.group_ranges,
+                desc.kind,
+            )?;
+            index.check()?;
+            stats
+        } else {
+            reframe?
+        };
         // The output index below is the reframe's count and range, so a
         // claim it does not match exactly (a blob claiming ways that holds
         // none above all, which would be re-indexed as Way count 0 over IDs
-        // 0..0) is refused rather than rewritten. Pass 0 already refused a
-        // foreign kind in this blob.
+        // 0..0) is refused rather than rewritten. The way scanner or the
+        // eager validation above has already checked for a foreign kind.
         if let Some(claim) = &desc.claim {
             crate::blob_meta::IdTally::of(stats.way_count, stats.min_way_id, stats.max_way_id)
                 .refuse_inexact(claim)?;
@@ -508,12 +591,26 @@ fn decode_one(
     Ok((blocks, block_stats))
 }
 
+enum IndexedStore {
+    Referenced(Box<super::sparse::SparseArrayIndex>),
+    AllNodes(eager::Index),
+}
+
+impl IndexedStore {
+    fn lookup<'a>(&'a self, source: &'a Arc<Path>) -> NodeIndex<'a> {
+        match self {
+            Self::Referenced(index) => NodeIndex::Sparse(index),
+            Self::AllNodes(index) => NodeIndex::Eager(eager::Lookup::new(index, source)),
+        }
+    }
+}
+
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn write_output_passthrough(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
-    mut store: super::sparse::StoreBuild,
+    mut store: Option<super::sparse::StoreBuild>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     relation_member_way_ids: Option<&IdSet>,
@@ -612,8 +709,8 @@ pub(super) fn write_output_passthrough(
     // which it stores but does not write: the way pass writes those in their
     // place. The store is complete only once every task has succeeded and
     // the workers have joined, so no way is reframed before then: a way's
-    // node can sit in the last node blob, and a conflicting duplicate there
-    // refuses the run.
+    // node can sit in the last node blob, including a conflicting duplicate
+    // that must refuse the run when referenced.
     host.invocation.marker("ALTW_PASS1_START");
     let prefix_at = crate::ordered_pool::DecodeSchedule::from_items(prefix, |d| {
         d.kind == Some(ElementKind::Node)
@@ -652,9 +749,15 @@ pub(super) fn write_output_passthrough(
         cancel: &host.invocation,
     };
     let pass1_counters = super::sparse::Pass1Counters::new();
+    let eager_slots: Vec<_> = if store.is_none() {
+        (0..node_tasks.len()).map(|_| OnceLock::new()).collect()
+    } else {
+        Vec::new()
+    };
     {
-        let sink = store.sink(&pass1_counters);
-        let sink = &sink;
+        let sink = store.as_mut().map(|store| store.sink(&pass1_counters));
+        let sink = sink.as_ref();
+        let eager_slots = &eager_slots;
         let node_tasks = &node_tasks;
         let mut workers = vec![(); decode_threads];
         crate::ordered_pool::run_ordered(
@@ -673,6 +776,10 @@ pub(super) fn write_output_passthrough(
             |_| WorkerScratch::new(&host.invocation),
             |(), scratch: &mut WorkerScratch, ordinal| {
                 let (desc, task) = node_tasks[ordinal];
+                let sink = match sink {
+                    Some(sink) => NodeSink::Referenced(sink),
+                    None => NodeSink::AllNodes(&eager_slots[ordinal]),
+                };
                 let result = node_task(
                     desc,
                     task,
@@ -698,10 +805,11 @@ pub(super) fn write_output_passthrough(
         )?;
     }
     consumer.end_prefix()?;
-    let index = store.finish(&pass1_counters, host);
-    #[cfg(test)]
-    let index = super::NodeIndex::Sparse(Box::new(index));
-    let node_index = &index;
+    let index = match store {
+        Some(store) => IndexedStore::Referenced(Box::new(store.finish(&pass1_counters, host))),
+        None => IndexedStore::AllNodes(eager::Index::finish(eager_slots, &host.invocation)?),
+    };
+    let index = &index;
     host.invocation.marker("ALTW_PASS1_END");
 
     // The way pass: the rest of the schedule, on the same writer.
@@ -728,10 +836,11 @@ pub(super) fn write_output_passthrough(
         |_| WorkerScratch::new(&host.invocation),
         |(), scratch: &mut WorkerScratch, ordinal| {
             let desc = &schedule[decode_at.position(ordinal)];
+            let mut node_index = index.lookup(source);
             let result = decode_one(
                 desc,
                 &shared_file,
-                node_index,
+                &mut node_index,
                 keep_untagged_nodes,
                 relation_member_node_ids,
                 relation_member_way_ids,
@@ -934,5 +1043,33 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Con
         (blocks, block_stats): (Vec<OwnedBlock>, Stats),
     ) -> crate::Result<()> {
         self.write_blocks(blocks, &block_stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ElementKind, validate_eager_way_blob};
+
+    #[test]
+    fn eager_way_reframe_preserves_the_reference_scans_extra_checks() {
+        // A way containing two data-bearing instances of the stale latitude
+        // field. The reframe strips those fields, so the guard must inspect
+        // the original message.
+        let duplicate_lat = [0x1a, 0x06, 0x08, 0x01, 0x48, 0x01, 0x48, 0x02];
+        let error = validate_eager_way_blob(
+            &duplicate_lat,
+            &[(0, duplicate_lat.len())],
+            Some(ElementKind::Way),
+        )
+        .expect_err("the old way scanner refused duplicate latitude arrays");
+        assert!(error.to_string().contains("Way.lat"), "{error}");
+
+        // A way and a plain node in one group under a way claim.
+        let mixed = [0x1a, 0x02, 0x08, 0x01, 0x0a, 0x00];
+        let error = validate_eager_way_blob(&mixed, &[(0, mixed.len())], Some(ElementKind::Way))
+            .expect_err("a false way claim must refuse before it is copied through");
+        let contradiction = error.kind_contradiction().expect("kind contradiction");
+        assert_eq!(contradiction.claimed, ElementKind::Way);
+        assert_eq!(contradiction.found, ElementKind::Node);
     }
 }

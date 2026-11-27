@@ -16,6 +16,7 @@ mod membership;
 mod multi;
 mod multi_dep;
 mod multi_fused;
+mod node_frames;
 mod polygon;
 mod simple;
 mod smart;
@@ -797,7 +798,7 @@ fn extract_multi_to(
         // Admitted once above for the dependency strategies; simple has no
         // admission.
         let stats = extract_admitted(
-            input, output, region, strategy, set_bounds, clean, write, overrides, host,
+            input, output, region, strategy, set_bounds, clean, write, overrides, None, host,
         )?;
         all_stats.push(stats);
     }
@@ -981,7 +982,16 @@ pub(crate) fn extract_to(
         require_dependency_indexdata(input, write, host)?;
     }
     extract_admitted(
-        input, output, region, strategy, set_bounds, clean, write, overrides, host,
+        input,
+        output,
+        region,
+        strategy,
+        set_bounds,
+        clean,
+        write,
+        overrides,
+        Some(node_frames::Limits::DEFAULT),
+        host,
     )
 }
 
@@ -998,6 +1008,7 @@ fn extract_admitted(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
+    frame_limits: Option<node_frames::Limits>,
     host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let result = match strategy {
@@ -1005,10 +1016,26 @@ fn extract_admitted(
             input, output, region, set_bounds, clean, write, overrides, host,
         ),
         ExtractStrategy::CompleteWays => complete::extract_complete_ways(
-            input, output, region, set_bounds, clean, write, overrides, host,
+            input,
+            output,
+            region,
+            set_bounds,
+            clean,
+            write,
+            overrides,
+            frame_limits,
+            host,
         ),
         ExtractStrategy::Smart => smart::extract_smart(
-            input, output, region, set_bounds, clean, write, overrides, host,
+            input,
+            output,
+            region,
+            set_bounds,
+            clean,
+            write,
+            overrides,
+            frame_limits,
+            host,
         ),
     }?;
     host.invocation

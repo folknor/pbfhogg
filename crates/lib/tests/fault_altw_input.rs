@@ -28,10 +28,10 @@ use crate::common::{
 #[derive(Clone, Copy, Debug)]
 enum Route {
     /// `add_locations_to_ways` with this index type, on an indexed input:
-    /// sparse is front, pass 0, pass 1, the relation scan and the pass 2
-    /// walk; external is front, the metadata scan, stage 1 and the relation
-    /// scan (concurrently), stage 2 and stage 4. Auto adds the estimate walk
-    /// after the front when it has a page-cache budget to route on.
+    /// sparse is front, the all-node estimate and/or pass 0, the relation
+    /// scan and the shared output schedule; external is front, the metadata
+    /// scan, stage 1 and the relation scan (concurrently), stage 2 and stage
+    /// 4. Auto estimates after the front when it has a page-cache budget.
     Indexed(IndexType),
     /// Forced sparse on an unindexed input: the pass 2 walk is replaced by
     /// the decode-all reader.
@@ -218,7 +218,7 @@ const SPARSE: (Route, Shape) = (
     Route::Indexed(IndexType::Sparse),
     Shape {
         memory_available: Some(8 << 30),
-        // The front read, pass 0, the relation scan and the output schedule,
+        // The front read, all-node estimate, relation scan and output schedule,
         // whose shared file the node and way passes both read.
         opens: 4,
         racing: None,
@@ -256,6 +256,21 @@ const AUTO_SPARSE: (Route, Shape) = (
     Route::Indexed(IndexType::Auto),
     Shape {
         memory_available: Some(8 << 30),
+        // The all-node store fits. The last replacement arm fires after
+        // the relation scan opens, before the shared output schedule opens.
+        opens: 4,
+        racing: None,
+        transports: "DBBB",
+    },
+);
+
+/// The 480-byte all-node store fits auto's 80% threshold on a 1 KiB
+/// page-cache budget, but exceeds the eager store's 35% share. Pass 0
+/// counts six referenced IDs, which fit the budget on the recheck.
+const AUTO_REFERENCE_SELECTED: (Route, Shape) = (
+    Route::Indexed(IndexType::Auto),
+    Shape {
+        memory_available: Some((3 << 30) + 1024),
         opens: 5,
         racing: None,
         transports: "DBBBB",
@@ -275,8 +290,8 @@ const AUTO_EXTERNAL: (Route, Shape) = (
     },
 );
 
-/// Unknown memory: auto keeps sparse and skips the estimate walk, so it
-/// opens the input exactly as many times as explicit sparse.
+/// Unknown memory: auto keeps reference-selected sparse and skips the
+/// estimate walk. Pass 0 opens the input in its place.
 const AUTO_UNKNOWN_MEMORY: (Route, Shape) = (
     Route::Indexed(IndexType::Auto),
     Shape {
@@ -320,6 +335,11 @@ fn external_reads_only_the_pinned_input() {
 #[test]
 fn auto_routed_sparse_reads_only_the_pinned_input() {
     check_route(AUTO_SPARSE.0, AUTO_SPARSE.1);
+}
+
+#[test]
+fn auto_reference_selected_sparse_reads_only_the_pinned_input() {
+    check_route(AUTO_REFERENCE_SELECTED.0, AUTO_REFERENCE_SELECTED.1);
 }
 
 #[test]

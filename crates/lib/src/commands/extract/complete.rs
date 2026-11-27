@@ -7,9 +7,9 @@ use crate::write::WriteOptions;
 use super::super::{HeaderOverrides, Result, writer_from_header};
 
 use super::common::{
-    BboxInt, ExtractPass2IdSets, extract_block_pass2, pread_write_pass,
-    pread_write_pass_with_schedule,
+    ExtractPass2IdSets, extract_block_pass2, pread_write_pass, pread_write_pass_with_schedule,
 };
+use super::node_frames;
 use super::smart::{CompleteRelationHandler, collect_pass1_generic, write_schedule_for};
 use super::{ExtractStats, Region};
 
@@ -23,6 +23,7 @@ pub(super) fn extract_complete_ways(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
+    frame_limits: Option<node_frames::Limits>,
     host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let WriteOptions {
@@ -43,10 +44,20 @@ pub(super) fn extract_complete_ways(
 
     // --- Pass 1: Collect matches ---
     host.invocation.marker("COMPLETE_PASS1_START");
-    let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
-    let mut result =
-        collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
+    let node_frame_options = frame_limits.map(|limits| node_frames::Options {
+        limits,
+        clean,
+        compression,
+    });
+    let mut result = collect_pass1_generic(
+        input,
+        region,
+        direct_io,
+        node_frame_options,
+        &mut handler,
+        host,
+    )?;
     host.invocation.marker("COMPLETE_PASS1_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
@@ -69,7 +80,7 @@ pub(super) fn extract_complete_ways(
         host,
     )?;
 
-    let pass1_blob_schedule = match &result.schedules {
+    let pass1_blob_schedule = match result.schedules.take() {
         Some(schedules) => Some(write_schedule_for(
             schedules,
             &[&result.bbox_node_ids, &result.outside_way_node_ids],
@@ -79,7 +90,6 @@ pub(super) fn extract_complete_ways(
         )?),
         None => None,
     };
-    result.schedules = None;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &result.bbox_node_ids,
@@ -92,10 +102,11 @@ pub(super) fn extract_complete_ways(
     host.invocation.marker("COMPLETE_PASS2_WRITE_START");
     // The pass 1 schedule, cut by span, on sorted input; the unsorted
     // fallback builds a full one.
-    if let Some(pass1_blob_schedule) = pass1_blob_schedule {
+    if let Some((pass1_blob_schedule, retained_nodes)) = pass1_blob_schedule {
         pread_write_pass_with_schedule(
             input,
             &pass1_blob_schedule,
+            retained_nodes,
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {

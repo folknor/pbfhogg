@@ -17,6 +17,7 @@ pub(super) use crate::commands::spatial::BboxInt;
 use crate::idset::IdSet;
 
 use super::ExtractStats;
+use super::node_frames::RetainedFrames;
 
 // ---------------------------------------------------------------------------
 // Node coordinates
@@ -158,7 +159,7 @@ impl MayHold for IdSet {
     }
 }
 
-fn any_may_hold(sets: &[&dyn MayHold], extent: Extent) -> bool {
+pub(super) fn any_may_hold(sets: &[&dyn MayHold], extent: Extent) -> bool {
     extent.is_some_and(|(lo, hi)| sets.iter().any(|s| s.may_hold(lo, hi)))
 }
 
@@ -500,11 +501,12 @@ pub(super) fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractSta
 /// verified raw copies would start the executor for a handful of rebuilt
 /// blocks and then leave it idle through the way classify. Framing on the
 /// workers keeps the executor out of every phase boundary here.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_execute<F>(
     input: &PinnedInput,
     schedule: &[BlobDesc],
+    retained_nodes: Option<RetainedFrames>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
@@ -516,6 +518,7 @@ where
         + Sync,
 {
     if schedule.is_empty() {
+        report_reused_frames(retained_nodes.as_ref(), 0, host)?;
         return Ok(());
     }
 
@@ -542,12 +545,14 @@ where
         crate::tunables::DECODE_WORKERS_FALLBACK,
     );
 
-    // Decode blobs go to the workers; verified passthrough blobs are copied
-    // by the consumer between them, in schedule order. Only a verified blob
-    // is copied raw. An unverified `Candidate` is decoded: its indexdata
-    // claim alone is not grounds to skip the filter.
+    // The consumer interleaves retained output and verified input frames
+    // between worker results in schedule order. An unverified `Candidate`
+    // still goes to a worker for decoding.
     let decode_at = crate::ordered_pool::DecodeSchedule::from_items(schedule, |d| {
         !matches!(d.passthrough, Passthrough::Verified { .. })
+            && !retained_nodes
+                .as_ref()
+                .is_some_and(|frames| frames.contains_key(&d.frame_offset))
     });
     let decode_at = &decode_at;
     let compression = writer.compression();
@@ -557,6 +562,8 @@ where
         schedule,
         file: &shared_file,
         frame_read_buf: Vec::new(),
+        retained_nodes,
+        reused_frames: 0,
         writer,
         stats,
         cancel: &host.invocation,
@@ -616,6 +623,27 @@ where
     for position in consumer.interleaved.rest() {
         consumer.passthrough(position)?;
     }
+    report_reused_frames(
+        consumer.retained_nodes.as_ref(),
+        consumer.reused_frames,
+        host,
+    )
+}
+
+fn report_reused_frames(
+    retained: Option<&RetainedFrames>,
+    reused: usize,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    if let Some(frames) = retained {
+        if !frames.is_empty() {
+            return Err(crate::Error::internal(
+                "extract: retained node frames were absent from the write schedule",
+            ));
+        }
+        host.invocation
+            .counter("extract_node_frames_reused", reused);
+    }
     Ok(())
 }
 
@@ -642,18 +670,30 @@ struct PreadConsumer<'a> {
     schedule: &'a [BlobDesc],
     file: &'a std::fs::File,
     frame_read_buf: Vec<u8>,
+    retained_nodes: Option<RetainedFrames>,
+    reused_frames: usize,
     writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &'a mut ExtractStats,
     cancel: &'a crate::host::Recorder,
 }
 
 impl PreadConsumer<'_> {
-    /// Read the raw frame at schedule position `position` and write it
-    /// without decode/re-encode.
+    /// Write the retained output or read and copy the verified input frame
+    /// at this schedule position.
     fn passthrough(&mut self, position: usize) -> Result<()> {
         use std::os::unix::fs::FileExt as _;
         self.cancel.check()?;
         let d = &self.schedule[position];
+        if let Some(frame) = self
+            .retained_nodes
+            .as_mut()
+            .and_then(|frames| frames.remove(&d.frame_offset))
+        {
+            self.writer.write_raw_owned(frame.bytes)?;
+            self.stats.nodes_in_bbox += frame.nodes;
+            self.reused_frames += 1;
+            return Ok(());
+        }
         let Passthrough::Verified { nodes } = d.passthrough else {
             return Err(crate::error::Error::internal(
                 "extract: a decode blob was scheduled as passthrough",
@@ -722,7 +762,7 @@ where
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the invocation has a sink.
     crate::debug::emit_mallinfo2(&host.invocation, "MI_POST_BLOB_SCHEDULE");
-    pread_write_pass_with_schedule(input, &schedule, writer, stats, block_fn, host)
+    pread_write_pass_with_schedule(input, &schedule, None, writer, stats, block_fn, host)
 }
 
 /// Variant of [`pread_write_pass`] that takes a pre-built blob schedule
@@ -734,6 +774,7 @@ where
 pub(super) fn pread_write_pass_with_schedule<F>(
     input: &PinnedInput,
     schedule: &[BlobDesc],
+    retained_nodes: Option<RetainedFrames>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
@@ -745,7 +786,15 @@ where
         + Sync,
 {
     host.invocation.marker("PREAD_WRITE_EXECUTE_START");
-    pread_execute(input, schedule, writer, stats, block_fn, host)?;
+    pread_execute(
+        input,
+        schedule,
+        retained_nodes,
+        writer,
+        stats,
+        block_fn,
+        host,
+    )?;
     host.invocation.marker("PREAD_WRITE_EXECUTE_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the invocation has a sink.
@@ -770,6 +819,31 @@ pub(super) struct ExtractPass2IdSets<'a> {
 
 use super::super::{clean_metadata, clean_partial_metadata};
 use crate::owned::{dense_node_metadata, element_metadata};
+
+pub(super) fn add_dense_node(
+    bb: &mut BlockBuilder,
+    node: &crate::DenseNode<'_>,
+    clean: &CleanAttrs,
+) -> Result<()> {
+    let (lat, lon) = dense_coords(node)?;
+    let meta = clean_metadata(dense_node_metadata(node)?, clean);
+    bb.add_node_dense(node.id(), lat, lon, node.tags(), meta.as_ref());
+    Ok(())
+}
+
+pub(super) fn add_plain_node(
+    bb: &mut BlockBuilder,
+    node: &crate::Node<'_>,
+    clean: &CleanAttrs,
+) -> Result<()> {
+    let (lat, lon) = plain_coords(node)?;
+    let meta = clean_partial_metadata(
+        element_metadata(crate::ElementKind::Node, node.id(), &node.info())?,
+        clean,
+    );
+    bb.add_node_partial(node.id(), lat, lon, node.tags(), meta.as_ref());
+    Ok(())
+}
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
 /// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.
@@ -815,9 +889,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 let from_way = ids.outside_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
-                    let (lat, lon) = dense_coords(dn)?;
-                    let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                    bb.add_node_dense(dn.id(), lat, lon, dn.tags(), meta.as_ref());
+                    add_dense_node(bb, dn, clean)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -830,12 +902,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 let from_way = ids.outside_way_node_ids.get(n.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
-                    let (lat, lon) = plain_coords(n)?;
-                    let meta = clean_partial_metadata(
-                        element_metadata(crate::ElementKind::Node, n.id(), &n.info())?,
-                        clean,
-                    );
-                    bb.add_node_partial(n.id(), lat, lon, n.tags(), meta.as_ref());
+                    add_plain_node(bb, n, clean)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {

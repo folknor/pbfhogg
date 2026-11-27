@@ -1,5 +1,6 @@
 //! Embed node coordinates in ways. Equivalent to `osmium add-locations-to-ways`.
 
+mod eager;
 pub mod external;
 mod passthrough;
 mod reframe;
@@ -339,21 +340,20 @@ impl std::fmt::Display for ResolvedBackend {
     }
 }
 
-#[cfg(not(test))]
-type NodeIndex = SparseArrayIndex;
-
-// Keep the reframe wire-format tests independent of an mmap-backed index.
-#[cfg(test)]
-enum NodeIndex {
-    Sparse(Box<SparseArrayIndex>),
+enum NodeIndex<'a> {
+    Sparse(&'a SparseArrayIndex),
+    Eager(eager::Lookup<'a>),
+    // Keep the reframe wire-format tests independent of a node store.
+    #[cfg(test)]
     InMemory(std::collections::HashMap<i64, (i32, i32)>),
 }
 
-#[cfg(test)]
-impl NodeIndex {
+impl NodeIndex<'_> {
     fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         match self {
             Self::Sparse(index) => index.get(node_id),
+            Self::Eager(index) => index.get(node_id),
+            #[cfg(test)]
             Self::InMemory(map) => map.get(&node_id).copied(),
         }
     }
@@ -453,9 +453,9 @@ impl Stats {
 
 /// Embed node coordinates into ways.
 ///
-/// Two-pass algorithm:
-/// 1. Read all nodes and build a coordinate index.
-/// 2. Re-read the input and write to output, attaching coordinates to ways.
+/// Build a node coordinate index, then write the ways with their coordinates.
+/// Sparse ALTW first collects way references when the all-node store does
+/// not fit the page-cache budget, or when prepass metadata is requested.
 ///
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
@@ -507,10 +507,9 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     // Every precondition that depends on the input (sorted, indexed, the
     // header) is answered by this one front read, whichever backend runs.
     // The header walks that follow are separate and deliberate (see
-    // `passthrough::build_schedule`). Scratch free space is not judged here:
-    // both backends size their scratch from counts only their first pass
-    // learns (sparse from the referenced-node set, external from stage 1),
-    // and check it then.
+    // `passthrough::build_schedule`). The reference-selected sparse store
+    // and the external join check scratch space once their first pass has
+    // the counts needed to size it.
     let mut front = InputFront::open(input, options.write.direct_reads, host)?;
     // Auto-select: sparse unless the input qualifies for external AND a
     // known page-cache budget is exceeded by the estimated store (see
@@ -518,10 +517,14 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     // `recheck` is the page-cache budget auto routed sparse on, when it
     // could have chosen external: the exact store is judged against it
     // again once pass 0 has counted it.
-    let (backend, recheck) = match options.index_type {
-        IndexType::Sparse => (ResolvedBackend::Sparse, None),
-        IndexType::External => (ResolvedBackend::External, None),
-        IndexType::Auto => auto_select_backend(input, &mut front, host)?,
+    let allow_eager = !options.inject_prepass;
+    let (backend, route) = match options.index_type {
+        IndexType::Sparse => (
+            ResolvedBackend::Sparse,
+            SparseRoute::for_eager(front.indexed()? && allow_eager, host),
+        ),
+        IndexType::External => (ResolvedBackend::External, SparseRoute::default()),
+        IndexType::Auto => auto_select_backend(input, &mut front, allow_eager, host)?,
     };
 
     // External join has its own pipeline - dispatch early.
@@ -556,31 +559,41 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         );
     }
 
-    // Pass 0: collect the set of node IDs referenced by ways. Only these
-    // nodes need coordinate lookups, so only these get indexed. The store
-    // therefore follows the referenced-node working set rather than every
-    // node in the input; see `reference/performance/add-locations-to-ways.md` for measurements.
-    host.invocation.marker("ALTW_PASS0_START");
-    let (referenced, shared) = collect_way_referenced_node_ids(
-        input,
-        options.write.direct_reads,
-        options.inject_prepass,
-        host,
-    )?;
-    host.invocation.marker("ALTW_PASS0_END");
-    // Cheap one-shot count; surfaces the way-ref IdSet size before the index
-    // build so the counter survives SIGKILL during pass 1.
-    let referenced_count = referenced.len();
-    host.invocation
-        .counter("altw_referenced_node_ids", referenced_count);
-    if let Some(budget) = recheck
-        && exact_store_exceeds_budget(referenced_count, &referenced, shared.as_ref(), budget, host)
-    {
-        drop((referenced, shared));
-        let front = InputFront::open(input, options.write.direct_reads, host)?;
-        return run_external(input, front, output, options, overrides, host, scratch);
-    }
+    let all_nodes = indexdata_present && allow_eager && route.fits_all_nodes(input, host)?;
+    let (nodes, shared) = if all_nodes {
+        (SparseNodes::AllNodes, None)
+    } else {
+        // Pass 0 shrinks the store to the way-referenced working set and
+        // supplies the shared-reference set when prepass injection is on.
+        host.invocation.marker("ALTW_PASS0_START");
+        let (referenced, shared) = collect_way_referenced_node_ids(
+            input,
+            options.write.direct_reads,
+            options.inject_prepass,
+            host,
+        )?;
+        host.invocation.marker("ALTW_PASS0_END");
+        let referenced_count = referenced.len();
+        host.invocation
+            .counter("altw_referenced_node_ids", referenced_count);
+        if let Some(budget) = route.budget.filter(|_| route.recheck)
+            && exact_store_exceeds_budget(
+                referenced_count,
+                &referenced,
+                shared.as_ref(),
+                budget,
+                host,
+            )
+        {
+            drop((referenced, shared));
+            let front = InputFront::open(input, options.write.direct_reads, host)?;
+            return run_external(input, front, output, options, overrides, host, scratch);
+        }
+        (SparseNodes::Referenced(referenced), shared)
+    };
     host.invocation.counter("altw_index_kind", 1);
+    host.invocation
+        .counter("altw_sparse_all_nodes", u64::from(all_nodes));
 
     // Relation members are collected before any node is read: the node pass
     // writes retained nodes as it stores coordinates, and a relation member
@@ -609,7 +622,7 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         input,
         output,
         scratch,
-        referenced,
+        nodes,
         options.keep_untagged_nodes,
         relation_scan.0.as_ref(),
         relation_scan.1.as_ref(),
@@ -760,8 +773,9 @@ fn enforce_missing_locations_policy(
 fn auto_select_backend(
     input: &PinnedInput,
     front: &mut InputFront<'_>,
+    allow_eager: bool,
     host: &crate::host::Entered<'_>,
-) -> Result<(ResolvedBackend, Option<u64>)> {
+) -> Result<(ResolvedBackend, SparseRoute)> {
     let sorted = front.is_sorted()?;
     let has_index = front.indexed()?;
 
@@ -774,7 +788,10 @@ fn auto_select_backend(
             "altw.auto_select",
             "auto-selected index type sparse (sorted={sorted}, indexed={has_index})"
         );
-        return Ok((ResolvedBackend::Sparse, None));
+        return Ok((
+            ResolvedBackend::Sparse,
+            SparseRoute::for_eager(has_index && allow_eager, host),
+        ));
     }
 
     // Both backends can run. The budget is probed first: when it cannot
@@ -801,7 +818,7 @@ fn auto_select_backend(
             "auto-selected index type sparse (sorted=true, indexed=true; {why}, so no \
              page-cache budget can justify the external index)"
         );
-        return Ok((ResolvedBackend::Sparse, None));
+        return Ok((ResolvedBackend::Sparse, SparseRoute::default()));
     };
 
     // Route on scale. The walk reads headers the selected backend will also
@@ -815,7 +832,7 @@ fn auto_select_backend(
     // An input the external join would refuse on its indexdata, or would
     // need its wide record for, runs sparse, which joins it, and is not
     // rechecked: there is nothing auto re-routes it to.
-    if let Err(refusal) = walk.external {
+    if let Err(refusal) = &walk.external {
         crate::host::diag!(
             host.diagnostics,
             Note,
@@ -823,7 +840,14 @@ fn auto_select_backend(
             "auto-selected index type sparse (sorted=true, indexed=true; auto does not \
              route this input to the external index: {refusal})"
         );
-        return Ok((ResolvedBackend::Sparse, None));
+        return Ok((
+            ResolvedBackend::Sparse,
+            SparseRoute {
+                budget: Some(budget),
+                walk: Some(walk),
+                recheck: false,
+            },
+        ));
     }
     let chosen = route_sorted_indexed(store, budget);
 
@@ -860,8 +884,55 @@ fn auto_select_backend(
              store estimate unavailable)"
         );
     }
-    let recheck = (chosen == ResolvedBackend::Sparse).then_some(budget);
-    Ok((chosen, recheck))
+    let recheck = chosen == ResolvedBackend::Sparse;
+    Ok((
+        chosen,
+        SparseRoute {
+            budget: Some(budget),
+            walk: Some(walk),
+            recheck,
+        },
+    ))
+}
+
+#[derive(Default)]
+struct SparseRoute {
+    budget: Option<u64>,
+    walk: Option<RouteWalk>,
+    recheck: bool,
+}
+
+impl SparseRoute {
+    fn for_eager(candidate: bool, host: &crate::host::Entered<'_>) -> Self {
+        let budget = if candidate {
+            page_cache_budget_bytes(host.resources.memory_available())
+        } else {
+            None
+        };
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
+    fn fits_all_nodes(&self, input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<bool> {
+        let Some(budget) = self.budget else {
+            return Ok(false);
+        };
+        let walk;
+        let counts = if let Some(walk) = &self.walk {
+            walk
+        } else {
+            host.invocation.marker("ALTW_SPARSE_ESTIMATE_WALK_START");
+            walk = route_walk(input, host)?;
+            host.invocation.marker("ALTW_SPARSE_ESTIMATE_WALK_END");
+            &walk
+        };
+        Ok(counts.saw_way
+            && counts
+                .store_estimate
+                .is_some_and(|bytes| eager::fits(bytes, counts.node_blobs, budget)))
+    }
 }
 
 /// Pure routing decision for an input both backends can handle (sorted +
@@ -894,9 +965,8 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: u64) -> Resolved
 /// available before pass 0 decodes the ways; the post-pass-0 recheck then
 /// judges the exact store, which also counts the referenced IDs the input
 /// does not hold. The estimate is `None` when the first OsmData blob lacks
-/// indexdata, since the sum would silently undercount; an input that is
-/// indexed on its first OsmData blob and not on a later one is refused by
-/// the walk.
+/// indexdata, since the sum would silently undercount. Any missing indexdata
+/// disables the estimate, leaving the consuming pass to apply its policy.
 ///
 /// The same walk asks [`external::HeaderAdmission`] whether the external
 /// join would admit the input's indexdata, so auto never routes, up front
@@ -904,6 +974,7 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: u64) -> Resolved
 fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<RouteWalk> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let mut node_count: u64 = 0;
+    let mut node_blobs: u64 = 0;
     let mut saw_way = false;
     let mut admission = external::HeaderAdmission::new();
     while let Some(meta) = walker.next_header()? {
@@ -914,6 +985,7 @@ fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Ro
             Some(idx) => {
                 if idx.kind == crate::ElementKind::Node {
                     node_count = node_count.saturating_add(idx.count);
+                    node_blobs += 1;
                 }
                 saw_way |= idx.kind == crate::ElementKind::Way;
                 admission.observe(idx);
@@ -921,6 +993,8 @@ fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Ro
             None => {
                 return Ok(RouteWalk {
                     store_estimate: None,
+                    node_blobs,
+                    saw_way,
                     external: Err(crate::error::new_missing_indexdata(
                         "an OsmData blob carries no indexdata",
                     )),
@@ -930,6 +1004,8 @@ fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<Ro
     }
     Ok(RouteWalk {
         store_estimate: Some(store_estimate_bytes(node_count, saw_way)),
+        node_blobs,
+        saw_way,
         external: admission.finish(),
     })
 }
@@ -963,6 +1039,8 @@ fn store_estimate_bytes(node_count: u64, saw_way: bool) -> u64 {
 /// which auto reports and routes around).
 struct RouteWalk {
     store_estimate: Option<u64>,
+    node_blobs: u64,
+    saw_way: bool,
     external: Result<()>,
 }
 
@@ -1461,12 +1539,17 @@ pub(crate) fn collect_relation_member_ids(
 // Pass 2: Write output with locations on ways
 // ---------------------------------------------------------------------------
 
+enum SparseNodes {
+    AllNodes,
+    Referenced(IdSet),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_output_checked(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
     scratch: &crate::scratch::RunScratch,
-    referenced: IdSet,
+    nodes: SparseNodes,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     relation_member_way_ids: Option<&IdSet>,
@@ -1490,10 +1573,16 @@ fn write_output_checked(
         .locate(crate::error::Location::in_file(input.path())));
     }
     if indexdata_present {
+        let store = match nodes {
+            SparseNodes::AllNodes => None,
+            SparseNodes::Referenced(referenced) => {
+                Some(sparse::StoreBuild::create(scratch, referenced, host)?)
+            }
+        };
         write_output_passthrough(
             input,
             output,
-            sparse::StoreBuild::create(scratch, referenced, host)?,
+            store,
             keep_untagged_nodes,
             relation_member_node_ids,
             relation_member_way_ids,
@@ -1505,10 +1594,11 @@ fn write_output_checked(
             host,
         )
     } else {
+        let SparseNodes::Referenced(referenced) = nodes else {
+            return Err(Error::internal("all-node store requires indexed input"));
+        };
         host.invocation.marker("ALTW_PASS1_START");
         let index = build_node_index_sparse(input, write.direct_reads, scratch, referenced, host)?;
-        #[cfg(test)]
-        let index = NodeIndex::Sparse(Box::new(index));
         host.invocation.marker("ALTW_PASS1_END");
         host.invocation.marker("ALTW_PASS2_START");
         let stats = write_output_decode_all(
@@ -1535,7 +1625,7 @@ fn write_output_checked(
 fn write_output_decode_all(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
-    index: &NodeIndex,
+    index: &SparseArrayIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     write: &WriteOptions,
@@ -1567,7 +1657,7 @@ fn write_output_decode_all(
                 &block,
                 &mut bb,
                 &mut output,
-                Some(index),
+                Some(&NodeIndex::Sparse(index)),
                 keep_untagged_nodes,
                 relation_member_node_ids,
                 &mut refs_buf,
@@ -1624,7 +1714,7 @@ fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    node_index: Option<&NodeIndex>,
+    node_index: Option<&NodeIndex<'_>>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     refs_buf: &mut Vec<i64>,
@@ -1727,13 +1817,189 @@ fn process_block(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::unwrap_in_result)]
 mod tests {
     use super::{
         AUTO_ANON_HEADROOM_BYTES, AUTO_STORE_BUDGET_PCT, ResolvedBackend, page_cache_budget_bytes,
         recheck_routes_external, route_sorted_indexed,
     };
+    use super::{AltwOptions, IndexType, add_locations_to_ways};
+    use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
+    use crate::host::{Fixed, Host, Invocation};
+    use crate::writer::{Compression, PbfWriter};
+    use std::num::NonZeroUsize;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
 
     const GB: u64 = 1_000_000_000;
+
+    struct SparseMode {
+        all_nodes: AtomicI64,
+        collected_refs: AtomicBool,
+    }
+
+    impl crate::debug::InstrumentSink for SparseMode {
+        fn marker(&self, name: &str) {
+            if name == "ALTW_PASS0_START" {
+                self.collected_refs.store(true, Relaxed);
+            }
+        }
+
+        fn counter(&self, name: &str, value: i64) {
+            if name == "altw_sparse_all_nodes" {
+                self.all_nodes.store(value, Relaxed);
+            }
+        }
+    }
+
+    fn sparse_test_host(memory: Option<u64>) -> (Host, Arc<SparseMode>) {
+        let mut host = Host::for_tests();
+        host.resources = Arc::new(Fixed {
+            parallelism: NonZeroUsize::new(4),
+            memory_available: memory,
+        });
+        let mode = Arc::new(SparseMode {
+            all_nodes: AtomicI64::new(-1),
+            collected_refs: AtomicBool::new(false),
+        });
+        host.invocation = Invocation::with_sink(Arc::clone(&mode) as _);
+        (host, mode)
+    }
+
+    fn write_eager_fixture(path: &Path, refs: &[i64]) {
+        let mut writer = PbfWriter::to_path_sync(path, Compression::None).unwrap();
+        writer
+            .write_header(&HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let mut builder = BlockBuilder::new();
+        // An identical duplicate, a genuine (0, 0), and an unreferenced
+        // duplicate whose first coordinate is outside the domain.
+        for (id, lat, lon) in [
+            (-7, 201, -102),
+            (-7, 201, -102),
+            (0, 0, 0),
+            (5, 910_000_000, 100),
+            (5, 500, 200),
+            (20, 900, 100),
+        ] {
+            builder.add_node(id, lat, lon, [], None);
+        }
+        writer
+            .write_primitive_block_owned(builder.take_owned().unwrap().unwrap())
+            .unwrap();
+        builder.add_way(100, [("highway", "residential")], refs, None);
+        writer
+            .write_primitive_block_owned(builder.take_owned().unwrap().unwrap())
+            .unwrap();
+
+        // Indexed but interleaved: a way can refer to a later node blob.
+        // The negative ID repeats across blobs, and ID 20 conflicts across
+        // the overlapping ranges. The pair well above u32::MAX forces the
+        // ID dictionary to keep full-width keys.
+        for (id, lat, lon) in [(1 << 40, 505, 601), (-7, 201, -102), (20, 700, 100)] {
+            builder.add_node(id, lat, lon, [("name", "retained")], None);
+        }
+        writer
+            .write_primitive_block_owned(builder.take_owned().unwrap().unwrap())
+            .unwrap();
+        builder.add_relation(
+            101,
+            [],
+            &[MemberData {
+                id: crate::MemberId::Node(0),
+                role: "member",
+            }],
+            None,
+        );
+        writer
+            .write_primitive_block_owned(builder.take_owned().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn embed_fixture(
+        host: &Host,
+        input: &Path,
+        output: &Path,
+        keep_untagged_nodes: bool,
+        inject_prepass: bool,
+        ignore_missing_nodes: bool,
+    ) -> crate::Result<super::Stats> {
+        let scratch = crate::scratch::RunScratch::create(input.parent().unwrap(), host).unwrap();
+        let output =
+            crate::output::Output::new(output, crate::output::Overwrite::Refuse, &host.diagnostics)
+                .unwrap();
+        add_locations_to_ways(
+            input,
+            output,
+            &AltwOptions {
+                keep_untagged_nodes,
+                write: crate::write::WriteOptions::from_flags(
+                    Compression::None,
+                    false,
+                    false,
+                    false,
+                ),
+                index_type: IndexType::Sparse,
+                inject_prepass,
+                ignore_missing_nodes,
+            },
+            &super::HeaderOverrides::default(),
+            host,
+            scratch,
+        )
+    }
+
+    #[test]
+    fn all_node_sparse_output_matches_reference_selected_bytes() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("fixture.pbf");
+        write_eager_fixture(&input, &[-7, 0, 1 << 40, -6, -6, -7]);
+        for keep in [false, true] {
+            let (eager_host, eager_mode) = sparse_test_host(Some(8 << 30));
+            let (ranked_host, ranked_mode) = sparse_test_host(None);
+            let eager = dir.path().join(format!("eager-{keep}.pbf"));
+            let ranked = dir.path().join(format!("ranked-{keep}.pbf"));
+            let eager_stats =
+                embed_fixture(&eager_host, &input, &eager, keep, false, true).unwrap();
+            let ranked_stats =
+                embed_fixture(&ranked_host, &input, &ranked, keep, false, true).unwrap();
+            assert_eq!(eager_mode.all_nodes.load(Relaxed), 1);
+            assert!(!eager_mode.collected_refs.load(Relaxed));
+            assert_eq!(ranked_mode.all_nodes.load(Relaxed), 0);
+            assert!(ranked_mode.collected_refs.load(Relaxed));
+            assert_eq!(eager_stats.missing_locations, 2);
+            assert_eq!(
+                eager_stats.missing_locations,
+                ranked_stats.missing_locations
+            );
+            assert_eq!(eager_stats.nodes_written, if keep { 9 } else { 4 });
+            assert_eq!(
+                std::fs::read(eager).unwrap(),
+                std::fs::read(ranked).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_prepass_collects_refs_even_with_memory_for_all_nodes() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("fixture.pbf");
+        write_eager_fixture(&input, &[-7, 0, -7]);
+        let (host, mode) = sparse_test_host(Some(8 << 30));
+        embed_fixture(
+            &host,
+            &input,
+            &dir.path().join("prepass.pbf"),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(mode.collected_refs.load(Relaxed));
+        assert_eq!(mode.all_nodes.load(Relaxed), 0);
+    }
 
     /// A file without ways has an empty store, so even a node count far
     /// over any budget keeps sparse; with ways every node is charged.

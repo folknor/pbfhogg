@@ -663,6 +663,22 @@
 
 ### Changed
 
+- **Repack is faster when growing blocks or using `--force` on
+  unindexed input.**
+  On bygg, the working tree on `31d469b5` versus HEAD `31d469b5` ran
+  about 5x as fast when growing Denmark blocks to the default cap and cut
+  forced repack wall time by about 32 % on raw Germany input.
+
+- **Smart and complete-ways extract are faster for small single-region
+  extracts.** On bygg, the working tree on `31d469b5` versus HEAD
+  `31d469b5` cut wall time on planet by about 18 % for smart and 20 %
+  for complete-ways when extracting a Berlin bounding box.
+
+- **Sparse `add-locations-to-ways` is faster on regions whose node
+  coordinates fit the memory budget.** On bygg, the working tree on
+  `31d469b5` versus HEAD `31d469b5` cut Germany wall time by about 9 %
+  and used more peak memory.
+
 - **Location checks and type-filtered cat are faster.** On planet inputs
   on bygg, the working tree on `c0ec89ca` cut wall time by about 15 % for
   `check --locations` and 8 % for `cat --type way` against HEAD `c0ec89ca`.

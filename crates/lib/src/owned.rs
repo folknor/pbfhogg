@@ -201,9 +201,9 @@ pub(crate) struct OwnedWay {
     /// LocationsOnWays preservation. Empty when the source way carried no
     /// inline coordinates (the common case; the reader goes by the way's
     /// payload, not the header's `LocationsOnWays` declaration). `read_way`
-    /// always leaves this empty; `read_way_with_locations` (repack) and
-    /// `read_declared_way` (the sort and `cat --dedupe` sweep over declaring
-    /// inputs) populate it. The `write_single_way*` helpers switch to
+    /// always leaves this empty; `read_declared_way` (the sort and
+    /// `cat --dedupe` sweep over declaring inputs) populates it.
+    /// The `write_single_way*` helpers switch to
     /// `add_way_with_locations` when this is non-empty; a non-empty vector
     /// whose length differs from `refs` is refused as an internal error.
     pub(crate) locations: Vec<(i32, i32)>,
@@ -861,21 +861,6 @@ pub(crate) fn read_way(w: &crate::Way<'_>) -> Result<OwnedWay> {
         metadata: element_metadata(crate::ElementKind::Way, w.id(), &w.info())?
             .map(OwnedMetadata::from_plain),
     })
-}
-
-/// Like [`read_way`] but also captures the way's inline node coordinates
-/// (LocationsOnWays). Used by `repack` when the input header declares the
-/// `LocationsOnWays` feature so the trailing-slice / merge path can
-/// round-trip coordinates. If the source way carries no inline coordinates
-/// (empty `node_locations()`), `locations` stays empty and the write path
-/// falls back to the plain `add_way` encoding for that way.
-pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> Result<OwnedWay> {
-    let mut way = read_way(w)?;
-    way.locations = w
-        .node_locations()
-        .map(|loc| Ok((loc.decimicro_lat()?, loc.decimicro_lon()?)))
-        .collect::<Result<_>>()?;
-    Ok(way)
 }
 
 /// A way's inline coordinates, into `out`, for a writer whose output header

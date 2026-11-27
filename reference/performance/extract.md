@@ -37,6 +37,34 @@ task; a kind the planner refuses (an unindexed blob, an overlap skipping a
 blob, more than 8 overlapping blobs in a run) classifies, then rereads and
 writes.
 
+### Retained node frames for single-region smart and complete-ways extract (bygg)
+
+Node classification encodes and retains output frames for node blobs with
+in-region hits, under a per-blob hit cap and shared work and byte budgets.
+The write pass reuses a retained frame at its scheduled slot when the blob's
+ID extent is isolated and cannot hold a completion ID.
+
+Planet `region-extract --bbox 13.08,52.33,13.77,52.68` (Berlin) on bygg.
+Cells are listed in interleaved order, all with `--iterations 1`.
+A is HEAD `31d469b5` and B is the working tree on `31d469b5`.
+
+| Strategy | Arm | Wall | Run |
+|---|---|---|---|
+| smart | A | 1m10s | `e80f96b9` |
+| smart | B | 54.1 s | `63615b21` |
+| smart | A | 1m03s | `5444755a` |
+| smart | B | 53.9 s | `cb878f4b` |
+| complete-ways | A | 1m02s | `55fcc1d9` |
+| complete-ways | B | 49.4 s | `4ba57af1` |
+
+Smart B counters: `extract_node_frames_encoded` 29,067,
+`extract_node_frames_admitted` 29,067, `extract_node_frames_reused` 23,219.
+
+Verdict: kept. Smart wall time fell about 18 % across the interleaved
+cells. Complete-ways fell about 20 % in one pair. Denmark and Germany
+`verify extract` passed on B with bbox regions. Neither dataset had a
+polygon configured.
+
 ### Prepared polygon subdivision (bygg, 2026-11-27, working tree on 0d1e05fb)
 
 Polygon membership uses a prepared adaptive subdivision with exact fallback.

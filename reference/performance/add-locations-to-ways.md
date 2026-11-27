@@ -1,5 +1,31 @@
 # Add Locations To Ways
 
+### Sparse all-node store skips reference collection when it fits (bygg)
+
+Germany `embed-locations --index-type sparse` on bygg, interleaved
+`--iterations 1` cells. A is HEAD `31d469b5` and B is the working tree on
+`31d469b5`.
+
+Sparse can skip pass 0 when indexdata shows that all raw coordinate pairs
+fit within 35 % of the existing page-cache budget and the store has room for
+keys and segment metadata. Node ingestion builds a per-blob segment store.
+Coordinate domain and duplicate checks run when a way references the ID.
+`--inject-prepass` keeps reference collection. The `altw_sparse_all_nodes`
+counter reports 1 for the all-node path and 0 for the reference-selected path.
+
+| Arm | Wall | Run |
+|---|---|---|
+| A | 8.3 s | `e546563d` |
+| B | 7.6 s | `0424426e` |
+| A | 8.4 s | `3d9532bf` |
+| B | 7.6 s | `f00aa3cd` |
+
+Verdict: kept for the fitting regime. Germany wall time fell about 9 %,
+while peak anonymous memory rose from 3.36 GB (A) to 7.27 GB (B). Planet
+exceeds the budget on bygg and stays on the reference-selected path.
+Germany `verify add-locations-to-ways` passed on B, with sparse and external
+agreeing.
+
 ### Sparse node blobs decoded once, relation scan before pass 1 (bygg, 2026-11-26, baseline `17304b00`)
 
 Pass 1 used to decode every node blob for the store, and pass 2 decoded it

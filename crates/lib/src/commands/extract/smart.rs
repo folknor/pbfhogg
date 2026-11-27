@@ -13,10 +13,12 @@ use super::super::{
 use crate::idset::IdSet;
 
 use super::common::{
-    BboxInt, BlobDesc, Extent, MayHold, Passthrough, WriteSlot, WriteSpan, pread_write_pass,
-    pread_write_pass_with_schedule, relation_has_matched_member, select_by_extent,
-    select_write_schedule, spatial_blob_filter, widen,
+    BboxInt, BlobDesc, Extent, MayHold, Passthrough, WriteSlot, WriteSpan, add_dense_node,
+    add_plain_node, any_may_hold, pread_write_pass, pread_write_pass_with_schedule,
+    relation_has_matched_member, select_by_extent, select_write_schedule, spatial_blob_filter,
+    widen,
 };
+use super::node_frames::{self, RetainedFrames};
 use super::{ExtractStats, Region};
 
 // ---------------------------------------------------------------------------
@@ -57,6 +59,7 @@ pub(super) struct Pass1Schedules {
     pub(super) write_schedule: Vec<BlobDesc>,
     /// One span per `write_schedule` entry.
     pub(super) write_spans: Vec<WriteSpan>,
+    retained_nodes: Option<RetainedFrames>,
 }
 
 /// Strategy-specific relation handling for pass 1.
@@ -209,8 +212,8 @@ impl UnsortedPhase {
 pub(super) fn collect_pass1_generic<H: RelationHandler>(
     input: &PinnedInput,
     region: &Region,
-    bbox_int: &BboxInt,
     direct_io: bool,
+    node_frame_options: Option<node_frames::Options<'_>>,
     handler: &mut H,
     host: &crate::host::Entered<'_>,
 ) -> Result<Pass1Result> {
@@ -230,7 +233,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader.leading_header()?;
     let is_sorted = header_blob.to_headerblock()?.is_sorted();
-    let filter = spatial_blob_filter(bbox_int);
+    let filter = spatial_blob_filter(&BboxInt::from_bbox(region.bbox()));
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     if !is_sorted {
@@ -362,6 +365,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // come from.
     let mut write_schedule: Vec<BlobDesc> = Vec::new();
     let mut write_slots: Vec<WriteSlot> = Vec::new();
+    let mut node_positions = Vec::new();
+    let mut all_indexed = true;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -370,7 +375,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         let idx = meta.index.as_ref();
         let entry = ScheduledBlob::from_meta(&meta, crate::scan::classify::KindClaims::Refuse)?;
         // The write schedule takes every OsmData blob (no kind or spatial
-        // filter, no passthrough: smart and complete never copy raw).
+        // filter, no input frame passthrough).
         let bbox = idx.and_then(|i| i.bbox);
         let kind_for_blob = idx.map(|i| i.kind);
         let before = (way_schedule.len(), relation_schedule.len());
@@ -391,7 +396,12 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         if let Some(idx) = idx {
             if filter.wants_index(idx) {
                 match idx.kind {
-                    crate::ElementKind::Node => node_schedule.push(entry),
+                    crate::ElementKind::Node => {
+                        node_schedule.push(entry);
+                        if node_frame_options.is_some() {
+                            node_positions.push(write_slots.len());
+                        }
+                    }
                     crate::ElementKind::Way => way_schedule.push(entry),
                     crate::ElementKind::Relation => relation_schedule.push(entry),
                 }
@@ -402,6 +412,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 (before.1, relation_schedule.len()),
             )?);
         } else {
+            all_indexed = false;
             // Non-indexed blob (force-flag path). Without indexdata we cannot
             // determine the blob's kind or bbox up front, so replicate into
             // every per-kind schedule; classify closures below already
@@ -433,73 +444,16 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let shared_file = walker.input();
     drop(walker);
 
-    // Phase 1: Classify nodes by region containment.
-    // For bbox-only regions, use columnar decode (batch IDs/lats/lons into
-    // contiguous arrays) for cache-friendly classification. Polygon regions
-    // fall back to element-by-element iteration.
     host.invocation.marker("PASS1_NODE_CLASSIFY_START");
-    let use_columnar = matches!(region, Region::Bbox(_));
-    // The columnar classifier decides point membership, not blob candidacy,
-    // so it runs against the exact box (`exact_bbox`). `bbox_int` is
-    // deliberately widened and would admit nodes up to one decimicrodegree
-    // outside the requested bbox.
-    let exact_bbox = &exact_bbox;
-    crate::scan::classify::parallel_classify_phase(
+    let retained_nodes = node_frames::classify_nodes(
         &shared_file,
         &node_schedule,
-        None,
-        || {
-            (
-                crate::read::columnar::DenseNodeColumns::new(),
-                Vec::<i64>::new(),
-            )
-        },
-        |block, (columns, ids)| {
-            ids.clear();
-            if use_columnar {
-                block.decode_dense_columns(columns)?;
-                columns.collect_matching_ids_bbox(
-                    exact_bbox.min_lat,
-                    exact_bbox.max_lat,
-                    exact_bbox.min_lon,
-                    exact_bbox.max_lon,
-                    ids,
-                );
-                // Dense columns deliberately exclude plain Node messages, so
-                // they are classified here; without this a plain node in the
-                // region, and every way and relation it would have matched,
-                // was missing from a sorted bbox extract.
-                for group in block.groups() {
-                    for node in group.nodes() {
-                        let (lat, lon) = super::common::plain_coords(&node)?;
-                        if exact_bbox.contains(lat, lon) {
-                            ids.push(node.id());
-                        }
-                    }
-                }
-            } else {
-                for element in block.elements_skip_metadata() {
-                    let (id, lat, lon) = match &element {
-                        Element::DenseNode(dn) => {
-                            (dn.id(), dn.decimicro_lat().ok(), dn.decimicro_lon().ok())
-                        }
-                        Element::Node(n) => {
-                            (n.id(), n.decimicro_lat().ok(), n.decimicro_lon().ok())
-                        }
-                        _ => continue,
-                    };
-                    if region.contains_node(exact_bbox, lat, lon)? {
-                        ids.push(id);
-                    }
-                }
-            }
-            Ok(std::mem::take(ids))
-        },
-        |_seq, ids| {
-            for id in ids {
-                bbox_node_ids.insert(id);
-            }
-        },
+        &write_schedule,
+        &node_positions,
+        region,
+        &exact_bbox,
+        node_frame_options.filter(|_| all_indexed),
+        &mut bbox_node_ids,
         host,
     )?;
     host.invocation.marker("PASS1_NODE_CLASSIFY_END");
@@ -632,6 +586,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             way_extents,
             write_schedule,
             write_spans,
+            retained_nodes,
         }),
     })
 }
@@ -639,12 +594,12 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 /// The write pass's schedule: the pass 1 write schedule cut to the blobs
 /// that may hold an element a set selects, counted for the sidecar.
 pub(super) fn write_schedule_for(
-    schedules: &Pass1Schedules,
+    mut schedules: Pass1Schedules,
     nodes: &[&dyn MayHold],
     ways: &[&dyn MayHold],
     relations: &[&dyn MayHold],
     host: &crate::host::Entered<'_>,
-) -> Result<Vec<BlobDesc>> {
+) -> Result<(Vec<BlobDesc>, Option<RetainedFrames>)> {
     let schedule = select_write_schedule(
         &schedules.write_schedule,
         &schedules.write_spans,
@@ -652,9 +607,21 @@ pub(super) fn write_schedule_for(
         ways,
         relations,
     )?;
+    if let Some(frames) = &mut schedules.retained_nodes {
+        // The first node set is the region set, already encoded in each
+        // frame. A possible member of any completion set requires a reread.
+        let (_, completion) = nodes.split_first().ok_or_else(|| {
+            crate::Error::internal("extract: missing region node set in write schedule")
+        })?;
+        frames.retain(|_, frame| !any_may_hold(completion, Some(frame.extent)));
+    }
+    let copied = schedules
+        .retained_nodes
+        .as_ref()
+        .map_or(0, RetainedFrames::len);
     host.invocation
-        .counter("extract_write_blobs", schedule.len());
-    Ok(schedule)
+        .counter("extract_write_blobs", schedule.len().saturating_sub(copied));
+    Ok((schedule, schedules.retained_nodes))
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +638,7 @@ pub(super) fn extract_smart(
     clean: &CleanAttrs,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
+    frame_limits: Option<node_frames::Limits>,
     host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     let WriteOptions {
@@ -691,10 +659,20 @@ pub(super) fn extract_smart(
 
     // --- Pass 1: Collect matches + smart relation deps ---
     host.invocation.marker("SMART_PASS1_START");
-    let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = SmartRelationHandler::new();
-    let mut result =
-        collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
+    let node_frame_options = frame_limits.map(|limits| node_frames::Options {
+        limits,
+        clean,
+        compression,
+    });
+    let mut result = collect_pass1_generic(
+        input,
+        region,
+        direct_io,
+        node_frame_options,
+        &mut handler,
+        host,
+    )?;
     let mut extra_node_ids = handler.extra_node_ids;
     host.invocation.marker("SMART_PASS1_END");
     // Brokkr stores named counters generically and reports changes in sidecar
@@ -802,7 +780,7 @@ pub(super) fn extract_smart(
         host,
     )?;
 
-    let pass1_blob_schedule = match &result.schedules {
+    let pass1_blob_schedule = match result.schedules.take() {
         Some(schedules) => Some(write_schedule_for(
             schedules,
             &[
@@ -816,7 +794,6 @@ pub(super) fn extract_smart(
         )?),
         None => None,
     };
-    result.schedules = None;
 
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &result.bbox_node_ids,
@@ -831,10 +808,11 @@ pub(super) fn extract_smart(
     host.invocation.marker("SMART_PASS3_WRITE_START");
     // The pass 1 schedule, cut by span, on sorted input; the unsorted
     // fallback builds a full one.
-    if let Some(pass1_blob_schedule) = pass1_blob_schedule {
+    if let Some((pass1_blob_schedule, retained_nodes)) = pass1_blob_schedule {
         pread_write_pass_with_schedule(
             input,
             &pass1_blob_schedule,
+            retained_nodes,
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {
@@ -873,8 +851,8 @@ struct ExtractPass3IdSets<'a> {
     matched_relation_ids: &'a IdSet,
 }
 
-use super::super::{clean_metadata, clean_partial_metadata};
-use crate::owned::{dense_node_metadata, element_metadata};
+use super::super::clean_partial_metadata;
+use crate::owned::element_metadata;
 
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
 /// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.
@@ -908,9 +886,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
-                    let (lat, lon) = super::common::dense_coords(dn)?;
-                    let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                    bb.add_node_dense(dn.id(), lat, lon, dn.tags(), meta.as_ref());
+                    add_dense_node(bb, dn, clean)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -927,12 +903,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
-                    let (lat, lon) = super::common::plain_coords(n)?;
-                    let meta = clean_partial_metadata(
-                        element_metadata(crate::ElementKind::Node, n.id(), &n.info())?,
-                        clean,
-                    );
-                    bb.add_node_partial(n.id(), lat, lon, n.tags(), meta.as_ref());
+                    add_plain_node(bb, n, clean)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {

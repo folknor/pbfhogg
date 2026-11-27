@@ -1,5 +1,34 @@
 # Repack Degrade
 
+## Parallel grow partitions and single-decode forced repack (bygg)
+
+Grow uses actual element counts to plan ordered partitions of retained
+decoded source slices. Workers encode and compress the partitions and the
+ordered writer receives finished frames. Forced repack inflates each
+unindexed blob once and dispatches the kinds it contains. Way and relation
+frames are staged in a spool beside the output. Degrade unsort continues
+to use its existing path.
+
+`reencode-pbf` on bygg, interleaved `--iterations 1` cells within each
+workload. A is HEAD `31d469b5` and B is the working tree on `31d469b5`.
+Denmark `--snapshot 1k` grows to the default cap. Germany uses
+`--variant raw --force-repack yes`.
+
+| Workload | Arm | Wall | Run |
+|---|---|---|---|
+| Denmark grow | A | 7.6 s | `ff8e3a52` |
+| Denmark grow | B | 1.4 s | `5dfeee77` |
+| Denmark grow | A | 7.6 s | `c445b12d` |
+| Denmark grow | B | 1.4 s | `1c8265b1` |
+| Germany forced | A | 12.1 s | `dac64199` |
+| Germany forced | B | 7.8 s | `b6b73d87` |
+| Germany forced | A | 10.9 s | `685fb61d` |
+| Germany forced | B | 7.7 s | `91ed3b2e` |
+
+Verdict: kept. Denmark grow was 5.4x as fast. Germany forced repack cut
+wall time by about 32 % and peak RSS fell from 514 MB (A) to 426 MB (B).
+Denmark `verify repack` and `verify degrade` passed on B.
+
 ## Tagless dense groups omit keys_vals (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 Denmark `reencode-pbf`, `--iterations 1` interleaved: default `1361533e`

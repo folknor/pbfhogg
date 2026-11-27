@@ -1,5 +1,28 @@
 # Getid
 
+## getid scopes validation to selection and retained output
+
+The PBF ID-list read and dependency discovery use selective projection
+and checked-span replay. The include and invert paths check retained
+fields before re-encoding, including metadata on referenced objects
+whose tags are stripped. See
+[DEVIATIONS.md](../../DEVIATIONS.md#id-and-reference-commands-validation-follows-the-fields-used).
+
+On bygg, A is HEAD `aa824014` and B is the working tree on that commit.
+Planet `id-select` used nine fixed IDs, with `--iterations 1` per cell.
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 6.2 s | `77f7575c` |
+| A (repeat) | 104 ms | `fcdd6b69` |
+| B | 86 ms | `2f481a24` |
+| B | 89 ms | `d902010f` |
+
+The first A cell paid 6.14 s in `GETID_SCAN` for a cold header-index
+read. The query skipped the same 50,813 blobs and returned the same
+nine elements. Verdict for this tiny-wall workload is neutral based on
+the warm cells. `getid-removeid` passed on germany.
+
 ## getid --add-referenced selects blobs by claimed ID range (bygg, 2026-11-26, against `50865b13`)
 
 The one header walk keeps each blob's claim; the way read, the second

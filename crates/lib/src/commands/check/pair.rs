@@ -8,10 +8,8 @@
 //! blobs once, for every check that reads that kind: the node phase for both
 //! (the ID check only where its type filter selects nodes), the way phase
 //! likewise, the relation phase for the ID check where it selects relations
-//! and for the reference check under `check_relations`. Validation is block
-//! construction's own call whichever projection rides along
-//! (`read::project_ids`), so a blob is refused or contradicts its claim
-//! exactly as it would in either call alone.
+//! and for the reference check under `check_relations`. Both checks use
+//! the same validation scope as their standalone scans (`read::project_ids`).
 //!
 //! # Each check decides alone
 //!
@@ -520,48 +518,48 @@ fn judge_blob(
     let mut ids_judge = ids.map(|limit| KindJudge::new(kind, limit));
     let refs = match (kind, sets) {
         (ElementKind::Node, sets) => {
-            let (KindIds { .. }, accepted) =
-                buffer.project(|_, _| KindIds::of(ElementKind::Node, &mut scratch.ids))?;
-            let bytes = accepted.bytes();
+            let (KindIds { .. }, accepted) = buffer
+                .project_ids_and_refs(|_, _| KindIds::of(ElementKind::Node, &mut scratch.ids))?;
+            let source = &accepted;
             if let Some(j) = ids_judge.as_mut() {
-                scratch.ids.each(bytes, |_, id| {
+                scratch.ids.each(source, |_, id| {
                     j.push(id, None);
                     Ok(())
                 })?;
             }
             sets.map(|sets| {
-                refs::replay_nodes(&scratch.ids, bytes, &sets.nodes)
+                refs::replay_nodes(&scratch.ids, source, &sets.nodes)
                     .map(|(count, overflow)| RefsBlob::Nodes(count, overflow))
             })
         }
         (ElementKind::Way, Some(sets)) => {
             let (WaySpans { .. }, accepted) =
-                buffer.project(|_, _| WaySpans::new(None, &mut scratch.ways))?;
+                buffer.project_ids_and_refs(|_, _| WaySpans::new(None, &mut scratch.ways))?;
             if let Some(j) = ids_judge.as_mut() {
                 for way in &scratch.ways {
                     j.push(way.id, None);
                 }
             }
-            Some(refs::judge_ways(&scratch.ways, accepted.bytes(), sets, judge).map(RefsBlob::Ways))
+            Some(refs::judge_ways(&scratch.ways, &accepted, sets, judge).map(RefsBlob::Ways))
         }
         (ElementKind::Relation, Some(sets)) => {
             let (RelationSpans { .. }, accepted) =
-                buffer.project(|_, _| RelationSpans::new(&mut scratch.relations))?;
+                buffer.project_ids_and_refs(|_, _| RelationSpans::new(&mut scratch.relations))?;
             if let Some(j) = ids_judge.as_mut() {
                 for relation in &scratch.relations {
                     j.push(relation.id, None);
                 }
             }
             Some(
-                refs::judge_relations(&scratch.relations, accepted.bytes(), sets, judge)
+                refs::judge_relations(&scratch.relations, &accepted, sets, judge)
                     .map(RefsBlob::Relations),
             )
         }
         (kind, None) => {
             let (KindIds { .. }, accepted) =
-                buffer.project(|_, _| KindIds::of(kind, &mut scratch.ids))?;
+                buffer.project_ids_and_refs(|_, _| KindIds::of(kind, &mut scratch.ids))?;
             if let Some(j) = ids_judge.as_mut() {
-                scratch.ids.each(accepted.bytes(), |_, id| {
+                scratch.ids.each(&accepted, |_, id| {
                     j.push(id, None);
                     Ok(())
                 })?;
@@ -671,22 +669,17 @@ fn unindexed_pass(
                 } = scratch;
                 ways.clear();
                 relations.clear();
-                let (((KindIds { .. }, _), (_, groups)), accepted) = buffer.project(|_, _| {
-                    (
-                        (
-                            KindIds::new(id_kinds, &mut *ids),
-                            way_spans.then(|| WaySpans::new(None, &mut *ways)),
-                        ),
-                        (
-                            relation_spans.then(|| RelationSpans::new(&mut *relations)),
-                            GroupKinds::default(),
-                        ),
-                    )
-                })?;
-                let bytes = accepted.bytes();
+                let (((KindIds { .. }, _), (_, groups)), accepted) =
+                    buffer.project_ids_and_refs(|_, _| {
+                        let ids = KindIds::new(id_kinds, &mut *ids);
+                        let ways = way_spans.then(|| WaySpans::new(None, &mut *ways));
+                        let relations = relation_spans.then(|| RelationSpans::new(&mut *relations));
+                        ((ids, ways), (relations, GroupKinds::default()))
+                    })?;
+                let source = &accepted;
                 let ids_blob = if ids_reads {
                     let mut judges = KINDS.map(|kind| KindJudge::new(kind, limit));
-                    ids.each(bytes, |kind, id| {
+                    ids.each(source, |kind, id| {
                         if ids_selects(kind) {
                             judges[usize::from(kind.ordinal())].push(id, None);
                         }
@@ -708,7 +701,7 @@ fn unindexed_pass(
                 };
                 let refs_blob = sets
                     .filter(|_| !refs_dead.load(Ordering::Relaxed))
-                    .map(|sets| refs::judge_unindexed(ids, ways, relations, bytes, sets, judge));
+                    .map(|sets| refs::judge_unindexed(ids, ways, relations, source, sets, judge));
                 Ok(UnindexedPairBlob {
                     ids: ids_blob,
                     refs: refs_blob,

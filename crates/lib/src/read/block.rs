@@ -1169,8 +1169,8 @@ pub(crate) struct BlockScan {
 /// built this way, so a full projection and a block refuse the same input with the
 /// same error, and the kind-claim refusal follows validation in both. The
 /// check itself is [`validate_in_place`], which a caller holding borrowed
-/// bytes it will not build a block from calls directly. The tags-filter
-/// and extract projections expose only the fields validated for their pass.
+/// bytes it will not build a block from calls directly. Selective
+/// projections expose only the fields validated for their pass.
 pub(crate) struct BlockBuffer<'w> {
     buffer: Vec<u8>,
     pool: Option<&'w std::sync::Arc<crate::blob::DecompressPool>>,
@@ -1230,6 +1230,15 @@ impl<'w> BlockBuffer<'w> {
         make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
     ) -> Result<(P, ValidatedBlock<'w, false>)> {
         self.project_fields::<false, _>(tags, make)
+    }
+
+    /// Project IDs and reference arrays with the structural checks of the
+    /// tag projection. No consumer of this projection reads tags or Info.
+    pub(crate) fn project_ids_and_refs<P: GroupProjection>(
+        self,
+        make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
+    ) -> Result<(P, ValidatedBlock<'w, false>)> {
+        self.project_tags([false; 3], make)
     }
 
     fn project_fields<const FULL: bool, P: GroupProjection>(
@@ -1403,7 +1412,8 @@ impl SelectionBlock {
         select: impl Fn(crate::ElementKind, i64) -> bool,
         mut visit: impl FnMut(Element<'a>) -> Result<()>,
     ) -> Result<()> {
-        self.visit_selected::<true>(
+        self.visit_selected(
+            DenseSelection::RetainedTags,
             |kind, id| {
                 if select(kind, id) {
                     Selection::KeepTags
@@ -1411,6 +1421,7 @@ impl SelectionBlock {
                     Selection::Discard
                 }
             },
+            None::<&fn(SelectionRefs<'_>) -> bool>,
             |element, _| visit(element),
         )
     }
@@ -1427,12 +1438,39 @@ impl SelectionBlock {
         select: impl Fn(crate::ElementKind, i64) -> Selection,
         visit: impl FnMut(Element<'a>, bool) -> Result<()>,
     ) -> Result<()> {
-        self.visit_selected::<false>(select, visit)
+        self.visit_selected(
+            DenseSelection::WholeTags,
+            select,
+            None::<&fn(SelectionRefs<'_>) -> bool>,
+            visit,
+        )
     }
 
-    fn visit_selected<'a, const RETAINED_DENSE_FIELDS: bool>(
+    /// Select records by ID and, optionally, by their checked references.
+    /// Reference matches keep their tags. When `select_nodes` is false
+    /// the selector must discard nodes, so dense IDs need no selection
+    /// walk. Dense tag indices are checked only on nodes whose tags are
+    /// written. See [`Self::visit`] for the selector and visitor contracts.
+    pub(crate) fn visit_matching<'a>(
         &'a self,
+        select_nodes: bool,
         select: impl Fn(crate::ElementKind, i64) -> Selection,
+        matches_refs: Option<&impl Fn(SelectionRefs<'a>) -> bool>,
+        visit: impl FnMut(Element<'a>, bool) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_selected(
+            DenseSelection::Scoped { select_nodes },
+            select,
+            matches_refs,
+            visit,
+        )
+    }
+
+    fn visit_selected<'a>(
+        &'a self,
+        dense_fields: DenseSelection,
+        select: impl Fn(crate::ElementKind, i64) -> Selection,
+        matches_refs: Option<&impl Fn(SelectionRefs<'a>) -> bool>,
         mut visit: impl FnMut(Element<'a>, bool) -> Result<()>,
     ) -> Result<()> {
         let wire = &self.data.wire;
@@ -1446,8 +1484,13 @@ impl SelectionBlock {
         };
         let mut kinds = crate::element_kind::ElementKindSet::default();
         for i in 0..wire.group_count() {
-            kinds = kinds.union(visit_selected_group::<RETAINED_DENSE_FIELDS>(
-                wire, i, &select, &mut offer,
+            kinds = kinds.union(visit_selected_group(
+                wire,
+                i,
+                dense_fields,
+                &select,
+                matches_refs,
+                &mut offer,
             )?);
         }
         self.utf8.as_ref().map_err(Clone::clone)?;
@@ -1615,10 +1658,25 @@ impl Selection {
     }
 }
 
-fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
+/// The reference values available for selecting a way or relation.
+pub(crate) enum SelectionRefs<'a> {
+    Way(super::elements::WayRefIter<'a>),
+    Relation(super::elements::MemberIdIter<'a>),
+}
+
+#[derive(Clone, Copy)]
+enum DenseSelection {
+    WholeTags,
+    RetainedTags,
+    Scoped { select_nodes: bool },
+}
+
+fn visit_selected_group<'a>(
     wire: &'a WireBlock<'static>,
     index: usize,
+    dense_fields: DenseSelection,
     select: &impl Fn(crate::ElementKind, i64) -> Selection,
+    matches_refs: Option<&impl Fn(SelectionRefs<'a>) -> bool>,
     visit: &mut impl FnMut(Element<'a>, bool),
 ) -> Result<crate::element_kind::ElementKindSet> {
     use crate::ElementKind::{Node as NodeKind, Relation as RelationKind, Way as WayKind};
@@ -1630,7 +1688,7 @@ fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
     let mut kinds = crate::element_kind::ElementKindSet::default();
     // Output is dense-first. Defer any dense validation failure until
     // after the ordinary records, matching the full validator's order.
-    let dense = visit_selected_dense::<RETAINED_DENSE_FIELDS>(wire, &group, select, visit);
+    let dense = visit_selected_dense(wire, &group, dense_fields, select, visit);
     for bytes in group.nodes() {
         kinds.add(NodeKind);
         let mut node = WireNode::parse(bytes)?;
@@ -1653,7 +1711,14 @@ fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
     for bytes in group.ways() {
         kinds.add(WayKind);
         let mut way = WireWay::parse(bytes)?;
-        let selection = select(WayKind, way.id);
+        let by_id = select(WayKind, way.id);
+        let by_ref = select_references(by_id, matches_refs, || {
+            validate_way_geometry_arrays(&way)?;
+            Ok(SelectionRefs::Way(
+                super::elements::WayRefIter::delta_decoded(way.refs_data),
+            ))
+        })?;
+        let selection = by_ref.unwrap_or(by_id);
         if selection != Selection::Discard {
             validate_info(way.info_data)?;
         }
@@ -1665,7 +1730,9 @@ fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
             strings,
             "way has mismatched keys/vals tag array lengths",
         )?;
-        validate_way_geometry_arrays(&way)?;
+        if by_ref.is_none() {
+            validate_way_geometry_arrays(&way)?;
+        }
         if selection != Selection::Discard {
             visit(Element::Way(Way::new(wire, way)), keep_tags);
         }
@@ -1673,7 +1740,15 @@ fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
     for bytes in group.relations() {
         kinds.add(RelationKind);
         let mut relation = WireRelation::parse(bytes)?;
-        let selection = select(RelationKind, relation.id);
+        let by_id = select(RelationKind, relation.id);
+        let by_ref = select_references(by_id, matches_refs, || {
+            validate_relation_member_arrays(&relation)?;
+            Ok(SelectionRefs::Relation(super::elements::MemberIdIter::new(
+                relation.memids_data,
+                relation.types_data,
+            )))
+        })?;
+        let selection = by_ref.unwrap_or(by_id);
         if selection != Selection::Discard {
             validate_info(relation.info_data)?;
         }
@@ -1685,7 +1760,9 @@ fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
             strings,
             "relation has mismatched keys/vals tag array lengths",
         )?;
-        validate_relation_member_arrays(&relation)?;
+        if by_ref.is_none() {
+            validate_relation_member_arrays(&relation)?;
+        }
         if selection != Selection::Discard {
             visit(Element::Relation(Relation::new(wire, relation)), keep_tags);
         }
@@ -1696,9 +1773,27 @@ fn visit_selected_group<'a, const RETAINED_DENSE_FIELDS: bool>(
     Ok(kinds)
 }
 
-fn visit_selected_dense<'a, const RETAINED_DENSE_FIELDS: bool>(
+/// When references can change the selection, validate them before handing
+/// them to the matcher. `None` leaves that structural check to the caller.
+fn select_references<'a>(
+    selection: Selection,
+    matches: Option<&impl Fn(SelectionRefs<'a>) -> bool>,
+    checked_refs: impl FnOnce() -> Result<SelectionRefs<'a>>,
+) -> Result<Option<Selection>> {
+    let Some(matches) = matches.filter(|_| selection == Selection::Discard) else {
+        return Ok(None);
+    };
+    Ok(Some(if matches(checked_refs()?) {
+        Selection::KeepTags
+    } else {
+        Selection::Discard
+    }))
+}
+
+fn visit_selected_dense<'a>(
     wire: &'a WireBlock<'static>,
     group: &WireGroup<'a>,
+    dense_fields: DenseSelection,
     select: &impl Fn(crate::ElementKind, i64) -> Selection,
     visit: &mut impl FnMut(Element<'a>, bool),
 ) -> Result<bool> {
@@ -1710,6 +1805,12 @@ fn visit_selected_dense<'a, const RETAINED_DENSE_FIELDS: bool>(
     };
     let mut dense = WireDenseNodes::parse(bytes)?;
     let count = validate_dense_coordinates(&dense)?;
+    if let DenseSelection::Scoped { select_nodes } = dense_fields
+        && (!select_nodes || count == 0)
+    {
+        packed_varint_count(dense.keys_vals_data)?;
+        return Ok(count != 0);
+    }
     if count == 0 {
         // With no IDs every nonempty tag run or metadata array is extraneous.
         validate_dense_keys_vals(dense.keys_vals_data, count, wire.stringtable.len())?;
@@ -1732,17 +1833,18 @@ fn visit_selected_dense<'a, const RETAINED_DENSE_FIELDS: bool>(
             }
         }
     }
-    let retained_through = if RETAINED_DENSE_FIELDS && selection == Selection::KeepTags {
-        validate_retained_dense_tags(&dense, count, wire.stringtable.len(), select)?
-    } else {
-        project_dense_tags(
-            &mut dense,
-            selection == Selection::KeepTags,
-            count,
-            wire.stringtable.len(),
-        )?;
-        count
-    };
+    let retained_through =
+        if !matches!(dense_fields, DenseSelection::WholeTags) && selection == Selection::KeepTags {
+            validate_retained_dense_tags(&dense, count, wire.stringtable.len(), select)?
+        } else {
+            project_dense_tags(
+                &mut dense,
+                selection == Selection::KeepTags,
+                count,
+                wire.stringtable.len(),
+            )?;
+            count
+        };
     if selection != Selection::Discard {
         validate_dense_info(&dense, count)?;
         for node in DenseNodeIter::new(wire, dense).take(retained_through) {
@@ -2215,11 +2317,11 @@ fn validate_retained_dense_tags(
         let Some((position, id)) = ids.next() else {
             return false;
         };
-        let keep = select(crate::ElementKind::Node, id) == Selection::KeepTags;
-        if keep {
+        let selection = select(crate::ElementKind::Node, id);
+        if selection != Selection::Discard {
             retained_through = position + 1;
         }
-        keep
+        selection == Selection::KeepTags
     };
     if dense.keys_vals_data.is_empty() {
         for _ in 0..count {

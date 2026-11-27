@@ -4,6 +4,20 @@ Earlier getparents cells (planet and europe walls, the projection change, the
 arm dispatch) are in `classify.md`, `projections.md`, `cross-command.md`,
 `read-pipeline.md`, `write-pipeline.md` and `memory.md`.
 
+## getparents scopes validation to selection and retained output
+
+Selection validates the references it uses, and re-encoding checks the
+fields retained in the output. A record with several defects can now
+report a reference error first. See
+[DEVIATIONS.md](../../DEVIATIONS.md#id-and-reference-commands-validation-follows-the-fields-used).
+
+On bygg, A is HEAD `aa824014` and B is the working tree on that commit.
+Planet `parent-select`, one interleaved pair with `--iterations 1` per cell,
+took 10.8 s on A (`fdc55a01`) and 9.6 s on B (`82df57c2`). The roughly
+11 % reduction is a modest single-pair result in the same direction as
+the [tags-filter](tags-filter.md) and [extract](extract.md) measurements.
+`getparents` passed on germany.
+
 ## `--add-self` selects node and way blobs by claimed ID range (bygg, 2026-11-26)
 
 Baseline `dfd36268` (`brokkr bench --commit`), variant the same tree with the

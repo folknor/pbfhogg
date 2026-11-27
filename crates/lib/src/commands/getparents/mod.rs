@@ -11,20 +11,17 @@
 //! the blob's claimed range holds; relation blobs when the query is
 //! non-empty. `Selection` is that rule, applied by both arms.
 
-use super::getid::ElementIds;
-use super::{
-    HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, writer_from_header_bytes,
-};
+use super::getid::{ElementIds, SelectedEncoder, element_key};
+use super::{HeaderOverrides, flush_local, writer_from_header_bytes};
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::block_builder::{BlockBuilder, OwnedBlock};
+use crate::read::block::{Selection as RecordSelection, SelectionRefs};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
-use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{ElementReader, MemberId};
 
 use super::Result;
 
@@ -484,213 +481,59 @@ fn getparents_pipelined(
     Ok(stats)
 }
 
-/// One blob's matches, re-encoded, with their counts: what both arms run on
-/// a decode worker.
-///
-/// The blob is validated through [`ParentProbe`], the projection that asks
-/// only whether any element is one [`process_block`] would emit
-/// (`BlockBuffer::project`: block construction's validator and kind-claim
-/// refusal, so the blob is refused exactly as building its block would
-/// refuse it). Almost every blob holds none, and that answer costs the
-/// validation pass plus the member tests, with no block built and no
-/// element re-parsed. A blob with a hit becomes its block from the
-/// validated bytes (no second validation) and goes through the unchanged
-/// `process_block`, so what is written, in what order, and every error a
-/// selected element raises (a bad user or role index) are as before. A
-/// blob without one cannot raise any: `process_block` resolves strings only
-/// for the elements it selects.
-///
-/// Each blob with a hit builds its own `BlockBuilder`, flushed into a
-/// per-blob `Vec<OwnedBlock>` before returning. Not because the builder is
-/// not `Send` (the ordered arm's worker state is built on the worker's
-/// thread and could hold one): a query hits few blobs, so a builder per hit
-/// costs next to nothing, and the fused arm (`for_each_fused_blob`) has
-/// no per-worker state to keep one in.
+/// Re-encode matching records in element order on either scan arm. A
+/// relation or way is matched by its own refs, since another version of the
+/// same ID can have different refs. Builders are allocated only on a hit.
 fn parents_in(
     buffer: crate::read::block::BlockBuffer<'_>,
     ids: &ElementIds,
     add_self: bool,
     coords: crate::owned::WayCoords,
     limits: &crate::commands::split::Limits,
-) -> crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))> {
-    let (probe, accepted) = buffer.project(|_, _| ParentProbe::new(ids, add_self))?;
-    if !probe.hit {
-        return Ok((Vec::new(), (0, 0, 0)));
-    }
-    let block = accepted.into_block();
-    let mut bb = BlockBuilder::new();
-    let mut output: Vec<OwnedBlock> = Vec::new();
-    let counts = process_block(&block, &mut bb, &mut output, ids, add_self, coords)?;
-    flush_local(&mut bb, &mut output)?;
-    // A rebuilt block the writer would refuse as too large is cut between
-    // elements here, on the worker (`commands/split.rs`).
-    crate::commands::split::fit_blocks(&mut output, limits)?;
-    Ok((output, counts))
-}
-
-/// Whether a block holds an element [`process_block`] would select: the
-/// same tests on the same values, read from the messages the validator
-/// already parsed. A way is a parent when one of its refs is a queried
-/// node; a relation when one of its members is a queried node, way or
-/// relation (an `Unknown` member type matches nothing, though its delta
-/// still advances the running ID); with `add_self`, a node, way or relation
-/// whose own ID is queried. Refs and member IDs decode as the element
-/// iterators decode them (`WayRefIter::delta_decoded`, `MemberIdIter`),
-/// dense node IDs by the same wrapping running sum, and every test goes
-/// through the same signed `IdSet::get`, so a negative ID matches here
-/// exactly as there.
-///
-/// Every element of every kind is tested whatever the blob's claim: an
-/// unindexed blob is scheduled into the walk conservatively and may hold
-/// anything. After the first hit the tests stop; validation does not.
-struct ParentProbe<'q> {
-    ids: &'q ElementIds,
-    add_self: bool,
-    /// A way can only be a parent through a queried node.
-    any_nodes: bool,
-    hit: bool,
-}
-
-impl<'q> ParentProbe<'q> {
-    fn new(ids: &'q ElementIds, add_self: bool) -> Self {
-        Self {
-            ids,
-            add_self,
-            any_nodes: ids.node_ids.has_any(),
-            hit: false,
-        }
-    }
-}
-
-impl crate::read::block::GroupProjection for ParentProbe<'_> {
-    fn node(
-        &mut self,
-        node: &crate::read::wire::WireNode<'_>,
-        _info: Option<&crate::read::wire::WireInfo>,
-    ) {
-        self.hit = self.hit || (self.add_self && self.ids.node_ids.get(node.id));
-    }
-
-    fn way(
-        &mut self,
-        way: &crate::read::wire::WireWay<'_>,
-        _info: Option<&crate::read::wire::WireInfo>,
-    ) {
-        self.hit = self.hit
-            || (self.any_nodes
-                && crate::read::elements::WayRefIter::delta_decoded(way.refs_data)
-                    .any(|r| self.ids.node_ids.get(r)))
-            || (self.add_self && self.ids.way_ids.get(way.id));
-    }
-
-    fn relation(
-        &mut self,
-        relation: &crate::read::wire::WireRelation<'_>,
-        _info: Option<&crate::read::wire::WireInfo>,
-    ) {
-        self.hit = self.hit
-            || crate::read::elements::MemberIdIter::new(relation.memids_data, relation.types_data)
-                .any(|m| match m {
-                    MemberId::Node(id) => self.ids.node_ids.get(id),
-                    MemberId::Way(id) => self.ids.way_ids.get(id),
-                    MemberId::Relation(id) => self.ids.relation_ids.get(id),
-                    MemberId::Unknown(..) => false,
-                })
-            || (self.add_self && self.ids.relation_ids.get(relation.id));
-    }
-
-    fn dense(
-        &mut self,
-        dense: &crate::read::wire::WireDenseNodes<'_>,
-        _ids: usize,
-        _info: Option<&crate::read::wire::WireDenseInfo<'_>>,
-    ) {
-        self.hit = self.hit
-            || (self.add_self
-                && crate::read::elements::WayRefIter::delta_decoded(dense.id_data)
-                    .any(|id| self.ids.node_ids.get(id)));
-    }
-}
-
-fn process_block(
-    block: &PrimitiveBlock,
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
-    ids: &ElementIds,
-    add_self: bool,
-    coords: crate::owned::WayCoords,
-) -> crate::Result<(u64, u64, u64)> {
-    let mut nodes: u64 = 0;
-    let mut ways: u64 = 0;
-    let mut relations: u64 = 0;
-
-    let mut way = crate::owned::WayScratch::default();
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-
-    for element in block.elements() {
-        match &element {
-            Element::DenseNode(dn) => {
-                // Nodes are never parents. Include only if --add-self and ID matches.
-                if add_self && ids.node_ids.get(dn.id()) {
-                    ensure_node_capacity_local(bb, output)?;
-                    let meta = dense_node_metadata(dn)?;
-                    bb.add_node_dense(
-                        dn.id(),
-                        dn.decimicro_lat()?,
-                        dn.decimicro_lon()?,
-                        dn.tags(),
-                        meta.as_ref(),
-                    );
-                    nodes += 1;
-                }
+) -> Result<(Vec<OwnedBlock>, (u64, u64, u64))> {
+    let block = buffer.for_selection()?;
+    let mut output = Vec::new();
+    let mut bb = None;
+    let mut encoder = SelectedEncoder::new(coords);
+    let mut counts = [0; 3];
+    let any_nodes = ids.node_ids.has_any();
+    block.visit_matching(
+        add_self && any_nodes,
+        |kind, id| {
+            if add_self && ids.of(kind).get(id) {
+                RecordSelection::KeepTags
+            } else {
+                RecordSelection::Discard
             }
-            Element::Node(n) => {
-                if add_self && ids.node_ids.get(n.id()) {
-                    ensure_node_capacity_local(bb, output)?;
-                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node_partial(
-                        n.id(),
-                        n.decimicro_lat()?,
-                        n.decimicro_lon()?,
-                        n.tags(),
-                        meta.as_ref(),
-                    );
-                    nodes += 1;
-                }
-            }
-            Element::Way(w) => {
-                // A way is a parent if it references any requested node ID.
-                let is_parent = w.refs().any(|r| ids.node_ids.get(r));
-                let is_self = add_self && ids.way_ids.get(w.id());
-                if is_parent || is_self {
-                    ensure_way_capacity_local(bb, output)?;
-                    way.prepare(w, coords)?;
-                    let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                    way.write(bb, w.tags(), meta.as_ref());
-                    ways += 1;
-                }
-            }
-            Element::Relation(r) => {
-                // A relation is a parent if any member matches a requested ID.
-                let is_parent = r.members().any(|m| match m.id {
-                    MemberId::Node(id) => ids.node_ids.get(id),
-                    MemberId::Way(id) => ids.way_ids.get(id),
-                    MemberId::Relation(id) => ids.relation_ids.get(id),
-                    MemberId::Unknown(..) => false,
-                });
-                let is_self = add_self && ids.relation_ids.get(r.id());
-                if is_parent || is_self {
-                    ensure_relation_capacity_local(bb, output)?;
-                    r.members_into(&mut members_buf)?;
-                    let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
-                    relations += 1;
-                }
-            }
-        }
+        },
+        Some(&|refs| match refs {
+            SelectionRefs::Way(mut refs) => any_nodes && refs.any(|id| ids.node_ids.get(id)),
+            SelectionRefs::Relation(mut members) => members.any(|member| match member {
+                MemberId::Node(id) => ids.node_ids.get(id),
+                MemberId::Way(id) => ids.way_ids.get(id),
+                MemberId::Relation(id) => ids.relation_ids.get(id),
+                MemberId::Unknown(..) => false,
+            }),
+        }),
+        |element, keep_tags| {
+            let (kind, _) = element_key(&element);
+            encoder.write(
+                bb.get_or_insert_with(BlockBuilder::new),
+                &mut output,
+                &element,
+                keep_tags,
+            )?;
+            counts[usize::from(kind.ordinal())] += 1;
+            Ok(())
+        },
+    )?;
+    if let Some(mut bb) = bb {
+        flush_local(&mut bb, &mut output)?;
+        // Cut a rebuilt block the writer would refuse as too large.
+        crate::commands::split::fit_blocks(&mut output, limits)?;
     }
-
-    Ok((nodes, ways, relations))
+    let [nodes, ways, relations] = counts;
+    Ok((output, (nodes, ways, relations)))
 }
 
 #[cfg(test)]
@@ -708,15 +551,10 @@ mod tests {
     use crate::writer::{Compression, PbfWriter};
     use crate::{Element, ElementKind, ElementReader, HeaderOverrides, MemberId};
 
-    /// For every fixture, every truncation and every probed byte value, and
-    /// a spread of queries with and without `--add-self`: `parents_in`
-    /// refuses exactly what block construction refuses, with the same
-    /// message, and on what it accepts returns what the unconditional
-    /// `process_block` over the constructed block returns (the same counts,
-    /// the same encoded blocks, or the same error), so the probe never
-    /// skips a blob `process_block` would have written from or failed on.
+    /// Compare the scoped selection with the full walk wherever block
+    /// construction accepts the fixture or mutation.
     #[test]
-    fn the_probe_answers_as_process_block_on_every_blob() {
+    fn scoped_getparents_matches_the_full_element_walk() {
         use crate::read::wire_fixtures::{mutations, projection_fixtures};
 
         let queries: Vec<(Vec<&str>, bool)> = vec![
@@ -755,7 +593,9 @@ mod tests {
             let cases =
                 std::iter::once(("as built".to_owned(), bytes.clone())).chain(mutations(&bytes));
             for (how, input) in cases {
-                let oracle = crate::PrimitiveBlock::from_vec(input.clone());
+                let Ok(block) = crate::PrimitiveBlock::from_vec(input.clone()) else {
+                    continue;
+                };
                 for (ids, add_self) in &queries {
                     let (mut st, mut gr) = (Vec::new(), Vec::new());
                     let buffer = crate::read::block::BlockBuffer::new(
@@ -765,7 +605,7 @@ mod tests {
                         &mut gr,
                         None,
                     );
-                    let probed = encoded(super::parents_in(
+                    let actual = encoded(super::parents_in(
                         buffer,
                         ids,
                         *add_self,
@@ -774,26 +614,150 @@ mod tests {
                             crate::write::compression::Compression::None,
                         ),
                     ));
-                    let expected = match &oracle {
-                        Err(e) => format!("error {e}"),
-                        Ok(block) => encoded((|| {
-                            let mut bb = BlockBuilder::new();
-                            let mut output = Vec::new();
-                            let counts = super::process_block(
-                                block,
-                                &mut bb,
-                                &mut output,
-                                ids,
-                                *add_self,
-                                crate::owned::WayCoords::Drop,
-                            )?;
-                            super::flush_local(&mut bb, &mut output)?;
-                            Ok((output, counts))
-                        })()),
-                    };
-                    assert_eq!(probed, expected, "{what}, {how}, add_self {add_self}");
+                    let expected = encoded((|| {
+                        let mut bb = BlockBuilder::new();
+                        let mut output = Vec::new();
+                        let mut counts = [0; 3];
+                        let mut encoder =
+                            super::SelectedEncoder::new(crate::owned::WayCoords::Drop);
+                        for element in block.elements() {
+                            let (kind, id) = super::element_key(&element);
+                            let parent = match &element {
+                                Element::Way(way) => way.refs().any(|id| ids.node_ids.get(id)),
+                                Element::Relation(rel) => {
+                                    rel.members().any(|member| match member.id {
+                                        MemberId::Node(id) => ids.node_ids.get(id),
+                                        MemberId::Way(id) => ids.way_ids.get(id),
+                                        MemberId::Relation(id) => ids.relation_ids.get(id),
+                                        MemberId::Unknown(..) => false,
+                                    })
+                                }
+                                _ => false,
+                            };
+                            if parent || (*add_self && ids.of(kind).get(id)) {
+                                encoder.write(&mut bb, &mut output, &element, true)?;
+                                counts[usize::from(kind.ordinal())] += 1;
+                            }
+                        }
+                        super::flush_local(&mut bb, &mut output)?;
+                        let [nodes, ways, relations] = counts;
+                        Ok((output, (nodes, ways, relations)))
+                    })());
+                    assert_eq!(actual, expected, "{what}, {how}, add_self {add_self}");
                 }
             }
+        }
+    }
+
+    type EncodedBlob = (Vec<Vec<u8>>, (u64, u64, u64));
+
+    fn run_blob(bytes: Vec<u8>) -> crate::Result<EncodedBlob> {
+        let (mut strings, mut groups) = (Vec::new(), Vec::new());
+        let buffer =
+            crate::read::block::BlockBuffer::new(bytes, None, &mut strings, &mut groups, None);
+        let ids = parse_ids(&["n1".to_owned()])?;
+        let (blocks, counts) = super::parents_in(
+            buffer,
+            &ids,
+            true,
+            crate::owned::WayCoords::Drop,
+            &crate::commands::split::Limits::new(Compression::None),
+        )?;
+        Ok((blocks.into_iter().map(|b| b.bytes).collect(), counts))
+    }
+
+    #[test]
+    fn getparents_uses_the_references_of_each_version() {
+        use crate::read::wire_fixtures::{Group, block, dense, field_bytes, relation, way};
+
+        let input = |discarded_tag, discarded_info: &[u8], discarded_dense: &[u8]| {
+            let mut earlier = way(10, &[2], (1, discarded_tag));
+            field_bytes(&mut earlier, 4, discarded_info);
+            let mut unselected_relation = relation(20, &[(0, 2, 0)]);
+            field_bytes(&mut unselected_relation, 4, discarded_info);
+            let mut dense = dense(&[(3, 0, 0)], &[1, discarded_tag, 0]);
+            field_bytes(&mut dense, 5, discarded_dense);
+            block(
+                &["", "k", "v"],
+                &[Group {
+                    dense: Some(dense),
+                    ways: vec![earlier, way(10, &[1], (1, 2))],
+                    relations: vec![unselected_relation, relation(20, &[(0, 1, 0)])],
+                    ..Group::default()
+                }],
+            )
+        };
+        let good = input(2, &[], &[]);
+        let bad = input(127, &[0x08], &[0x0a, 2]);
+        let full = crate::PrimitiveBlock::from_vec(bad.clone())
+            .expect_err("full validation rejects the truncated way Info");
+        assert!(
+            matches!(
+                full.kind(),
+                crate::ErrorKind::WireFormat {
+                    msg: "truncated varint"
+                }
+            ),
+            "{full}"
+        );
+        let expected = run_blob(good).expect("well-formed versions");
+        assert_eq!(expected.1, (0, 1, 1));
+        assert_eq!(run_blob(bad).expect("unselected versions"), expected);
+    }
+
+    #[test]
+    fn getparents_checks_selection_and_output_fields() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes, relation, way};
+
+        let mut broken_refs = way(10, &[], (1, 2));
+        field_bytes(&mut broken_refs, 8, &[0x80]);
+        let mut broken_members = relation(20, &[]);
+        field_bytes(&mut broken_members, 9, &[0]);
+        field_bytes(&mut broken_members, 10, &[0]);
+        field_bytes(&mut broken_members, 8, &[0x80]);
+        let mut broken_types = relation(20, &[]);
+        field_bytes(&mut broken_types, 8, &[0]);
+        field_bytes(&mut broken_types, 9, &[2]);
+        field_bytes(&mut broken_types, 10, &[0x80]);
+        let mut bad_info = way(10, &[1], (1, 2));
+        field_bytes(&mut bad_info, 4, &[0x08]);
+        for group in [
+            Group {
+                ways: vec![broken_refs],
+                ..Group::default()
+            },
+            Group {
+                ways: vec![bad_info],
+                ..Group::default()
+            },
+            Group {
+                ways: vec![way(10, &[1], (1, 127))],
+                ..Group::default()
+            },
+            Group {
+                relations: vec![broken_members],
+                ..Group::default()
+            },
+            Group {
+                relations: vec![broken_types],
+                ..Group::default()
+            },
+            Group {
+                relations: vec![relation(20, &[(127, 1, 0)])],
+                ..Group::default()
+            },
+        ] {
+            let input = block(&["", "k", "v"], &[group]);
+            let full = crate::PrimitiveBlock::from_vec(input.clone())
+                .and_then(|block| {
+                    if let Some(Element::Relation(rel)) = block.elements().next() {
+                        rel.members_into(&mut Vec::new())?;
+                    }
+                    Ok(())
+                })
+                .expect_err("full walk must refuse");
+            let scoped = run_blob(input).expect_err("scoped walk must refuse");
+            assert_eq!(scoped.to_string(), full.to_string());
         }
     }
 

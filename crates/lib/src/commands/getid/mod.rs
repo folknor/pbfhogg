@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::idset::IdSet;
 
 use super::output_header::{Declared, OutputFacts, Ways};
-use super::relation_closure::{EdgeStore, relation_phase};
+use super::relation_closure::{EdgeStore, RelationRefs};
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
@@ -14,15 +14,15 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Error;
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata};
-use crate::read::block::BlockBuffer;
+use crate::read::block::{BlockBuffer, Selection, SelectionRefs};
 use crate::read::header_walker::ScanArm;
 use crate::read::input::{InputFile, InputSource, PinnedInput};
-use crate::read::project_ids::WaySpans;
+use crate::read::project_ids::{RelationSpans, WaySpans};
 use crate::scan::classify::ScheduledBlob;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
-use crate::{BlobFilter, Element, ElementKind, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementKind, ElementReader, MemberId};
 
 use super::Result;
 
@@ -64,7 +64,7 @@ impl ElementIds {
     }
 
     /// The set of one kind.
-    fn of(&self, kind: ElementKind) -> &IdSet {
+    pub(super) fn of(&self, kind: ElementKind) -> &IdSet {
         match kind {
             ElementKind::Node => &self.node_ids,
             ElementKind::Way => &self.way_ids,
@@ -288,9 +288,8 @@ pub fn parse_ids_from_pbf<'a>(
     }
 
     // Every element's ID, read through the shared ID projection on the
-    // block validator (no block built; refused exactly as construction
-    // refuses). The three sets are independent unions, so the order between
-    // kinds does not matter.
+    // scoped block validator. The three sets are independent unions, so
+    // the order between kinds does not matter.
     let mut all_kinds = crate::element_kind::ElementKindSet::default();
     for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
         all_kinds.add(kind);
@@ -302,13 +301,15 @@ pub fn parse_ids_from_pbf<'a>(
         crate::read::project_ids::IdScratch::default,
         |_, buffer, scratch| {
             let (crate::read::project_ids::KindIds { .. }, accepted) = buffer
-                .project(|_, _| crate::read::project_ids::KindIds::new(all_kinds, &mut *scratch))?;
+                .project_ids_and_refs(|_, _| {
+                    crate::read::project_ids::KindIds::new(all_kinds, &mut *scratch)
+                })?;
             let mut batch = IdBatch {
                 node_ids: Vec::new(),
                 way_ids: Vec::new(),
                 relation_ids: Vec::new(),
             };
-            scratch.each(accepted.bytes(), |kind, id| {
+            scratch.each(&accepted, |kind, id| {
                 match kind {
                     ElementKind::Node => batch.node_ids.push(id),
                     ElementKind::Way => batch.way_ids.push(id),
@@ -737,7 +738,7 @@ fn filter_by_id_walker(
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut bb = BlockBuilder::new();
+    let mut bb = None;
     let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
     let mut stats = GetidStats {
         nodes_written: 0,
@@ -751,6 +752,13 @@ fn filter_by_id_walker(
         ids.way_ids.has_any(),
         ids.relation_ids.has_any(),
     );
+    let selection = IdSelection {
+        ids,
+        pulled: None,
+        include_matches: include_mode,
+        strip_tags: false,
+        report_found,
+    };
     let mut blobs_skipped: u64 = 0;
     let mut blobs_passthrough: u64 = 0;
     let mut osmdata_blobs: u64 = 0;
@@ -862,32 +870,10 @@ fn filter_by_id_walker(
                     &mut gr_scratch,
                     meta.index.as_ref().map(|idx| idx.kind),
                 );
-                // Include mode builds the block only when it holds a
-                // selected element (`included_block`); invert re-encodes
-                // nearly every element of a blob it decodes, so a probe
-                // could only add work there and it builds the block outright.
-                let block = if include_mode {
-                    match included_block(buffer, ids, None).map_err(locate)? {
-                        Some(block) => block,
-                        None => continue,
-                    }
-                } else {
-                    buffer.block().map_err(locate)?
-                };
                 output_blocks.clear();
-                let outcome = process_block(
-                    &block,
-                    &mut bb,
-                    &mut output_blocks,
-                    ids,
-                    include_mode,
-                    None,
-                    false,
-                    report_found,
-                    coords,
-                )
-                .map_err(locate)?;
-                flush_local(&mut bb, &mut output_blocks)?;
+                let outcome =
+                    process_block(buffer, &mut bb, &mut output_blocks, &selection, coords)
+                        .map_err(locate)?;
                 // Only an unindexed blob can be a way blob decoded under a
                 // header that declared the copied way enrichments (with
                 // them, no way ID is removed, so an indexed way blob never
@@ -989,6 +975,13 @@ fn filter_by_id_streaming(
         relations_written: 0,
         found: report_found.then(ElementIds::empty),
     };
+    let selection = IdSelection {
+        ids,
+        pulled: None,
+        include_matches: true,
+        strip_tags: false,
+        report_found,
+    };
     let mut blobs_skipped: u64 = 0;
     let mut osmdata_blobs: u64 = 0;
 
@@ -998,7 +991,7 @@ fn filter_by_id_streaming(
         host,
     );
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut bb = BlockBuilder::new();
+    let mut bb = None;
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -1068,8 +1061,7 @@ fn filter_by_id_streaming(
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.
-                // See `filter_by_id_walker`: a lying kind claim is refused,
-                // and the block is built only when it holds a selected element.
+                // As on the walker, the selection validates the kind claim.
                 let buffer = BlockBuffer::new(
                     std::mem::take(&mut decompress_buf),
                     None,
@@ -1077,23 +1069,10 @@ fn filter_by_id_streaming(
                     &mut gr_scratch,
                     index.as_ref().map(|idx| idx.kind),
                 );
-                let Some(block) = included_block(buffer, ids, None).map_err(locate)? else {
-                    continue;
-                };
                 output_blocks.clear();
-                let outcome = process_block(
-                    &block,
-                    &mut bb,
-                    &mut output_blocks,
-                    ids,
-                    true,
-                    None,
-                    false,
-                    report_found,
-                    coords,
-                )
-                .map_err(locate)?;
-                flush_local(&mut bb, &mut output_blocks)?;
+                let outcome =
+                    process_block(buffer, &mut bb, &mut output_blocks, &selection, coords)
+                        .map_err(locate)?;
                 crate::commands::split::fit_blocks(&mut output_blocks, &limits).map_err(locate)?;
                 for block in output_blocks.drain(..) {
                     w.write_primitive_block_owned(block)?;
@@ -1232,9 +1211,8 @@ fn getid_with_refs(
         .counter("getid_dep_relation_ids", pulled.relation_ids.len());
 
     // Pass 2: write the requested and pulled-in elements, in file order,
-    // from the blobs whose claimed range holds one of them (`included_block`
-    // and `process_block` select by the same union); an unindexed file's
-    // every blob once.
+    // from the blobs whose claimed range holds one of them. An unindexed
+    // file's blobs are read once each.
     host.invocation.marker("GETID_PASS2_START");
     let schedule = if indexed {
         let mut schedule = in_claimed_range(
@@ -1278,14 +1256,13 @@ fn getid_with_refs(
         host,
     )?;
 
-    let pulled_ref = (!pulled.is_empty()).then_some(&pulled);
-    // `--remove-tags` strips every emitted object that was not itself
-    // requested, of any kind: those are exactly the pulled-in ones.
-    let strip_tags = add.remove_tags;
-
-    // Almost every blob holds nothing selected; `included_block` answers that
-    // from the validator's pass and builds the block only for a blob that
-    // does.
+    let selection = IdSelection {
+        ids,
+        pulled: (!pulled.is_empty()).then_some(&pulled),
+        include_matches: true,
+        strip_tags: add.remove_tags,
+        report_found,
+    };
     let limits = crate::commands::split::Limits::new(writer.compression());
     crate::scan::classify::parallel_project_phase_ordered(
         &shared_file,
@@ -1294,23 +1271,9 @@ fn getid_with_refs(
         None,
         || (),
         |buffer, _| {
-            let Some(block) = included_block(buffer, ids, pulled_ref)? else {
-                return Ok((Vec::new(), BlockOutcome::default()));
-            };
-            let mut bb = BlockBuilder::new();
+            let mut bb = None;
             let mut output = Vec::new();
-            let outcome = process_block(
-                &block,
-                &mut bb,
-                &mut output,
-                ids,
-                true,
-                pulled_ref,
-                strip_tags,
-                report_found,
-                coords,
-            )?;
-            flush_local(&mut bb, &mut output)?;
+            let outcome = process_block(buffer, &mut bb, &mut output, &selection, coords)?;
             crate::commands::split::fit_blocks(&mut output, &limits)?;
             Ok((output, outcome))
         },
@@ -1382,13 +1345,12 @@ fn close_relations(
     let mut seeds: Vec<i64> = Vec::new();
     let mut edges = EdgeStore::default();
     let mut store_failed: Option<Error> = None;
-    relation_phase(
+    collect_relation_members(
         shared_file,
         schedule,
         claims,
         &ids.relation_ids,
         true,
-        None,
         |refs| {
             insert_all(&mut pulled.node_ids, refs.nodes);
             insert_all(&mut pulled.way_ids, refs.ways);
@@ -1429,13 +1391,12 @@ fn close_relations(
         let reached = in_claimed_range(schedule, claims, &pulled.relation_ids, None)?;
         host.invocation
             .counter("getid_reached_relation_blobs", reached.len());
-        relation_phase(
+        collect_relation_members(
             shared_file,
             &reached,
             None,
             &pulled.relation_ids,
             false,
-            None,
             |refs| {
                 insert_all(&mut pulled.node_ids, refs.nodes);
                 insert_all(&mut pulled.way_ids, refs.ways);
@@ -1444,6 +1405,67 @@ fn close_relations(
         )?;
     }
     Ok(())
+}
+
+/// Collect relation members and closure edges through the scoped validator.
+fn collect_relation_members(
+    shared_file: &InputFile,
+    schedule: &[ScheduledBlob],
+    claims: Option<&[crate::blob_meta::BlobIndex]>,
+    collect: &IdSet,
+    seed_edges: bool,
+    mut merge: impl FnMut(RelationRefs),
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    if let Some(claims) = claims
+        && claims.len() != schedule.len()
+    {
+        return Err(Error::internal(
+            "relation phase: claims do not match the schedule entry for entry",
+        ));
+    }
+    crate::scan::classify::parallel_project_phase(
+        shared_file,
+        schedule,
+        None,
+        Vec::new,
+        |position, buffer, relations| -> Result<RelationRefs> {
+            let (RelationSpans { .. }, accepted) =
+                buffer.project_ids_and_refs(|_, _| RelationSpans::new(&mut *relations))?;
+            if let Some(claim) = claims.and_then(|c| c.get(position)) {
+                let mut walk =
+                    crate::blob_meta::ClaimWalk::new(Some(claim), crate::blob_meta::Order::Free);
+                for relation in relations.iter() {
+                    walk.observe(relation.id)?;
+                }
+                walk.finish()?;
+            }
+            let mut refs = RelationRefs::default();
+            for relation in relations.iter() {
+                let collected = collect.get(relation.id);
+                if !collected && !seed_edges {
+                    continue;
+                }
+                for member in relation.members(&accepted)? {
+                    match member {
+                        MemberId::Node(id) if collected => refs.nodes.push(id),
+                        MemberId::Way(id) if collected => refs.ways.push(id),
+                        MemberId::Relation(id) if seed_edges => {
+                            if collected {
+                                refs.relations.push(id);
+                            } else {
+                                refs.edges.push((relation.id, id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(refs)
+        },
+        |_seq, refs| merge(refs),
+        host,
+    )
 }
 
 /// The entries of `schedule` whose claimed ID range holds an ID of `set`
@@ -1478,9 +1500,8 @@ fn in_claimed_range(
 
 /// Add the node refs of every way in `pulled.way_ids` to `pulled.node_ids`.
 ///
-/// Each blob is validated through `WaySpans` restricted to those ways (no
-/// block built; refused exactly as construction refuses), and only after it
-/// is accepted are those ways' refs decoded, sorted and deduplicated into a
+/// Each blob projects `WaySpans` for those ways. After acceptance, their
+/// refs are decoded, sorted and deduplicated into a
 /// per-blob vector, which the consumer inserts into the one node set. A
 /// per-worker set would hold up to one node-range bitmap per worker on a
 /// broad query (`-I` naming every way); the per-blob vector is bounded by
@@ -1502,10 +1523,10 @@ fn collect_way_nodes(
         Vec::new,
         |_, buffer, ways| -> Result<Vec<i64>> {
             let (WaySpans { .. }, accepted) =
-                buffer.project(|_, _| WaySpans::new(Some(way_ids), &mut *ways))?;
+                buffer.project_ids_and_refs(|_, _| WaySpans::new(Some(way_ids), &mut *ways))?;
             let mut refs: Vec<i64> = Vec::new();
             for way in ways.iter() {
-                refs.extend(way.refs(accepted.bytes())?);
+                refs.extend(way.refs(&accepted)?);
             }
             refs.sort_unstable();
             refs.dedup();
@@ -1518,47 +1539,34 @@ fn collect_way_nodes(
     )
 }
 
-/// The block of a decoded blob in include mode, or `None` when it holds no
-/// element include mode would emit.
-///
-/// The blob is validated through [`SelectProbe`] (`BlockBuffer::project`:
-/// block construction's validator and kind-claim refusal, so the blob is
-/// refused exactly as building its block would refuse it, whatever the
-/// probe answers). Almost every blob a narrow query decodes holds no
-/// selected element, and that answer costs the validation pass plus one ID
-/// test per element, with no block built and no element re-parsed. A blob
-/// with a hit becomes its block from the validated bytes (no second
-/// validation) and goes through the unchanged [`process_block`], so what is
-/// written, in what order, and every error a selected element raises (a
-/// bad user or role index) are as before. A blob without one cannot raise
-/// any: `process_block` resolves strings only for the elements it emits.
-///
-/// Recording the selected elements' spans during validation, so a hit
-/// blob need not be rebuilt and walked again, was weighed and not done: a
-/// narrow query has a handful of hit blobs, and the whole of
-/// `--add-referenced`'s pass 2, rebuilds included, is 81 ms of a 7 s
-/// planet run (bygg, 2026-11-26, reference/performance/getid.md).
-///
-/// Invert mode does not come here: it emits every element not requested,
-/// so a blob it decodes is a hit at its first unrequested element and a
-/// probe would only add a pass.
-fn included_block(
-    buffer: BlockBuffer<'_>,
-    ids: &ElementIds,
-    pulled: Option<&ElementIds>,
-) -> Result<Option<PrimitiveBlock>> {
-    let (probe, accepted) = buffer.project(|_, _| SelectProbe::new(ids, pulled))?;
-    Ok(probe.hit.then(|| accepted.into_block()))
+struct IdSelection<'a> {
+    ids: &'a ElementIds,
+    pulled: Option<&'a ElementIds>,
+    include_matches: bool,
+    strip_tags: bool,
+    report_found: bool,
 }
 
-/// Whether `id` of `kind` is selected: requested, or pulled in by
-/// `--add-referenced`. The one test every selection gate applies.
-fn selected(ids: &ElementIds, pulled: Option<&ElementIds>, kind: ElementKind, id: i64) -> bool {
-    ids.of(kind).get(id) || pulled.is_some_and(|p| p.of(kind).get(id))
+impl IdSelection<'_> {
+    fn select(&self, kind: ElementKind, id: i64) -> Selection {
+        let requested = self.ids.of(kind).get(id);
+        let selected = requested || self.pulled.is_some_and(|p| p.of(kind).get(id));
+        if selected == self.include_matches {
+            Selection::retain(!self.strip_tags || requested)
+        } else {
+            Selection::Discard
+        }
+    }
+
+    fn may_select_nodes(&self) -> bool {
+        !self.include_matches
+            || self.ids.node_ids.has_any()
+            || self.pulled.is_some_and(|p| p.node_ids.has_any())
+    }
 }
 
 /// An element's kind and ID.
-fn element_key(element: &Element<'_>) -> (ElementKind, i64) {
+pub(super) fn element_key(element: &Element<'_>) -> (ElementKind, i64) {
     match element {
         Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
         Element::Node(n) => (ElementKind::Node, n.id()),
@@ -1567,148 +1575,72 @@ fn element_key(element: &Element<'_>) -> (ElementKind, i64) {
     }
 }
 
-/// Whether a block holds an element [`is_dominated`] selects: the same
-/// tests on the same values, read from the messages the validator already
-/// parsed. Dense node IDs decode by the wrapping running sum
-/// `DenseNodeIter` uses (`WayRefIter::delta_decoded`), and every test is
-/// the same signed `IdSet::get`, so a negative ID matches here exactly as
-/// there. Every
-/// element of every
-/// kind is tested whatever the blob's claim; after the first hit the tests
-/// stop, validation does not.
-struct SelectProbe<'q> {
-    ids: &'q ElementIds,
-    pulled: Option<&'q ElementIds>,
-    /// Whether any node can be selected: a requested node, or a pulled-in
-    /// one.
-    any_nodes: bool,
-    hit: bool,
-}
-
-impl<'q> SelectProbe<'q> {
-    fn new(ids: &'q ElementIds, pulled: Option<&'q ElementIds>) -> Self {
-        Self {
-            ids,
-            pulled,
-            any_nodes: ids.node_ids.has_any() || pulled.is_some_and(|p| p.node_ids.has_any()),
-            hit: false,
-        }
-    }
-
-    fn selected(&self, kind: ElementKind, id: i64) -> bool {
-        selected(self.ids, self.pulled, kind, id)
-    }
-}
-
-impl crate::read::block::GroupProjection for SelectProbe<'_> {
-    fn node(
-        &mut self,
-        node: &crate::read::wire::WireNode<'_>,
-        _info: Option<&crate::read::wire::WireInfo>,
-    ) {
-        self.hit = self.hit || (self.any_nodes && self.selected(ElementKind::Node, node.id));
-    }
-
-    fn way(
-        &mut self,
-        way: &crate::read::wire::WireWay<'_>,
-        _info: Option<&crate::read::wire::WireInfo>,
-    ) {
-        self.hit = self.hit || self.selected(ElementKind::Way, way.id);
-    }
-
-    fn relation(
-        &mut self,
-        relation: &crate::read::wire::WireRelation<'_>,
-        _info: Option<&crate::read::wire::WireInfo>,
-    ) {
-        self.hit = self.hit || self.selected(ElementKind::Relation, relation.id);
-    }
-
-    fn dense(
-        &mut self,
-        dense: &crate::read::wire::WireDenseNodes<'_>,
-        _ids: usize,
-        _info: Option<&crate::read::wire::WireDenseInfo<'_>>,
-    ) {
-        self.hit = self.hit
-            || (self.any_nodes
-                && crate::read::elements::WayRefIter::delta_decoded(dense.id_data)
-                    .any(|id| self.selected(ElementKind::Node, id)));
-    }
-}
-
-/// Whether the element is covered by the query: requested by ID, or
-/// pulled in by `--add-referenced`.
-///
-/// Include mode emits dominated elements; invert mode emits the rest.
-fn is_dominated(ids: &ElementIds, pulled: Option<&ElementIds>, element: &Element<'_>) -> bool {
-    let (kind, id) = element_key(element);
-    selected(ids, pulled, kind, id)
-}
-
-/// Note the element about to be written, if the user actually asked for
-/// it by ID.
-///
-/// Only *requested* IDs count, of every kind: in `--add-referenced` mode a
-/// node, way or relation can be emitted because something requested
-/// references it, which is not the same as the user having asked for it,
-/// and reporting those would make the "did not find" list go silent on
-/// genuine misses.
-fn record_found(found: &mut Vec<(ElementKind, i64)>, ids: &ElementIds, element: &Element<'_>) {
-    let (kind, id) = element_key(element);
-    if ids.of(kind).get(id) {
-        found.push((kind, id));
-    }
-}
-
-/// Process a single `PrimitiveBlock` through the ID filter, writing matching
-/// elements into the thread-local `BlockBuilder` and flushing complete blocks
-/// into `output`. Returns the per-block [`BlockOutcome`].
-///
-/// Called on the decode-worker threads via `for_each_fused_block`.
-#[allow(clippy::too_many_arguments)]
+/// Re-encode the selection in source order. The builder is reused on the
+/// serial arms and allocated lazily on workers, where most blobs have no hit.
 fn process_block(
-    block: &PrimitiveBlock,
-    bb: &mut BlockBuilder,
+    buffer: BlockBuffer<'_>,
+    bb: &mut Option<BlockBuilder>,
     output: &mut Vec<OwnedBlock>,
-    ids: &ElementIds,
-    include_mode: bool,
-    pulled: Option<&ElementIds>,
-    strip_tags: bool,
-    report_found: bool,
+    selection: &IdSelection<'_>,
     coords: crate::owned::WayCoords,
-) -> crate::Result<BlockOutcome> {
-    let mut nodes: u64 = 0;
-    let mut ways: u64 = 0;
-    let mut relations: u64 = 0;
-    let mut found: Vec<(ElementKind, i64)> = Vec::new();
+) -> Result<BlockOutcome> {
+    let mut outcome = BlockOutcome::default();
+    let block = buffer.for_selection()?;
+    let mut encoder = SelectedEncoder::new(coords);
+    block.visit_matching(
+        selection.may_select_nodes(),
+        |kind, id| selection.select(kind, id),
+        None::<&fn(SelectionRefs<'_>) -> bool>,
+        |element, keep_tags| {
+            let (kind, id) = element_key(&element);
+            if selection.report_found && selection.include_matches && selection.ids.of(kind).get(id)
+            {
+                outcome.found.push((kind, id));
+            }
+            encoder.write(
+                bb.get_or_insert_with(BlockBuilder::new),
+                output,
+                &element,
+                keep_tags,
+            )?;
+            match kind {
+                ElementKind::Node => outcome.nodes += 1,
+                ElementKind::Way => outcome.ways += 1,
+                ElementKind::Relation => outcome.relations += 1,
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(bb) = bb {
+        flush_local(bb, output)?;
+    }
+    Ok(outcome)
+}
 
-    let mut way = crate::owned::WayScratch::default();
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+/// Reusable re-encoding scratch for the ID and parent selectors.
+pub(super) struct SelectedEncoder<'a> {
+    coords: crate::owned::WayCoords,
+    way: crate::owned::WayScratch,
+    members: Vec<MemberData<'a>>,
+}
 
-    for element in block.elements() {
-        let dominated = is_dominated(ids, pulled, &element);
-        let emit = if include_mode { dominated } else { !dominated };
-        if !emit {
-            continue;
+impl<'a> SelectedEncoder<'a> {
+    pub(super) fn new(coords: crate::owned::WayCoords) -> Self {
+        Self {
+            coords,
+            way: crate::owned::WayScratch::default(),
+            members: Vec::new(),
         }
+    }
 
-        if report_found && include_mode {
-            record_found(&mut found, ids, &element);
-        }
-
-        // `--remove-tags` (include mode only) strips an emitted object
-        // that was not itself requested, of any kind: one pulled in. A
-        // requested object keeps its tags even where it is also referenced.
-        let (kind, id) = element_key(&element);
-        let keep_tags = if strip_tags && !ids.of(kind).get(id) {
-            0
-        } else {
-            usize::MAX
-        };
-
-        match &element {
+    pub(super) fn write(
+        &mut self,
+        bb: &mut BlockBuilder,
+        output: &mut Vec<OwnedBlock>,
+        element: &Element<'a>,
+        keep_tags: bool,
+    ) -> Result<()> {
+        match element {
             Element::DenseNode(dn) => {
                 ensure_node_capacity_local(bb, output)?;
                 let meta = dense_node_metadata(dn)?;
@@ -1716,10 +1648,9 @@ fn process_block(
                     dn.id(),
                     dn.decimicro_lat()?,
                     dn.decimicro_lon()?,
-                    dn.tags().take(keep_tags),
+                    keep_tags.then(|| dn.tags()).into_iter().flatten(),
                     meta.as_ref(),
                 );
-                nodes += 1;
             }
             Element::Node(n) => {
                 ensure_node_capacity_local(bb, output)?;
@@ -1728,39 +1659,34 @@ fn process_block(
                     n.id(),
                     n.decimicro_lat()?,
                     n.decimicro_lon()?,
-                    n.tags().take(keep_tags),
+                    keep_tags.then(|| n.tags()).into_iter().flatten(),
                     meta.as_ref(),
                 );
-                nodes += 1;
             }
             Element::Way(w) => {
                 ensure_way_capacity_local(bb, output)?;
-                way.prepare(w, coords)?;
+                self.way.prepare(w, self.coords)?;
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                way.write(bb, w.tags().take(keep_tags), meta.as_ref());
-                ways += 1;
+                self.way.write(
+                    bb,
+                    keep_tags.then(|| w.tags()).into_iter().flatten(),
+                    meta.as_ref(),
+                );
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                r.members_into(&mut members_buf)?;
+                r.members_into(&mut self.members)?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation_partial(
                     r.id(),
-                    r.tags().take(keep_tags),
-                    &members_buf,
+                    keep_tags.then(|| r.tags()).into_iter().flatten(),
+                    &self.members,
                     meta.as_ref(),
                 );
-                relations += 1;
             }
         }
+        Ok(())
     }
-
-    Ok(BlockOutcome {
-        nodes,
-        ways,
-        relations,
-        found,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2652,92 +2578,332 @@ mod tests {
         }
     }
 
-    /// For every fixture, every mutation, and queries with and without a
-    /// dependent node set, tag stripping and found-ID reporting: building
-    /// the block only on a probe hit and running `process_block` on it
-    /// writes and reports exactly what `process_block` on the constructed
-    /// block does, and refuses exactly what construction refuses, with the
-    /// same message.
+    fn run_block(
+        bytes: Vec<u8>,
+        selection: &IdSelection<'_>,
+        coords: crate::owned::WayCoords,
+    ) -> Result<(Vec<Vec<u8>>, BlockOutcome)> {
+        let (mut strings, mut groups) = (Vec::new(), Vec::new());
+        let buffer = BlockBuffer::new(bytes, None, &mut strings, &mut groups, None);
+        let mut output = Vec::new();
+        let outcome = process_block(buffer, &mut None, &mut output, selection, coords)?;
+        Ok((output.into_iter().map(|b| b.bytes).collect(), outcome))
+    }
+
+    fn id_selection(ids: &ElementIds) -> IdSelection<'_> {
+        IdSelection {
+            ids,
+            pulled: None,
+            include_matches: true,
+            strip_tags: false,
+            report_found: true,
+        }
+    }
+
     #[test]
-    fn the_include_probe_answers_as_process_block_on_every_blob() {
+    fn scoped_getid_matches_the_full_element_walk() {
         use crate::read::wire_fixtures::{mutations, projection_fixtures};
 
-        let queries: Vec<ElementIds> = [
-            vec!["n8"],
-            vec!["n1"],
-            vec!["n99"],
-            vec!["w21"],
-            vec!["w42"],
-            vec!["r30", "n12"],
-            vec!["r51"],
-            vec!["n12345"],
+        let queries = [
+            &["n1"][..],
+            &["n10", "n99", "w20", "r30"],
+            &["w21"],
+            &["r51"],
+            &["n12345"],
         ]
-        .into_iter()
-        .map(|specs| {
-            let specs: Vec<String> = specs.into_iter().map(str::to_owned).collect();
-            parse_ids(&specs).unwrap()
-        })
-        .collect();
-        // Pulled in beside the requests, of every kind: tagged ones among
-        // them, so stripping shows.
-        let mut deps = ElementIds::empty();
-        for id in [3, 9, 11] {
-            deps.node_ids.insert(id);
-        }
-        deps.way_ids.insert(20);
-        deps.relation_ids.insert(31);
-
-        let run = |block: &PrimitiveBlock,
-                   ids: &ElementIds,
-                   dep: Option<&ElementIds>,
-                   strip: bool|
-         -> crate::Result<String> {
-            let mut bb = BlockBuilder::new();
-            let mut output = Vec::new();
-            let outcome = process_block(
-                block,
-                &mut bb,
-                &mut output,
-                ids,
-                true,
-                dep,
-                strip,
-                true,
-                crate::owned::WayCoords::Drop,
-            )?;
-            flush_local(&mut bb, &mut output)?;
-            let bytes: Vec<Vec<u8>> = output.iter().map(|b| b.bytes.clone()).collect();
-            Ok(format!(
-                "{bytes:?} {} {} {} {:?}",
-                outcome.nodes, outcome.ways, outcome.relations, outcome.found
-            ))
-        };
-        let text = |r: crate::Result<String>| r.unwrap_or_else(|e| format!("error {e}"));
-
+        .map(|query| {
+            parse_ids(&query.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>()).unwrap()
+        });
+        let deps = parse_ids(&["n3", "n9", "n11", "w20", "r31"].map(str::to_owned)).unwrap();
+        let coords = crate::owned::WayCoords::Drop;
         for (what, bytes) in projection_fixtures() {
-            let cases =
-                std::iter::once(("as built".to_owned(), bytes.clone())).chain(mutations(&bytes));
-            for (how, input) in cases {
-                let oracle = PrimitiveBlock::from_vec(input.clone());
+            for input in
+                std::iter::once(bytes.clone()).chain(mutations(&bytes).into_iter().map(|(_, b)| b))
+            {
+                let Ok(block) = crate::PrimitiveBlock::from_vec(input.clone()) else {
+                    continue;
+                };
                 for ids in &queries {
-                    for (dep, strip) in [(None, false), (Some(&deps), false), (Some(&deps), true)] {
-                        let (mut st, mut gr) = (Vec::new(), Vec::new());
-                        let buffer = BlockBuffer::new(input.clone(), None, &mut st, &mut gr, None);
-                        let probed =
-                            text(
-                                included_block(buffer, ids, dep).and_then(|block| match block {
-                                    Some(block) => run(&block, ids, dep, strip),
-                                    None => Ok(format!("{:?} 0 0 0 []", Vec::<Vec<u8>>::new())),
-                                }),
-                            );
-                        let expected = match &oracle {
-                            Err(e) => format!("error {e}"),
-                            Ok(block) => text(run(block, ids, dep, strip)),
+                    for (include_matches, pulled, strip_tags) in [
+                        (true, None, false),
+                        (false, None, false),
+                        (true, Some(&deps), false),
+                        (true, Some(&deps), true),
+                    ] {
+                        let selection = IdSelection {
+                            include_matches,
+                            pulled,
+                            strip_tags,
+                            ..id_selection(ids)
                         };
-                        assert_eq!(probed, expected, "{what}, {how}, dep {}", dep.is_some());
+                        let mut bb = BlockBuilder::new();
+                        let mut encoder = SelectedEncoder::new(coords);
+                        let mut expected = Vec::new();
+                        let mut counts = [0; 3];
+                        let mut found = Vec::new();
+                        let oracle = (|| -> Result<()> {
+                            for element in block.elements() {
+                                let (kind, id) = element_key(&element);
+                                let requested = ids.of(kind).get(id);
+                                let dependent = pulled.is_some_and(|deps| deps.of(kind).get(id));
+                                if include_matches == (requested || dependent) {
+                                    if include_matches && requested {
+                                        found.push((kind, id));
+                                    }
+                                    counts[usize::from(kind.ordinal())] += 1;
+                                    encoder.write(
+                                        &mut bb,
+                                        &mut expected,
+                                        &element,
+                                        !strip_tags || requested,
+                                    )?;
+                                }
+                            }
+                            flush_local(&mut bb, &mut expected)
+                        })();
+                        match (oracle, run_block(input.clone(), &selection, coords)) {
+                            (Ok(()), Ok((output, stats))) => {
+                                assert_eq!(
+                                    output,
+                                    expected.into_iter().map(|b| b.bytes).collect::<Vec<_>>(),
+                                    "{what}"
+                                );
+                                assert_eq!(
+                                    [stats.nodes, stats.ways, stats.relations],
+                                    counts,
+                                    "{what}"
+                                );
+                                assert_eq!(stats.found, found, "{what}");
+                            }
+                            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{what}"),
+                            (a, b) => panic!(
+                                "{what}: full accepted {}, scoped accepted {}",
+                                a.is_ok(),
+                                b.is_ok()
+                            ),
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn getid_checks_retained_output_fields() {
+        use crate::owned::WayCoords;
+        use crate::read::wire_fixtures::{
+            Group, block, dense, field_bytes, plain_node, relation, way,
+        };
+
+        let ids = parse_ids(&["n1", "w2", "r3"].map(str::to_owned)).unwrap();
+        let selection = id_selection(&ids);
+        let node = |record| Group {
+            nodes: vec![record],
+            ..Group::default()
+        };
+        let dense_node = |record| Group {
+            dense: Some(record),
+            ..Group::default()
+        };
+        let plain_info = |info: &[u8]| {
+            let mut record = plain_node(1, 0, 0, &[], None);
+            field_bytes(&mut record, 4, info);
+            node(record)
+        };
+        let dense_info = |info: &[u8]| {
+            let mut record = dense(&[(1, 0, 0), (2, 0, 0)], &[]);
+            field_bytes(&mut record, 5, info);
+            dense_node(record)
+        };
+        let mut locations = way(2, &[1], (1, 2));
+        field_bytes(
+            &mut locations,
+            9,
+            &crate::read::wire_fixtures::deltas(&[i64::MAX]),
+        );
+        field_bytes(&mut locations, 10, &[0]);
+        for group in [
+            node(plain_node(1, 0, 0, &[(1, 127)], None)),
+            node(plain_node(1, i64::MAX, 0, &[], None)),
+            plain_info(&[0x08]),
+            plain_info(&[0x28, 127]),
+            dense_node(dense(&[(1, 0, 0)], &[1, 127, 0])),
+            dense_node(dense(&[(1, i64::MAX, 0)], &[])),
+            dense_info(&[0x0a, 1, 1]), // version count shorter than the ID column
+            dense_info(&[0x2a, 3, 254, 1]), // truncated inner framing
+            dense_info(&[0x2a, 3, 254, 1, 0]), // user_sid delta of 127
+            Group {
+                ways: vec![locations],
+                ..Group::default()
+            },
+            Group {
+                relations: vec![relation(3, &[(127, 1, 0)])],
+                ..Group::default()
+            },
+        ] {
+            let input = block(&["", "k", "v"], &[group]);
+            let full = crate::PrimitiveBlock::from_vec(input.clone())
+                .and_then(|block| {
+                    let mut encoder = SelectedEncoder::new(WayCoords::Keep);
+                    for element in block.elements().filter(|el| {
+                        let (kind, id) = element_key(el);
+                        ids.of(kind).get(id)
+                    }) {
+                        encoder.write(&mut BlockBuilder::new(), &mut Vec::new(), &element, true)?;
+                    }
+                    Ok(())
+                })
+                .expect_err("full writer must refuse invalid retained data");
+            let scoped = run_block(input, &selection, WayCoords::Keep)
+                .map(drop)
+                .expect_err("scoped writer must refuse invalid retained data");
+            assert_eq!(scoped.to_string(), full.to_string());
+        }
+    }
+
+    #[test]
+    fn getid_discards_unread_fields_and_strips_only_dependency_tags() {
+        use crate::owned::WayCoords;
+        use crate::read::wire_fixtures::{Group, block, dense, field_bytes, plain_node, way};
+
+        let input = |stripped_tag, discarded_tag, discarded_info: &[u8]| {
+            let mut discarded = way(10, &[1], (1, discarded_tag));
+            field_bytes(&mut discarded, 4, discarded_info);
+            block(
+                &["", "k", "v"],
+                &[Group {
+                    nodes: vec![plain_node(4, 0, 0, &[(1, discarded_tag)], None)],
+                    dense: Some(dense(
+                        &[(1, 0, 0), (2, 1, 1), (3, 2, 2)],
+                        &[1, 2, 0, 1, stripped_tag, 0, 1, discarded_tag, 0],
+                    )),
+                    ways: vec![discarded],
+                    ..Group::default()
+                }],
+            )
+        };
+        let good = input(2, 2, &[]);
+        let bad = input(127, 127, &[0x08]);
+        let full = crate::PrimitiveBlock::from_vec(bad.clone())
+            .expect_err("full validation rejects the fixture's bad tag index");
+        assert!(
+            matches!(
+                full.kind(),
+                crate::ErrorKind::StringtableIndexOutOfBounds { index: 127 }
+            ),
+            "{full}"
+        );
+        let ids = parse_ids(&["n1".to_owned()]).unwrap();
+        let deps = parse_ids(&["n2".to_owned()]).unwrap();
+        let selection = IdSelection {
+            pulled: Some(&deps),
+            strip_tags: true,
+            ..id_selection(&ids)
+        };
+        let (expected, _) = run_block(good, &selection, WayCoords::Drop).unwrap();
+        let (blocks, stats) = run_block(bad.clone(), &selection, WayCoords::Drop).unwrap();
+        assert_eq!(blocks, expected);
+        assert_eq!(stats.nodes, 2);
+        assert_eq!(stats.found, [(ElementKind::Node, 1)]);
+        let keep_dependency_tags = IdSelection {
+            strip_tags: false,
+            ..selection
+        };
+        let scoped = run_block(bad, &keep_dependency_tags, WayCoords::Drop)
+            .map(drop)
+            .expect_err("retaining dependency tags must reject the bad tag index");
+        assert!(
+            matches!(
+                scoped.kind(),
+                crate::ErrorKind::StringtableIndexOutOfBounds { index: 127 }
+            ),
+            "{scoped}"
+        );
+    }
+
+    #[test]
+    fn getid_invert_does_not_validate_removed_records() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes, way};
+
+        let input = |tag, info: &[u8]| {
+            let mut removed = way(10, &[1], (1, tag));
+            field_bytes(&mut removed, 4, info);
+            block(
+                &["", "k", "v"],
+                &[Group {
+                    ways: vec![removed, way(20, &[2], (1, 2))],
+                    ..Group::default()
+                }],
+            )
+        };
+        let ids = parse_ids(&["w10".to_owned()]).unwrap();
+        let selection = IdSelection {
+            include_matches: false,
+            ..id_selection(&ids)
+        };
+        let coords = crate::owned::WayCoords::Drop;
+        let (good, _) = run_block(input(2, &[]), &selection, coords).unwrap();
+        let (bad, outcome) = run_block(input(127, &[0x08]), &selection, coords).unwrap();
+        assert_eq!(bad, good);
+        assert_eq!(outcome.ways, 1);
+        assert!(outcome.found.is_empty());
+    }
+
+    #[test]
+    fn getid_dependency_scans_leave_stripped_tags_for_the_write_pass() {
+        use crate::block_builder::HeaderBuilder;
+        use crate::read::wire_fixtures::{Group, block, dense, field_bytes, relation, way};
+
+        let dir = crate::path_guard::tests::scratch();
+        let ids = parse_ids(&["r40".to_owned()]).unwrap();
+        let host = crate::host::Host::for_tests();
+        let entered = host.entered();
+        let run = |name: &str, tag| {
+            let mut pulled = relation(30, &[(0, 20, 1)]);
+            field_bytes(&mut pulled, 2, &[1]);
+            field_bytes(&mut pulled, 3, &[tag]);
+            let dense_tags: &[u64] = if tag == 127 { &[1] } else { &[1, 2, 0] };
+            let bytes = block(
+                &["", "k", "v"],
+                &[Group {
+                    dense: Some(dense(&[(1, 0, 0)], dense_tags)),
+                    ways: vec![way(20, &[1], (1, u64::from(tag)))],
+                    relations: vec![pulled, relation(40, &[(0, 30, 2)])],
+                    ..Group::default()
+                }],
+            );
+            let input = dir.path().join(format!("{name}.pbf"));
+            let mut writer =
+                PbfWriter::new(std::fs::File::create(&input).unwrap(), Compression::None);
+            writer
+                .write_header(&HeaderBuilder::new().build().unwrap())
+                .unwrap();
+            writer.write_primitive_block_no_indexdata(&bytes).unwrap();
+            writer.flush().unwrap();
+            let output = dir.path().join(format!("{name}-out.pbf"));
+            let staged = crate::output::Output::new(
+                &output,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap()
+            .bind(&entered.invocation)
+            .unwrap();
+            getid_with_refs(
+                &PinnedInput::pin(&input, &entered).unwrap(),
+                &staged,
+                &ids,
+                &AddReferenced { remove_tags: true },
+                false,
+                &WriteOptions::default(),
+                &HeaderOverrides::default(),
+                &entered,
+            )
+            .unwrap();
+            staged.publish().unwrap();
+            assert_eq!(ids_in_file_order(&output), [1, 20, 30, 40]);
+            std::fs::read(output).unwrap()
+        };
+        assert_eq!(run("malformed", 127), run("well-formed", 2));
     }
 }

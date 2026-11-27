@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::idset::{AtomicWordBatch, IdSet};
 use crate::read::input::{InputFile, InputSource};
 use crate::read::project_ids::{
-    IdScratch, KindIds, RelationSpan, RelationSpans, WaySpan, WaySpans,
+    IdScratch, KindIds, RelationSpan, RelationSpans, SpanSource, WaySpan, WaySpans,
 };
 use crate::scan::classify::{
     KindSchedules, ScheduledBlob, build_classify_schedules_split, parallel_project_phase,
@@ -190,9 +190,8 @@ fn append_capped_missing_refs(
 /// and decompress each blob and validate it through a projection on the block
 /// validator instead of building a block (`read::project_ids`: the node IDs,
 /// each way's ID and `refs` position, each relation's ID and member-array
-/// positions). The validator and kind-claim refusal are block construction's
-/// own call, so a blob is refused exactly as building its block would refuse
-/// it, with the same error. Only after the blob is accepted does the worker
+/// positions). The projection checks framing, array lengths, string-table
+/// UTF-8 and kind claims. Only after the blob is accepted does the worker
 /// replay what the projection recorded, in element-walk order, through the
 /// same checks the element walk ran (shared-set insertion, the
 /// unknown-member refusal, missing references), so a blob's first refusal is the one the walk
@@ -266,12 +265,9 @@ fn append_capped_missing_refs(
 /// # What a phase reads
 ///
 /// Node IDs; each way's ID and node refs; each relation's ID and member IDs
-/// and types. Never coordinates, tags, metadata or roles, which validation
-/// still checks (a check that passed a corrupt file would vouch for it). An
-/// earlier refusal of a selective parser here rested on a Europe hotpath
-/// that timed only the offset tables; the element walk it left out was most
-/// of the workers' CPU after decompression (`reference/performance/projections.md`,
-/// "check --refs and getid read through projections").
+/// and types. Coordinates, tags, metadata and roles supply no values to
+/// the verdict. The projection checks their outer framing and countable
+/// packed arrays.
 ///
 /// # Input
 ///
@@ -375,7 +371,7 @@ pub(super) struct PhaseBlobs {
 /// batch drops, before the combined phase checks this blob's ways.
 pub(super) fn replay_nodes(
     scratch: &IdScratch,
-    bytes: &[u8],
+    source: &(impl SpanSource + ?Sized),
     node_ids: &IdSet,
 ) -> Result<(u64, Vec<i64>)> {
     let mut count: u64 = 0;
@@ -383,7 +379,7 @@ pub(super) fn replay_nodes(
     let mut batch = AtomicWordBatch::new(node_ids);
     // The scratch may hold other kinds' IDs too (the default pair's
     // unindexed pass records relation IDs for the ID check beside them).
-    scratch.each(bytes, |kind, id| {
+    scratch.each(source, |kind, id| {
         if kind != ElementKind::Node {
             return Ok(());
         }
@@ -401,7 +397,7 @@ pub(super) fn replay_nodes(
 /// The way batch drops before the combined phase checks this blob's relations.
 pub(super) fn judge_ways(
     ways: &[WaySpan],
-    bytes: &[u8],
+    source: &(impl SpanSource + ?Sized),
     sets: &Sets,
     judge: Judge,
 ) -> Result<WayBlobResult> {
@@ -414,7 +410,7 @@ pub(super) fn judge_ways(
             r.overflow_ids.push(wid);
         }
         r.way_count += 1;
-        for nref in way.refs(bytes)? {
+        for nref in way.refs(source)? {
             r.way_refs_checked += 1;
             if !sets.nodes.get(nref) {
                 r.missing_node_refs.push(nref);
@@ -439,7 +435,7 @@ pub(super) fn judge_ways(
 /// their sets, its relation members deferred.
 pub(super) fn judge_relations(
     relations: &[RelationSpan],
-    bytes: &[u8],
+    source: &(impl SpanSource + ?Sized),
     sets: &Sets,
     judge: Judge,
 ) -> Result<RelBlobResult> {
@@ -451,7 +447,7 @@ pub(super) fn judge_relations(
             r.overflow_ids.push(rid);
         }
         r.relation_count += 1;
-        for member in rel.members(bytes)? {
+        for member in rel.members(source)? {
             match member {
                 MemberId::Node(id) => {
                     r.rel_node_members_checked += 1;
@@ -611,9 +607,9 @@ fn node_phase(
         None,
         IdScratch::default,
         |_, buffer, scratch| -> Result<(u64, Vec<i64>)> {
-            let (KindIds { .. }, accepted) =
-                buffer.project(|_, _| KindIds::of(ElementKind::Node, &mut *scratch))?;
-            replay_nodes(scratch, accepted.bytes(), &sets.nodes)
+            let (KindIds { .. }, accepted) = buffer
+                .project_ids_and_refs(|_, _| KindIds::of(ElementKind::Node, &mut *scratch))?;
+            replay_nodes(scratch, &accepted, &sets.nodes)
         },
         |_seq, (count, overflow_ids)| tally.merge_nodes(count, overflow_ids, host),
         host,
@@ -637,8 +633,8 @@ fn way_phase(
         Vec::new,
         |_, buffer, ways| -> Result<WayBlobResult> {
             let (WaySpans { .. }, accepted) =
-                buffer.project(|_, _| WaySpans::new(None, &mut *ways))?;
-            judge_ways(ways, accepted.bytes(), sets, judge)
+                buffer.project_ids_and_refs(|_, _| WaySpans::new(None, &mut *ways))?;
+            judge_ways(ways, &accepted, sets, judge)
         },
         |_seq, r| tally.merge_ways(r, judge, host),
         host,
@@ -663,8 +659,8 @@ fn relation_phase(
         Vec::new,
         |_, buffer, relations| -> Result<RelBlobResult> {
             let (RelationSpans { .. }, accepted) =
-                buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
-            judge_relations(relations, accepted.bytes(), sets, judge)
+                buffer.project_ids_and_refs(|_, _| RelationSpans::new(&mut *relations))?;
+            judge_relations(relations, &accepted, sets, judge)
         },
         |_seq, r| tally.merge_relations(r, judge, host),
         host,
@@ -709,15 +705,15 @@ pub(super) fn judge_unindexed(
     ids: &IdScratch,
     ways: &[WaySpan],
     relations: &[RelationSpan],
-    bytes: &[u8],
+    source: &(impl SpanSource + ?Sized),
     sets: &Sets,
     judge: Judge,
 ) -> Result<UnindexedBlobResult> {
-    let (node_count, node_overflow) = replay_nodes(ids, bytes, &sets.nodes)?;
+    let (node_count, node_overflow) = replay_nodes(ids, source, &sets.nodes)?;
     let ways = if ways.is_empty() {
         Judged::Absent
     } else {
-        let r = judge_ways(ways, bytes, sets, judge)?;
+        let r = judge_ways(ways, source, sets, judge)?;
         if r.missing_node_ref_occurrences > 0 {
             Judged::Again
         } else {
@@ -727,7 +723,7 @@ pub(super) fn judge_unindexed(
     let relations = if !judge.check_relations || relations.is_empty() {
         Judged::Absent
     } else {
-        let r = judge_relations(relations, bytes, sets, judge)?;
+        let r = judge_relations(relations, source, sets, judge)?;
         if r.missing_node_member_occurrences + r.missing_way_ref_occurrences > 0 {
             Judged::Again
         } else {
@@ -813,7 +809,7 @@ fn unindexed_phase(
                 relations,
             } = scratch;
             relations.clear();
-            let (_, accepted) = buffer.project(|_, _| {
+            let (_, accepted) = buffer.project_ids_and_refs(|_, _| {
                 (
                     (
                         KindIds::of(ElementKind::Node, &mut *ids),
@@ -824,7 +820,7 @@ fn unindexed_phase(
                         .then(|| RelationSpans::new(&mut *relations)),
                 )
             })?;
-            judge_unindexed(ids, ways, relations, accepted.bytes(), sets, judge)
+            judge_unindexed(ids, ways, relations, &accepted, sets, judge)
         },
         |seq, r| again.merge(seq, r, tally, judge, host),
         host,
@@ -1106,12 +1102,73 @@ pub(super) fn finish(
 
 #[cfg(test)]
 mod tests {
-    use super::replay_nodes;
+    use super::{CheckRefsOptions, check_refs_inner, replay_nodes};
     use crate::ElementKind;
+    use crate::block_builder::HeaderBuilder;
     use crate::idset::IdSet;
     use crate::read::block::BlockBuffer;
     use crate::read::project_ids::{IdScratch, KindIds};
-    use crate::read::wire_fixtures::{Group, block, dense, plain_node};
+    use crate::read::wire_fixtures::{Group, block, dense, field_bytes, plain_node, relation, way};
+    use crate::writer::{Compression, PbfWriter};
+
+    #[test]
+    fn ref_verdict_ignores_tag_values_metadata_and_roles() {
+        let dir = crate::path_guard::tests::scratch();
+        let host = crate::host::Host::for_tests();
+        let entered = host.entered();
+        let fixture = |name, tag, info: &[u8], role, member_type| {
+            let mut referenced_way = way(10, &[1, 1], (1, tag));
+            field_bytes(&mut referenced_way, 4, info);
+            let payload = block(
+                &["", "k", "v"],
+                &[Group {
+                    dense: Some(dense(&[(1, 0, 0)], &[1, tag, 0])),
+                    ways: vec![referenced_way],
+                    relations: vec![relation(20, &[(role, 10, member_type)])],
+                    ..Group::default()
+                }],
+            );
+            let path = dir.path().join(name);
+            let mut writer = PbfWriter::new(
+                std::fs::File::create(&path).expect("fixture"),
+                Compression::None,
+            );
+            writer
+                .write_header(&HeaderBuilder::new().build().expect("header"))
+                .expect("write header");
+            writer
+                .write_primitive_block_no_indexdata(&payload)
+                .expect("write fixture");
+            writer.flush().expect("flush fixture");
+            path
+        };
+        let options = CheckRefsOptions {
+            direct_io: false,
+            check_relations: true,
+            show_ids: None,
+        };
+        for path in [
+            fixture("good.pbf", 2, &[], 0, 1),
+            fixture("ignored.pbf", 127, &[0x08], 127, 1),
+        ] {
+            let report =
+                check_refs_inner(path.as_path().into(), &options, &entered).expect("ref verdict");
+            assert!(report.is_valid());
+            assert_eq!(
+                (report.node_count, report.way_count, report.relation_count),
+                (1, 1, 1)
+            );
+        }
+        let bad_type = fixture("bad-type.pbf", 127, &[0x08], 127, 7);
+        let error = check_refs_inner(bad_type.as_path().into(), &options, &entered)
+            .map(drop)
+            .expect_err("unknown member type must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains(&super::unknown_member_error(20, 7, 10).to_string())
+        );
+    }
 
     #[test]
     fn batched_node_replay_matches_per_node_insertion() {
@@ -1127,7 +1184,7 @@ mod tests {
         let bytes = block(&[""], &[group]);
         let buffer = BlockBuffer::new(bytes, None, &mut strings, &mut groups, None);
         let (_, accepted) = buffer
-            .project(|_, _| KindIds::of(ElementKind::Node, &mut scratch))
+            .project_ids_and_refs(|_, _| KindIds::of(ElementKind::Node, &mut scratch))
             .expect("valid node block");
 
         let mut plain = IdSet::new();
@@ -1141,7 +1198,7 @@ mod tests {
             .collect();
 
         let (count, overflow) =
-            replay_nodes(&scratch, accepted.bytes(), &batched).expect("accepted node replay");
+            replay_nodes(&scratch, &accepted, &batched).expect("accepted node replay");
         assert_eq!(count, 12);
         assert_eq!(overflow, expected_overflow);
         assert_eq!(overflow, [-1, -64, far]);

@@ -1,18 +1,14 @@
 //! Element IDs and reference arrays read through the block validator
-//! ([`BlockBuffer::project`](super::block::BlockBuffer::project)) instead of
-//! a built block: [`KindIds`] (`check --ids`, the node phase of
+//! instead of a built block: [`KindIds`] (`check --ids`, the node phase of
 //! `check --refs`, `getid -I`), [`WaySpans`] (the way phase of
 //! `check --refs`, `getid --add-referenced`'s first pass) and
 //! [`RelationSpans`] (the relation phase of `check --refs`).
 //!
 //! Each records positions in the validated bytes, not copies, and reads them
-//! back only from the accepted blob
-//! ([`ValidatedBlock::bytes`](super::block::ValidatedBlock::bytes)), so
-//! every judgement on what it
-//! recorded runs after the blob was accepted and nothing a hook gathers
-//! outlives a refusal.
+//! back only from the accepted blob. Each caller chooses full validation or
+//! the ID and reference scope. No judgement runs before acceptance.
 
-use super::block::GroupProjection;
+use super::block::{GroupProjection, ValidatedBlock};
 use super::elements::{MemberIdIter, WayRefIter};
 use super::wire::{WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation, WireWay};
 use crate::ElementKind;
@@ -55,6 +51,24 @@ impl Span {
     }
 }
 
+/// Read back a span from full block bytes or a selective projection, which
+/// exposes only the spans recorded by its hooks.
+pub(crate) trait SpanSource {
+    fn span(&self, span: Span) -> crate::error::Result<&[u8]>;
+}
+
+impl SpanSource for [u8] {
+    fn span(&self, span: Span) -> crate::error::Result<&[u8]> {
+        span.in_blob(self)
+    }
+}
+
+impl SpanSource for ValidatedBlock<'_, false> {
+    fn span(&self, span: Span) -> crate::error::Result<&[u8]> {
+        ValidatedBlock::span(self, span)
+    }
+}
+
 /// A way's ID and the position of its `refs` array.
 #[derive(Clone, Copy)]
 pub(crate) struct WaySpan {
@@ -65,8 +79,11 @@ pub(crate) struct WaySpan {
 impl WaySpan {
     /// The way's node refs, decoded from `bytes` (the accepted blob) as
     /// [`Way::refs`](super::elements::Way::refs) decodes them.
-    pub(crate) fn refs(self, bytes: &[u8]) -> crate::error::Result<WayRefIter<'_>> {
-        Ok(WayRefIter::delta_decoded(self.refs.in_blob(bytes)?))
+    pub(crate) fn refs(
+        self,
+        source: &(impl SpanSource + ?Sized),
+    ) -> crate::error::Result<WayRefIter<'_>> {
+        Ok(WayRefIter::delta_decoded(source.span(self.refs)?))
     }
 }
 
@@ -111,10 +128,13 @@ impl RelationSpan {
     /// The relation's typed member IDs, decoded from `bytes` (the accepted
     /// blob) as [`Relation::members`](super::elements::Relation::members)
     /// decodes them, roles aside.
-    pub(crate) fn members(self, bytes: &[u8]) -> crate::error::Result<MemberIdIter<'_>> {
+    pub(crate) fn members(
+        self,
+        source: &(impl SpanSource + ?Sized),
+    ) -> crate::error::Result<MemberIdIter<'_>> {
         Ok(MemberIdIter::new(
-            self.memids.in_blob(bytes)?,
-            self.types.in_blob(bytes)?,
+            source.span(self.memids)?,
+            source.span(self.types)?,
         ))
     }
 }
@@ -153,11 +173,9 @@ impl GroupProjection for RelationSpans<'_> {
 /// across the pool.) Way, relation and plain node IDs, taken from the
 /// messages the validator already parsed, are copied.
 ///
-/// Validation is block construction's own call, so a blob is refused here
-/// exactly when building its block would refuse it, with the same error,
-/// and a contradicted kind claim is refused after it. What a hook records is
-/// provisional: every judgement on the IDs runs after the blob has been
-/// accepted, through [`IdScratch::each`].
+/// Full and scoped validation both check the ID encoding and kind claims.
+/// What a hook records is provisional: every judgement on the IDs runs
+/// after the blob has been accepted, through [`IdScratch::each`].
 ///
 /// Order: the element walk yields a group's dense nodes before its plain
 /// ones while the validator hands over the plain ones first, so a group's
@@ -265,18 +283,18 @@ pub(crate) struct IdScratch {
 }
 
 impl IdScratch {
-    /// Hand the recorded IDs with their kinds to `f`, read from `bytes`, the
+    /// Hand the recorded IDs with their kinds to `f`, read from the
     /// accepted blob the dense runs point into; within a kind in
     /// element-walk order (see [`KindIds`]). Stops at `f`'s first error.
     pub(crate) fn each(
         &self,
-        bytes: &[u8],
+        source: &(impl SpanSource + ?Sized),
         mut f: impl FnMut(ElementKind, i64) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
         let mut copied = self.ids.iter();
         for run in &self.runs {
             match *run {
-                IdRun::Dense(span) => WayRefIter::delta_decoded(span.in_blob(bytes)?)
+                IdRun::Dense(span) => WayRefIter::delta_decoded(source.span(span)?)
                     .try_for_each(|id| f(ElementKind::Node, id))?,
                 IdRun::Copied { kind, count } => copied
                     .by_ref()
@@ -294,6 +312,101 @@ mod tests {
     use super::{IdScratch, KindIds};
     use crate::element_kind::ElementKindSet;
     use crate::{Element, ElementKind};
+
+    #[test]
+    fn id_and_ref_scope_keeps_framing_counts_utf8_and_kind_claims() {
+        use super::{RelationSpans, WaySpans};
+        use crate::read::block::BlockBuffer;
+        use crate::read::wire_fixtures::{Group, block, field_bytes, field_varint, relation, way};
+
+        let accept = |input: Vec<u8>, claim| {
+            let (mut st, mut groups) = (Vec::new(), Vec::new());
+            let (mut ids, mut ways, mut relations) = (IdScratch::default(), Vec::new(), Vec::new());
+            BlockBuffer::new(input, None, &mut st, &mut groups, claim)
+                .project_ids_and_refs(|_, _| {
+                    (
+                        KindIds::of(ElementKind::Node, &mut ids),
+                        (
+                            WaySpans::new(None, &mut ways),
+                            RelationSpans::new(&mut relations),
+                        ),
+                    )
+                })
+                .map(drop)
+        };
+        let mut dense = Vec::new();
+        field_bytes(&mut dense, 1, &[0x80]);
+        field_bytes(&mut dense, 8, &[0]);
+        field_bytes(&mut dense, 9, &[0]);
+        let mut bad_ref = way(1, &[], (0, 0));
+        field_bytes(&mut bad_ref, 8, &[0x80]);
+        let bad_member_column = |field| {
+            let mut r = relation(1, &[]);
+            for i in 8..=10 {
+                field_bytes(&mut r, i, &[if i == field { 0x80 } else { 0 }]);
+            }
+            r
+        };
+        let mut unequal_tags = Vec::new();
+        field_varint(&mut unequal_tags, 1, 1);
+        field_bytes(&mut unequal_tags, 2, &[0, 0]);
+        field_bytes(&mut unequal_tags, 3, &[0]);
+        let bad_members = (8..=10).map(|column| Group {
+            relations: vec![bad_member_column(column)],
+            ..Group::default()
+        });
+        for group in [
+            Group {
+                dense: Some(dense),
+                ..Group::default()
+            },
+            Group {
+                nodes: vec![vec![0x08, 0x80]],
+                ..Group::default()
+            },
+            Group {
+                ways: vec![vec![0x08, 0x80]],
+                ..Group::default()
+            },
+            Group {
+                relations: vec![vec![0x08, 0x80]],
+                ..Group::default()
+            },
+            Group {
+                ways: vec![bad_ref],
+                ..Group::default()
+            },
+            Group {
+                ways: vec![unequal_tags],
+                ..Group::default()
+            },
+        ]
+        .into_iter()
+        .chain(bad_members)
+        {
+            let bytes = block(&[""], &[group]);
+            let full = crate::PrimitiveBlock::from_vec(bytes.clone()).unwrap_err();
+            let scoped = accept(bytes, None).unwrap_err();
+            assert_eq!(scoped.to_string(), full.to_string());
+        }
+        let mut invalid_table = block(&["", "k"], &[]);
+        *invalid_table.last_mut().unwrap() = 0xff;
+        let error = accept(invalid_table, None).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            crate::ErrorKind::StringtableUtf8 { .. }
+        ));
+
+        let bad_claim = block(
+            &[""],
+            &[Group {
+                ways: vec![way(1, &[], (0, 0))],
+                ..Group::default()
+            }],
+        );
+        let error = accept(bad_claim, Some(ElementKind::Node)).unwrap_err();
+        assert!(error.kind_contradiction().is_some());
+    }
 
     /// The IDs of `kind` the element walk yields, in its order.
     fn walked_ids(block: &crate::PrimitiveBlock, kind: ElementKind) -> Vec<i64> {

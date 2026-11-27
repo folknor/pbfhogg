@@ -1027,6 +1027,44 @@ run counts in a dense tag stream no retained node reads. Malformed tag
 indices used in smart's type lookup still fail there, even before output.
 The newly accepted fields contribute no selection or output value.
 
+## ID and reference commands: validation follows the fields used
+
+`check --ids`, `check --refs` and their combined scan validate block,
+group and element framing, string-table UTF-8, packed-varint framing,
+countable parallel arrays and any enforced kind claim. ID checks use the
+element kinds and IDs. Reference checks also use way refs and, when
+enabled, relation member IDs and types. An unsupported member type still
+fails the relation reference check. `getid`'s PBF ID-list read and
+`--add-referenced` discovery use that same scope. The relation discovery
+pass still checks the indexed relation counts and ID ranges it relies on.
+
+These scans can accept malformed contents of unread Info and DenseInfo
+messages, including malformed packed varints, duplicate packed fields and
+wrong metadata array lengths inside DenseInfo. They can also accept
+oversized or out-of-table tag indices, missing dense key/value pairs and
+incorrect dense tag run counts. None of these fields supply IDs or
+references. The enclosing message framing, duplicate data-bearing
+messages and packed fields outside unread metadata are still checked.
+
+When `getid` (including `--invert`) or `getparents` re-encodes a blob,
+it validates metadata and tag indices for the records it writes and
+resolves retained relation roles and coordinates as required by the
+output. Bad inner metadata on discarded records or on dense groups
+with no retained nodes is accepted. Dense metadata framing and column
+lengths are checked when any node in the group is written, since shared
+deltas can contribute to a retained value. Unwritten tag indices are
+ignored, including those stripped by `--remove-tags` on objects included
+only by reference. Dense tag run structure is checked when tags from the
+group are written, to associate runs with the correct nodes. When no
+tags in a group are written, only packed-varint framing is checked, so
+missing key/value pairs and incorrect run counts can be accepted.
+Tags and metadata never determine which records these commands select.
+`getparents` checks the reference arrays before using them to select a
+record, so a record with both bad refs and bad retained metadata or tags
+can report the reference error first.
+The existing `--invert` raw frame copy still uses indexdata to decide
+which blobs it copies without decoding.
+
 ## tags-filter and inspect tags: expression-syntax edge cases
 
 The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`
@@ -1134,8 +1172,8 @@ extract therefore fails the run.
 **pbfhogg behavior:** `getid` exits 0 whenever it wrote its output, found
 or not. `-v, --verbose` reports the requested IDs that were not written,
 requested ones only: an object `-r` reached that the file lacks is not a
-miss (`print_missing_ids` in `crates/cli/src/lib.rs`, fed by `record_found` in
-`crates/lib/src/commands/getid/mod.rs`, which records requested IDs of every kind).
+miss (`print_missing_ids` in `crates/cli/src/lib.rs`, fed by the requested
+IDs of every kind recorded during re-encoding).
 
 **Rationale:** on any extract, members cut off at the border are the normal
 case, so an exit status that fails on them reports the extract, not the

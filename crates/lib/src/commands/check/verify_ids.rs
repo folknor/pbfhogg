@@ -731,10 +731,9 @@ fn push_bounded(ids: &mut Vec<i64>, id: i64, limit: Option<usize>) {
     }
 }
 
-/// Validate one blob through [`KindIds`] (the shared ID projection: block
-/// construction's validator and kind-claim refusal, no block built) and
-/// judge its IDs of `kind` once it is accepted ([`KindJudge`]). The
-/// projection takes IDs by the element's own kind, never the blob's claim.
+/// Check a blob's structure and kind claim through [`KindIds`], then judge
+/// its IDs of `kind` ([`KindJudge`]). The projection picks the IDs by each
+/// element's kind.
 fn verify_blob(
     buffer: BlockBuffer<'_>,
     kind: ElementKind,
@@ -742,9 +741,10 @@ fn verify_blob(
     limit: Option<usize>,
     scratch: &mut IdScratch,
 ) -> Result<BlobVerifyResult> {
-    let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
+    let (KindIds { .. }, accepted) =
+        buffer.project_ids_and_refs(|_, _| KindIds::of(kind, &mut *scratch))?;
     let mut judge = KindJudge::new(kind, limit);
-    scratch.each(accepted.bytes(), |_, id| {
+    scratch.each(&accepted, |_, id| {
         judge.push(id, atomic_ids);
         Ok(())
     })?;
@@ -818,10 +818,11 @@ fn unindexed_pass(
         None,
         IdScratch::default,
         |_, buffer, scratch| -> Result<([BlobVerifyResult; 3], KindSpans<usize>)> {
-            let ((KindIds { .. }, groups), accepted) = buffer
-                .project(|_, _| (KindIds::new(kinds, &mut *scratch), GroupKinds::default()))?;
+            let ((KindIds { .. }, groups), accepted) = buffer.project_ids_and_refs(|_, _| {
+                (KindIds::new(kinds, &mut *scratch), GroupKinds::default())
+            })?;
             let mut judges = KINDS.map(|kind| KindJudge::new(kind, limit));
-            scratch.each(accepted.bytes(), |kind, id| {
+            scratch.each(&accepted, |kind, id| {
                 let index = usize::from(kind.ordinal());
                 judges[index].push(id, sets[index]);
                 Ok(())
@@ -1366,8 +1367,76 @@ pub(super) fn check_type_order<K: Ord + Copy>(
 
 #[cfg(test)]
 mod tests {
-    use super::{IdViolation, check_type_order, schedule_span};
+    use super::{IdViolation, VerifyIdsOptions, check_type_order, schedule_span, verify_ids_inner};
+    use crate::block_builder::HeaderBuilder;
+    use crate::read::wire_fixtures::{Group, block, dense, field_bytes, plain_node, relation, way};
     use crate::scan::classify::ScheduledBlob;
+    use crate::writer::{Compression, PbfWriter};
+
+    #[test]
+    fn id_report_ignores_tag_values_and_unread_metadata() {
+        let fixture = |tag, info: &[u8], dense_tags: &[u64]| {
+            let mut node = plain_node(1, 0, 0, &[(1, tag)], None);
+            field_bytes(&mut node, 4, info);
+            let mut dense = dense(&[(3, 0, 0), (2, 0, 0), (3, 0, 0)], dense_tags);
+            field_bytes(&mut dense, 5, info);
+            block(
+                &["", "k", "v"],
+                &[Group {
+                    nodes: vec![node],
+                    dense: Some(dense),
+                    ways: vec![way(10, &[1], (1, tag))],
+                    relations: vec![relation(20, &[(0, 10, 1)])],
+                }],
+            )
+        };
+        let good = fixture(2, &[], &[1, 2, 0, 0, 0]);
+        let bad = fixture(127, &[0x08], &[1, 127]);
+        let full = crate::PrimitiveBlock::from_vec(bad.clone())
+            .expect_err("full validation rejects the truncated node Info");
+        assert!(
+            matches!(
+                full.kind(),
+                crate::ErrorKind::WireFormat {
+                    msg: "truncated varint"
+                }
+            ),
+            "{full}"
+        );
+        let dir = crate::path_guard::tests::scratch();
+        let host = crate::host::Host::for_tests();
+        let entered = host.entered();
+        let report = |name, payload: &[u8]| {
+            let path = dir.path().join(name);
+            let mut writer = PbfWriter::new(
+                std::fs::File::create(&path).expect("fixture"),
+                Compression::None,
+            );
+            writer
+                .write_header(&HeaderBuilder::new().build().expect("header"))
+                .expect("write header");
+            writer
+                .write_primitive_block_no_indexdata(payload)
+                .expect("write fixture");
+            writer.flush().expect("flush fixture");
+            verify_ids_inner(
+                path.as_path().into(),
+                &VerifyIdsOptions {
+                    max_errors: 0,
+                    direct_io: false,
+                    full: true,
+                    type_filter: None,
+                },
+                &entered,
+            )
+            .expect("ID report")
+            .to_json_value("fixture")
+        };
+        let expected = report("good.pbf", &good);
+        assert_eq!(expected["counts"]["nodes"].as_u64(), Some(4));
+        assert_eq!(expected["passed"].as_bool(), Some(false));
+        assert_eq!(report("bad.pbf", &bad), expected);
+    }
 
     /// One schedule entry per frame start, each a small frame.
     fn blobs(frames: &[u64]) -> Vec<ScheduledBlob> {

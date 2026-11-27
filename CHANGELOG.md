@@ -677,6 +677,11 @@
   multi-region runs. Malformed fields that extract neither reads nor writes
   can now be accepted. Raw passthrough still requires full block validation.
   See [DEVIATIONS.md](DEVIATIONS.md#extract-pbf-validation-follows-classification-and-retained-output).
+  `check --ids`, `check --refs` (standalone and combined), `getid` and
+  `getparents` also scope validation to the fields each pass uses. The
+  getid and getparents writers validate retained fields before
+  re-encoding. See
+  [DEVIATIONS.md](DEVIATIONS.md#id-and-reference-commands-validation-follows-the-fields-used).
 
 - **`apply-changes` writes smaller files and finishes faster.** Rewritten
   blocks no longer repeat the source string table across every output

@@ -1,5 +1,26 @@
 # Check
 
+## check --ids and --refs scope validation to IDs and references
+
+On bygg, A is HEAD `aa824014` and B is the working tree on that commit.
+Planet, one interleaved pair per workload, with `--iterations 1` in each cell.
+
+| Workload | A wall and run | B wall and run | Wall change |
+|---|---|---|---:|
+| `id-order` | 24.6 s `8e7d3f5e` | 22.5 s `57e5fa16` | about -9 % |
+| `ref-integrity` | 25.9 s `c1d8c37b` | 24.5 s `8e2807aa` | about -5 % |
+
+The ID and reference checks use selective projection and replay checked
+spans in standalone and combined scans. Framing, countable packed arrays,
+string-table UTF-8 and kind claims still get checked. See
+[DEVIATIONS.md](../../DEVIATIONS.md#id-and-reference-commands-validation-follows-the-fields-used)
+for the malformed fields these scans can now accept.
+
+Both single pairs show modest reductions in the same direction as the
+[tags-filter](tags-filter.md) and [extract](extract.md) measurements.
+Tier 1 passed, `pbfhogg-verify all` passed 25 of 25 checks on denmark,
+and `check-refs` passed on germany.
+
 ## check --locations packs coordinates (bygg, working tree on `c0ec89ca`)
 
 The store packs latitude and longitude deltas from per-axis minima in

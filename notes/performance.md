@@ -214,13 +214,22 @@ single- and multi-region runs. Classification validates selection fields,
 and the write pass validates retained fields for re-encoding. Raw
 passthrough still uses full validation. See [extract measurements](../reference/performance/extract.md).
 
-Remaining work:
+ID and reference consumers now use scoped validation in `check --ids`,
+`check --refs` (standalone and combined), getid's PBF ID-list read,
+dependency discovery, include and invert paths, and getparents. The
+selective projection and checked-span replay validate the fields each
+scan uses. Writers check retained fields before re-encoding. See the
+[check](../reference/performance/check.md),
+[getid](../reference/performance/getid.md) and
+[getparents](../reference/performance/getparents.md) measurements.
 
-- `check --ids` and `KindIds` share the full projection path. They need to
-  opt in to scoped validation in `commands/check/verify_ids.rs` and
-  `read/project_ids.rs`.
-- Geocode, diff, getid, getparents and `check --refs` still need
-  consumer-specific validation scopes.
+Remaining candidates for scoped validation are geocode, diff and other
+consumers still on full `PrimitiveBlock` validation where profiling shows
+validation accounts for substantial time.
+
+- Getid's scoped relation scan duplicates the shared closure scan driver.
+- The selective writer builds offset tables for decoded blobs with no
+  matches.
 - Explore reusing extract's group framing from classification in the
   write pass.
 - Check whether pass 2 can avoid the extra dense ID probing with

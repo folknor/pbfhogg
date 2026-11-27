@@ -1209,6 +1209,16 @@ pub(crate) const CHECK_LOCATIONS_KEY_SHARDS: usize = 64;
 /// holds.
 pub(crate) const CHECK_LOCATIONS_KEY_BATCH: usize = 1 << 16;
 
+/// `check --locations`: maximum ranks per compressed chunk. At 32 Ki
+/// ranks, word offsets fit in a `u16` and rounding a partition by one
+/// chunk costs at most 280 KiB, including the side arrays.
+pub(crate) const CHECK_LOCATIONS_CHUNK_SLOTS: usize = 1 << 15;
+
+/// `check --locations`: maximum ranks staged as raw coordinates at once,
+/// bounding staging at 512 MiB. Large windows amortize node scan pool
+/// startup and rereads of blobs that straddle windows.
+pub(crate) const CHECK_LOCATIONS_BUILD_WINDOW_SLOTS: usize = 1 << 26;
+
 /// `inspect --anomalies` flags a block whose element count is below
 /// `ANOMALY_SMALL_NUMERATOR / ANOMALY_SMALL_DENOMINATOR` of its type's median.
 pub(crate) const ANOMALY_SMALL_NUMERATOR: u64 = 1;

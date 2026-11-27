@@ -1,5 +1,33 @@
 # Check
 
+## check --locations packs coordinates (bygg, working tree on `c0ec89ca`)
+
+The store packs latitude and longitude deltas from per-axis minima in
+32-slot blocks. It uses exact escape words for special states and blocks
+without packing savings. Partitions are sized by encoded bytes.
+
+On bygg, A is HEAD `c0ec89ca` and B is the working tree on `c0ec89ca`
+for the variant under test. Cells are interleaved, each with `--iterations 1`,
+with one fstrim at the head of the planet suite.
+
+`location-integrity --dataset planet` on `altw-keep-untagged`:
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 2m45s | `24bfd0dc` |
+| B | 2m17s | `730423b7` |
+| A | 2m35s | `b4067987` |
+| B | 2m14s | `bd1dae0c` |
+
+Wall time fell about 15 %. The `checkloc_partitions` counter fell from 6
+to 4, with about 16.1 GB of encoded store per partition on B. Germany
+`verify add-locations-to-ways`, which runs `check --locations --agreement`,
+passed on B.
+
+Each partition still decompresses every way blob. A single partition on
+this host needs denser exact storage within the same budget or a lookup
+design that reads the way blobs once.
+
 ## check --refs inserts word-batched (bygg, 2026-11-26, `876d9dd7` against `6808a7c1`)
 
 Node, way and relation ID replay inserts through `AtomicWordBatch`, one

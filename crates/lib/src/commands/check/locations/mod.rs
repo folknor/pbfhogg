@@ -49,19 +49,20 @@
 //!    holds recorded. Later passes route these blobs on what this pass saw,
 //!    not on their indexdata.
 //! 2. With `agreement`, every way blob's references join the key set too.
-//! 3. The key set is ranked and its rank space cut into partitions whose slot
-//!    store fits the budget (`store`). Per partition, the blobs that hold
-//!    nodes in its ID interval are decoded and their records joined into the
-//!    store, then every way blob is decoded and each reference the partition
-//!    owns is checked. The first partition also makes the checks that do not
-//!    depend on the partition, and validates every blob claiming ways, which
-//!    pass 1 did not read; one whose groups hold another kind is refused,
-//!    since its nodes were not collected.
+//! 3. Replay node records in bounded windows of ranks. Join duplicates
+//!    before packing each window into chunks. Accumulate chunks until the
+//!    next one would exceed the partition's store budget, then check every
+//!    way reference the partition owns. The first partition also makes the
+//!    checks independent of the partition and validates every blob claiming
+//!    ways; one whose groups hold another kind is refused, since its nodes
+//!    were not collected.
 //!
 //! # Memory
 //!
-//! The store budget bounds one partition's slot store and nothing else. On
-//! top of it: the key set (a bit set over the node-ID space, about 1.7 GB
+//! The store budget bounds one partition's coordinate store (with a
+//! one-slot minimum). The builder also holds one bounded window of node
+//! words and the compressed chunks produced from it. On top of those:
+//! the key set (a bit set over the node-ID space, about 1.7 GB
 //! for a planet's node IDs) and its rank index, which follow the number of
 //! distinct IDs; each worker's decompressed blob (validated where it lies,
 //! never copied) and a fixed ID batch (`CHECK_LOCATIONS_KEY_BATCH`); and the retained violation
@@ -71,10 +72,13 @@
 //! back; with `max_errors` zero every violation is kept. Way scanning streams one reference
 //! at a time, so a long way costs no worker memory. No scratch disk is used.
 
+mod compressed;
 mod scan;
 mod store;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::AtomicU64};
+
+use rayon::prelude::*;
 
 use crate::ElementKind;
 use crate::error::{Error, Result};
@@ -82,15 +86,17 @@ use crate::idset::{IdSet, RankedIdSet};
 use crate::read::input::{InputFile, InputSource, PinnedInput};
 use crate::scan::classify::{ScheduledBlob, parallel_scan_blobs_raw};
 use crate::tunables::{
-    CHECK_LOCATIONS_FALLBACK_BUDGET_BYTES, CHECK_LOCATIONS_HEADROOM_BYTES,
-    CHECK_LOCATIONS_KEY_BATCH, CHECK_LOCATIONS_KEY_SHARDS, CHECK_LOCATIONS_MIN_BUDGET_BYTES,
-    CHECK_LOCATIONS_PARTITION_WARN, CHECK_LOCATIONS_STORE_BUDGET_PCT,
+    CHECK_LOCATIONS_BUILD_WINDOW_SLOTS, CHECK_LOCATIONS_FALLBACK_BUDGET_BYTES,
+    CHECK_LOCATIONS_HEADROOM_BYTES, CHECK_LOCATIONS_KEY_BATCH, CHECK_LOCATIONS_KEY_SHARDS,
+    CHECK_LOCATIONS_MIN_BUDGET_BYTES, CHECK_LOCATIONS_PARTITION_WARN,
+    CHECK_LOCATIONS_STORE_BUDGET_PCT,
 };
 
+use self::compressed::{Chunk, Store};
 use self::scan::{
     Coord, Groups, Kinds, ValidateScratch, WayEvent, scan_nodes, scan_ways, validate_block,
 };
-use self::store::{Plan, SlotState, Store, in_partition, range_meets, slots_for_budget};
+use self::store::{SlotState, in_partition, join_node, lowest_id_with_rank_at_least, range_meets};
 
 /// Options for [`check_locations`].
 #[derive(Debug, Clone, Copy)]
@@ -107,10 +113,10 @@ pub struct CheckLocationsOptions {
     /// what it establishes and what it costs.
     pub agreement: bool,
     /// Bytes one partition's coordinate store may take. `None` derives it
-    /// from the host's available memory. The store costs about 8.25 bytes per
-    /// node ID with a slot; a smaller budget means more passes over the way
-    /// blobs, never a different answer. It bounds the store only; see the
-    /// module docs for the rest of the run's memory.
+    /// from the host's available memory. Store size depends on how closely
+    /// nearby ranks' coordinates pack. A smaller budget can require more
+    /// passes over the way blobs. See the module docs for the rest of the
+    /// run's memory.
     pub store_budget_bytes: Option<u64>,
 }
 
@@ -241,8 +247,8 @@ pub struct LocationsReport {
     /// Whether the agreement check ran.
     pub agreement: bool,
     /// Partitions (passes over the way blobs) the run used. A resource
-    /// decision, not a property of the file: it follows the store budget,
-    /// which by default follows the host's available memory.
+    /// decision based on the encoded store size and the store budget, which
+    /// by default follows the host's available memory.
     pub partitions: u64,
     /// Blob decodes the run made, over every pass. A cost figure, like
     /// `partitions`.
@@ -814,50 +820,20 @@ fn check_locations_inner(
     let key_bytes = key_set_bytes(&keys);
     let keys = keys.into_ranked();
     let budget = store_budget(opts, available, key_bytes);
-    let plan = Plan::new(&keys, slots_for_budget(budget));
-    report.partitions = plan.partitions() as u64;
     if opts.agreement {
         report.nodes_absent = Some(0);
     }
     host.invocation.counter("checkloc_keys", keys.total_count());
-    host.invocation
-        .counter("checkloc_partitions", report.partitions);
-    if plan.partitions() > CHECK_LOCATIONS_PARTITION_WARN {
-        crate::host::diag!(
-            host.diagnostics,
-            Warning,
-            "check.locations_partitions",
-            "the location check will read every way blob {} times: {} node IDs \
-             need a slot and the coordinate store budget is {} MiB",
-            plan.partitions(),
-            keys.total_count(),
-            budget >> 20
-        );
-    }
-
     let ctx = RunCtx {
         file: &walk.file,
         nodes: &nodes,
         ways: &ways,
         keys: &keys,
-        plan: &plan,
         agreement: opts.agreement,
         cap,
     };
-    // Every partition decompresses every way blob; a later one skips, way by
-    // way, the ways without a reference it owns. Two ways of not rereading
-    // were judged and refused (reference/performance/check.md, "check
-    // --locations skips ways a partition does not own"): skipping whole
-    // blobs by the partitions their refs touch skips nothing on a planet
-    // (every blob touches every partition), and routing way-reference
-    // observations to node-ID buckets on scratch writes and reads back more
-    // bytes than the rereads cost, against a check that uses no scratch.
-    for k in 0..plan.partitions() {
-        host.invocation.check()?;
-        host.invocation.marker("CHECKLOC_PARTITION_START");
-        ctx.run_partition(k, &mut report, &mut details, host)?;
-        host.invocation.marker("CHECKLOC_PARTITION_END");
-    }
+    ctx.run(budget, &mut report, &mut details, host)?;
+    record_partition_costs(&report, keys.total_count(), budget, host);
 
     report.violations = details.finish();
     host.invocation
@@ -867,6 +843,28 @@ fn check_locations_inner(
     host.invocation
         .counter("checkloc_refs_without_node", report.refs_without_node);
     Ok(report)
+}
+
+fn record_partition_costs(
+    report: &LocationsReport,
+    keys: u64,
+    budget: u64,
+    host: &crate::host::Entered<'_>,
+) {
+    host.invocation
+        .counter("checkloc_partitions", report.partitions);
+    if report.partitions > CHECK_LOCATIONS_PARTITION_WARN as u64 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "check.locations_partitions",
+            "the location check read every way blob {} times: {} node IDs \
+             need a slot and the coordinate store budget is {} MiB",
+            report.partitions,
+            keys,
+            budget >> 20
+        );
+    }
 }
 
 /// The up-front pass over every blob not claiming ways: validate it, count
@@ -995,10 +993,19 @@ fn store_budget(opts: &CheckLocationsOptions, available: Option<u64>, key_bytes:
 }
 
 /// Slot of `rank` within a partition starting at `first_rank`. Both come
-/// from the plan the store was sized by, so the index is in bounds.
+/// from the same rank interval, whose length the store checked against usize.
 #[allow(clippy::cast_possible_truncation)]
 fn slot_index(rank: u64, first_rank: u64) -> usize {
     (rank - first_rank) as usize
+}
+
+/// Staging is independent of the final compressed partition size. Align
+/// the windows to chunks so only the file's tail can produce a short one.
+fn build_window_slots(budget: u64, chunk_slots: usize) -> u64 {
+    let chunk_slots = chunk_slots as u64;
+    let raw_slots =
+        (budget / size_of::<AtomicU64>() as u64).min(CHECK_LOCATIONS_BUILD_WINDOW_SLOTS as u64);
+    (raw_slots / chunk_slots).max(1) * chunk_slots
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,39 +1018,127 @@ struct RunCtx<'a> {
     nodes: &'a Schedule,
     ways: &'a Schedule,
     keys: &'a RankedIdSet,
-    plan: &'a Plan,
     agreement: bool,
     cap: usize,
 }
 
 impl RunCtx<'_> {
-    /// One partition: join its node records, then check every way reference
-    /// it owns, then count the final slot states.
-    fn run_partition(
+    /// The partition boundaries are known as chunks arrive. The first ID at
+    /// a rank boundary may be absent, so find the lowest ID with that rank:
+    /// every absent ID then has exactly one owner as well.
+    fn run(
         &self,
-        k: usize,
+        budget: u64,
         report: &mut LocationsReport,
         details: &mut Details,
         host: &crate::host::Entered<'_>,
     ) -> Result<()> {
-        let range = self.plan.ids(k);
-        let (first_rank, len) = self.plan.ranks(k);
-        let store = Store::new(len)?;
-        if len > 0 {
-            self.node_phase(range, first_rank, &store, report, host)?;
+        let total = self.keys.total_count();
+        let chunk_slots = Chunk::slots_for_budget(budget, self.agreement);
+        let window = build_window_slots(budget, chunk_slots);
+        let mut first_rank = 0;
+        let mut lo = i64::MIN;
+        let mut store = Store::new(chunk_slots);
+        let mut replay_rank = 0;
+        let mut replay_lo = i64::MIN;
+        while replay_rank < total {
+            host.invocation.check()?;
+            let end = replay_rank + (total - replay_rank).min(window);
+            let hi = (end < total).then(|| lowest_id_with_rank_at_least(self.keys, end));
+            let chunks = self.build_chunks(
+                (replay_lo, hi),
+                replay_rank,
+                end - replay_rank,
+                chunk_slots,
+                report,
+                host,
+            )?;
+            for chunk in chunks {
+                if !store.fits(&chunk, budget) {
+                    let next = first_rank + store.len() as u64;
+                    let bound = lowest_id_with_rank_at_least(self.keys, next);
+                    self.run_partition(
+                        (lo, Some(bound)),
+                        first_rank,
+                        &store,
+                        report,
+                        details,
+                        host,
+                    )?;
+                    (first_rank, lo) = (next, bound);
+                    store = Store::new(chunk_slots);
+                }
+                store.push(chunk)?;
+            }
+            replay_rank = end;
+            replay_lo = hi.unwrap_or(i64::MAX);
         }
-        self.way_phase(k, range, first_rank, &store, report, details, host)?;
-        self.finish_partition(range, &store, len, report, details);
-        Ok(())
+        // Even without keys, a pass is needed for the structural checks.
+        self.run_partition((lo, None), first_rank, &store, report, details, host)
     }
 
-    /// The blobs holding nodes in the partition's interval, as the up-front
-    /// pass saw them; each record in the interval joins its slot.
-    fn node_phase(
+    /// A window's raw words are dropped before any way checks. Each chunk
+    /// is independent after the node replay joins all workers.
+    fn build_chunks(
+        &self,
+        range: (i64, Option<i64>),
+        first_rank: u64,
+        len: u64,
+        chunk_slots: usize,
+        report: &mut LocationsReport,
+        host: &crate::host::Entered<'_>,
+    ) -> Result<Vec<Chunk>> {
+        let len = usize::try_from(len)
+            .map_err(|_| Error::internal("location check build window does not fit in memory"))?;
+        host.invocation.marker("CHECKLOC_REPLAY_START");
+        let words: Vec<_> = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(len)
+            .collect();
+        self.node_phase(range, first_rank, &words, report, host)?;
+        host.invocation.marker("CHECKLOC_REPLAY_END");
+
+        host.invocation.marker("CHECKLOC_COMPRESS_START");
+        let mut chunks = Vec::new();
+        words
+            .par_chunks(chunk_slots)
+            .map(|words| {
+                host.invocation.check()?;
+                Ok(Chunk::encode(words, self.agreement))
+            })
+            .collect_into_vec(&mut chunks);
+        host.invocation.marker("CHECKLOC_COMPRESS_END");
+        chunks.into_iter().collect()
+    }
+
+    /// Check every way reference this partition owns, then count the final
+    /// slot states. Later passes retain the existing per-way ownership filter.
+    fn run_partition(
         &self,
         range: (i64, Option<i64>),
         first_rank: u64,
         store: &Store,
+        report: &mut LocationsReport,
+        details: &mut Details,
+        host: &crate::host::Entered<'_>,
+    ) -> Result<()> {
+        host.invocation.check()?;
+        host.invocation.marker("CHECKLOC_PARTITION_START");
+        host.invocation
+            .counter("checkloc_partition_store_bytes", store.budgeted_bytes());
+        self.way_phase(range, first_rank, store, report, details, host)?;
+        self.finish_partition(range, store, report, details);
+        report.partitions += 1;
+        host.invocation.marker("CHECKLOC_PARTITION_END");
+        Ok(())
+    }
+
+    /// The blobs holding nodes in the window's interval, as the up-front
+    /// pass saw them; each record in the interval joins its temporary word.
+    fn node_phase(
+        &self,
+        range: (i64, Option<i64>),
+        first_rank: u64,
+        words: &[AtomicU64],
         report: &mut LocationsReport,
         host: &crate::host::Entered<'_>,
     ) -> Result<()> {
@@ -1064,7 +1159,7 @@ impl RunCtx<'_> {
                     if in_partition(id, range)
                         && let Some(rank) = keys.numeric_rank_if_set(id)
                     {
-                        store.join_node(slot_index(rank, first_rank), coord);
+                        join_node(&words[slot_index(rank, first_rank)], coord);
                     }
                     Ok(())
                 })?;
@@ -1077,12 +1172,9 @@ impl RunCtx<'_> {
         Ok(())
     }
 
-    /// Every way blob. The node phase's pool join is the barrier that makes
-    /// every node join visible here.
-    #[allow(clippy::too_many_arguments)]
+    /// Every way blob, with the partition's finalized node states.
     fn way_phase(
         &self,
-        k: usize,
         range: (i64, Option<i64>),
         first_rank: u64,
         store: &Store,
@@ -1092,6 +1184,7 @@ impl RunCtx<'_> {
     ) -> Result<()> {
         let facts = &self.ways.facts;
         let cap = self.cap;
+        let designated = report.partitions == 0;
         parallel_scan_blobs_raw(
             self.file,
             &self.ways.blobs,
@@ -1103,7 +1196,7 @@ impl RunCtx<'_> {
                     store,
                     range,
                     first_rank,
-                    designated: k == 0,
+                    designated,
                     agreement: self.agreement,
                     facts: facts[pos],
                 };
@@ -1176,7 +1269,6 @@ impl RunCtx<'_> {
         &self,
         range: (i64, Option<i64>),
         store: &Store,
-        len: u64,
         report: &mut LocationsReport,
         details: &mut Details,
     ) {
@@ -1188,7 +1280,7 @@ impl RunCtx<'_> {
         report.nodes_mismatched += fin.mismatched;
         report.nodes_disagreeing += fin.disagreeing;
         if let Some(absent) = report.nodes_absent.as_mut() {
-            *absent += len - fin.present;
+            *absent += store.len() as u64 - fin.present;
         }
         // Node-ID details, smallest IDs first. Partitions run in ID order, so
         // the ones earlier partitions already retained are the smallest; this
@@ -1320,7 +1412,8 @@ impl WayCtx<'_> {
             .keys
             .numeric_rank_if_set(node_id)
             .map(|rank| slot_index(rank, self.first_rank));
-        let Some(i) = slot.filter(|&i| self.store.has_authority(i)) else {
+        let Some((i, state)) = slot.and_then(|i| self.store.node_state(i).map(|state| (i, state)))
+        else {
             out.without_node += 1;
             if coord == Some(Coord::Valid { lat: 0, lon: 0 }) {
                 out.null_island += 1;
@@ -1332,7 +1425,7 @@ impl WayCtx<'_> {
             }
             return;
         };
-        match self.store.state(i) {
+        match state {
             SlotState::Coord {
                 lat: node_lat,
                 lon: node_lon,

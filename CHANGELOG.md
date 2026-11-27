@@ -663,6 +663,10 @@
 
 ### Changed
 
+- **Location checks and type-filtered cat are faster.** On planet inputs
+  on bygg, the working tree on `c0ec89ca` cut wall time by about 15 % for
+  `check --locations` and 8 % for `cat --type way` against HEAD `c0ec89ca`.
+
 - **Self-dedupe and single-pass tag filtering are faster.** On bygg,
   the working tree on `d64b3548` versus HEAD `d64b3548` cut wall time
   by 18 % for warm-cache Germany self-dedupe and about 10 % for planet

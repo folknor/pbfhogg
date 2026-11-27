@@ -1,5 +1,35 @@
 # Apply Changes
 
+## Selective node-blob decode in location mode (bygg, stashed on `c0ec89ca`)
+
+The experiment decoded a node blob only when its range intersected a node
+change or a coordinate request.
+
+On bygg, A is HEAD `c0ec89ca` and B is the working tree on `c0ec89ca`
+for the variant under test. Cells are interleaved, each with `--iterations 1`,
+with one fstrim at the head of the planet suite.
+
+`apply-diff --dataset planet --variant altw-keep-untagged --locations-on-ways yes --osc 4913`:
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 4m22s | `50507100` |
+| B | 4m20s | `7c9e0669` |
+| A | 4m21s | `05c983ef` |
+| B | 4m17s | `cba32b06` |
+
+Neutral on this workload. `merge_loc_node_blobs_scanned` was 32152 of
+about 32.8 k node blobs on B. A daily planet OSC requests coordinates
+from almost every node blob. The experiment remains stashed and uncommitted.
+Only small or geographically concentrated changes are candidates for a
+payoff, and no bench registers such a workload.
+
+Skipping a blob also relaxes refusals because malformed contents in that
+blob go unseen. The prototype fixed a signed-ordering bug in its own
+intersection logic. Requests sort zero first, then negative IDs by
+magnitude, then positive IDs. Blob ranges use numeric order, so range
+intersection must account for the different ordering.
+
 ## Grouped rewritten-frame writes and hit-driven refresh (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 The drain now submits consecutive rewritten frames in groups (up to

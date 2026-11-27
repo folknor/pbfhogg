@@ -1,22 +1,5 @@
-//! The partition plan and the per-partition slot store of `check --locations`.
-//!
-//! # Partitions
-//!
-//! The key set `K` (node IDs with a slot) is ranked, and its rank space is cut
-//! into partitions of at most `S` slots. Partition `k` holds ranks
-//! `[k*S, (k+1)*S)`, which are exactly the members of the ID interval
-//! `[B_k, B_k+1)`, where `B_k` is the smallest ID whose rank (members strictly
-//! below it) is at least `k*S`. `B_0` is `i64::MIN` and the last partition is
-//! unbounded above, so the partitions cover every `i64` and each ID belongs to
-//! exactly one of them, whether or not it is in `K`.
-//!
-//! # Slots
-//!
-//! One `u64` per member of the partition, in rank order, plus two bit sets:
-//! *authority* (a node record with this ID exists) and *mismatch* (some ref
-//! disagreed with that record). A slot holds a [`crate::coord_pack`] word or
-//! one of three sentinels, which put a biased latitude above the 1.8e9 that
-//! `coord_pack::pack` can produce, so no coordinate can collide with them.
+//! Rank boundaries and the state transitions shared by the compressed store
+//! and the plain test oracle.
 //!
 //! The node phase joins every record into its slot over the lattice
 //! `EMPTY < VALID(c) < CONFLICT < UNUSABLE`: two different valid coordinates
@@ -41,15 +24,7 @@ const CONFLICT: u64 = PRESENT | 0x7FFF_FFF0;
 /// A node record with this ID has a coordinate outside the domain.
 const UNUSABLE: u64 = PRESENT | 0x7FFF_FFF1;
 /// No node record; the refs carry at least two different coordinates.
-const DISAGREE: u64 = PRESENT | 0x7FFF_FFF2;
-
-/// Bits one slot costs: the word plus the two bit sets.
-const BITS_PER_SLOT: u64 = 64 + 2;
-
-/// The slot capacity a store budget in bytes buys, at least one.
-pub(super) fn slots_for_budget(bytes: u64) -> u64 {
-    (bytes.saturating_mul(8) / BITS_PER_SLOT).max(1)
-}
+pub(super) const DISAGREE: u64 = PRESENT | 0x7FFF_FFF2;
 
 /// The decoded state of one slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +36,7 @@ pub(super) enum SlotState {
     Disagree,
 }
 
-fn decode(word: u64) -> SlotState {
+pub(super) fn decode(word: u64) -> SlotState {
     match word {
         0 => SlotState::Empty,
         CONFLICT => SlotState::Conflict,
@@ -74,57 +49,13 @@ fn decode(word: u64) -> SlotState {
     }
 }
 
-/// How the key set's rank space is cut into partitions.
-pub(super) struct Plan {
-    total: u64,
-    slots_per_partition: u64,
-    /// `B_1 ..= B_(P-1)`, ascending.
-    bounds: Vec<i64>,
-}
-
-impl Plan {
-    /// Plan partitions of at most `slots_per_partition` members over `keys`.
-    /// An empty key set gets one partition and no boundary search.
-    pub(super) fn new(keys: &RankedIdSet, slots_per_partition: u64) -> Self {
-        let total = keys.total_count();
-        let slots_per_partition = slots_per_partition.max(1);
-        let partitions = total.div_ceil(slots_per_partition).max(1);
-        let bounds = (1..partitions)
-            .map(|k| lowest_id_with_rank_at_least(keys, k * slots_per_partition))
-            .collect();
-        Self {
-            total,
-            slots_per_partition,
-            bounds,
-        }
-    }
-
-    pub(super) fn partitions(&self) -> usize {
-        self.bounds.len() + 1
-    }
-
-    /// Partition `k`'s ID interval: inclusive low end, exclusive high end
-    /// (`None`: unbounded).
-    pub(super) fn ids(&self, k: usize) -> (i64, Option<i64>) {
-        let lo = if k == 0 { i64::MIN } else { self.bounds[k - 1] };
-        (lo, self.bounds.get(k).copied())
-    }
-
-    /// Partition `k`'s first rank and its slot count.
-    pub(super) fn ranks(&self, k: usize) -> (u64, u64) {
-        let first = k as u64 * self.slots_per_partition;
-        let end = (first + self.slots_per_partition).min(self.total);
-        (first, end.saturating_sub(first))
-    }
-}
-
 /// The smallest ID whose rank is at least `target`, searched over every
 /// `i64`. The caller asks only for `target < total`, which `x = i64::MAX`
 /// always satisfies (its rank counts every member but possibly `i64::MAX`
 /// itself). The midpoint is taken through the unsigned distance, which
 /// `hi - lo` would overflow for `lo < 0 < hi`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-fn lowest_id_with_rank_at_least(keys: &RankedIdSet, target: u64) -> i64 {
+pub(super) fn lowest_id_with_rank_at_least(keys: &RankedIdSet, target: u64) -> i64 {
     let (mut lo, mut hi) = (i64::MIN, i64::MAX);
     while lo < hi {
         let mid = lo.wrapping_add((hi.wrapping_sub(lo) as u64 / 2) as i64);
@@ -137,7 +68,7 @@ fn lowest_id_with_rank_at_least(keys: &RankedIdSet, target: u64) -> i64 {
     lo
 }
 
-/// Whether `id` lies in the half-open interval `(lo, hi)` of a partition.
+/// Whether `id` lies in the half-open interval `[lo, hi)` of a partition.
 pub(super) fn in_partition(id: i64, (lo, hi): (i64, Option<i64>)) -> bool {
     id >= lo && hi.is_none_or(|hi| id < hi)
 }
@@ -147,18 +78,19 @@ pub(super) fn range_meets(min: i64, max: i64, (lo, hi): (i64, Option<i64>)) -> b
     max >= lo && hi.is_none_or(|hi| min < hi)
 }
 
-fn bitset(len: usize) -> Vec<AtomicU64> {
+pub(super) fn bitset(len: usize) -> Vec<AtomicU64> {
     std::iter::repeat_with(|| AtomicU64::new(0))
         .take(len.div_ceil(64))
         .collect()
 }
 
-fn bit(set: &[AtomicU64], i: usize) -> (&AtomicU64, u64) {
+pub(super) fn bit(set: &[AtomicU64], i: usize) -> (&AtomicU64, u64) {
     (&set[i >> 6], 1_u64 << (i & 63))
 }
 
-/// One partition's slots.
-pub(super) struct Store {
+/// One partition's slots in the original plain representation.
+#[cfg(test)]
+pub(super) struct PlainStore {
     slots: Vec<AtomicU64>,
     authority: Vec<AtomicU64>,
     mismatch: Vec<AtomicU64>,
@@ -177,7 +109,8 @@ pub(super) struct Final {
     pub disagreeing: u64,
 }
 
-impl Store {
+#[cfg(test)]
+impl PlainStore {
     pub(super) fn new(len: u64) -> crate::Result<Self> {
         let len = usize::try_from(len).map_err(|_| {
             crate::Error::internal("location check partition does not fit in memory")
@@ -195,28 +128,7 @@ impl Store {
     pub(super) fn join_node(&self, i: usize, coord: Coord) {
         let (word, mask) = bit(&self.authority, i);
         word.fetch_or(mask, Relaxed);
-        let record = match coord {
-            // In domain by construction, so `pack` cannot refuse it; the
-            // fallback keeps the join total rather than panicking.
-            Coord::Valid { lat, lon } => pack(lat, lon).unwrap_or(UNUSABLE),
-            Coord::Invalid { .. } => UNUSABLE,
-        };
-        let slot = &self.slots[i];
-        let mut cur = slot.load(Relaxed);
-        loop {
-            let next = match cur {
-                UNUSABLE => return,
-                _ if record == UNUSABLE => UNUSABLE,
-                CONFLICT => return,
-                0 => record,
-                same if same == record => return,
-                _ => CONFLICT,
-            };
-            match slot.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
-                Ok(_) => return,
-                Err(seen) => cur = seen,
-            }
-        }
+        join_node(&self.slots[i], coord);
     }
 
     pub(super) fn has_authority(&self, i: usize) -> bool {
@@ -233,33 +145,11 @@ impl Store {
         word.fetch_or(mask, Relaxed);
     }
 
-    /// Record an inline coordinate for slot `i`, which has no node record.
     pub(super) fn agree(&self, i: usize, lat: i32, lon: i32) {
-        let Some(coord) = pack(lat, lon) else {
-            return;
-        };
-        let slot = &self.slots[i];
-        let mut cur = slot.load(Relaxed);
-        loop {
-            let next = match cur {
-                DISAGREE => return,
-                0 => coord,
-                same if same == coord => return,
-                _ => DISAGREE,
-            };
-            match slot.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
-                Ok(_) => return,
-                Err(seen) => cur = seen,
-            }
-        }
+        join_agreement(&self.slots[i], lat, lon);
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Count the final states. Call only after every phase writing the store
-    /// has joined.
+    /// Count the final states after every writer has joined.
     pub(super) fn finish(&self) -> Final {
         let mut out = Final::default();
         for i in 0..self.slots.len() {
@@ -280,8 +170,6 @@ impl Store {
         out
     }
 
-    /// Whether slot `i` is one a node-ID detail reports: conflicting node
-    /// records, or (without a node record) disagreeing refs.
     pub(super) fn reportable(&self, i: usize) -> Option<SlotState> {
         match (self.has_authority(i), self.state(i)) {
             (true, SlotState::Conflict) => Some(SlotState::Conflict),
@@ -291,9 +179,55 @@ impl Store {
     }
 }
 
+pub(super) fn join_node(slot: &AtomicU64, coord: Coord) {
+    let record = match coord {
+        // In domain by construction, so `pack` cannot refuse it; the
+        // fallback keeps the join total rather than panicking.
+        Coord::Valid { lat, lon } => pack(lat, lon).unwrap_or(UNUSABLE),
+        Coord::Invalid { .. } => UNUSABLE,
+    };
+    let mut cur = slot.load(Relaxed);
+    loop {
+        let next = match cur {
+            UNUSABLE => return,
+            _ if record == UNUSABLE => UNUSABLE,
+            CONFLICT => return,
+            0 => record,
+            same if same == record => return,
+            _ => CONFLICT,
+        };
+        match slot.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+/// Record an inline coordinate for a slot with no node record.
+pub(super) fn join_agreement(slot: &AtomicU64, lat: i32, lon: i32) {
+    let Some(coord) = pack(lat, lon) else {
+        return;
+    };
+    let mut cur = slot.load(Relaxed);
+    loop {
+        let next = match cur {
+            DISAGREE => return,
+            0 => coord,
+            same if same == coord => return,
+            _ => DISAGREE,
+        };
+        match slot.compare_exchange_weak(cur, next, Relaxed, Relaxed) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Coord, Plan, SlotState, Store, in_partition, range_meets, slots_for_budget};
+    use super::{
+        Coord, PlainStore, SlotState, in_partition, lowest_id_with_rank_at_least, range_meets,
+    };
     use crate::idset::IdSet;
 
     fn valid(lat: i32, lon: i32) -> Coord {
@@ -321,7 +255,7 @@ mod tests {
             let orders = permutations(records.len());
             assert_eq!(orders.len(), (1..=records.len()).product::<usize>());
             for order in orders {
-                let store = Store::new(1).expect("construct location store");
+                let store = PlainStore::new(1).expect("construct location store");
                 for &r in &order {
                     store.join_node(0, records[r]);
                 }
@@ -370,7 +304,7 @@ mod tests {
                         SlotState::Coord { lat: 3, lon: 4 }
                     };
                     for order in permutations(3) {
-                        let store = Store::new(1).expect("construct location store");
+                        let store = PlainStore::new(1).expect("construct location store");
                         assert_eq!(store.state(0), SlotState::Empty);
                         for index in order {
                             store.join_node(0, records[selection[index]]);
@@ -387,7 +321,7 @@ mod tests {
     fn agreement_matches_the_set_model() {
         for mask in 0..8 {
             for order in permutations(3) {
-                let store = Store::new(1).expect("construct location store");
+                let store = PlainStore::new(1).expect("construct location store");
                 for index in order {
                     let lat = if mask & (1 << index) == 0 { 5 } else { 7 };
                     store.agree(0, lat, 6);
@@ -419,7 +353,7 @@ mod tests {
             (&[valid(1, 2), valid(3, 4), BAD], SlotState::Unusable),
         ];
         for (records, want) in cases {
-            let store = Store::new(1).expect("construct location store");
+            let store = PlainStore::new(1).expect("construct location store");
             let barrier = std::sync::Barrier::new(records.len());
             std::thread::scope(|scope| {
                 for &record in records {
@@ -445,7 +379,7 @@ mod tests {
             ),
             ([(5, 6), (5, 6), (7, 8)], SlotState::Disagree),
         ] {
-            let store = Store::new(1).expect("construct location store");
+            let store = PlainStore::new(1).expect("construct location store");
             let barrier = std::sync::Barrier::new(copies.len());
             std::thread::scope(|scope| {
                 for (lat, lon) in copies {
@@ -462,7 +396,7 @@ mod tests {
 
     #[test]
     fn agreement_is_absorbing() {
-        let store = Store::new(2).expect("construct location store");
+        let store = PlainStore::new(2).expect("construct location store");
         store.agree(0, 5, 6);
         store.agree(0, 5, 6);
         assert_eq!(store.state(0), SlotState::Coord { lat: 5, lon: 6 });
@@ -478,7 +412,7 @@ mod tests {
     /// Null Island is a coordinate, not an empty slot.
     #[test]
     fn null_island_is_a_coordinate() {
-        let store = Store::new(1).expect("construct location store");
+        let store = PlainStore::new(1).expect("construct location store");
         store.join_node(0, valid(0, 0));
         assert_eq!(store.state(0), SlotState::Coord { lat: 0, lon: 0 });
     }
@@ -517,34 +451,30 @@ mod tests {
         }
         let keys = set.into_ranked();
         for per in 1..=9 {
-            let plan = Plan::new(&keys, per);
-            assert_eq!(plan.partitions() as u64, (ids.len() as u64).div_ceil(per));
+            let total = keys.total_count();
+            let mut first = 0;
+            let mut lo = i64::MIN;
             let mut seen = 0;
-            for k in 0..plan.partitions() {
-                let range = plan.ids(k);
-                let (first, len) = plan.ranks(k);
+            while first < total {
+                let len = per.min(total - first);
+                let end = first + len;
+                let hi = (end < total).then(|| lowest_id_with_rank_at_least(&keys, end));
+                let range = (lo, hi);
                 let members: Vec<i64> = ids
                     .iter()
                     .copied()
                     .filter(|&id| in_partition(id, range))
                     .collect();
-                assert_eq!(members.len() as u64, len, "per {per} partition {k}");
+                assert_eq!(members.len() as u64, len, "per {per}, first rank {first}");
                 for (offset, id) in members.iter().enumerate() {
                     assert_eq!(keys.numeric_rank_if_set(*id), Some(first + offset as u64));
                 }
                 seen += members.len();
+                first = end;
+                lo = hi.unwrap_or(i64::MAX);
             }
             assert_eq!(seen, ids.len());
         }
-    }
-
-    #[test]
-    fn an_empty_key_set_has_one_unbounded_partition() {
-        let keys = IdSet::new().into_ranked();
-        let plan = Plan::new(&keys, 10);
-        assert_eq!(plan.partitions(), 1);
-        assert_eq!(plan.ids(0), (i64::MIN, None));
-        assert_eq!(plan.ranks(0), (0, 0));
     }
 
     #[test]
@@ -554,11 +484,5 @@ mod tests {
         assert!(!range_meets(20, 30, (9, Some(20))));
         assert!(range_meets(i64::MIN, -1, (i64::MIN, Some(0))));
         assert!(range_meets(i64::MAX, i64::MAX, (9, None)));
-    }
-
-    #[test]
-    fn budget_buys_at_least_one_slot() {
-        assert_eq!(slots_for_budget(0), 1);
-        assert_eq!(slots_for_budget(66), 8);
     }
 }

@@ -63,16 +63,6 @@ decode.
 
 Kind: high-conviction architectural rewrite.
 
-## PERF-002 - Type-filtered cat reads rejected raw-frame bodies
-
-Reported by: framing, pipeline, tags.
-
-Cat's raw-frame loop (`cat_type_filtered`, `cat_type_passthrough`) still
-reads rejected bodies before deciding whether to copy or decode. Move that
-decision to the header and retain the required framing and refusal checks.
-The remaining workload includes `copy-pbf --type way`. See the
-[reader-side filter measurements](../reference/performance/tags-filter.md).
-
 ## PERF-003 - Source ranges are not a first-class output representation
 
 Reported by: output, framing, copy, altw-sparse, altw-external, apply-core,
@@ -80,9 +70,10 @@ merge, sort.
 
 Mechanism: range copy exists (`PbfWriter::write_raw_copy`, blob merge
 `CopyRun`), but many paths do not reach it: indexed `cat_passthrough` reads
-complete frames and hands buffers to the writer; type-filtered cat reads before
-checking kind; header-only degrade reads every payload and `reframe_raw` copies
-it again; cat reindex `reframe_with` and `framing.rs` header-only reframing
+complete frames and hands buffers to the writer; type-filtered cat skips
+rejected bodies and buffers kept frames; header-only degrade reads every
+payload and `reframe_raw` copies it again; cat reindex `reframe_with` and
+`framing.rs` header-only reframing
 build a new contiguous buffer copying the unchanged body; both ALTW output
 routes (`Pass2Consumer::passthrough`, stage 4) read unchanged frames
 synchronously on the ordered consumer thread; blob-merge `write_frame` builds
@@ -98,9 +89,9 @@ Redesign: an ordered output recipe of owned byte segments and source-file
 range references; a header rewrite becomes a small owned header plus a range
 for the original body; unchanged runs stay ranges end to end; the scheduler
 coalesces for planning and then splits into balanced, independently scheduled
-extents (`copy_file_range` for buffered, parallel aligned read and write for
-direct). Commands hand ranges and replacement segments instead of reading a
-frame to call `write_raw_owned`. Target userspace traffic for indexed cat,
+extents (parallel range execution for buffered, parallel aligned read and
+write for direct). Commands hand ranges and replacement segments instead of
+reading a frame to call `write_raw_owned`. Target userspace traffic for indexed cat,
 type-filtered cat and header-only degrade is roughly 0 % of payload; for
 apply-changes, header and probe bytes plus compressed candidate payload bytes
 (copy gives a per-command budget table in its report). For degrade, alternating
@@ -117,6 +108,38 @@ fields carry forward; header-only scans must still detect malformed framing.
 Kernel copy does not guarantee storage avoids the bytes.
 
 Kind: high-conviction rewrite.
+
+Buffered cat range copy was refused after these `copy-pbf --dataset planet`
+cells. B included header skipping and submitted kept frames as ranges.
+
+On bygg, A is HEAD `c0ec89ca` and B is the working tree on `c0ec89ca`
+for the variant under test. Cells are interleaved, each with `--iterations 1`,
+with one fstrim at the head of the planet suite.
+
+| Range submission | Workload | Arm | Wall | Run |
+|---|---|---|---:|---|
+| Unbounded | `--type way` | A | 33.2 s | `8fa9c0f8` |
+| Unbounded | `--type way` | B | 37.2 s | `61b84fcf` |
+| Unbounded | `--type way` | A | 28.6 s | `7c2dc85d` |
+| Unbounded | `--type way` | B | 30.0 s | `c0113a7e` |
+| 16 MiB | `--type way` | B | 29.6 s | `48b40018` |
+| 16 MiB | `--type way` | A | 31.5 s | `873d47a2` |
+| 16 MiB | `--type way` | B | 28.3 s | `8840e914` |
+| 16 MiB | `--type way` | A | 31.5 s | `52983ab5` |
+| 16 MiB | Plain | A | 43.5 s | `118d9659` |
+| 16 MiB | Plain | B | 64 s | `e0cc5b4f` |
+| 16 MiB | Plain | A | 54.1 s | `16d20848` |
+| 16 MiB | Plain | B | 65 s | `de159370` |
+
+Buffered cat range copy was removed. Unbounded ranges lost on filtered
+cat. Submitting at 16 MiB recovered the filtered gain, but plain passthrough
+was substantially slower in both pairs. The likely cause is that the
+buffered backend executes `copy_file_range` serially on its writer thread,
+while buffered frame transfer overlaps producer reads with writer writes.
+Revisit buffered cat range copy only after a named backend change such as
+parallel range execution.
+
+The final header-skip-only results are in the [cat performance record](../reference/performance/cat.md).
 
 ## PERF-004 - Header discovery and payload work are separate walks with a full-file barrier
 
@@ -924,6 +947,19 @@ changes still touch many blobs; Bloom summaries per blob can admit most blobs.
 
 Kind: high conviction (requested join); larger storage redesign (reverse index).
 
+The selective node-blob decode experiment is stashed and uncommitted.
+It decoded a blob only when a node change or coordinate request intersected
+its range. On bygg, HEAD `c0ec89ca` ran in 4m22s (`50507100`) and 4m21s
+(`05c983ef`). The prototype on `c0ec89ca` ran in 4m20s (`7c9e0669`) and
+4m17s (`cba32b06`). The result is neutral. A daily planet OSC touches almost
+every node blob for coordinates. A retry needs a small or geographically
+concentrated change workload, which no bench currently registers, and a
+decision on the relaxed refusals for malformed contents in skipped blobs.
+The prototype fixed its own intersection bug caused by sorting requests
+zero first, negatives by magnitude, then positives, while blob ranges use
+numeric order. The ordinal join and whole-way refresh redesign remain open.
+See the [apply-changes performance record](../reference/performance/apply-changes.md).
+
 ## PERF-035 - apply-changes way work waits for node output to drain
 
 Reported by: apply-locations, apply-core.
@@ -1056,32 +1092,31 @@ After block-local selection and tallying, workers still merge accepted
 rows into shared mutex-protected shards. Partition-owner counting remains
 an unmeasured option.
 
-## PERF-046 - Location checking decompresses every way blob per partition
+## PERF-046 - Location checking still rereads ways across coordinate partitions
 
 Reported by: check.
 
-Mechanism: `check_locations_inner` splits the node-ID space into P partitions
-when the coordinate store does not fit (planet `altw-keep-untagged` on a
-28 GB-class host: 6), and every partition decompresses every way blob and
-scans every ref; later partitions skip the coordinate decode of ways they do
-not own. Skipping whole blobs and spilling observations to scratch were both
-refused with measurements and arithmetic (reference/performance/check.md,
-2026-11-26).
+The compressed coordinate store is implemented. On bygg, planet
+`altw-keep-untagged` went from 6 partitions at HEAD `c0ec89ca` to 4 in the
+working tree on `c0ec89ca`, with about 16.1 GB of encoded store per
+partition and about 15 % lower wall time.
+See the [check performance record](../reference/performance/check.md).
 
-Redesign: fewer partitions, or none. Candidates: a lossless compressed
-coordinate store (blocks of nearby ranks, bit-packed deltas, exact escape
-blocks; about 12 bits per key would fit planet keep-untagged in one
-partition here), or a node-side lookup (way blobs read once, node blobs as
-backing store with a bounded decoded-projection cache, a rank-indexed
-mismatch bitset across batches). `--agreement` needs exact first-coordinate
-or disagree state for absent IDs in either.
+Every partition still decompresses every way blob and scans every ref.
+Later partitions skip coordinate decoding for ways they do not own.
+Whole-blob skipping and spilling observations to scratch were already
+ruled out in the check performance record.
 
-Risks: coordinate locality decides whether the compressed store fits; node
-read amplification for the lookup; duplicate precedence, absent-node
-agreement, violation order and the `partitions` / `blob_decodes` cost
-figures. The verifier runs this check several times per `verify all`.
+A single partition on this host needs denser exact storage within the
+same budget. A node-side lookup could instead read the way blobs once,
+using node blobs as backing storage, a bounded cache of decoded coordinate
+projections and a rank-indexed mismatch bitset across batches. Measure
+node read amplification for that design. Preserve duplicate precedence,
+exact first-coordinate or disagreement state for absent IDs under
+`--agreement`, violation order and the reported partition and blob-decode
+counts.
 
-Kind: scaling payoff (check), smaller than first filed.
+Kind: scaling payoff (check).
 
 ## PERF-050 - Renumber lookups are scalar and touch separate arrays
 

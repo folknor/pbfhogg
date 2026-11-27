@@ -49,7 +49,7 @@ pub(crate) struct Launch<'a> {
 }
 
 /// A settled launch: the leader's status and its whole stderr.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Ended {
     pub(crate) status: ExitStatus,
     pub(crate) stderr: Vec<u8>,

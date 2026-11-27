@@ -60,6 +60,7 @@ use crate::error::Error;
 use crate::extract_config::PolygonInput;
 use crate::extract_config::{ExtractStrategy, NamedRegion, PbfhoggCommand};
 use crate::harness::{Harness, Role, Verdict};
+use crate::opl_compare::{self, Policy};
 use crate::pbf_frames::{Origin, SORT_TYPE_THEN_ID};
 use pbfhogg_devkit::Bbox;
 
@@ -168,8 +169,12 @@ struct StrategyRun<'a> {
 impl StrategyRun<'_> {
     /// Its sequential extracts, then each config's single pass against them,
     /// recorded into the harness.
-    #[allow(clippy::too_many_lines)]
     fn run(&self, harness: &mut Harness) -> Result<(), Error> {
+        opl_compare::with_sequential_decodings(harness, |h| self.compare_configs(h))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn compare_configs(&self, harness: &mut Harness) -> Result<(), Error> {
         let (pbf, strategy, input_sorted, outdir) =
             (self.pbf, self.strategy, self.input_sorted, self.outdir);
         let name = strategy.name();
@@ -185,7 +190,7 @@ impl StrategyRun<'_> {
         std::fs::create_dir_all(&seq_dir)?;
         harness.msg(&format!("  running sequential {name} extracts..."));
         let mut sequential: HashMap<String, Sequential> = HashMap::new();
-        for named in self.all {
+        for (index, named) in self.all.iter().enumerate() {
             let seq_out = seq_dir.join(named.output_name());
             let command = PbfhoggCommand::Extract { strategy };
             let seq_args = command.extract_args_for(pbf, &named.region, &seq_out)?;
@@ -206,14 +211,27 @@ impl StrategyRun<'_> {
                 seq_out
             } else {
                 record_no_sort_claim(harness, &label, &seq_out)?;
-                let copy = sorted_copy(harness, &seq_out)?;
-                // Its own decode, not folded into the region comparison below:
-                // that comes only after the multi-extract run, whose failure
-                // would otherwise lose this verdict.
-                let (unique, _) = harness.check_sorted_counted(&label, (&copy, Origin::Other))?;
-                harness.record(&format!("{label} output repeats an ID"), unique);
-                copy
+                sorted_copy(harness, &seq_out)?
             };
+            if !input_sorted || (self.polygons && index < self.strips) {
+                opl_compare::retain_sequential(harness, &compared)?;
+            }
+            if !input_sorted {
+                // Record this verdict before either config runs. Read under
+                // the copy's comparison policy so its later merges can reuse
+                // this decoding. If its header is unreadable, keep the order
+                // scan's original policy and let the later comparison judge it.
+                let seq_side = (compared.as_path(), Origin::Other);
+                let policy = crate::pbf_frames::header(seq_side.0, seq_side.1).map_or(
+                    Policy::CONTENT,
+                    |header| Policy {
+                        metadata: true,
+                        locations: header.optional_feature("LocationsOnWays"),
+                    },
+                );
+                let unique = harness.check_sorted_as(&label, seq_side, policy)?;
+                harness.record(&format!("{label} output repeats an ID"), unique);
+            }
             sequential.insert(named.stem.clone(), Sequential { compared });
         }
 
@@ -311,10 +329,7 @@ impl StrategyRun<'_> {
                 } else {
                     Origin::Other
                 };
-                let policy = crate::opl_compare::Policy::between(
-                    (&compared, origin),
-                    (&seq.compared, origin),
-                )?;
+                let policy = Policy::between((&compared, origin), (&seq.compared, origin))?;
                 let (same, [counts, _]) = harness.same_elements_judged(
                     (
                         (&compared, origin),
@@ -421,6 +436,42 @@ fn sorted_copy(harness: &mut Harness, output: &Path) -> Result<PathBuf, Error> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn the_region_merge_reports_order_before_raising_the_strict_cursor_error() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let multi = scratch.path().join("multi.opl");
+        let sequential = scratch.path().join("sequential.opl");
+        let listing = scratch.path().join("region.diff.txt");
+        std::fs::write(&multi, "n1 Tname=other\nn3 T\nn2 T\nn4 T\n").unwrap();
+        std::fs::write(&sequential, "n1 T\nn3 T\nn4 T\n").unwrap();
+
+        let (walked, _) = opl_compare::merge_judged(&multi, &sequential, &listing, |_| {}).unwrap();
+        let [multi_order, seq_order] = walked.scans;
+        assert_eq!(
+            multi_order.unwrap(),
+            opl_compare::Scan {
+                ordered: false,
+                counts: [4, 0, 0],
+            }
+        );
+        assert!(seq_order.unwrap().ordered);
+        let Err(Error::Failed(error)) = walked.merged else {
+            panic!("a step-down must fail the strict merge");
+        };
+        assert_eq!(
+            error,
+            format!(
+                "OPL {} line 3: an object at or below the previous one: the stream is not in \
+                 strict kind and ID order",
+                multi.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(listing).unwrap(),
+            "-n1 Tname=other\n+n1 T\n"
+        );
+    }
 
     #[test]
     fn the_claim_names_the_configs_and_what_unsorted_input_leaves_out() {

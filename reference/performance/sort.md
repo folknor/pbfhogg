@@ -199,6 +199,35 @@ every blob), `--iterations 1` cells alternated, baseline `042871e6` through
 
 ## History
 
+### Parallel key ranges for large sort overlap components (stashed)
+
+The experimental sort path decodes each large overlap component once, spills
+packed records to scratch and merges disjoint key ranges in parallel. It
+requires a component above `SORT_RANGE_MIN_RECORDS` (1 million records in the
+patch against `5a8af88b`, tested on bygg).
+
+`sort-pbf` cells on bygg. A is `5a8af88b`; B is the experimental working tree
+on `5a8af88b`.
+
+| Dataset and input | Arm on `5a8af88b` (bygg) | Wall | Result |
+|---|---|---|---|
+| Denmark `unsorted` (blob shuffle) | A | 442 ms (cold) | `56d4485a` |
+| Denmark `unsorted` | B | 317 ms | `93c0561a` |
+| Denmark `unsorted` | A | 314 ms | `ca04cdb8` |
+| Denmark `unsorted` | B | 299 ms | `75263747` |
+| Denmark `unsorted-intra` | B | 410 ms | `33b9167a` |
+| Planet `history2` raw, `--force-sort` | B | 1m27s | `c21dae4c` |
+
+No cell showed a `SORT_RANGE_PREPARE` or `SORT_RANGE_MERGE` span. No tested
+component crossed the threshold, so the parallel path was unmeasurable on
+bygg. The patch is saved in
+[notes/stashed-perf-015-sort-parallel-key-ranges.patch](../../notes/stashed-perf-015-sort-parallel-key-ranges.patch).
+
+To resurface, first create a bench input whose disorder forms a large overlap
+component, for example by shuffling elements across the whole file. No such
+bench input exists yet. Confirm that the patched arm emits both range spans
+before comparing walls.
+
 ### Sort
 
 `pbfhogg sort` repairs unsorted PBFs into `Sort.Type_then_ID` order via a

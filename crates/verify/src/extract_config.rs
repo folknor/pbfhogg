@@ -63,7 +63,11 @@ impl PbfhoggCommand {
             Region::Bbox(bbox) => argv.arg(bbox.to_pbfhogg_arg()),
             Region::Polygon(polygon) => argv.arg("--polygon").input(&polygon.path),
         };
-        Ok(argv.output(output))
+        let argv = argv.output(output);
+        if *strategy == ExtractStrategy::Simple && matches!(region, Region::Polygon(_)) {
+            return Ok(argv.memoized_output());
+        }
+        Ok(argv)
     }
 }
 pub(crate) struct NamedRegion {

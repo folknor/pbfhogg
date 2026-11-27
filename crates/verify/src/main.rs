@@ -32,6 +32,7 @@ mod harness;
 mod opl_compare;
 mod output;
 mod process;
+mod producer;
 mod reference;
 mod reference_cache;
 mod run;

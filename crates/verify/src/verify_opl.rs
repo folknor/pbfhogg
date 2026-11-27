@@ -268,7 +268,7 @@ fn parse_way_nodes(list: &[u8]) -> Result<Vec<i64>, String> {
 }
 
 /// One OPL line (without its newline) as a relation record.
-fn parse_relation(line: &[u8]) -> Result<OplRelation, String> {
+pub(super) fn parse_relation(line: &[u8]) -> Result<OplRelation, String> {
     let mut fields = line.split(|&b| b == b' ');
     let first = fields.next().unwrap_or_default();
     let id = match first.split_first() {

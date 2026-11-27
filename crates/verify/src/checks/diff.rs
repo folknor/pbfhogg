@@ -105,13 +105,9 @@ pub fn run(
 
     let new_pbf = outdir.join("new.osm.pbf");
     harness.msg("--- creating 'new' PBF via apply-changes ---");
-    let captured = harness.pbfhogg_discard(
-        PbfArgv::new("apply-changes")
-            .input(pbf)
-            .input(osc)
-            .output(&new_pbf),
-    )?;
-    harness.require_success(&captured, "pbfhogg apply-changes")?;
+    let captured = harness
+        .pbfhogg_discard(crate::argv::apply_changes(pbf, osc, &new_pbf).memoized_output())?;
+    harness.require_output(&captured, "pbfhogg apply-changes", &new_pbf)?;
 
     let runs = DiffRuns::run(harness, &outdir, (pbf, &new_pbf), direct_io)?;
     let judgement = against_osmium(
@@ -187,17 +183,11 @@ impl DiffRuns {
         // apply-changes refuses an unindexed base, so a raw variant cannot
         // drive it; stripping both sides of the pair can. The two indexed
         // diffs and the two strips read only the pair and each writes its own
-        // file, so they run as one launch group, consumed in the order they
-        // once ran; the unindexed diffs, which read the strips, follow as a
-        // second group.
+        // file, so the diffs and any strip misses run as one launch group,
+        // with exits judged in caller order. The unindexed diffs, which read
+        // the strips, follow as a second group.
         let old_raw = outdir.join("old-unindexed.osm.pbf");
         let new_raw = outdir.join("new-unindexed.osm.pbf");
-        let strip = |input: &Path, output: &Path| {
-            PbfArgv::new("degrade")
-                .arg("--strip-indexdata")
-                .input(input)
-                .output(output)
-        };
         let indexed = [
             ("indexed verbose", "pbfhogg-diff-verbose", true),
             ("indexed plain", "pbfhogg-diff", false),
@@ -211,8 +201,14 @@ impl DiffRuns {
                 )
             })
             .collect();
-        launches.push((strip(old, &old_raw), outdir.join("old-unindexed.stdout")));
-        launches.push((strip(new, &new_raw), outdir.join("new-unindexed.stdout")));
+        launches.push((
+            crate::argv::strip_indexdata(old, &old_raw),
+            outdir.join("old-unindexed.stdout"),
+        ));
+        launches.push((
+            crate::argv::strip_indexdata(new, &new_raw),
+            outdir.join("new-unindexed.stdout"),
+        ));
         let mut ended = harness.pbfhogg_group(launches)?.into_iter();
         let mut next = || {
             ended
@@ -225,9 +221,9 @@ impl DiffRuns {
             runs.push(diff_run(harness, outdir, label, stem, &captured)?);
         }
         harness.msg("--- stripping indexdata from old and new ---");
-        for _ in 0..2 {
+        for raw in [&old_raw, &new_raw] {
             let captured = next()?;
-            harness.require_success(&captured, "pbfhogg degrade --strip-indexdata")?;
+            harness.require_output(&captured, "pbfhogg degrade --strip-indexdata", raw)?;
         }
         let unindexed = [
             ("unindexed verbose", "pbfhogg-unindexed-diff-verbose", true),

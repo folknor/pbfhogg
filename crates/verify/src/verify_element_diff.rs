@@ -104,24 +104,8 @@ fn print_id_sample(kind: &str, sampled: &Sampled, emit: &mut impl FnMut(&str)) {
 /// `old` holds, [`OscAction::Create`] for one only `new` holds and
 /// [`OscAction::Modify`] for one both hold with unequal records.
 ///
-/// Returns only once both streams have been read whole, so a caller acts on
-/// what it accumulated only after `Ok`. A side out of strict kind and ID
-/// order is an error, never a verdict.
-pub(crate) fn scan_element_diff(
-    harness: &mut Harness,
-    old: opl_compare::Operand<'_>,
-    new: opl_compare::Operand<'_>,
-    listing: &Path,
-    policy: Policy,
-    each: impl FnMut(OscAction, OscKind, i64),
-) -> Result<(), Error> {
-    opl_compare::compare(harness, old, new, listing, policy, classify(each))?;
-    Ok(())
-}
-
-/// [`scan_element_diff`] with each side's order judged under its [`Role`]
-/// from the same decodings ([`Harness::judge_walk`]); returns both sides'
-/// counts.
+/// Judge each side's order under its [`Role`] from the same decodings
+/// ([`Harness::judge_walk`]) and return both sides' counts.
 pub(crate) fn scan_element_diff_judged(
     harness: &mut Harness,
     old: (opl_compare::Operand<'_>, Role<'_>),

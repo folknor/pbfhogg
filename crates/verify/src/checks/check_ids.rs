@@ -396,6 +396,7 @@ pub(crate) fn build_fixture(
     )?;
     harness.require_success(&captured, "osmium cat (fixture)")?;
     let indexed = outdir.join(format!("{stem}-indexed.osm.pbf"));
+    // This stays private: the empty-claim case appends to its indexed file.
     let captured =
         harness.pbfhogg_discard(PbfArgv::new("cat").input(&unindexed).output(&indexed))?;
     harness.require_success(&captured, "pbfhogg cat (fixture)")?;

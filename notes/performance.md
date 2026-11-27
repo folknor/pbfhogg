@@ -582,6 +582,26 @@ retain every occurrence independently of merge deduplication.
 
 Kind: high-conviction full rewrite.
 
+Status: the sort half is stashed against `5a8af88b`. Large overlap components
+above `SORT_RANGE_MIN_RECORDS` (1 million records in the patch tested on bygg)
+decode once, spill packed records and merge disjoint key ranges in parallel.
+On bygg, the Denmark `unsorted` A/B cells on `5a8af88b` and the patched B cells
+for Denmark `unsorted-intra` and planet `history2` raw with `--force-sort`
+emitted neither range span. No component crossed the threshold. The walls
+and run IDs are in [sort performance](../reference/performance/sort.md#parallel-key-ranges-for-large-sort-overlap-components-stashed).
+The new path was unmeasurable on this host and remains outside the landed
+implementation. The blob-merge redesign remains open.
+
+To resurface, create a bench input whose disorder forms a large overlap
+component, such as an element-level shuffle across the whole file. No such
+bench input exists yet. Apply
+[notes/stashed-perf-015-sort-parallel-key-ranges.patch](stashed-perf-015-sort-parallel-key-ranges.patch)
+against `5a8af88b` and confirm both `SORT_RANGE_PREPARE` and `SORT_RANGE_MERGE`
+spans before comparing walls. The patch carries `blob_merge.rs`, `sweep.rs`,
+`sweep/ranges.rs` and `sweep/ranges/`, `sort/mod.rs`, `tests/merge_pbf.rs`,
+and the `SORT_RANGE_MIN_RECORDS`, `SORT_RANGE_TARGET_RECORDS` and
+`SORT_RANGE_TARGET_BYTES` tunables.
+
 ## PERF-016 - Broader raw passthrough for cat --dedupe
 
 Reported by: copy, merge.
@@ -1476,42 +1496,17 @@ ranking caps scratch during one.
 
 Kind: local, medium.
 
-## PERF-069 - Checks rebuild the same fixtures independently
+## PERF-069 - OSC parsing and check-ids unsort runs remain separate
 
 Reported by: orchestration-opus, orchestration-codex, heavy-codex, other-opus,
 other-codex.
 
-Mechanism: identical argv on identical inputs is run by several checks:
-
-- `pbfhogg apply-changes INPUT OSC` (buffered) is run by apply-changes (when
-  `--direct-io` is off), diff and diff --format osc.
-- `degrade --strip-indexdata INPUT` is run by repack, check-ids, diff and
-  derive-changes. The same strip of `new` is run by diff and derive-changes.
-- check-ids' cross-blob `--unsort` at cap 8000 matches degrade's default cap,
-  but the argv differs (`--elements-per-blob 8000 --force`). The intra-blob
-  input is stripped and needs distinct framing.
-- extract's buffered polygon simple run is identical to multi-extract's
-  sequential polygon baseline.
-- `reencode::read_input` on the input (fileinfo, header, framing,
-  `index_truth`, `check --index`) is run by both repack and degrade.
-- The OSC is parsed separately by plain apply, apply -l, merge-changes and
-  tags-filter --input-kind osc.
-
-Redesign: a run-level, single-flight memo keyed by (executable digest,
-canonical argv with inputs by content digest, I/O mode). It returns the
-artifact plus its recorded exit and stderr, kept in-run only because these are
-pbfhogg outputs. Each check still judges its own claims and reports its own
-failure if a shared prerequisite fails, and the store records which check
-built an entry. codex-orchestration counts five full-file producer launches
-saved in the buffered default case. Under `--direct-io`, the judged direct
-run keeps its own entry.
-
-Risks: stderr that a check judges must be the recorded stderr; never alias an
-artifact a check mutates (check-ids `append_empty_claim` mutates only its
-copy); suite order should put the consumers of a shared artifact next to each
-other.
-
-Kind: structural, medium-large; high confidence (codex-orchestration).
+Plain apply, apply -l, merge-changes and tags-filter --input-kind osc still
+parse the OSC separately. Check-ids still produces its unsort fixtures in
+separate runs. The cross-blob case uses explicit cap and force arguments,
+and the intra-blob case starts from stripped input and needs distinct
+framing. The shared producer results are recorded in
+[verifier performance](../reference/performance/verifier.md).
 
 ## PERF-070 - degrade and repack still decode and merge on cold runs
 
@@ -1674,28 +1669,17 @@ mixed-timestamp condition, byte parity for jobs.
 Kind: rewrite (codex, ranked below PBF); local (opus). Matters only for large
 OSC inputs.
 
-## PERF-080 - extract and multi-extract re-ask osmium questions they already answered
+## PERF-080 - Extract decoding reuse still has policy and retention costs
 
 Reported by: other-opus, other-codex, engine-opus, orchestration-codex.
 
-Mechanism: per region, extract runs three strategies on each side, with
-order-check decodes before each diff. `verify_extract_simple::adjudicate`
-decodes complete-ways relations twice, runs `osmium removeid` on osmium's
-simple output and diffs it against the original to find which members are
-present, then compares pbfhogg simple against complete-ways separately.
-multi-extract runs `check_sorted_counted(multi)` before `same_elements`, and
-decodes the sequential outputs again for the mixed pass.
-
-Redesign: one ordered comparison of pbfhogg simple, osmium simple and osmium
-complete-ways, collecting member IDs as the records pass (the check refuses
-an input with a negative ID and an osmium output with a negative ref or
-member, so removeid's absolute-value matching never matters). Use
-osmium's multi-region config once per strategy where there are several regions
-(other-codex). On the production side, share the classifier work across
-strategies (see PERF-019). Fuse multi-extract's order check into its merge and
-decode each sequential output once.
-
-Kind: rewrite plus local.
+On LocationsOnWays inputs the present-member listing uses a separate decode
+under the no-locations policy. Multi-extract retains sequential decodings
+until each strategy ends, which can exceed the idle decoding budget. The
+simple relation-count diagnostic still names osmium fileinfo even though
+the count comes from the OPL comparison. The ordered comparison and
+sequential reuse measurements are recorded in
+[verifier performance](../reference/performance/verifier.md).
 
 ## PERF-081 - Selection checks run one tool invocation per request
 

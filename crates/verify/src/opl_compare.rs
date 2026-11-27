@@ -31,11 +31,12 @@ use crate::error::Error;
 use crate::harness::Harness;
 use crate::pbf_frames::Origin;
 use crate::reference::ToolRun;
+use crate::reference_cache::{Key, Summary};
+use crate::run::Source;
 
 /// A file osmium decodes and who wrote it, which decides how a failed
 /// decode is judged ([`crate::reference::RunArg::Input`]).
 pub(crate) type Operand<'a> = (&'a Path, Origin);
-use crate::reference_cache::{Key, Summary};
 
 /// What a comparison reads from each object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,44 +150,6 @@ impl Merged {
 /// The step label of every merge walk, timed apart from the decodes it reads.
 const MERGE_STEP: &str = "opl merge";
 
-/// What one decoding was made from: the file's identity stamp (device,
-/// inode, size, mtime, the run's trusted input identity) and its name's
-/// format text. osmium picks its reader from the name, so the same inode
-/// under `x.osc` and `x.osc.gz`, or `pbf` and `data`, is not one source:
-/// the text is everything from the first dot, or the whole name when it has
-/// none. Keyed by stamp, not content digest: no fresh output is hashed, and
-/// cache-placed reference artifacts, hard links of one inode in several
-/// checks, still meet. Byte-identical files at distinct inodes decode apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Source {
-    stamp: (u64, u64, u64, i64, i64),
-    format: std::ffi::OsString,
-}
-
-impl Source {
-    fn of(pbf: &Path) -> Result<Self, Error> {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(pbf)
-            .map_err(|e| Error::Environment(format!("{}: {e}", pbf.display())))?;
-        let name = pbf.file_name().unwrap_or_default().as_bytes();
-        let format = name
-            .iter()
-            .position(|&b| b == b'.')
-            .map_or(name, |i| &name[i..]);
-        Ok(Self {
-            stamp: (
-                meta.dev(),
-                meta.ino(),
-                meta.size(),
-                meta.mtime(),
-                meta.mtime_nsec(),
-            ),
-            format: std::ffi::OsStr::from_bytes(format).to_os_string(),
-        })
-    }
-}
-
 struct Entry {
     source: Source,
     policy: Policy,
@@ -226,15 +189,20 @@ impl Entry {
 pub(crate) struct Decodings {
     entries: Vec<Entry>,
     scans: Vec<(Source, Scan)>,
+    retained: Vec<Source>,
     tick: u64,
     made: u64,
 }
 
 impl Decodings {
+    fn idle(&self, entry: &Entry) -> bool {
+        entry.idle() && !self.retained.contains(&entry.source)
+    }
+
     fn idle_bytes(&self) -> u64 {
         self.entries
             .iter()
-            .filter(|e| e.idle())
+            .filter(|e| self.idle(e))
             .map(|e| e.bytes)
             .sum()
     }
@@ -247,7 +215,7 @@ impl Decodings {
                 .entries
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| e.idle())
+                .filter(|(_, e)| self.idle(e))
                 .min_by_key(|(_, e)| e.used)
                 .map(|(i, _)| i)
             else {
@@ -278,7 +246,7 @@ impl Decodings {
         while let Some(i) = self
             .entries
             .iter()
-            .position(|e| e.idle() && e.bytes > crate::tunables::DECODING_BUDGET)
+            .position(|e| self.idle(e) && e.bytes > crate::tunables::DECODING_BUDGET)
         {
             self.evict(i)?;
         }
@@ -326,6 +294,34 @@ impl Decodings {
                 ));
             }
         }
+    }
+}
+
+/// Retain a sequential operand that multi-extract will read more than once.
+/// Registration does not decode anything, so each pass keeps its tool and
+/// verdict order, including the summary shortcuts.
+pub(super) fn retain_sequential(harness: &mut Harness, pbf: &Path) -> Result<(), Error> {
+    harness.run.watch(pbf)?;
+    let source = Source::of(pbf)?;
+    harness.run.decodings.retained.push(source);
+    Ok(())
+}
+
+/// Release the strategy's operands on success, error or interruption.
+pub(super) fn with_sequential_decodings<T>(
+    harness: &mut Harness,
+    work: impl FnOnce(&mut Harness) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let retained = harness.run.decodings.retained.len();
+    let result = work(harness);
+    harness.run.decodings.retained.truncate(retained);
+    let released = harness.run.decodings.release(&[], false);
+    match (result, released) {
+        (Err(error), Err(cleanup)) => {
+            harness.msg(&format!("  decoding cleanup failed: {cleanup}"));
+            Err(error)
+        }
+        (result, released) => released.and(result),
     }
 }
 
@@ -567,8 +563,7 @@ fn acquire_missing(
     let estimate = plan.iter().fold(0_u64, |sum, (source, ..)| {
         sum.saturating_add(
             source
-                .stamp
-                .2
+                .size_bytes()
                 .saturating_mul(crate::tunables::OPL_EXPANSION),
         )
     });
@@ -659,7 +654,7 @@ fn acquire_missing(
 /// error names stays in the kept run directory, and the failure stays the
 /// one raised. `work` returns whether its outcome, though `Ok`, is a failure
 /// whose decodings are kept too.
-fn with_decodings<T>(
+pub(super) fn with_decodings<T>(
     harness: &mut Harness,
     sides: &[(Operand<'_>, Policy)],
     work: impl FnOnce(&mut Harness, &[PathBuf]) -> Result<(T, bool), Error>,
@@ -910,7 +905,7 @@ pub(crate) fn compare_judged(
     })
 }
 
-fn log_merge(harness: &mut Harness, listing: &Path, merged: &Merged) {
+pub(super) fn log_merge(harness: &mut Harness, listing: &Path, merged: &Merged) {
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -1432,7 +1427,7 @@ impl<R: std::io::Read> std::io::Read for Hashing<R> {
 /// One OPL stream: its current record and the key it last held. Its bytes
 /// come from a file, or from any reader that yields a whole OPL stream
 /// (`path` then names what that reader projects, for messages).
-struct Stream<R = File> {
+pub(super) struct Stream<R = File> {
     path: PathBuf,
     reader: BufReader<Hashing<R>>,
     line: Vec<u8>,
@@ -1450,7 +1445,7 @@ struct Stream<R = File> {
 }
 
 impl Stream {
-    fn open(path: &Path) -> Result<Self, Error> {
+    pub(super) fn open(path: &Path) -> Result<Self, Error> {
         let file = File::open(path)
             .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
         Ok(Stream::from_reader(file, path))
@@ -1479,7 +1474,7 @@ impl<R: std::io::Read> Stream<R> {
     }
 
     /// The summary of a stream read to its end without error.
-    fn summary(&self) -> Summary {
+    pub(super) fn summary(&self) -> Summary {
         Summary {
             ordered: !self.disordered,
             counts: self.counts,
@@ -1497,7 +1492,7 @@ impl<R: std::io::Read> Stream<R> {
 
     /// Advance to the next record, requiring strict order; `None` at the
     /// end.
-    fn next(&mut self) -> Result<Option<(usize, i64)>, Error> {
+    pub(super) fn next(&mut self) -> Result<Option<(usize, i64)>, Error> {
         let Some(key) = self.read_record()? else {
             return Ok(None);
         };
@@ -1510,6 +1505,10 @@ impl<R: std::io::Read> Stream<R> {
         }
         self.key = Some(key);
         Ok(Some(key))
+    }
+
+    pub(super) fn line(&self) -> &[u8] {
+        &self.line
     }
 
     /// Advance to the next record, in [`next`](Self::next)'s order when
@@ -1625,16 +1624,39 @@ pub(crate) fn sequence_merge(
 
 /// [`merge`] over two open streams.
 fn merge_streams<A: std::io::Read, B: std::io::Read>(
+    a: Stream<A>,
+    b: Stream<B>,
+    listing: &Path,
+    strict: bool,
+    each: impl FnMut(Group),
+    mut paired: impl FnMut(Pair<'_>),
+) -> Result<(Merged, [Summary; 2]), Error> {
+    merge_observed(a, b, listing, strict, each, |(kind, id), first, second| {
+        if let (Some(first), Some(second)) = (first, second) {
+            paired(Pair {
+                kind,
+                id,
+                first,
+                second,
+            });
+        }
+        Ok(())
+    })
+}
+
+/// The same merge with a visitor for every key, including unmatched records.
+/// Extract advances its third cursor and reads candidate relations here.
+pub(super) fn merge_observed<A: std::io::Read, B: std::io::Read>(
     mut a: Stream<A>,
     mut b: Stream<B>,
     listing: &Path,
     strict: bool,
     each: impl FnMut(Group),
-    paired: impl FnMut(Pair<'_>),
+    visit: impl FnMut((usize, i64), Option<&[u8]>, Option<&[u8]>) -> Result<(), Error>,
 ) -> Result<(Merged, [Summary; 2]), Error> {
     let mut out = BufWriter::new(File::create(listing)?);
     let mut merged = Merged::default();
-    pair_streams(&mut a, &mut b, &mut out, strict, &mut merged, each, paired)?;
+    pair_streams(&mut a, &mut b, &mut out, strict, &mut merged, each, visit)?;
     out.flush()?;
     merged.first = a.counts;
     merged.second = b.counts;
@@ -1642,9 +1664,28 @@ fn merge_streams<A: std::io::Read, B: std::io::Read>(
     Ok((merged, [a.summary(), b.summary()]))
 }
 
+/// Keep the same order and decoding summaries as a completed strict merge.
+pub(super) fn publish_extract_merge(
+    harness: &mut Harness,
+    paths: [&Path; 3],
+    summaries: &[Summary; 3],
+) -> Result<(), Error> {
+    for (path, summary) in paths.into_iter().zip(summaries) {
+        publish_summary(harness, path, summary)?;
+        harness.run.decodings.publish(
+            path,
+            Scan {
+                ordered: summary.ordered,
+                counts: summary.counts,
+            },
+        );
+    }
+    Ok(())
+}
+
 /// The strict [`merge`] of [`compare_judged`]: a step-down is a judgment of
 /// both sides, its cursor error saved, rather than an early return.
-fn merge_judged(
+pub(super) fn merge_judged(
     first: &Path,
     second: &Path,
     listing: &Path,
@@ -1654,7 +1695,15 @@ fn merge_judged(
     let mut b = Stream::open(second)?;
     let mut out = BufWriter::new(File::create(listing)?);
     let mut merged = Merged::default();
-    match pair_streams(&mut a, &mut b, &mut out, true, &mut merged, each, |_| {}) {
+    match pair_streams(
+        &mut a,
+        &mut b,
+        &mut out,
+        true,
+        &mut merged,
+        each,
+        |_, _, _| Ok(()),
+    ) {
         Ok(()) => {
             out.flush()?;
             merged.first = a.counts;
@@ -1710,47 +1759,41 @@ fn pair_streams<A: std::io::Read, B: std::io::Read>(
     strict: bool,
     merged: &mut Merged,
     mut each: impl FnMut(Group),
-    mut paired: impl FnMut(Pair<'_>),
+    mut visit: impl FnMut((usize, i64), Option<&[u8]>, Option<&[u8]>) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut ka = a.advance(strict)?;
     let mut kb = b.advance(strict)?;
     loop {
-        let class = match (ka, kb) {
+        let (key, first, second) = match (ka, kb) {
             (None, None) => break,
-            (Some(x), Some(y)) if x == y => {
-                paired(Pair {
-                    kind: x.0,
-                    id: x.1,
-                    first: &a.line,
-                    second: &b.line,
-                });
-                if a.line == b.line {
-                    merged.same += 1;
-                    ka = a.advance(strict)?;
-                    kb = b.advance(strict)?;
-                    continue;
-                }
-                Class::Differs
-            }
-            (Some(x), Some(y)) if rank(x) < rank(y) => Class::FirstOnly,
-            (Some(_), None) => Class::FirstOnly,
-            _ => Class::SecondOnly,
+            (Some(x), Some(y)) if x == y => (x, Some(a.line()), Some(b.line())),
+            (Some(x), Some(y)) if rank(x) < rank(y) => (x, Some(a.line()), None),
+            (Some(x), None) => (x, Some(a.line()), None),
+            (_, Some(y)) => (y, None, Some(b.line())),
         };
-        let (kind, id) = match class {
-            Class::SecondOnly => kb,
-            _ => ka,
-        }
-        .ok_or_else(|| Error::tool("merge lost its key"))?;
-        if class != Class::SecondOnly {
+        visit(key, first, second)?;
+        let class = match (first, second) {
+            (Some(a_line), Some(b_line)) if a_line == b_line => {
+                merged.same += 1;
+                ka = a.advance(strict)?;
+                kb = b.advance(strict)?;
+                continue;
+            }
+            (Some(_), Some(_)) => Class::Differs,
+            (Some(_), None) => Class::FirstOnly,
+            (None, _) => Class::SecondOnly,
+        };
+        if let Some(line) = first {
             out.write_all(b"-")?;
-            out.write_all(&a.line)?;
+            out.write_all(line)?;
             out.write_all(b"\n")?;
         }
-        if class != Class::FirstOnly {
+        if let Some(line) = second {
             out.write_all(b"+")?;
-            out.write_all(&b.line)?;
+            out.write_all(line)?;
             out.write_all(b"\n")?;
         }
+        let (kind, id) = key;
         each(Group { class, kind, id });
         match class {
             Class::FirstOnly => {

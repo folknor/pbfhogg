@@ -12,6 +12,8 @@ pub(crate) mod tunables;
 
 #[path = "../src/output.rs"]
 pub(crate) mod output;
+#[path = "../src/producer.rs"]
+pub(crate) mod producer;
 #[path = "../src/reference.rs"]
 pub(crate) mod reference;
 #[path = "../src/reference_cache.rs"]

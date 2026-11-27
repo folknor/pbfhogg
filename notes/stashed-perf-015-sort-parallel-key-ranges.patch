@@ -1,0 +1,1885 @@
+diff --git a/crates/lib/src/commands/blob_merge.rs b/crates/lib/src/commands/blob_merge.rs
+index 1adf02ab..2ae73c1d 100644
+--- a/crates/lib/src/commands/blob_merge.rs
++++ b/crates/lib/src/commands/blob_merge.rs
+@@ -20,9 +20,9 @@
+ //! Overlap runs are swept on worker threads, which frame their own blocks
+ //! and stream them to the write loop in run order, through a bounded channel
+ //! per run and an admission window over the runs (see [`write_plan`] for the
+-//! memory bound and the shutdown protocol). A run is one serial sweep however
+-//! large, so a single giant overlap component streams rather than being held
+-//! whole.
++//! memory bound and the shutdown protocol). Large sort components first
++//! spill decoded records into indexed runs, then merge their ID ranges on
++//! independent workers. The output uses the same ordered drain.
+ //!
+ //! The commands differ only in their [`IndexPolicy`] and in whether the sweep
+ //! drops exact duplicates; their markers, counters and diagnostic keys stay
+@@ -39,6 +39,7 @@ use crate::blob_meta::{
+ };
+ use crate::error::{Error, Result};
+ use crate::file_writer::FileWriter;
++use crate::ordered_pool::StreamConsumer;
+ use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker, Positional};
+ use crate::read::input::{InputFile, PinnedInput};
+ use crate::tunables::{
+@@ -1606,6 +1607,32 @@ pub(crate) fn write_plan(
+     dedupe: bool,
+     compression: crate::writer::Compression,
+     host: &crate::host::Entered<'_>,
++) -> Result<WriteCounts> {
++    write_plan_inner(plan, sources, writer, dedupe, compression, None, host)
++}
++
++pub(super) use sweep::ranges::Config as SortRanges;
++
++#[hotpath::measure]
++pub(super) fn write_sort_plan(
++    plan: &Plan,
++    sources: &Sources,
++    writer: &mut PbfWriter<FileWriter>,
++    compression: crate::writer::Compression,
++    ranges: Option<SortRanges<'_>>,
++    host: &crate::host::Entered<'_>,
++) -> Result<WriteCounts> {
++    write_plan_inner(plan, sources, writer, false, compression, ranges, host)
++}
++
++fn write_plan_inner(
++    plan: &Plan,
++    sources: &Sources,
++    writer: &mut PbfWriter<FileWriter>,
++    dedupe: bool,
++    compression: crate::writer::Compression,
++    ranges: Option<SortRanges<'_>>,
++    host: &crate::host::Entered<'_>,
+ ) -> Result<WriteCounts> {
+     // The writer's invocation, whose framing counters the sweeps record into
+     // now that they frame their own blocks.
+@@ -1624,6 +1651,7 @@ pub(crate) fn write_plan(
+         copy: CopyRun::default(),
+         frame_buf: FrameBuf::default(),
+         cursor: 0,
++        run_offset: 0,
+         resources: RunResources::default(),
+     };
+     if !plan.runs.is_empty() {
+@@ -1633,38 +1661,55 @@ pub(crate) fn write_plan(
+             crate::tunables::DECODE_WORKERS_RESERVED,
+             crate::tunables::DECODE_WORKERS_MIN,
+             crate::tunables::DECODE_WORKERS_FALLBACK,
+-        )
+-        .clamp(1, plan.runs.len());
+-        let window = std::num::NonZeroUsize::new(
+-            workers.saturating_mul(crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER),
+-        )
+-        .unwrap_or(std::num::NonZeroUsize::MIN);
+-        crate::ordered_pool::run_ordered_streams(
+-            plan.runs.len(),
+-            workers,
+-            crate::ordered_pool::StreamConfig {
+-                window,
+-                depth: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,
+-                cancel: &host.invocation,
+-            },
+-            |_| FrameBuf::default(),
+-            |frame_buf: &mut FrameBuf, k, emitter| {
+-                let run = &plan.runs[k];
+-                sweep::Sweep {
+-                    entries: &plan.entries[run.start..run.end],
+-                    frames: &plan.frames,
+-                    sources,
+-                    kind: run.kind,
++        );
++        let mut start = 0;
++        if let Some(config) = ranges {
++            for (k, run) in plan.runs.iter().enumerate() {
++                let count = plan.entries[run.start..run.end]
++                    .iter()
++                    .fold(0u64, |sum, entry| sum.saturating_add(entry.index.count));
++                if count < config.min_records {
++                    continue;
++                }
++                out.sweep_runs(
++                    start..k,
++                    workers,
+                     dedupe,
+-                    keep_locations: plan.keep_locations,
+-                    cancel: &host.invocation,
+-                    emitter,
+-                    compression: &compression,
++                    &compression,
++                    &host.invocation,
++                    metrics,
++                )?;
++                out.run_offset = k;
++                out.before_task(0)?;
++                match sweep::ranges::write(
++                    &mut out,
++                    run,
++                    config,
++                    &compression,
+                     metrics,
++                    workers,
++                    host,
++                )? {
++                    Some(emitted) => out.finish_task(0, emitted)?,
++                    None => out.sweep_runs(
++                        k..k + 1,
++                        workers,
++                        dedupe,
++                        &compression,
++                        &host.invocation,
++                        metrics,
++                    )?,
+                 }
+-                .run(frame_buf)
+-            },
+-            &mut out,
++                start = k + 1;
++            }
++        }
++        out.sweep_runs(
++            start..plan.runs.len(),
++            workers,
++            dedupe,
++            &compression,
++            &host.invocation,
++            metrics,
+         )?;
+         out.resources.emit(&host.invocation);
+     }
+@@ -1695,11 +1740,59 @@ struct PlanWriter<'a> {
+     frame_buf: FrameBuf,
+     /// The next plan entry to write.
+     cursor: usize,
++    /// Run index of the current pool's first task.
++    run_offset: usize,
+     /// The runs' resource figures, folded as each run finishes.
+     resources: RunResources,
+ }
+ 
+ impl PlanWriter<'_> {
++    fn sweep_runs(
++        &mut self,
++        runs: std::ops::Range<usize>,
++        workers: usize,
++        dedupe: bool,
++        compression: &crate::writer::Compression,
++        cancel: &crate::host::Recorder,
++        metrics: &crate::write::metrics::WriterMetrics,
++    ) -> Result<()> {
++        if runs.is_empty() {
++            return Ok(());
++        }
++        let plan = self.plan;
++        let sources = self.sources;
++        let workers = workers.clamp(1, runs.len());
++        self.run_offset = runs.start;
++        let batch = &plan.runs[runs];
++        crate::ordered_pool::run_ordered_streams(
++            batch.len(),
++            workers,
++            crate::ordered_pool::StreamConfig {
++                window: run_window(workers),
++                depth: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,
++                cancel,
++            },
++            |_| FrameBuf::default(),
++            |frame_buf: &mut FrameBuf, k, emitter| {
++                let run = &batch[k];
++                sweep::Sweep {
++                    entries: &plan.entries[run.start..run.end],
++                    frames: &plan.frames,
++                    sources,
++                    kind: run.kind,
++                    dedupe,
++                    keep_locations: plan.keep_locations,
++                    cancel,
++                    emitter,
++                    compression,
++                    metrics,
++                }
++                .run(frame_buf)
++            },
++            self,
++        )
++    }
++
+     /// Write the passthrough entries from the cursor up to `end`. Every one
+     /// must be a copy: a rewrite entry the runs do not start at is a plan
+     /// defect.
+@@ -1738,9 +1831,9 @@ impl PlanWriter<'_> {
+     }
+ }
+ 
+-impl crate::ordered_pool::StreamConsumer<sweep::Chunk, RunCounts> for PlanWriter<'_> {
++impl StreamConsumer<sweep::Chunk, RunCounts> for PlanWriter<'_> {
+     fn before_task(&mut self, k: usize) -> Result<()> {
+-        let start = self.plan.runs[k].start;
++        let start = self.plan.runs[self.run_offset + k].start;
+         self.passthrough_until(start)?;
+         if self.cursor != start {
+             return Err(Error::internal("rewrite entry outside its planned run"));
+@@ -1753,7 +1846,7 @@ impl crate::ordered_pool::StreamConsumer<sweep::Chunk, RunCounts> for PlanWriter
+     }
+ 
+     fn finish_task(&mut self, k: usize, emitted: RunCounts) -> Result<()> {
+-        let run = &self.plan.runs[k];
++        let run = &self.plan.runs[self.run_offset + k];
+         match run.kind {
+             ElementKind::Node => self.counts.nodes += emitted.elements,
+             ElementKind::Way => self.counts.ways += emitted.elements,
+@@ -1766,6 +1859,13 @@ impl crate::ordered_pool::StreamConsumer<sweep::Chunk, RunCounts> for PlanWriter
+     }
+ }
+ 
++fn run_window(workers: usize) -> std::num::NonZeroUsize {
++    std::num::NonZeroUsize::new(
++        workers.saturating_mul(crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER),
++    )
++    .unwrap_or(std::num::NonZeroUsize::MIN)
++}
++
+ /// The in-flight `copy_file_range` stretch: (source, start, end).
+ #[derive(Default)]
+ struct CopyRun(Option<(usize, u64, u64)>);
+diff --git a/crates/lib/src/commands/blob_merge/sweep.rs b/crates/lib/src/commands/blob_merge/sweep.rs
+index 3b315b8f..c10d62e2 100644
+--- a/crates/lib/src/commands/blob_merge/sweep.rs
++++ b/crates/lib/src/commands/blob_merge/sweep.rs
+@@ -142,6 +142,7 @@ use crate::write::metrics::WriterMetrics;
+ use crate::writer::{Compression, frame_blob_pipelined_pieces};
+ use crate::{Element, ElementKind, PrimitiveBlock};
+ 
++pub(super) mod ranges;
+ mod raw_copy;
+ 
+ /// One run's chunk of framed output, written in order: whole frames, or the
+@@ -485,7 +486,30 @@ struct Output<'s> {
+     staged_high_water: usize,
+ }
+ 
+-impl Output<'_> {
++impl<'s> Output<'s> {
++    fn new(keep_locations: bool, compression: &'s Compression, metrics: &'s WriterMetrics) -> Self {
++        Self {
++            bb: BlockBuilder::new(),
++            origin: None,
++            filled: Vec::new(),
++            chunk: Vec::new(),
++            chunk_bytes: 0,
++            pieces: Vec::new(),
++            way: crate::owned::WayScratch::default(),
++            coords: if keep_locations {
++                crate::owned::WayCoords::Keep
++            } else {
++                crate::owned::WayCoords::Drop
++            },
++            compression,
++            limits: crate::commands::split::Limits::new(*compression),
++            metrics,
++            chunks: 0,
++            chunk_high_water: 0,
++            staged_high_water: 0,
++        }
++    }
++
+     fn encode_held_relation(&mut self, relation: &crate::Relation<'_>) -> Result<()> {
+         crate::commands::ensure_relation_capacity_local(&mut self.bb, &mut self.filled)?;
+         let members = relation.members().enumerate().map(|(position, member)| {
+@@ -839,7 +863,7 @@ impl Sweep<'_, '_> {
+             }
+             prepared = Some(cursor);
+         }
+-        let mut out = self.output();
++        let mut out = Output::new(self.keep_locations, self.compression, self.metrics);
+         let mut merge = Merge {
+             cursors: Vec::with_capacity(entries.len()),
+             heap: BinaryHeap::new(),
+@@ -891,29 +915,6 @@ impl Sweep<'_, '_> {
+         Ok(counts)
+     }
+ 
+-    fn output(&self) -> Output<'_> {
+-        Output {
+-            bb: BlockBuilder::new(),
+-            origin: None,
+-            filled: Vec::new(),
+-            chunk: Vec::new(),
+-            chunk_bytes: 0,
+-            pieces: Vec::new(),
+-            way: crate::owned::WayScratch::default(),
+-            coords: if self.keep_locations {
+-                crate::owned::WayCoords::Keep
+-            } else {
+-                crate::owned::WayCoords::Drop
+-            },
+-            compression: self.compression,
+-            limits: crate::commands::split::Limits::new(*self.compression),
+-            metrics: self.metrics,
+-            chunks: 0,
+-            chunk_high_water: 0,
+-            staged_high_water: 0,
+-        }
+-    }
+-
+     fn advance_to(
+         &self,
+         entry: &BlobEntry,
+@@ -932,7 +933,6 @@ impl Sweep<'_, '_> {
+         }
+         Ok(())
+     }
+-
+     /// An isolated repeated frame can only compete with itself. Try the
+     /// byte proof before building a PrimitiveBlock. On a miss, decode from
+     /// the same read buffer and let the usual sweep do its validation.
+diff --git a/crates/lib/src/commands/blob_merge/sweep/ranges.rs b/crates/lib/src/commands/blob_merge/sweep/ranges.rs
+new file mode 100644
+index 00000000..939efb06
+--- /dev/null
++++ b/crates/lib/src/commands/blob_merge/sweep/ranges.rs
+@@ -0,0 +1,613 @@
++//! Large sort components are decoded into runs of packed records, one per
++//! input frame. Each run has a fixed-width index sorted by (ID, version,
++//! occurrence) and a separate arena for the bodies and frame dictionary.
++//! The ranges share those runs by slicing the index at ID boundaries.
++//!
++//! The spill is immutable once mapped. A worker keeps one heap head per
++//! intersecting run and materializes one body at a time. The scheduler only
++//! keeps descriptors for pending splits and for the ordered pool's window.
++
++use std::cmp::Reverse;
++use std::collections::BinaryHeap;
++use std::io::{BufWriter, Write};
++use std::num::NonZeroUsize;
++use std::ops::Range;
++use std::path::Path;
++
++use super::{Check, Chunk, Output, RunCounts, borrowed_version, of_kind};
++use crate::commands::blob_merge::{FrameBuf, Plan, PlanWriter, Run, Sources, read_block};
++use crate::host::{Entered, Recorder};
++use crate::ordered_pool::{self, ConsumeFn, Emitter, PoolConfig, StreamConfig, StreamConsumer};
++use crate::osm_id::{osm_id_from_ordinal, osm_id_ordinal};
++use crate::scratch::{RunScratch, ScratchFile};
++use crate::tunables::{
++    DEFAULT_ELEMENT_CAP, OVERLAP_RUN_CHANNEL_DEPTH, SORT_RANGE_TARGET_BYTES,
++    SWEEP_CHECKPOINT_REMOVALS,
++};
++use crate::write::metrics::WriterMetrics;
++use crate::writer::Compression;
++use crate::{ElementKind, Error, Result};
++
++mod record;
++
++#[derive(Clone, Copy)]
++pub(in crate::commands) struct Config<'a> {
++    pub(in crate::commands) parent: &'a Path,
++    pub(in crate::commands) min_records: u64,
++    pub(in crate::commands) target_records: u64,
++}
++
++const INDEX_BYTES: usize = 16;
++type IndexBytes = [u8; INDEX_BYTES];
++
++#[derive(Clone, Copy)]
++struct Key {
++    ordinal: u64,
++    version: i32,
++    /// The record's position before sorting, then its byte offset in the body arena.
++    offset: u32,
++}
++
++impl Key {
++    fn encode(self) -> IndexBytes {
++        let mut bytes = [0; INDEX_BYTES];
++        bytes[..8].copy_from_slice(&self.ordinal.to_le_bytes());
++        bytes[8..12].copy_from_slice(&self.version.to_le_bytes());
++        bytes[12..].copy_from_slice(&self.offset.to_le_bytes());
++        bytes
++    }
++
++    fn decode(bytes: &IndexBytes) -> Self {
++        let words = bytes.as_chunks::<4>().0;
++        Self {
++            ordinal: u64::from(u32::from_le_bytes(words[0]))
++                | (u64::from(u32::from_le_bytes(words[1])) << 32),
++            version: i32::from_le_bytes(words[2]),
++            offset: u32::from_le_bytes(words[3]),
++        }
++    }
++}
++
++struct Prepared {
++    keys: Vec<IndexBytes>,
++    bodies: Vec<u8>,
++    strings: Vec<u8>,
++    frame: usize,
++    // A dense version below -1 with a rounded-to-zero timestamp may sort
++    // differently after the old sweep demotes it. Preserve its schedule.
++    needs_legacy: bool,
++}
++
++fn prepare(
++    plan: &Plan,
++    sources: &Sources,
++    run: &Run,
++    entry_index: usize,
++    buf: &mut FrameBuf,
++    cancel: &Recorder,
++) -> Result<Prepared> {
++    let entry = &plan.entries[entry_index];
++    let frame = &plan.frames[entry.frame];
++    let source = &sources[frame.source];
++    let block = read_block(source, frame, buf, cancel)?;
++    let build = || -> Result<Prepared> {
++        let believed = !entry.index_scanned;
++        if believed {
++            block.refuse_foreign_kind(Some(entry.index.kind))?;
++        }
++        let mut check = Check {
++            claim: believed.then_some(entry.index),
++            tally: Default::default(),
++            last: None,
++            ordered: !entry.intra_unsorted && !entry.restructured,
++        };
++        let mut bodies = record::Bodies::default();
++        let mut keys = Vec::new();
++        let mut positions = Vec::new();
++        let mut needs_legacy = false;
++        for elem in block.elements().filter(|e| of_kind(e, run.kind)) {
++            let id = super::element_id(&elem);
++            check.visit(id)?;
++            let version = borrowed_version(&elem);
++            let record = body_offset(keys.len())?;
++            positions.push(body_offset(bodies.bytes.len())?);
++            keys.push(Key {
++                ordinal: osm_id_ordinal(id),
++                version,
++                offset: record,
++            });
++            needs_legacy |= bodies.push(&elem, plan.keep_locations)?;
++            if keys.len().is_multiple_of(SWEEP_CHECKPOINT_REMOVALS) {
++                cancel.check()?;
++            }
++        }
++        check.finish()?;
++        positions.push(body_offset(bodies.bytes.len())?);
++        order_run(&mut keys, &positions, &mut bodies.bytes, cancel)?;
++        Ok(Prepared {
++            keys: keys.into_iter().map(Key::encode).collect(),
++            bodies: bodies.bytes,
++            strings: bodies.strings,
++            frame: entry.frame,
++            needs_legacy,
++        })
++    };
++    build().map_err(|e| source.locate_at(frame.file_offset, e))
++}
++
++fn body_offset(n: usize) -> Result<u32> {
++    u32::try_from(n).map_err(|_| Error::internal("one sort run body arena exceeds 4 GiB"))
++}
++
++fn order_run(
++    keys: &mut [Key],
++    positions: &[u32],
++    bodies: &mut Vec<u8>,
++    cancel: &Recorder,
++) -> Result<()> {
++    let order = |key: &Key| (key.ordinal, key.version, key.offset);
++    if keys.is_sorted_by_key(order) {
++        for (key, &position) in keys.iter_mut().zip(positions) {
++            key.offset = position;
++        }
++        return Ok(());
++    }
++    keys.sort_unstable_by_key(order);
++    // Store bodies in key order too, so each range reads just one span of
++    // each frame even when all of the original frame's IDs were scrambled.
++    let mut ordered = Vec::with_capacity(bodies.len());
++    for (i, key) in keys.iter_mut().enumerate() {
++        let record = key.offset as usize;
++        key.offset = body_offset(ordered.len())?;
++        ordered
++            .extend_from_slice(&bodies[positions[record] as usize..positions[record + 1] as usize]);
++        if i.is_multiple_of(SWEEP_CHECKPOINT_REMOVALS) {
++            cancel.check()?;
++        }
++    }
++    *bodies = ordered;
++    Ok(())
++}
++
++/// The bounded views of one source frame in the finished spill.
++struct FrameRun {
++    bodies: Range<usize>,
++    strings: Range<usize>,
++    index: Range<usize>,
++    frame: usize,
++}
++
++impl FrameRun {
++    fn keys<'a>(&self, mapped: &'a [u8]) -> &'a [IndexBytes] {
++        // The writer appends an integral number of fixed-width keys.
++        mapped[self.index.clone()].as_chunks::<INDEX_BYTES>().0
++    }
++
++    fn body<'a>(&self, mapped: &'a [u8], offset: u32, end: usize) -> Result<&'a [u8]> {
++        let bytes = &mapped[self.bodies.clone()];
++        bytes
++            .get(offset as usize..end)
++            .ok_or_else(|| Error::internal("sort run record length exceeds its arena"))
++    }
++}
++
++struct Spill {
++    file: BufWriter<ScratchFile>,
++    runs: Vec<FrameRun>,
++    size: usize,
++    needs_legacy: bool,
++}
++
++impl Spill {
++    fn append(&mut self, bytes: &[u8]) -> Result<Range<usize>> {
++        let start = self.size;
++        self.size = start
++            .checked_add(bytes.len())
++            .ok_or_else(|| Error::internal("sort run spill exceeds address space"))?;
++        self.file.write_all(bytes)?;
++        Ok(start..self.size)
++    }
++
++    fn push(&mut self, prepared: &Prepared) -> Result<()> {
++        self.needs_legacy |= prepared.needs_legacy;
++        if prepared.keys.is_empty() || self.needs_legacy {
++            return Ok(());
++        }
++        let bodies = self.append(&prepared.bodies)?;
++        let strings = self.append(&prepared.strings)?;
++        let index = self.append(prepared.keys.as_flattened())?;
++        self.runs.push(FrameRun {
++            bodies,
++            strings,
++            index,
++            frame: prepared.frame,
++        });
++        Ok(())
++    }
++}
++
++#[derive(Clone, Copy)]
++struct Slice<'a> {
++    run: &'a FrameRun,
++    keys: &'a [IndexBytes],
++    body_end: usize,
++}
++
++struct Work<'a> {
++    slices: Vec<Slice<'a>>,
++    count: u64,
++    bytes: usize,
++}
++
++impl<'a> Work<'a> {
++    fn new(slices: Vec<Slice<'a>>) -> Self {
++        let (count, bytes) = slices.iter().fold((0, 0), |(count, bytes), slice| {
++            let offset = Key::decode(&slice.keys[0]).offset as usize;
++            (
++                count + slice.keys.len() as u64,
++                bytes + (slice.body_end - offset),
++            )
++        });
++        Self {
++            slices,
++            count,
++            bytes,
++        }
++    }
++
++    fn split(self) -> std::result::Result<(Self, Self), Self> {
++        let min = self
++            .slices
++            .iter()
++            .map(|s| Key::decode(&s.keys[0]).ordinal)
++            .min();
++        let max = self
++            .slices
++            .iter()
++            .filter_map(|s| s.keys.last().map(Key::decode))
++            .map(|key| key.ordinal)
++            .max();
++        let (Some(min), Some(max)) = (min, max) else {
++            return Err(self);
++        };
++        if min == max {
++            return Err(self);
++        }
++        // An exclusive upper bound for the left range. Even at a signed ID
++        // extreme the cut is between distinct keys and both sides advance.
++        let cut = min + (max - min).div_ceil(2);
++        let mut left = Vec::new();
++        let mut right = Vec::new();
++        for slice in self.slices {
++            let at = slice
++                .keys
++                .partition_point(|key| Key::decode(key).ordinal < cut);
++            let (before, after) = slice.keys.split_at(at);
++            if !before.is_empty() {
++                left.push(Slice {
++                    keys: before,
++                    body_end: after
++                        .first()
++                        .map_or(slice.body_end, |key| Key::decode(key).offset as usize),
++                    ..slice
++                });
++            }
++            if !after.is_empty() {
++                right.push(Slice {
++                    keys: after,
++                    ..slice
++                });
++            }
++        }
++        Ok((Self::new(left), Self::new(right)))
++    }
++}
++
++struct Schedule<'a> {
++    pending: Vec<Work<'a>>,
++    target: u64,
++    ordinal: u64,
++}
++
++impl<'a> Schedule<'a> {
++    fn next(&mut self, cancel: &Recorder) -> Result<Option<(u64, Work<'a>)>> {
++        while let Some(work) = self.pending.pop() {
++            cancel.check()?;
++            let work = if work.count > self.target || work.bytes > SORT_RANGE_TARGET_BYTES {
++                match work.split() {
++                    Ok((left, right)) => {
++                        self.pending.push(right);
++                        self.pending.push(left);
++                        continue;
++                    }
++                    Err(one_id) => one_id,
++                }
++            } else {
++                work
++            };
++            let start = self.ordinal;
++            self.ordinal += work.count;
++            return Ok(Some((start, work)));
++        }
++        Ok(None)
++    }
++}
++
++struct MergeRanges<'a> {
++    mapped: &'a [u8],
++    frames: &'a [super::Frame],
++    sources: &'a Sources,
++    kind: ElementKind,
++    keep_locations: bool,
++    compression: &'a Compression,
++    metrics: &'a WriterMetrics,
++    cancel: &'a Recorder,
++}
++
++impl MergeRanges<'_> {
++    fn merge(
++        &self,
++        (start, work): (u64, Work<'_>),
++        emitter: &Emitter<'_, Chunk, RunCounts>,
++    ) -> Result<RunCounts> {
++        let mut slices = work.slices;
++        let mut heap = BinaryHeap::with_capacity(slices.len());
++        for (slot, slice) in slices.iter().enumerate() {
++            self.offer(&mut heap, slot, slice);
++        }
++        let mut output = Output::new(self.keep_locations, self.compression, self.metrics);
++        let mut scratch = record::EncodeScratch::default();
++        let mut elements = 0u64;
++        let cap = DEFAULT_ELEMENT_CAP.get() as u64;
++        // Rejoin the original count boundaries after the block cut in two by
++        // a range boundary. Ranges starting on a boundary need no adjustment.
++        let first_flush = cap - start % cap;
++        while let Some(Reverse((ordinal, _, _, _, slot))) = heap.pop() {
++            let slice = &mut slices[slot];
++            let key = Key::decode(&slice.keys[0]);
++            slice.keys = &slice.keys[1..];
++            let end = slice
++                .keys
++                .first()
++                .map_or(slice.body_end, |key| Key::decode(key).offset as usize);
++            let frame = &self.frames[slice.run.frame];
++            let here = (frame.source, frame.file_offset);
++            scratch
++                .write(
++                    slice.run.body(self.mapped, key.offset, end)?,
++                    &self.mapped[slice.run.strings.clone()],
++                    self.kind,
++                    osm_id_from_ordinal(ordinal),
++                    &mut output,
++                )
++                .map_err(|e| self.sources[here.0].locate_at(here.1, e))?;
++            if !output.filled.is_empty() {
++                let origin = output.origin.replace(here);
++                self.ship(&mut output, emitter, origin)?;
++            } else if output.origin.is_none() {
++                output.origin = Some(here);
++            }
++            elements += 1;
++            if elements == first_flush {
++                self.flush(&mut output, emitter)?;
++            }
++            if elements.is_multiple_of(SWEEP_CHECKPOINT_REMOVALS as u64) {
++                self.cancel.check()?;
++                if emitter.abandoned() {
++                    return Err(Error::internal("sort range abandoned"));
++                }
++            }
++            self.offer(&mut heap, slot, slice);
++        }
++        if elements != work.count {
++            return Err(Error::internal(
++                "sort range emitted an inexact record count",
++            ));
++        }
++        self.flush(&mut output, emitter)?;
++        output.send(emitter)?;
++        Ok(RunCounts {
++            elements,
++            chunks: output.chunks,
++            chunk_high_water: output.chunk_high_water,
++            staged_high_water: output.staged_high_water,
++            ..RunCounts::default()
++        })
++    }
++
++    fn offer(&self, heap: &mut Heap, slot: usize, slice: &Slice<'_>) {
++        if let Some(first) = slice.keys.first() {
++            let key = Key::decode(first);
++            let frame = &self.frames[slice.run.frame];
++            // Each source frame yields one sorted feed; its equal keys
++            // already follow occurrence order in the original frame.
++            heap.push(Reverse((
++                key.ordinal,
++                key.version,
++                frame.source,
++                frame.file_offset,
++                slot,
++            )));
++        }
++    }
++
++    fn flush(&self, out: &mut Output<'_>, emitter: &Emitter<'_, Chunk, RunCounts>) -> Result<()> {
++        crate::commands::flush_local(&mut out.bb, &mut out.filled)?;
++        let origin = out.origin.take();
++        self.ship(out, emitter, origin)
++    }
++
++    fn ship(
++        &self,
++        out: &mut Output<'_>,
++        emitter: &Emitter<'_, Chunk, RunCounts>,
++        origin: Option<(usize, u64)>,
++    ) -> Result<()> {
++        out.ship(emitter, &|e| match origin {
++            Some((source, offset)) => self.sources[source].locate_at(offset, e),
++            None => e,
++        })
++    }
++}
++
++type Heap = BinaryHeap<Reverse<(u64, i32, usize, u64, usize)>>;
++
++struct RangeOutput<'a, 'w> {
++    out: &'a mut PlanWriter<'w>,
++    counts: RunCounts,
++    ranges: usize,
++}
++
++impl StreamConsumer<Chunk, RunCounts> for RangeOutput<'_, '_> {
++    fn item(&mut self, _task: usize, chunk: Chunk) -> Result<()> {
++        self.out.writer.write_raw_chunks(chunk)
++    }
++
++    fn finish_task(&mut self, _task: usize, counts: RunCounts) -> Result<()> {
++        self.counts.elements += counts.elements;
++        self.counts.chunks += counts.chunks;
++        self.counts.chunk_high_water = self.counts.chunk_high_water.max(counts.chunk_high_water);
++        self.counts.staged_high_water = self.counts.staged_high_water.max(counts.staged_high_water);
++        self.ranges += 1;
++        Ok(())
++    }
++}
++
++pub(in crate::commands::blob_merge) fn write(
++    out: &mut PlanWriter<'_>,
++    run: &Run,
++    config: Config<'_>,
++    compression: &Compression,
++    metrics: &WriterMetrics,
++    workers: usize,
++    host: &Entered<'_>,
++) -> Result<Option<RunCounts>> {
++    let scratch = RunScratch::create(config.parent, host)?;
++    let path = scratch.file("sort-ranges")?;
++    let file = crate::scratch::create_read_write(&path, true)
++        .map_err(|e| Error::from(e).context(format!("create {}", path.display())))?;
++    let mut spill = Spill {
++        file: BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
++        runs: Vec::new(),
++        size: 0,
++        needs_legacy: false,
++    };
++    host.invocation.marker("SORT_RANGE_PREPARE_START");
++    prepare_runs(
++        out.plan,
++        out.sources,
++        run,
++        workers,
++        &host.invocation,
++        &mut spill,
++    )
++    .map_err(|e| e.context(format!("prepare sort ranges in {}", path.display())))?;
++    host.invocation.marker("SORT_RANGE_PREPARE_END");
++    if spill.needs_legacy || spill.runs.is_empty() {
++        host.invocation.counter("sort_range_legacy_fallback", 1);
++        return Ok(None);
++    }
++    let file = spill
++        .file
++        .into_inner()
++        .map_err(std::io::IntoInnerError::into_error)?;
++    // SAFETY: the spill is in this invocation's private scratch directory.
++    // Its writer is flushed above and nothing modifies it after this point.
++    let mapped = unsafe { memmap2::Mmap::map(file.as_file()) }
++        .map_err(|e| Error::from(e).context(format!("map {}", path.display())))?;
++    host.invocation
++        .counter("sort_range_spill_bytes", spill.size);
++    let first = Work::new(
++        spill
++            .runs
++            .iter()
++            .map(|run| Slice {
++                run,
++                keys: run.keys(&mapped),
++                body_end: run.bodies.len(),
++            })
++            .collect(),
++    );
++    let mut schedule = Schedule {
++        pending: vec![first],
++        target: config.target_records,
++        ordinal: 0,
++    };
++    let plan = out.plan;
++    let merge = MergeRanges {
++        mapped: &mapped,
++        frames: &plan.frames,
++        sources: out.sources,
++        kind: run.kind,
++        keep_locations: plan.keep_locations,
++        compression,
++        metrics,
++        cancel: &host.invocation,
++    };
++    let mut drain = RangeOutput {
++        out,
++        counts: RunCounts::default(),
++        ranges: 0,
++    };
++    host.invocation.marker("SORT_RANGE_MERGE_START");
++    ordered_pool::run_ordered_streams_from(
++        &mut || schedule.next(&host.invocation),
++        workers,
++        StreamConfig {
++            window: super::super::run_window(workers),
++            depth: OVERLAP_RUN_CHANNEL_DEPTH,
++            cancel: &host.invocation,
++        },
++        |_| (),
++        |&mut (), _, work, emitter| merge.merge(work, emitter),
++        &mut drain,
++    )?;
++    host.invocation.marker("SORT_RANGE_MERGE_END");
++    host.invocation.counter("sort_ranges", drain.ranges);
++    Ok(Some(drain.counts))
++}
++
++fn prepare_runs(
++    plan: &Plan,
++    sources: &Sources,
++    run: &Run,
++    workers: usize,
++    cancel: &Recorder,
++    spill: &mut Spill,
++) -> Result<()> {
++    let mut shards = vec![(); workers.min(run.end - run.start)];
++    let mut validation_failed = false;
++    let result = ordered_pool::run_ordered(
++        run.end - run.start,
++        &mut shards,
++        PoolConfig {
++            window: NonZeroUsize::new(workers).unwrap_or(NonZeroUsize::MIN),
++            cancel,
++            waits: ordered_pool::Waits::default(),
++        },
++        |_| FrameBuf::default(),
++        |&mut (), buf, k| Ok(prepare(plan, sources, run, run.start + k, buf, cancel)),
++        &mut ConsumeFn(|_, prepared: Result<Prepared>| match prepared {
++            Ok(prepared) => spill.push(&prepared),
++            Err(error) => {
++                validation_failed = !matches!(
++                    error.kind(),
++                    crate::ErrorKind::Io(_)
++                        | crate::ErrorKind::InputReplaced
++                        | crate::ErrorKind::Cancelled
++                        | crate::ErrorKind::Internal { .. }
++                );
++                Err(error)
++            }
++        }),
++    );
++    // Preparation visits frames and fields in a different order from the
++    // sweep. When input validation fails, the sweep decides which failure
++    // to return in its original order. Scratch write failures stay here.
++    if validation_failed {
++        spill.needs_legacy = true;
++        cancel.check()
++    } else {
++        result
++    }
++}
+diff --git a/crates/lib/src/commands/blob_merge/sweep/ranges/record.rs b/crates/lib/src/commands/blob_merge/sweep/ranges/record.rs
+new file mode 100644
+index 00000000..c9c8ef5e
+--- /dev/null
++++ b/crates/lib/src/commands/blob_merge/sweep/ranges/record.rs
+@@ -0,0 +1,421 @@
++//! Packed scratch bodies. Each frame stores its strings once and shares
++//! the dictionary with every range that merges records from that frame.
++//! Neither writing to scratch nor reading it constructs an owned element.
++
++use protohoggr::{Cursor, encode_varint, zigzag_encode_64};
++use rustc_hash::FxHashMap;
++
++use super::super::Output;
++use crate::block_builder::{DenseMetadata, MemberData, Metadata, PartialMetadata};
++use crate::owned::{declared_way_locations, dense_node_metadata, element_metadata};
++use crate::{DenseColumns, Element, ElementKind, Error, MemberId, MemberType, Result};
++
++#[derive(Default)]
++pub(super) struct Bodies {
++    pub(super) bytes: Vec<u8>,
++    pub(super) strings: Vec<u8>,
++    slots: FxHashMap<String, usize>,
++    locations: Vec<(i32, i32)>,
++}
++
++#[derive(Clone, Copy)]
++enum Meta<'a> {
++    Plain(Option<PartialMetadata<'a>>),
++    Dense(DenseMetadata<'a>),
++}
++
++impl<'a> Meta<'a> {
++    fn plain(self) -> Result<Option<PartialMetadata<'a>>> {
++        match self {
++            Self::Plain(meta) => Ok(meta),
++            Self::Dense(_) => Err(corrupt()),
++        }
++    }
++}
++
++impl Bodies {
++    fn number(&mut self, value: u64) {
++        encode_varint(&mut self.bytes, value);
++    }
++
++    fn signed(&mut self, value: i64) {
++        self.number(zigzag_encode_64(value));
++    }
++
++    fn string(&mut self, value: &str) {
++        let offset = if let Some(&slot) = self.slots.get(value) {
++            slot
++        } else {
++            let slot = self.strings.len();
++            encode_varint(&mut self.strings, value.len() as u64);
++            self.strings.extend_from_slice(value.as_bytes());
++            self.slots.insert(value.to_owned(), slot);
++            slot
++        };
++        self.number(offset as u64);
++    }
++
++    fn metadata(&mut self, metadata: Meta<'_>) {
++        let (mask, fields) = match metadata {
++            Meta::Plain(None) => {
++                self.number(0);
++                return;
++            }
++            Meta::Plain(Some(fields)) => (0, fields),
++            Meta::Dense(DenseMetadata { meta, columns, .. }) => (
++                1 << 6,
++                PartialMetadata {
++                    version: columns.version().then_some(meta.version),
++                    timestamp: columns.timestamp().then_some(meta.timestamp),
++                    changeset: columns.changeset().then_some(meta.changeset),
++                    uid: columns.uid().then_some(meta.uid),
++                    user: columns.user().then_some(meta.user),
++                    visible: columns.visible().then_some(meta.visible),
++                },
++            ),
++        };
++        let PartialMetadata {
++            version,
++            timestamp,
++            changeset,
++            uid,
++            user,
++            visible,
++        } = fields;
++        let present = [
++            version.is_some(),
++            timestamp.is_some(),
++            changeset.is_some(),
++            uid.is_some(),
++            user.is_some(),
++            visible.is_some(),
++        ];
++        self.number(
++            present
++                .into_iter()
++                .enumerate()
++                .fold(mask, |mask, (i, set)| mask | (u64::from(set) << i)),
++        );
++        for value in [
++            version.map(i64::from),
++            timestamp,
++            changeset,
++            uid.map(i64::from),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            self.signed(value);
++        }
++        if let Some(user) = user {
++            self.string(user);
++        }
++        if let Some(visible) = visible {
++            self.number(u64::from(visible));
++        }
++    }
++
++    fn slot(&mut self) -> usize {
++        let start = self.bytes.len();
++        self.bytes.extend_from_slice(&[0; 4]);
++        start
++    }
++
++    fn fill(&mut self, start: usize, value: usize) -> Result<()> {
++        let value = u32::try_from(value)
++            .map_err(|_| Error::internal("packed sort record exceeds 4 GiB"))?;
++        self.bytes[start..start + 4].copy_from_slice(&value.to_le_bytes());
++        Ok(())
++    }
++
++    fn coords(&mut self, lat: i32, lon: i32) {
++        self.signed(i64::from(lat));
++        self.signed(i64::from(lon));
++    }
++
++    fn tags<'t>(&mut self, tags: impl Iterator<Item = (&'t str, &'t str)>) {
++        for (key, value) in tags {
++            self.string(key);
++            self.string(value);
++        }
++    }
++
++    fn way(&mut self, way: &crate::Way<'_>, keep_locations: bool) -> Result<()> {
++        let meta = element_metadata(ElementKind::Way, way.id(), &way.info())?;
++        let slot = self.slot();
++        let mut prev = 0i64;
++        let mut count = 0;
++        for id in way.refs() {
++            self.signed(id.wrapping_sub(prev));
++            prev = id;
++            count += 1;
++        }
++        self.fill(slot, count)?;
++        if keep_locations {
++            declared_way_locations(way, count, &mut self.locations)?;
++            let locations = std::mem::take(&mut self.locations);
++            for &(lat, lon) in &locations {
++                self.coords(lat, lon);
++            }
++            self.locations = locations;
++        }
++        self.metadata(Meta::Plain(meta));
++        self.tags(way.tags());
++        Ok(())
++    }
++
++    fn relation(&mut self, relation: &crate::Relation<'_>) -> Result<()> {
++        let slot = self.slot();
++        let mut prev = 0i64;
++        let mut count = 0;
++        for (position, member) in relation.members().enumerate() {
++            let id = member.id.id();
++            self.signed(id.wrapping_sub(prev));
++            prev = id;
++            let kind = match member.id.member_type() {
++                MemberType::Node => 0,
++                MemberType::Way => 1,
++                MemberType::Relation => 2,
++                MemberType::Unknown(raw) => raw,
++            };
++            self.signed(i64::from(kind));
++            self.string(relation.member_role(position, &member)?);
++            count += 1;
++        }
++        self.fill(slot, count)?;
++        self.metadata(Meta::Plain(element_metadata(
++            ElementKind::Relation,
++            relation.id(),
++            &relation.info(),
++        )?));
++        self.tags(relation.tags());
++        Ok(())
++    }
++
++    /// Returns true when the serial sweep can change this node's sort
++    /// version at demotion. Its component must run through that sweep.
++    pub(super) fn push(&mut self, element: &Element<'_>, keep_locations: bool) -> Result<bool> {
++        let mut needs_legacy = false;
++        match element {
++            Element::DenseNode(node) => {
++                let dense = dense_node_metadata(node)?;
++                let meta = match &dense {
++                    Some(m) if m.writes_plain() => {
++                        needs_legacy = m.meta.version != 0;
++                        Meta::Plain(Some(m.plain_claim_metadata()))
++                    }
++                    Some(m) => Meta::Dense(*m),
++                    None => Meta::Plain(None),
++                };
++                self.coords(node.decimicro_lat()?, node.decimicro_lon()?);
++                self.metadata(meta);
++                self.tags(node.tags());
++            }
++            Element::Node(node) => {
++                let meta = element_metadata(ElementKind::Node, node.id(), &node.info())?;
++                self.coords(node.decimicro_lat()?, node.decimicro_lon()?);
++                self.metadata(Meta::Plain(meta));
++                self.tags(node.tags());
++            }
++            Element::Way(way) => self.way(way, keep_locations)?,
++            Element::Relation(relation) => self.relation(relation)?,
++        }
++        Ok(needs_legacy)
++    }
++}
++
++struct Body<'a> {
++    cursor: Cursor<'a>,
++    strings: &'a [u8],
++}
++
++fn corrupt() -> Error {
++    Error::internal("invalid packed sort run record")
++}
++
++impl<'a> Body<'a> {
++    fn number(&mut self) -> Result<usize> {
++        let value = self.cursor.read_varint().map_err(|_| corrupt())?;
++        usize::try_from(value).map_err(|_| corrupt())
++    }
++
++    fn count(&mut self) -> Result<usize> {
++        self.cursor
++            .read_fixed32()
++            .map(|n| n as usize)
++            .map_err(|_| corrupt())
++    }
++
++    fn signed(&mut self) -> Result<i64> {
++        self.cursor.read_sint64().map_err(|_| corrupt())
++    }
++
++    fn int(&mut self) -> Result<i32> {
++        i32::try_from(self.signed()?).map_err(|_| corrupt())
++    }
++
++    fn string(&mut self) -> Result<&'a str> {
++        let start = self.number()?;
++        let mut cursor = Cursor::new(self.strings.get(start..).ok_or_else(corrupt)?);
++        let bytes = cursor.read_len_delimited().map_err(|_| corrupt())?;
++        std::str::from_utf8(bytes).map_err(|_| corrupt())
++    }
++
++    fn metadata(&mut self) -> Result<Meta<'a>> {
++        let mask = self.number()?;
++        if mask == 0 {
++            return Ok(Meta::Plain(None));
++        }
++        let present = [0, 1, 2, 3, 4, 5].map(|i| mask & (1 << i) != 0);
++        let [version, timestamp, changeset, uid, user, visible] = present;
++        let version = version.then(|| self.int()).transpose()?;
++        let timestamp = timestamp.then(|| self.signed()).transpose()?;
++        let changeset = changeset.then(|| self.signed()).transpose()?;
++        let uid = uid.then(|| self.int()).transpose()?;
++        let user = user.then(|| self.string()).transpose()?;
++        let visible = visible.then(|| self.number().map(|n| n != 0)).transpose()?;
++        Ok(if mask & (1 << 6) == 0 {
++            Meta::Plain(Some(PartialMetadata {
++                version,
++                timestamp,
++                changeset,
++                uid,
++                user,
++                visible,
++            }))
++        } else {
++            Meta::Dense(DenseMetadata {
++                meta: Metadata {
++                    version: version.unwrap_or_default(),
++                    timestamp: timestamp.unwrap_or_default(),
++                    changeset: changeset.unwrap_or_default(),
++                    uid: uid.unwrap_or_default(),
++                    user: user.unwrap_or_default(),
++                    visible: visible.unwrap_or(true),
++                },
++                columns: DenseColumns::from_presence(present),
++                explicit: DenseColumns::default(),
++            })
++        })
++    }
++
++    fn tags(&mut self, tags: &mut Vec<(&'a str, &'a str)>) -> Result<()> {
++        tags.clear();
++        while !self.cursor.is_empty() {
++            tags.push((self.string()?, self.string()?));
++        }
++        Ok(())
++    }
++
++    fn refs(&mut self, refs: &mut Vec<i64>) -> Result<()> {
++        refs.clear();
++        let mut prev = 0i64;
++        for _ in 0..self.count()? {
++            prev = prev.wrapping_add(self.signed()?);
++            refs.push(prev);
++        }
++        Ok(())
++    }
++
++    fn members(&mut self, members: &mut Vec<MemberData<'a>>) -> Result<()> {
++        members.clear();
++        let mut prev = 0i64;
++        for _ in 0..self.count()? {
++            prev = prev.wrapping_add(self.signed()?);
++            let id = match self.int()? {
++                0 => MemberId::Node(prev),
++                1 => MemberId::Way(prev),
++                2 => MemberId::Relation(prev),
++                raw => MemberId::Unknown(raw, prev),
++            };
++            members.push(MemberData {
++                id,
++                role: self.string()?,
++            });
++        }
++        Ok(())
++    }
++}
++
++#[derive(Default)]
++pub(super) struct EncodeScratch<'a> {
++    tags: Vec<(&'a str, &'a str)>,
++    refs: Vec<i64>,
++    locations: Vec<(i32, i32)>,
++    members: Vec<MemberData<'a>>,
++}
++
++impl<'a> EncodeScratch<'a> {
++    pub(super) fn write(
++        &mut self,
++        bytes: &'a [u8],
++        strings: &'a [u8],
++        kind: ElementKind,
++        id: i64,
++        out: &mut Output<'_>,
++    ) -> Result<()> {
++        let mut body = Body {
++            cursor: Cursor::new(bytes),
++            strings,
++        };
++        match kind {
++            ElementKind::Node => self.node(&mut body, id, out),
++            ElementKind::Way => self.way(&mut body, id, out),
++            ElementKind::Relation => self.relation(&mut body, id, out),
++        }
++    }
++
++    fn node(&mut self, body: &mut Body<'a>, id: i64, out: &mut Output<'_>) -> Result<()> {
++        let lat = body.int()?;
++        let lon = body.int()?;
++        let meta = body.metadata()?;
++        body.tags(&mut self.tags)?;
++        crate::commands::ensure_node_capacity_local(&mut out.bb, &mut out.filled)?;
++        let tags = self.tags.iter().copied();
++        match meta {
++            Meta::Plain(meta) => out.bb.add_node_partial(id, lat, lon, tags, meta.as_ref()),
++            Meta::Dense(meta) => out.bb.add_node_dense(id, lat, lon, tags, Some(&meta)),
++        }
++        Ok(())
++    }
++
++    fn way(&mut self, body: &mut Body<'a>, id: i64, out: &mut Output<'_>) -> Result<()> {
++        body.refs(&mut self.refs)?;
++        self.locations.clear();
++        let keep = out.coords == crate::owned::WayCoords::Keep;
++        if keep {
++            for _ in 0..self.refs.len() {
++                self.locations.push((body.int()?, body.int()?));
++            }
++        }
++        let meta = body.metadata()?.plain()?;
++        body.tags(&mut self.tags)?;
++        crate::commands::ensure_way_capacity_local(&mut out.bb, &mut out.filled)?;
++        let tags = self.tags.iter().copied();
++        if keep {
++            out.bb.add_way_with_locations_partial(
++                id,
++                tags,
++                &self.refs,
++                &self.locations,
++                meta.as_ref(),
++            );
++        } else {
++            out.bb.add_way_partial(id, tags, &self.refs, meta.as_ref());
++        }
++        Ok(())
++    }
++
++    fn relation(&mut self, body: &mut Body<'a>, id: i64, out: &mut Output<'_>) -> Result<()> {
++        body.members(&mut self.members)?;
++        let meta = body.metadata()?.plain()?;
++        body.tags(&mut self.tags)?;
++        crate::commands::ensure_relation_capacity_local(&mut out.bb, &mut out.filled)?;
++        out.bb.add_relation_partial_iter(
++            id,
++            self.tags.iter().copied(),
++            self.members.iter().copied().map(Ok),
++            meta.as_ref(),
++        )
++    }
++}
+diff --git a/crates/lib/src/commands/sort/mod.rs b/crates/lib/src/commands/sort/mod.rs
+index 17f53c98..7c8cc10d 100644
+--- a/crates/lib/src/commands/sort/mod.rs
++++ b/crates/lib/src/commands/sort/mod.rs
+@@ -4,9 +4,9 @@
+ //! `cat --dedupe` (`commands::blob_merge`): index each blob's element type +
+ //! ID range, order the index, write in order. Non-overlapping blobs pass
+ //! through as raw bytes; overlapping blobs are decoded and merged via a
+-//! streaming sweep. Memory is O(num_blobs) for non-overlapping inputs, plus
+-//! each active sweep's overlap depth and a bounded window of re-encoded
+-//! blocks when blobs overlap.
++//! streaming sweep. Large overlap components spill indexed records into
++//! scratch on the output's filesystem and merge disjoint ID ranges on
++//! parallel workers. Each path streams framed output in plan order.
+ 
+ use crate::commands::blob_merge::{self, IndexPolicy};
+ use crate::read::input::InputSource;
+@@ -70,9 +70,10 @@ pub(crate) fn omitted_clause(omitted: u64) -> String {
+ 
+ /// Sort a PBF file into standard order (nodes -> ways -> relations, by ID).
+ ///
+-/// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
+-/// blobs are passed through as raw bytes; overlapping blobs are decoded,
+-/// sorted, and re-encoded.
++/// Uses blob-level permutation sort. Non-overlapping blobs are passed
++/// through as raw bytes; overlapping blobs are decoded, sorted, and
++/// re-encoded. Large overlap components use scratch beside the staging
++/// output to merge concurrently over disjoint ID ranges.
+ ///
+ /// The input is read in several passes, so it must be a regular file
+ /// (`InvalidArgument` otherwise), and is pinned for the run
+@@ -137,7 +138,6 @@ pub fn sort_with<'a>(
+ }
+ 
+ /// [`sort_with`] writing to a borrowed output it does not publish.
+-#[allow(clippy::too_many_lines)]
+ #[hotpath::measure]
+ pub(crate) fn sort_to<'a>(
+     input: impl Into<InputSource<'a>>,
+@@ -145,6 +145,26 @@ pub(crate) fn sort_to<'a>(
+     opts: &SortOptions,
+     overrides: &HeaderOverrides,
+     host: &crate::host::Entered<'_>,
++) -> Result<SortStats> {
++    let ranges = blob_merge::SortRanges {
++        parent: output
++            .path()
++            .parent()
++            .unwrap_or_else(|| std::path::Path::new(".")),
++        min_records: crate::tunables::SORT_RANGE_MIN_RECORDS,
++        target_records: crate::tunables::SORT_RANGE_TARGET_RECORDS,
++    };
++    sort_to_with_ranges(input, output, opts, overrides, Some(ranges), host)
++}
++
++#[allow(clippy::too_many_lines)]
++fn sort_to_with_ranges<'a>(
++    input: impl Into<InputSource<'a>>,
++    output: &crate::output::BoundOutput,
++    opts: &SortOptions,
++    overrides: &HeaderOverrides,
++    ranges: Option<blob_merge::SortRanges<'_>>,
++    host: &crate::host::Entered<'_>,
+ ) -> Result<SortStats> {
+     let SortOptions {
+         write:
+@@ -332,7 +352,8 @@ pub(crate) fn sort_to<'a>(
+     // SORT_WRITE_LOOP spans both (the separate SORT_OVERLAP_PARALLEL phase of
+     // the earlier collect-then-write shape no longer exists).
+     host.invocation.marker("SORT_WRITE_LOOP_START");
+-    let counts = blob_merge::write_plan(&plan, &sources, &mut writer, false, compression, host)?;
++    let counts =
++        blob_merge::write_sort_plan(&plan, &sources, &mut writer, compression, ranges, host)?;
+     host.invocation.marker("SORT_WRITE_LOOP_END");
+ 
+     host.invocation
+@@ -370,6 +391,323 @@ pub(crate) fn sort_to<'a>(
+     })
+ }
+ 
++#[cfg(test)]
++mod range_tests {
++    use super::*;
++    use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
++    use crate::content::{Prepass, write_full_record};
++    use crate::osm_id::osm_id_ordinal;
++    use crate::writer::{Compression, PbfWriter};
++    use crate::{BlobReader, Element, ElementReader};
++    use protohoggr::{
++        encode_bytes_field, encode_int64_field, encode_sint64_field, encode_varint,
++        zigzag_encode_64,
++    };
++    use std::io::{BufReader, BufWriter};
++    use std::path::Path;
++
++    fn fixture(
++        path: &Path,
++        header: HeaderBuilder<'_>,
++        write: impl FnOnce(&mut PbfWriter<BufWriter<std::fs::File>>),
++    ) {
++        let file = std::fs::File::create(path).expect("fixture");
++        let mut writer = PbfWriter::new(BufWriter::new(file), Compression::default());
++        writer
++            .write_header(&header.build().expect("header"))
++            .expect("write header");
++        write(&mut writer);
++        writer.flush().expect("flush fixture");
++    }
++
++    fn run(input: &Path, output: &Path, target: Option<u64>) -> Result<SortStats> {
++        let owner = crate::host::Host::for_tests();
++        let host = owner.entered();
++        let output = crate::output::Output::new(
++            output,
++            crate::output::Overwrite::Refuse,
++            &crate::host::Diagnostics::discard(),
++        )?
++        .bind(&owner.invocation)?;
++        let options = SortOptions {
++            write: WriteOptions {
++                force: true,
++                ..WriteOptions::default()
++            },
++            distrust_metadata: false,
++        };
++        let ranges = target.map(|target_records| blob_merge::SortRanges {
++            parent: input.parent().expect("fixture directory"),
++            min_records: 1,
++            target_records,
++        });
++        let stats = sort_to_with_ranges(
++            input,
++            &output,
++            &options,
++            &HeaderOverrides::default(),
++            ranges,
++            &host,
++        )?;
++        output.publish()?;
++        Ok(stats)
++    }
++
++    fn read(path: &Path, visit: impl for<'a> FnMut(Element<'a>)) {
++        let file = std::fs::File::open(path).expect("open output");
++        ElementReader::for_tests(BufReader::new(file))
++            .expect("read header")
++            .for_each(visit)
++            .expect("read elements");
++    }
++
++    fn full_stream(path: &Path) -> Vec<u8> {
++        let mut bytes = Vec::new();
++        read(path, |element| {
++            let id = match &element {
++                Element::Node(n) => n.id(),
++                Element::DenseNode(n) => n.id(),
++                Element::Way(w) => w.id(),
++                Element::Relation(r) => r.id(),
++            };
++            write_full_record(&element, id, Prepass::default(), None, &mut bytes)
++                .expect("element record");
++        });
++        bytes
++    }
++
++    fn compare(input: &Path, target: u64, check: impl FnOnce(&Path, &Path, SortStats)) {
++        let baseline = input.with_extension("serial.pbf");
++        let partitioned = input.with_extension("ranges.pbf");
++        let expected = run(input, &baseline, None).expect("serial sort");
++        let actual = run(input, &partitioned, Some(target)).expect("range sort");
++        assert_eq!(full_stream(&baseline), full_stream(&partitioned));
++        assert_eq!(actual.nodes, expected.nodes);
++        assert_eq!(actual.ways, expected.ways);
++        assert_eq!(actual.relations, expected.relations);
++        assert_eq!(actual.blobs_rewritten, expected.blobs_rewritten);
++        assert_eq!(actual.blobs_passthrough, expected.blobs_passthrough);
++        assert_eq!(actual.passthrough_claimed, expected.passthrough_claimed);
++        check(&baseline, &partitioned, actual);
++    }
++
++    #[test]
++    fn scrambled_component_is_split_at_many_points() {
++        let dir = pbfhogg_test_scratch::scratch();
++        let input = dir.path().join("scrambled.pbf");
++        fixture(&input, HeaderBuilder::new(), |writer| {
++            let mut builder = BlockBuilder::new();
++            for frame in (1..=24).rev() {
++                for row in (0..100).rev() {
++                    let metadata = Metadata {
++                        version: 1,
++                        timestamp: 123,
++                        changeset: 4,
++                        uid: 5,
++                        user: "mapper",
++                        visible: true,
++                    };
++                    builder.add_node(
++                        i64::from(row) * 24 + frame,
++                        row,
++                        0,
++                        [("k", "v")],
++                        (row % 2 == 0).then_some(&metadata),
++                    );
++                }
++                writer
++                    .write_primitive_block(builder.take().expect("encode").expect("nodes"))
++                    .expect("write nodes");
++            }
++        });
++        compare(&input, 47, |_, partitioned, stats| {
++            assert_eq!((stats.nodes, stats.blobs_rewritten), (2400, 24));
++            let file = std::fs::File::open(partitioned).expect("open output");
++            let decoded = BlobReader::new(BufReader::new(file))
++                .collect::<Result<Vec<_>>>()
++                .expect("read blobs");
++            assert!(
++                decoded.len() > 50,
++                "range tasks must have flushed their own blocks"
++            );
++        });
++    }
++
++    #[test]
++    fn an_aligned_split_preserves_bytes() {
++        let dir = pbfhogg_test_scratch::scratch();
++        let input = dir.path().join("aligned.pbf");
++        let cap = i64::try_from(crate::tunables::DEFAULT_ELEMENT_CAP.get()).expect("small cap");
++        fixture(&input, HeaderBuilder::new(), |writer| {
++            let mut builder = BlockBuilder::new();
++            for first_id in [1, 2] {
++                for index in (0..cap).rev() {
++                    let id = 2 * index + first_id;
++                    builder.add_node(id, 10, -20, [], None);
++                }
++                writer
++                    .write_primitive_block(builder.take().expect("encode").expect("nodes"))
++                    .expect("write nodes");
++            }
++        });
++        compare(&input, cap.unsigned_abs(), |baseline, partitioned, _| {
++            assert_eq!(
++                std::fs::read(baseline).expect("serial bytes"),
++                std::fs::read(partitioned).expect("range bytes"),
++            );
++        });
++    }
++
++    #[test]
++    fn history_keeps_versions_and_occurrences_in_file_order_within_ties() {
++        let dir = pbfhogg_test_scratch::scratch();
++        let input = dir.path().join("history.pbf");
++        let header = HeaderBuilder::new()
++            .historical()
++            .optional_feature(crate::HeaderBlock::LOCATIONS_ON_WAYS);
++        fixture(&input, header, |writer| {
++            let mut builder = BlockBuilder::new();
++            for frame in [
++                &[
++                    (8, 1, "last"),
++                    (4, 3, "v3"),
++                    (4, 1, "first"),
++                    (4, 1, "again"),
++                ][..],
++                &[(4, 2, "v2"), (1, 1, "low"), (4, 1, "later frame")][..],
++            ] {
++                for &(id, version, name) in frame {
++                    let metadata = Metadata {
++                        version,
++                        timestamp: 12_345,
++                        changeset: 2,
++                        uid: 3,
++                        user: "mapper",
++                        visible: version != 3,
++                    };
++                    builder.add_way_with_locations(
++                        id,
++                        [("name", name)],
++                        &[1, 2],
++                        &[(12, 34), (56, 78)],
++                        Some(&metadata),
++                    );
++                }
++                writer
++                    .write_primitive_block(builder.take().expect("encode").expect("ways"))
++                    .expect("write ways");
++            }
++        });
++        compare(&input, 1, |_, partitioned, stats| {
++            assert_eq!(stats.ways, 7);
++            let mut names = Vec::new();
++            read(partitioned, |element| {
++                let Element::Way(way) = element else {
++                    panic!("expected way")
++                };
++                if way.id() == 4 {
++                    let (_, name) = way.tags().next().expect("name tag");
++                    names.push(name.to_owned());
++                }
++            });
++            assert_eq!(names, ["first", "again", "later frame", "v2", "v3"]);
++        });
++    }
++
++    #[test]
++    fn signed_ids_use_osm_order_including_extremes() {
++        let dir = pbfhogg_test_scratch::scratch();
++        let input = dir.path().join("signed.pbf");
++        let frames = [[i64::MIN, -2, 0, 21], [-1, i64::MAX, -i64::MAX, 1]];
++        fixture(&input, HeaderBuilder::new(), |writer| {
++            let mut builder = BlockBuilder::new();
++            for frame in frames {
++                for id in frame {
++                    builder.add_node(id, 1, 2, [], None);
++                }
++                writer
++                    .write_primitive_block(builder.take().expect("encode").expect("nodes"))
++                    .expect("write nodes");
++            }
++        });
++        compare(&input, 1, |_, partitioned, _| {
++            let mut seen = Vec::new();
++            read(partitioned, |element| {
++                let Element::DenseNode(node) = element else {
++                    panic!("expected dense node")
++                };
++                seen.push(node.id());
++            });
++            let mut expected: Vec<_> = frames.into_iter().flatten().collect();
++            expected.sort_by_key(|&id| osm_id_ordinal(id));
++            assert_eq!(seen, expected);
++        });
++    }
++
++    #[test]
++    fn mixed_groups_and_kinds_are_partitioned_in_kind_order() {
++        let dir = pbfhogg_test_scratch::scratch();
++        let input = dir.path().join("mixed.pbf");
++        fixture(&input, HeaderBuilder::new(), |writer| {
++            for ids in [[8, 1], [5, 3]] {
++                let mut group = Vec::new();
++                for id in ids {
++                    let mut way = Vec::new();
++                    encode_int64_field(&mut way, 1, id);
++                    encode_bytes_field(&mut group, 3, &way);
++                    let mut node = Vec::new();
++                    encode_sint64_field(&mut node, 1, id);
++                    encode_sint64_field(&mut node, 8, 10);
++                    encode_sint64_field(&mut node, 9, -20);
++                    encode_bytes_field(&mut group, 1, &node);
++                    let mut relation = Vec::new();
++                    encode_int64_field(&mut relation, 1, id);
++                    let mut member = Vec::new();
++                    encode_varint(&mut member, zigzag_encode_64(id));
++                    encode_bytes_field(&mut relation, 8, &[1]); // role string index
++                    encode_bytes_field(&mut relation, 9, &member);
++                    encode_bytes_field(&mut relation, 10, &[1]); // member is a way
++                    encode_bytes_field(&mut group, 4, &relation);
++                }
++                let mut block = Vec::new();
++                encode_bytes_field(&mut block, 1, b"\x0a\x00\x0a\x05outer");
++                encode_bytes_field(&mut block, 2, &group);
++                writer
++                    .write_primitive_block_no_indexdata(&block)
++                    .expect("mixed blob");
++            }
++        });
++        compare(&input, 1, |_, _, stats| {
++            assert_eq!((stats.nodes, stats.ways, stats.relations), (4, 4, 4));
++            assert_eq!(stats.blobs_rewritten, 2);
++        });
++    }
++
++    #[test]
++    fn sorted_indexed_frames_still_pass_through() {
++        let dir = pbfhogg_test_scratch::scratch();
++        let input = dir.path().join("ordered.pbf");
++        fixture(&input, HeaderBuilder::new().sorted(), |writer| {
++            let mut builder = BlockBuilder::new();
++            for ids in [[1, 2], [3, 4]] {
++                for id in ids {
++                    builder.add_node(id, 2, 3, [], None);
++                }
++                writer
++                    .write_primitive_block(builder.take().expect("encode").expect("nodes"))
++                    .expect("write nodes");
++            }
++        });
++        compare(&input, 1, |baseline, partitioned, stats| {
++            assert_eq!((stats.blobs_passthrough, stats.blobs_rewritten), (2, 0));
++            assert_eq!(
++                std::fs::read(baseline).expect("serial bytes"),
++                std::fs::read(partitioned).expect("range bytes"),
++            );
++        });
++    }
++}
++
+ #[cfg(test)]
+ #[cfg(feature = "linux-direct-io")]
+ mod tests {
+diff --git a/crates/lib/src/tunables.rs b/crates/lib/src/tunables.rs
+index 20bb3701..b693cc3c 100644
+--- a/crates/lib/src/tunables.rs
++++ b/crates/lib/src/tunables.rs
+@@ -902,6 +902,21 @@ pub(crate) const SWEEP_CHECKPOINT_REMOVALS: usize = 4096;
+ /// sizes where a scan dominates serves.
+ pub(crate) const SWEEP_GROUP_INDEX_THRESHOLD: usize = 32;
+ 
++/// Sort spills a large overlap component into indexed runs before merging
++/// its key ranges. A million records amortize the spill and the extra pool
++/// startup over work that would otherwise occupy one sweep worker.
++pub(crate) const SORT_RANGE_MIN_RECORDS: u64 = 1_000_000;
++
++/// Maximum records per parallel sort range when an ID group permits the
++/// cut. This gives a worker about 32 full output blocks per task while
++/// leaving several tasks available in a component at the spill threshold.
++pub(crate) const SORT_RANGE_TARGET_RECORDS: u64 = 256_000;
++
++/// Packed bodies per sort range when an ID group permits the cut. This
++/// limits work on ways and relations whose ref or member lists can make a
++/// record count alone a poor estimate of encode and compression time.
++pub(crate) const SORT_RANGE_TARGET_BYTES: usize = 64 << 20;
++
+ // ---------------------------------------------------------------------------
+ // Diff
+ // ---------------------------------------------------------------------------
+diff --git a/crates/lib/tests/merge_pbf.rs b/crates/lib/tests/merge_pbf.rs
+index dda18784..f29ad5a1 100644
+--- a/crates/lib/tests/merge_pbf.rs
++++ b/crates/lib/tests/merge_pbf.rs
+@@ -1385,6 +1385,71 @@ fn sparse_tails_are_demoted_within_the_pinned_budget() {
+     );
+ }
+ 
++/// A believed sorted claim does not excuse a descent in an overlap run.
++/// Exercise both production routes. Dropping a staged writer is valid
++/// refusal cleanup; the unit-test drop assertion would mask the error.
++#[test]
++fn a_believed_blob_internally_out_of_order_is_still_refused() {
++    use pbfhogg::block_builder::{BlockBuilder, DEFAULT_ELEMENT_CAP, HeaderBuilder};
++    use pbfhogg::writer::{Compression, PbfWriter};
++
++    // 128 full blobs share one range and exceed the one-million-record
++    // threshold. Build the repeated payload once to keep the fixture cheap.
++    for (overlapping_blobs, expected_fallbacks) in [(1, 0), (128, 1)] {
++        let dir = crate::common::test_scratch();
++        let input = dir.path().join("false-order.pbf");
++        let output = dir.path().join("failed.pbf");
++        let file = std::fs::File::create(&input).expect("create fixture");
++        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
++        writer
++            .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
++            .expect("write header");
++        let mut builder = BlockBuilder::new();
++        for id in [3, 1] {
++            builder.add_node(id, 2, 3, [], None);
++        }
++        writer
++            .write_primitive_block(builder.take().expect("encode").expect("descending nodes"))
++            .expect("write descending nodes");
++        let cap = i64::try_from(DEFAULT_ELEMENT_CAP.get()).expect("small cap");
++        for id in 2..2 + cap {
++            builder.add_node(id, 2, 3, [], None);
++        }
++        let block = builder.take().expect("encode").expect("overlapping nodes");
++        for _ in 0..overlapping_blobs {
++            writer.write_primitive_block(block).expect("write nodes");
++        }
++        writer.flush().expect("flush fixture");
++        drop(writer);
++
++        let (host, counters) = recording_host(4);
++        let Err(error) = pbfhogg::commands::sort::sort(
++            input.as_path(),
++            crate::common::out(&output),
++            &uncompressed_opts(),
++            &pbfhogg::HeaderOverrides::default(),
++            &host,
++        ) else {
++            panic!("sort accepted a descending blob");
++        };
++        assert!(
++            matches!(error.kind(), pbfhogg::ErrorKind::Unsorted { .. }),
++            "{}",
++            error.report(),
++        );
++        assert!(!output.exists(), "a refused sort published output");
++        assert_eq!(counters.get("sort_overlap_runs"), 1);
++        let fallbacks = counters
++            .0
++            .lock()
++            .expect("sink")
++            .iter()
++            .filter(|(name, _)| name == "sort_range_legacy_fallback")
++            .count();
++        assert_eq!(fallbacks, expected_fallbacks, "wrong route for fixture");
++    }
++}
++
+ /// An internally unsorted blob is merged through views sorted by ID, one
+ /// `Element` per element, which outweigh the decoded block itself; the run's
+ /// charge counts them.

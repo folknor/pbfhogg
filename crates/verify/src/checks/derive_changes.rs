@@ -69,13 +69,9 @@ pub fn run(
     let new_pbf = outdir.join("new.osm.pbf");
 
     harness.msg("--- creating 'new' PBF via apply-changes ---");
-    let captured = harness.pbfhogg_discard(
-        PbfArgv::new("apply-changes")
-            .input(pbf)
-            .input(osc)
-            .output(&new_pbf),
-    )?;
-    harness.require_success(&captured, "pbfhogg apply-changes")?;
+    let captured = harness
+        .pbfhogg_discard(crate::argv::apply_changes(pbf, osc, &new_pbf).memoized_output())?;
+    harness.require_output(&captured, "pbfhogg apply-changes", &new_pbf)?;
 
     // Step 2: Derive changes with both tools. The two pbfhogg derives, the
     // indexed one and its rerun on the pair stripped of indexdata, take
@@ -95,9 +91,12 @@ pub fn run(
     harness.msg("--- stripping indexdata from old and new ---");
     let mut ended = harness
         .pbfhogg_group(vec![
-            (strip(pbf, &old_raw), outdir.join("old-unindexed.stdout")),
             (
-                strip(&new_pbf, &new_raw),
+                crate::argv::strip_indexdata(pbf, &old_raw),
+                outdir.join("old-unindexed.stdout"),
+            ),
+            (
+                crate::argv::strip_indexdata(&new_pbf, &new_raw),
                 outdir.join("new-unindexed.stdout"),
             ),
         ])?
@@ -111,8 +110,10 @@ pub fn run(
     let strip_new = next()?;
     // Old before new, the order they once ran in.
     let strips = harness
-        .require_success(&strip_old, "pbfhogg degrade --strip-indexdata")
-        .and_then(|()| harness.require_success(&strip_new, "pbfhogg degrade --strip-indexdata"));
+        .require_output(&strip_old, "pbfhogg degrade --strip-indexdata", &old_raw)
+        .and_then(|()| {
+            harness.require_output(&strip_new, "pbfhogg degrade --strip-indexdata", &new_raw)
+        });
 
     harness.msg("--- pbfhogg diff --format osc, indexed and unindexed inputs ---");
     let mut launches = vec![(
@@ -383,15 +384,6 @@ fn refused(
         )?;
     }
     Ok(claim)
-}
-
-/// `pbfhogg degrade --strip-indexdata INPUT -o OUTPUT`, buffered: it builds
-/// an unindexed comparison input.
-fn strip(input: &Path, output: &Path) -> PbfArgv {
-    PbfArgv::new("degrade")
-        .arg("--strip-indexdata")
-        .input(input)
-        .output(output)
 }
 
 /// Judge the derive rerun on the same pair stripped of indexdata, requiring

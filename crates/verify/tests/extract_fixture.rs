@@ -230,11 +230,10 @@ pub fn tool(args: &[OsString]) -> i32 {
             "-o"
         }))
     };
-    if args[0] == "cat" && args.contains(&"relation") {
-        // osmium's complete_ways relations: the fixture has none.
-        std::fs::write(output(), "").unwrap();
-        return 0;
-    }
+    assert!(
+        args[0] != "cat" || !args.contains(&"relation"),
+        "extract reads relations from the comparison decoding"
+    );
     if fake_pbf::is_opl_cat(&args) {
         fake_pbf::opl_cat(&args);
         // Under the negative-ref fault, osmium's extract outputs also hold

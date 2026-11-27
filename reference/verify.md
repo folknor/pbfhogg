@@ -209,13 +209,11 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   or parse error before any step-down is raised with no order verdict.
   Elsewhere (the reference side of the input-order family, apply-changes'
   output, multi-extract's sequential sorted copies) a separate decode
-  (`opl_compare::order`, no metadata or coordinates; apply-changes and the
-  input-order family's reference side decode under their comparison's
-  policy instead, so the element merge reuses that decoding - the family
-  takes it from the reference header alone, metadata always and inline
-  coordinates when the reference declares them, before anything of
-  pbfhogg's is read) judges it first, since a later failure would
-  otherwise lose the verdict.
+  scan judges it first, since a later failure would otherwise lose the
+  verdict. A new decoding for that scan reads metadata and reads inline
+  coordinates when the reference header declares them, so the element
+  merge can reuse it under the same policy. In the input-order family that
+  policy comes from the reference header before any pbfhogg output is read.
   `osmium fileinfo -e` cannot serve here, since it refuses a file whose ways
   lack their nodes, as every way-only or filtered output does; it still
   reads whole inputs for check-ids, repack and degrade. apply-changes and
@@ -285,10 +283,14 @@ four finite coordinates and preserve their original spelling. Only `all`,
 implies geographic filtering.
 
 The suite reports every entry in order, including explicit `SKIPPED`
-lines counted separately from passes. Extract skips without either a bbox
-or polygons; multi-extract skips without a bbox. The six OSC-consuming
-entries skip only when no OSC is configured. The two locations entries,
-`degrade -l` and `apply-changes -l`, also skip for a fixture PBF or an
+lines counted separately from passes. The shared-fixture sequence is
+`check-ids`, `repack`, `degrade`, `apply-changes`, `diff`, then
+`diff --format osc`. Text diff can build a missing strip alongside its
+indexed diffs. The two locations entries follow this sequence. `extract`
+and `multi-extract` are adjacent earlier in the suite. Extract skips without
+either a bbox or polygons; multi-extract skips without a bbox. The six
+OSC-consuming entries skip only when no OSC is configured. The two locations
+entries, `degrade -l` and `apply-changes -l`, also skip for a fixture PBF or an
 absent selected-generation `altw-keep-untagged` base; `degrade -l` needs
 no OSC. Configured invalid inputs fail resolution, even
 when another missing prerequisite would have skipped the check. Snapshot
@@ -332,7 +334,7 @@ OPL comparison's missing decodes, uncached reference runs, and the
 independent pbfhogg runs of diff, diff --format osc, cat --dedupe and
 geocode's two `build-geocode-index` builds, each exit judged at settlement (at
 most `PBFHOGG_GROUP` per group, each group judged before the next starts;
-in diff --format osc the two strips run together, then the indexed and
+in diff --format osc the missing strips run together, then the indexed and
 unindexed derives together, or the indexed derive alone when a strip
 failed; the indexed exit is judged at settlement, while the strips' exits
 and the unindexed derive's exit and fallback note are judged at the parity
@@ -343,6 +345,13 @@ of its outputs is read or another group starts: every leader's status is
 collected, then any surviving descendant is killed and reaped until none
 remains. Inputs are revalidated at each member's exit and again after the
 group settles.
+
+For a group that requests shared fixtures, memo misses launch alongside
+unshared members. Repeated keys within the group reserve one launch. The
+results, including hits, are handed back in caller order after all launched
+members settle and the input and lifecycle checks pass. With all hits the
+verifier revalidates and checkpoints without launching a group. A group
+abort publishes no producer record from its launches.
 
 - A descendant that outlived its leader makes the check ENVIRONMENT: its
   outputs may be partial. With several members alive it cannot be
@@ -382,13 +391,53 @@ replacement; a same-size rewrite that leaves mtime equal is not detected,
 the local single-user tool's accepted gap; concurrent namespace manipulation by a process outside the lock
 is unsupported.
 
+## Producer reuse
+
+The run memoizes selected pbfhogg invocations that produce one read-only file
+or stdout report. A key contains the private executable's XXH3-128 digest,
+the I/O mode (buffered or direct), and the ordered argv with literal
+arguments intact. Each declared input operand is replaced by its identity
+stamp and filename suffix, as in Decoding reuse. Each output operand is
+replaced by its filename suffix. The key includes whether the invocation
+uses scratch. The launch's private staging and scratch paths, the output
+destination, and the stdout sink do not enter the key. Byte-identical files
+at distinct inodes have distinct input keys. Every reuse revalidates the
+watched inputs and checkpoints the lifecycle.
+
+The record holds the producer's artifact path, the identity of any regular
+file it wrote there, its settled exit status, its exact stderr bytes, and the
+check that launched it. A hit checks that identity and hard-links the file
+to the consumer's path. Every consumer treats it as read-only. If the
+producer left no regular file, the hit supplies no file. The consumer
+receives the recorded exit and stderr, including any nonzero exit, and
+interprets those and the output under its own check rules. A failed exit or
+a successful exit missing a required file can fail each dependent check
+independently. The memo is in memory for one verifier run. A kept run
+directory retains its files for diagnosis, and later runs always launch
+their own producers.
+
+The shared producers are the initial `apply-changes` in apply-changes and
+both diff checks, `degrade --strip-indexdata` of the base in check-ids,
+repack and both diff checks, the same strip of the applied PBF in both diff
+checks, and the simple polygon extract in extract and multi-extract's
+sequential baseline. The buffered baselines and the judged direct runs
+use distinct entries. The `--locations-on-ways` apply has distinct argv.
+Check-ids' fixed indexed fixture for `append_empty_claim` is produced
+privately so its mutation touches only that file.
+
+Repack and degrade also share their input observations at the same resolved
+path and identity: osmium fileinfo, the header, framing, and the verifier's
+index audit and collected claims. For indexed input both checks judge
+`pbfhogg check --index --json` from its memoized stdout report and recorded
+exit and stderr. Each runs its output checks separately.
+
 ## Reference cache
 
 Completed reference executions are stored at
-`SCRATCH/tools/verify-reference/` (format 2). No pbfhogg output or verdict
-is cached: every comparison is decided again. The element comparison's OPL
-decodings are not cached across runs either: each is as large as its
-input, and publishing them filled a germany run's scratch; within a run
+`SCRATCH/tools/verify-reference/` (format 2). That cache holds reference
+executions and decoding summaries. Every comparison is decided again. The
+element comparison's OPL decodings stay within a run: each is as large as
+its input, and publishing them filled a germany run's scratch. Within a run
 they are reused under a budget ("Decoding reuse" above). What is kept
 across runs is a summary of each decoding ("Decoding summaries" below). A
 hit is shown as
@@ -847,6 +896,13 @@ membership; simple requires identical nodes and ways, and relations holding
 any direct node or way member in those sets. Relations present only in
 pbfhogg simple must have their first node or way member outside the sets,
 which explains osmium simple's omission. Shared element content must agree.
+Once the simple node and way sets agree, one ordered walk compares
+pbfhogg simple with osmium complete_ways and collects the node and way IDs
+from osmium simple. It reads each complete_ways relation's members during
+that walk and judges them against those IDs. The present-member listing
+contains the deletion lines for requested node and way members present in
+osmium simple, rendered without inline way coordinates as in the former
+removeid comparison. The verifier writes it directly from the OPL records.
 A polygon with multiple features, an open ring or an edge spanning more
 than 180 degrees is refused before launching either tool, since their
 interpretations differ. osmium extract matches IDs, way refs and members
@@ -874,7 +930,10 @@ compared with its own strategy's sequential extract. For complete-ways and
 smart the config route is the shared dependency engine and the sequential
 reference is the single-region ID-set engine. Its sequential extracts run
 buffered; `--direct-io` reaches config runs only. With polygons it also
-runs a mixed strip/polygon config per strategy. Adjacent strips share an inclusive edge, so a node on
+runs a mixed strip/polygon config per strategy. The run retains sequential
+decodings needed across the order scan or the two config comparisons until
+the strategy ends, even if their size exceeds the idle decoding budget.
+Adjacent strips share an inclusive edge, so a node on
 it belongs to both. This does not establish osmium membership. Fallback
 outputs equal the sequential reference by construction, so each config
 run's stderr must report the route the input header predicts: the

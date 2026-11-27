@@ -36,6 +36,7 @@
 //! because a block would be too large for the format is recorded as refused,
 //! never verified ([`Ran::TooLarge`]).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::opl_compare::{self, Merged, Policy};
+use crate::run::Source;
 
 /// pbfhogg's documented default `--elements-per-blob`, for repack and for
 /// degrade's decode path: the cap a run that omits the flag is held to.
@@ -74,9 +76,8 @@ pub(super) struct Input {
     /// but IDs out of order reads as not. The OPL scan detects grouping
     /// independently before deciding whether it needs to write a partition.
     pub standard: bool,
-    /// Every data blob carries indexdata, and both the verifier's own blob
-    /// decode and `check --index` found every claim true: its claims can
-    /// feed a layout prediction.
+    /// Every data blob carries indexdata. Each check judges `check --index`
+    /// before using the claims to predict layout.
     pub indexed: bool,
     /// Validated claims bucketed by kind, in file order within each kind.
     pub claims: [Vec<BlobClaim>; 3],
@@ -88,10 +89,65 @@ impl Input {
     }
 }
 
+/// Input observations shared by repack and degrade at the resolved path.
+/// Their verdict on the pbfhogg index report is made separately.
+#[derive(Default)]
+pub(crate) struct InputStore {
+    entries: HashMap<(PathBuf, Source), Rc<Input>>,
+}
+
 /// Read the input: osmium's counts and order, the header claims, the framing
 /// and, on an indexed input, `check --index`. A history header, or a claim
 /// its payload contradicts, is an error.
-pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Result<Input, Error> {
+pub(super) fn read_input(
+    harness: &mut Harness,
+    outdir: &Path,
+    pbf: &Path,
+) -> Result<Rc<Input>, Error> {
+    harness.checkpoint()?;
+    harness.run.watch(pbf)?;
+    harness.run.revalidate()?;
+    let key = (pbf.to_path_buf(), Source::of(pbf)?);
+    let input = if let Some(input) = harness.run.reencode_inputs.entries.get(&key) {
+        Rc::clone(input)
+    } else {
+        let input = Rc::new(read_input_facts(harness, outdir, pbf)?);
+        harness.run.revalidate()?;
+        harness.checkpoint()?;
+        harness
+            .run
+            .reencode_inputs
+            .entries
+            .insert(key, Rc::clone(&input));
+        input
+    };
+    if input.indexed {
+        let index = check_index(harness, outdir, "input", pbf, true)?;
+        if !index.passed {
+            return Err(Error::Failed(format!(
+                "pbfhogg check --index finds {} claims of {} false: its blob layout cannot be \
+                 predicted from them",
+                index.total_violations,
+                pbf.display()
+            )));
+        }
+    }
+    harness.msg(&format!(
+        "  input: {}, {}indexed, kinds {}grouped in order, sort claim {}, LocationsOnWays {}",
+        if input.info.strictly_ordered() {
+            "in strict order"
+        } else {
+            "not in strict order"
+        },
+        if input.indexed { "" } else { "not " },
+        if input.standard { "" } else { "not " },
+        input.sorted_claim,
+        input.locations
+    ));
+    Ok(input)
+}
+
+fn read_input_facts(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Result<Input, Error> {
     let info = fileinfo(
         harness,
         (pbf, Origin::Other),
@@ -130,17 +186,8 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
                 truth.shown.join("; ")
             )));
         }
-        let index = check_index(harness, outdir, "input", pbf)?;
-        if !index.passed {
-            return Err(Error::Failed(format!(
-                "pbfhogg check --index finds {} claims of {} false: its blob layout cannot be \
-                 predicted from them",
-                index.total_violations,
-                pbf.display()
-            )));
-        }
     }
-    let input = Input {
+    Ok(Input {
         path: pbf.to_path_buf(),
         sorted_claim: header.optional_sorted(),
         locations: header.optional_feature(LOCATIONS_ON_WAYS),
@@ -148,20 +195,7 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
         info,
         indexed,
         claims,
-    };
-    harness.msg(&format!(
-        "  input: {}, {}indexed, kinds {}grouped in order, sort claim {}, LocationsOnWays {}",
-        if input.info.strictly_ordered() {
-            "in strict order"
-        } else {
-            "not in strict order"
-        },
-        if input.indexed { "" } else { "not " },
-        if input.standard { "" } else { "not " },
-        input.sorted_claim,
-        input.locations
-    ));
-    Ok(input)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -191,20 +225,20 @@ struct IndexViolation {
 /// `pbfhogg check --index --json` of `pbf`, the report at
 /// `<stem>.check-index.json` in `outdir`. Exit 0 must come with a pass and 1
 /// with a failure; anything else is an error. Runs buffered: a comparator.
-pub(super) fn check_index(
+fn check_index(
     harness: &mut Harness,
     outdir: &Path,
     stem: &str,
     pbf: &Path,
+    share: bool,
 ) -> Result<IndexSection, Error> {
     let report = outdir.join(format!("{stem}.check-index.json"));
-    let captured = harness.pbfhogg(
-        PbfArgv::new("check")
-            .arg("--index")
-            .arg("--json")
-            .input(pbf),
-        &report,
-    )?;
+    let argv = PbfArgv::new("check")
+        .arg("--index")
+        .arg("--json")
+        .input(pbf);
+    let argv = if share { argv.memoized_stdout() } else { argv };
+    let captured = harness.pbfhogg(argv, &report)?;
     if !matches!(captured.code(), Some(0 | 1)) {
         harness.require_success(&captured, "pbfhogg check --index")?;
     }
@@ -267,7 +301,7 @@ fn judge_index(
         Verdict::from_pass(ok),
     );
     let stem = label.replace(' ', "-");
-    let index = check_index(harness, outdir, &stem, output)?;
+    let index = check_index(harness, outdir, &stem, output, false)?;
     let ok = index.passed && index.blobs_with_indexdata == index.blobs;
     harness.msg(&format!(
         "  {label}: check --index: {} of {} blobs indexed, {} violations {}",

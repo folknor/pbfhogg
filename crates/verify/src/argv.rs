@@ -15,12 +15,30 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::error::Error;
+use crate::producer::{Arg, IoMode, Key, Request};
+use crate::run::{Run, Source, suffix};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Memo {
+    Output,
+    Stdout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathArg {
+    Input,
+    Output,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PbfArgv {
     args: Vec<OsString>,
     inputs: Vec<PathBuf>,
     outputs: Vec<PathBuf>,
+    paths: Vec<(usize, PathArg)>,
     scratch: bool,
+    memo: Option<Memo>,
 }
 
 impl PbfArgv {
@@ -29,7 +47,9 @@ impl PbfArgv {
             args: vec![subcommand.into()],
             inputs: Vec::new(),
             outputs: Vec::new(),
+            paths: Vec::new(),
             scratch: false,
+            memo: None,
         }
     }
 
@@ -68,6 +88,7 @@ impl PbfArgv {
 
     /// A positional input path.
     pub(crate) fn input(mut self, path: &Path) -> Self {
+        self.paths.push((self.args.len(), PathArg::Input));
         self.args.push(path.into());
         self.inputs.push(path.to_path_buf());
         self
@@ -75,17 +96,15 @@ impl PbfArgv {
 
     /// `--output PATH`. Long flags only: pbfhogg has reassigned short
     /// letters between versions.
-    pub(crate) fn output(mut self, path: &Path) -> Self {
-        self.args.push("--output".into());
-        self.args.push(path.into());
-        self.outputs.push(path.to_path_buf());
-        self
+    pub(crate) fn output(self, path: &Path) -> Self {
+        self.output_flag("--output", path)
     }
 
     /// An output named by a command's own long flag (`--output-dir` of
     /// `build-geocode-index`), with the same staging effect as [`Self::output`].
     pub(crate) fn output_flag(mut self, flag: &str, path: &Path) -> Self {
         self.args.push(flag.into());
+        self.paths.push((self.args.len(), PathArg::Output));
         self.args.push(path.into());
         self.outputs.push(path.to_path_buf());
         self
@@ -102,6 +121,68 @@ impl PbfArgv {
             .first()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    /// Share a single file output. Every consumer must treat it as read-only.
+    pub(crate) fn memoized_output(mut self) -> Self {
+        self.memo = Some(Memo::Output);
+        self
+    }
+
+    /// Share a report written to stdout. Every consumer reads the report
+    /// and judges the recorded exit independently.
+    pub(crate) fn memoized_stdout(mut self) -> Self {
+        self.memo = Some(Memo::Stdout);
+        self
+    }
+
+    pub(crate) fn is_memoized(&self) -> bool {
+        self.memo.is_some()
+    }
+
+    pub(crate) fn request(&self, run: &mut Run, sink: &Path) -> Result<Option<Request>, Error> {
+        let Some(memo) = self.memo else {
+            return Ok(None);
+        };
+        let artifact: &Path = match (memo, self.outputs.as_slice()) {
+            (Memo::Output, [path]) => path,
+            (Memo::Stdout, []) => sink,
+            _ => return Err(Error::tool("a memoized producer must declare one artifact")),
+        };
+        if self.paths.len() != self.inputs.len() + self.outputs.len() {
+            return Err(Error::tool("a memoized producer cannot use indirect paths"));
+        }
+        let mut paths = self.paths.iter().peekable();
+        let mut io = IoMode::Buffered;
+        let mut args = Vec::with_capacity(self.args.len());
+        for (index, arg) in self.args.iter().enumerate() {
+            let kind = paths
+                .next_if(|(slot, _)| *slot == index)
+                .map(|(_, kind)| kind);
+            args.push(match kind {
+                Some(PathArg::Input) => {
+                    let path = Path::new(arg);
+                    run.watch(path)?;
+                    Arg::Input(Source::of(path)?)
+                }
+                Some(PathArg::Output) => Arg::Output(suffix(Path::new(arg))),
+                None => {
+                    if arg == "--direct-io" {
+                        io = IoMode::Direct;
+                    }
+                    Arg::Literal(arg.clone())
+                }
+            });
+        }
+        Ok(Some(Request {
+            key: Key {
+                executable: run.pbfhogg_digest.clone(),
+                args,
+                io,
+                scratch: self.scratch,
+            },
+            artifact: artifact.to_path_buf(),
+        }))
     }
 
     /// The final argv, with private directories under `private`: `staging`
@@ -126,9 +207,98 @@ impl PbfArgv {
     }
 }
 
+/// Buffered construction of an unindexed comparison input.
+pub(crate) fn strip_indexdata(input: &Path, output: &Path) -> PbfArgv {
+    PbfArgv::new("degrade")
+        .arg("--strip-indexdata")
+        .input(input)
+        .output(output)
+        .memoized_output()
+}
+
+/// The common apply invocation. Its caller adds any mode flags before
+/// opting into reuse of the read-only result.
+pub(crate) fn apply_changes(input: &Path, osc: &Path, output: &Path) -> PbfArgv {
+    PbfArgv::new("apply-changes")
+        .input(input)
+        .input(osc)
+        .output(output)
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn producer_keys_canonicalize_only_declared_paths() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let executable = dir.join("exe");
+        std::fs::write(&executable, b"first executable").unwrap();
+        let mut run = Run::create(dir, &executable, false).unwrap();
+        let input = dir.join("base.osm.pbf");
+        let osc = dir.join("changes.osc.gz");
+        std::fs::write(&input, b"base").unwrap();
+        std::fs::write(&osc, b"changes").unwrap();
+        let input_alias = dir.join("alias.osm.pbf");
+        let osc_alias = dir.join("alias.osc.gz");
+        let wrong_format = dir.join("alias.osc");
+        std::fs::hard_link(&input, &input_alias).unwrap();
+        std::fs::hard_link(&osc, &osc_alias).unwrap();
+        std::fs::hard_link(&osc, &wrong_format).unwrap();
+        let other_osc = dir.join("other.osc.gz");
+        std::fs::write(&other_osc, b"changes").unwrap();
+        let sink = dir.join("stdout");
+        let out = dir.join("out.osm.pbf");
+        let other_out = dir.join("another.osm.pbf");
+
+        let key = |run: &mut Run, argv: PbfArgv| {
+            argv.memoized_output()
+                .request(run, &sink)
+                .unwrap()
+                .unwrap()
+                .key
+        };
+        let buffered = key(&mut run, apply_changes(&input, &osc, &out));
+        assert_eq!(
+            buffered,
+            key(
+                &mut run,
+                apply_changes(&input_alias, &osc_alias, &other_out)
+            )
+        );
+        assert_ne!(
+            buffered,
+            key(&mut run, apply_changes(&input, &other_osc, &out))
+        );
+        assert_ne!(
+            buffered,
+            key(&mut run, apply_changes(&input, &wrong_format, &out))
+        );
+        let direct = key(
+            &mut run,
+            apply_changes(&input, &osc, &out).arg("--direct-io"),
+        );
+        assert_ne!(buffered, direct);
+        assert_eq!(direct.io, IoMode::Direct);
+        let literal = PbfArgv::new("apply-changes")
+            .input(&input)
+            .arg(osc.as_os_str())
+            .output(&out);
+        assert_ne!(buffered, key(&mut run, literal));
+        assert_ne!(
+            buffered,
+            key(&mut run, apply_changes(&input, &osc, &dir.join("out.pbf")))
+        );
+
+        std::fs::write(&executable, b"another executable").unwrap();
+        let mut other_run = Run::create(dir, &executable, false).unwrap();
+        assert_ne!(
+            buffered,
+            key(&mut other_run, apply_changes(&input, &osc, &out))
+        );
+    }
 
     #[test]
     fn outputs_get_staging_and_declared_scratch_gets_tmp() {

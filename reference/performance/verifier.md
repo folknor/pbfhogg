@@ -1,5 +1,35 @@
 # pbfhogg-verify
 
+## Shared producers and extract comparison reuse (bygg, `5a8af88b` working trees)
+
+The run-local single-flight memo keys shared pbfhogg producers by executable
+digest, canonical argv with input identities, and I/O mode. The harness
+replays the read-only artifact, exit status and exact stderr. Buffered and
+direct I/O runs have separate keys, and check-ids builds the fixture it
+mutates privately. The suite groups check-ids, repack, degrade, apply-changes,
+diff and diff --format osc so they can reuse shared prerequisites.
+
+One ordered walk over pbfhogg simple, osmium simple and osmium complete-ways
+settles simple relations and collects present members. This removes the
+`osmium removeid` and relation-only `osmium cat` runs. Multi-extract reuses its
+sequential decodings across the order check and config comparisons.
+
+Denmark `verify all` on bygg, with a warm reference cache and one run per arm.
+The previous tree was `5a8af88b` plus the round-six experiments. The new arm
+was the working tree on `5a8af88b` with both verifier changes.
+
+| Check | Previous tree on `5a8af88b` (bygg, run `1795782681`) | New tree on `5a8af88b` (bygg, run `1795788522`) |
+|---|---|---|
+| Suite | 4m06s, 25 of 25 PASS | 3m39s, 25 of 25 PASS |
+| `getid-removeid` | 10.2 s | 0.8 s |
+| `diff --format osc` | 21.5 s | 11.7 s |
+| `extract` | 2.4 s | 2.1 s |
+| `sort` | 8.1 s | 0.4 s |
+
+The previous run had an uncached osmium sort. Reference cache reuse accounts
+for the sort difference. The suite walls include that cache effect and the
+pair does not isolate the effect of either verifier change.
+
 ## Frame audit reuse and cold equality scans (bygg, 2026-11-26, `876d9dd7` against `6808a7c1`)
 
 Frame audits are reused per file identity within a run, and a cold

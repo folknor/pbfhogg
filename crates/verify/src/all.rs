@@ -42,10 +42,6 @@ fn comparable_bbox(bbox: &pbfhogg_devkit::Bbox) -> Result<(), Error> {
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one line per check in suite order; splitting it would hide the order"
-)]
 pub(crate) fn run(
     h: &mut Harness,
     pbf: &Path,
@@ -109,6 +105,20 @@ pub(crate) fn run(
     counts.add(h.run_check("check-ids", |h| checks::check_ids::run(h, pbf, direct_io))?);
     counts.add(h.run_check("repack", |h| checks::repack::run(h, pbf, direct_io))?);
     counts.add(h.run_check("degrade", |h| checks::degrade::run(h, pbf, direct_io))?);
+    // Text diff can build a missing strip alongside its indexed diffs.
+    if let Some(osc) = osc {
+        counts.add(h.run_check("apply-changes", |h| {
+            checks::apply_changes::run(h, pbf, osc, direct_io, false)
+        })?);
+        counts.add(h.run_check("diff", |h| checks::diff::run(h, pbf, osc, direct_io))?);
+        counts.add(h.run_check("diff --format osc", |h| {
+            checks::derive_changes::run(h, pbf, osc, direct_io)
+        })?);
+    } else {
+        counts.skip("apply-changes", "no OSC configured");
+        counts.skip("diff", "no OSC configured");
+        counts.skip("diff --format osc", "no OSC configured");
+    }
     match locations_base {
         Ok(base) => counts.add(h.run_check("degrade -l", |h| {
             checks::degrade::run_locations(h, base, direct_io)
@@ -116,9 +126,6 @@ pub(crate) fn run(
         Err(why) => counts.skip("degrade -l", why),
     }
     if let Some(osc) = osc {
-        counts.add(h.run_check("apply-changes", |h| {
-            checks::apply_changes::run(h, pbf, osc, direct_io, false)
-        })?);
         match locations_base {
             Ok(base) => counts.add(h.run_check("apply-changes -l", |h| {
                 checks::apply_changes::run(h, base, osc, direct_io, true)
@@ -126,7 +133,6 @@ pub(crate) fn run(
             Err(why) => counts.skip("apply-changes -l", why),
         }
     } else {
-        counts.skip("apply-changes", "no OSC configured");
         counts.skip("apply-changes -l", "no OSC configured");
     }
     if let Some(osc) = osc {
@@ -140,21 +146,9 @@ pub(crate) fn run(
         counts.skip("merge-changes", "no OSC configured");
         counts.skip("tags-filter --input-kind osc", "no OSC configured");
     }
-    if let Some(osc) = osc {
-        counts.add(h.run_check("diff --format osc", |h| {
-            checks::derive_changes::run(h, pbf, osc, direct_io)
-        })?);
-    } else {
-        counts.skip("diff --format osc", "no OSC configured");
-    }
     counts.add(h.run_check("renumber", |h| {
         checks::renumber::run(h, pbf, "input", None, true, direct_io)
     })?);
-    if let Some(osc) = osc {
-        counts.add(h.run_check("diff", |h| checks::diff::run(h, pbf, osc, direct_io))?);
-    } else {
-        counts.skip("diff", "no OSC configured");
-    }
     output::result(&banner(&counts, start.elapsed()));
     Ok(counts)
 }

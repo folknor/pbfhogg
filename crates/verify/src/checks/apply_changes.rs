@@ -87,10 +87,7 @@ pub fn run(
     }
 
     let pbfhogg_out = outdir.join("pbfhogg.osm.pbf");
-    let pbfhogg_args = PbfArgv::new("apply-changes")
-        .input(pbf)
-        .input(osc)
-        .output(&pbfhogg_out)
+    let pbfhogg_args = crate::argv::apply_changes(pbf, osc, &pbfhogg_out)
         .arg_if(direct_io, "--direct-io")
         .arg_if(locations_on_ways, "--locations-on-ways");
 
@@ -109,6 +106,7 @@ pub fn run(
         );
     }
 
+    let pbfhogg_args = pbfhogg_args.memoized_output();
     let model = read_model(harness, pbf, osc, &outdir)?;
     if let Some(why) = model.refusal() {
         return expect_version_refusal(harness, pbfhogg_args, &pbfhogg_out, &why);

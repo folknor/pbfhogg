@@ -13,6 +13,7 @@
 //! stamp turns the check into an environment outcome. That detects ordinary
 //! external replacement; concurrent namespace manipulation by a process that
 //! does not hold the lock is unsupported.
+use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ use crate::tunables;
 /// copy of each such artifact before it could be watched. The verifier is a
 /// local single-user tool, so a same-size rewrite that leaves mtime equal is
 /// outside what it defends against, the same stamp policy cache lookups use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Stamp {
     dev: u64,
     ino: u64,
@@ -42,7 +43,7 @@ pub(crate) fn stamp(path: &Path) -> Result<Stamp, Error> {
 }
 
 impl Stamp {
-    fn of(meta: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         Self {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -50,6 +51,38 @@ impl Stamp {
             mtime: (meta.mtime(), meta.mtime_nsec()),
         }
     }
+}
+
+/// Run-local file identity together with the name text that selects a
+/// reader. Hard links can share it without rereading the file to hash it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Source {
+    stamp: Stamp,
+    format: OsString,
+}
+
+impl Source {
+    pub(crate) fn of(path: &Path) -> Result<Self, Error> {
+        Ok(Self {
+            stamp: stamp(path)?,
+            format: suffix(path),
+        })
+    }
+
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.stamp.size
+    }
+}
+
+/// Everything from the first dot, or the whole name if it has no dot.
+pub(crate) fn suffix(path: &Path) -> OsString {
+    use std::os::unix::ffi::OsStrExt;
+    let name = path.file_name().unwrap_or_default().as_bytes();
+    let suffix = name
+        .iter()
+        .position(|&b| b == b'.')
+        .map_or(name, |i| &name[i..]);
+    std::ffi::OsStr::from_bytes(suffix).to_os_string()
 }
 
 pub(crate) struct Run {
@@ -66,8 +99,10 @@ pub(crate) struct Run {
     /// The run's retained OPL decodings, in `RUN/decodings/`: owned by the
     /// run, so no other run ever reads them.
     pub(crate) decodings: crate::opl_compare::Decodings,
+    pub(crate) producers: crate::producer::Producers,
     /// Expected OPL projections shared by the re-encoding checks.
     pub(crate) reencode_references: crate::verify_reencode::ReferenceStore,
+    pub(crate) reencode_inputs: crate::verify_reencode::InputStore,
     pub(crate) frames: crate::verify_reencode::FrameStore,
     keep: bool,
 }
@@ -93,7 +128,9 @@ impl Run {
             inputs: Vec::new(),
             digests: std::collections::HashMap::new(),
             decodings: crate::opl_compare::Decodings::default(),
+            producers: crate::producer::Producers::default(),
             reencode_references: crate::verify_reencode::ReferenceStore::default(),
+            reencode_inputs: crate::verify_reencode::InputStore::default(),
             frames: crate::verify_reencode::FrameStore::default(),
             keep,
         })

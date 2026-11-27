@@ -16,6 +16,7 @@ use crate::opl_compare::{self, Operand, Policy};
 use crate::output::{self, Detail};
 use crate::pbf_frames::Origin;
 use crate::process::{Ended, Launch, Lifecycle};
+use crate::producer::Batch;
 use crate::reference::{ToolRun, Tools};
 use crate::run::Run;
 use crate::{pbf_frames, stream, tunables};
@@ -124,6 +125,7 @@ pub(crate) struct Harness {
     launches: u64,
     /// The check in flight's directory.
     check_dir: Option<PathBuf>,
+    check_name: String,
 }
 
 impl Harness {
@@ -144,6 +146,7 @@ impl Harness {
             steps: Vec::new(),
             launches: 0,
             check_dir: None,
+            check_name: String::new(),
         }
     }
 
@@ -228,6 +231,12 @@ impl Harness {
     /// the file `sink`.
     /// The exit status is the caller's to judge.
     pub(crate) fn pbfhogg(&mut self, argv: PbfArgv, sink: &Path) -> Result<Ended, Error> {
+        if argv.is_memoized() {
+            return self
+                .pbfhogg_group(vec![(argv, sink.to_path_buf())])?
+                .pop()
+                .ok_or_else(|| Error::tool("a pbfhogg launch group of one ended empty"));
+        }
         let label = format!("pbfhogg {}", argv.subcommand());
         let private = self.private_dir("pbfhogg")?;
         let (args, dirs) = argv.finish(&private);
@@ -248,17 +257,53 @@ impl Harness {
         ended
     }
 
-    /// Run pbfhogg CLI invocations together as one launch group
-    /// (`Lifecycle::run_group`), each with its standard output in its own
-    /// sink and its own private directory, and hand back every exit, in
-    /// member order, only once the whole group settled. The members must
-    /// write disjoint files and never read each other's outputs. A group
-    /// abort (a failed start, an overflow, an adoption, a moved input) is the
-    /// error of the whole group, so a caller judges earlier groups before
-    /// starting a later one. Inputs are observed at each member's exit and
-    /// again after settlement. The wall is recorded once per label, every
-    /// launch counted. At most `tunables::PBFHOGG_GROUP` members.
+    /// Run the misses and unshared members as one launch group. Return every
+    /// exit in caller order after settlement, including the recorded exits
+    /// of memo hits. Members write disjoint files and never read one
+    /// another's outputs.
     pub(crate) fn pbfhogg_group(
+        &mut self,
+        members: Vec<(PbfArgv, PathBuf)>,
+    ) -> Result<Vec<Ended>, Error> {
+        if !members.iter().any(|(argv, _)| argv.is_memoized()) {
+            return self.launch_pbfhogg_group(members);
+        }
+        self.checkpoint()?;
+        let mut batch = Batch::default();
+        let mut launches = Vec::new();
+        for (argv, sink) in members {
+            let request = argv.request(&mut self.run, &sink)?;
+            if batch.reserve(request, &self.run.producers) {
+                launches.push((argv, sink));
+            }
+        }
+        self.run.revalidate()?;
+        let ended = if launches.is_empty() {
+            self.checkpoint()?;
+            Vec::new()
+        } else {
+            self.launch_pbfhogg_group(launches)?
+        };
+        let outcomes = batch.settled(&mut self.run.producers, &self.check_name, ended)?;
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| {
+                if let Some(reuse) = outcome.reuse {
+                    self.msg(&format!(
+                        "  reusing producer from {}: {}",
+                        reuse.builder,
+                        reuse.artifact.display()
+                    ));
+                }
+                outcome.ended
+            })
+            .collect())
+    }
+
+    /// A group abort is the error of the whole group. Inputs are observed
+    /// at each member's exit and again after settlement. Record wall time
+    /// once per label and count every launch.
+    fn launch_pbfhogg_group(
         &mut self,
         members: Vec<(PbfArgv, PathBuf)>,
     ) -> Result<Vec<Ended>, Error> {
@@ -356,13 +401,8 @@ impl Harness {
 
     /// Buffered construction of an unindexed comparison input.
     pub(crate) fn strip_indexdata(&mut self, input: &Path, output: &Path) -> Result<(), Error> {
-        let ended = self.pbfhogg_discard(
-            PbfArgv::new("degrade")
-                .arg("--strip-indexdata")
-                .input(input)
-                .output(output),
-        )?;
-        self.require_success(&ended, "pbfhogg degrade --strip-indexdata")
+        let ended = self.pbfhogg_discard(crate::argv::strip_indexdata(input, output))?;
+        self.require_output(&ended, "pbfhogg degrade --strip-indexdata", output)
     }
 
     /// Whether `pbf`'s header declares `Sort.Type_then_ID`, read by the
@@ -650,6 +690,27 @@ impl Harness {
         )))
     }
 
+    /// Require a successful exit and its file before it becomes an input to
+    /// another launch, whose input watcher would report absence as a move.
+    pub(crate) fn require_output(
+        &self,
+        ended: &Ended,
+        program: &str,
+        output: &Path,
+    ) -> Result<(), Error> {
+        self.require_success(ended, program)?;
+        match output.symlink_metadata() {
+            Ok(meta) if meta.is_file() => return Ok(()),
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(Error::tool(format!("{}: {e}", output.display()))),
+        }
+        Err(Error::Failed(format!(
+            "{program} exited successfully without a regular output at {}",
+            output.display()
+        )))
+    }
+
     /// Require an explicitly accepted answer, including a diff's exit 1.
     pub(crate) fn require_codes(
         &self,
@@ -721,20 +782,6 @@ impl Harness {
         let (ordered, counts) = opl_compare::order_as(self, pbf, cold)?;
         let scan = opl_compare::Scan { ordered, counts };
         Ok(self.report_order(label, pbf.0, scan))
-    }
-
-    /// The same order verdict and osmium's counts from the same reading.
-    pub(crate) fn check_sorted_counted(
-        &mut self,
-        label: &str,
-        pbf: Operand<'_>,
-    ) -> Result<(Verdict, crate::counts::Counts), Error> {
-        let (ordered, counts) = opl_compare::order(self, pbf)?;
-        let scan = opl_compare::Scan { ordered, counts };
-        Ok((
-            self.report_order(label, pbf.0, scan),
-            counts_of(scan.counts),
-        ))
     }
 
     /// Print `label`'s counts and order verdict from `scan`, a reading of
@@ -854,6 +901,7 @@ impl Harness {
         self.failures.clear();
         self.steps.clear();
         self.check_dir = None;
+        self.check_name = name.to_owned();
         let result = check(self);
         let validation = self.run.revalidate();
         let result = match result {

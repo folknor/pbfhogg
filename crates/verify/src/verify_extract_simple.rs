@@ -1,180 +1,307 @@
-//! Verify extract: simple's relation membership, judged against osmium's
-//! complete_ways output.
+//! Verify extract's simple relation rule using osmium's complete_ways output.
 //!
-//! pbfhogg's simple writes a relation when any direct node member is in its
-//! node set or any direct way member in its way set; osmium's simple decides
-//! on the first node or way member only. So pbfhogg simple's relations are
-//! not osmium simple's, and equal relation sets would not even prove pbfhogg
-//! right (a regression to osmium's rule would pass). The expected set is
-//! built instead from a reference that holds every candidate: osmium's
-//! complete_ways output holds every relation matched by the same node and
-//! way sets (the inside nodes and the ways with one of them, which simple's
-//! node/way gate has already proven equal between the tools), plus their
-//! parent relations. A relation of it belongs in simple exactly when one of
-//! its direct node or way members is in simple's sets.
-//!
-//! The steps, each a reference run or an element diff of osmium's decodings
-//! ([`crate::opl_compare`]):
-//! - the relations of osmium's complete_ways output as OPL
-//!   (`osmium cat -t relation -f opl`), read by [`crate::verify_opl`], whose
-//!   record count must equal the relation count osmium fileinfo gave that
-//!   output;
-//! - which of their node and way members simple's sets hold: `osmium
-//!   removeid` drops all of them from osmium's simple output, and an element
-//!   diff from that output to the result lists exactly the ones present, as
-//!   deletes (anything else in it is an error);
-//! - an element diff from pbfhogg's simple output to osmium's
-//!   complete_ways output: simple is a subset of complete_ways in every kind,
-//!   so an element only pbfhogg holds is a FAIL, and a content difference is
-//!   a FAIL for every element pbfhogg's simple writes, including the
-//!   relations osmium's simple omits; the relations it creates are the
-//!   complete_ways relations simple left out;
-//! - per complete_ways relation, in or out of pbfhogg's simple output must
-//!   match the rule, and every relation only pbfhogg's simple holds must have
-//!   its first node or way member outside simple's sets, the documented
-//!   reason osmium's simple omits it.
+//! Complete_ways holds the candidates: every relation matched by the same
+//! nodes and ways as simple, plus their parent relations. Once the simple
+//! node and way sets agree, a candidate belongs in pbfhogg simple exactly
+//! when one of its direct node or way members is in osmium simple. For a
+//! pbfhogg-only relation, osmium's first node or way member must be absent.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 use crate::harness::Harness;
-use crate::osc::{OscAction, OscKind};
-use crate::reference::ToolRun;
-use crate::verify_element_diff::{self as element_diff, PerType};
-use crate::verify_opl::{self as opl, OplRelation};
+use crate::opl_compare::{self, Class, Merged, Policy, Stream, rank};
+use crate::osc::OscKind;
+use crate::pbf_frames::Origin;
+use crate::reference_cache::Summary;
+use crate::verify_element_diff::PerType;
+use crate::verify_opl::{OplRelation, parse_relation};
 
-/// What the adjudication reads: simple's outputs as compared, osmium's
-/// complete_ways output with osmium's relation count of it, and the full,
-/// sorted, distinct IDs of the relations only pbfhogg's simple holds.
+/// The simple comparison has already judged order and established that
+/// both simple outputs hold the same node and way IDs.
 pub(super) struct SimpleRelations<'a> {
-    /// The arm's label in failures, `pbfhogg extract --simple` and the
-    /// region it ran on.
     pub label: &'a str,
     pub outdir: &'a Path,
     pub pbfhogg_simple: &'a Path,
-    /// Who wrote `pbfhogg_simple`: pbfhogg, or osmium sorting it.
-    pub pbfhogg_simple_origin: crate::pbf_frames::Origin,
+    pub pbfhogg_simple_origin: Origin,
     pub osmium_simple: &'a Path,
     pub osmium_complete: &'a Path,
     pub complete_relations: u64,
     pub pbfhogg_only: &'a [i64],
 }
 
-/// Judge pbfhogg simple's relation membership; failures land in the harness,
-/// a comparison that could not be made is an error.
 pub(super) fn adjudicate(harness: &mut Harness, input: &SimpleRelations<'_>) -> Result<(), Error> {
     harness.msg(&format!(
         "=== verify {} relations against osmium complete_ways ===",
         input.label.trim_start_matches("pbfhogg ")
     ));
-    let (relations, records, requested) = candidate_relations(harness, input)?;
-    let present = present_members(harness, input.outdir, input.osmium_simple, &requested)?;
-    let left_out = simple_vs_complete(harness, input)?;
-    let judged = judge_relations(input, &relations, records, &left_out, &present)?;
-    judged.report(harness, input.label, records, input.pbfhogg_only.len());
-    Ok(())
-}
-
-/// osmium's complete_ways relations as OPL, their record count checked
-/// against osmium fileinfo's, and every node and way they reference.
-fn candidate_relations(
-    harness: &mut Harness,
-    input: &SimpleRelations<'_>,
-) -> Result<(PathBuf, u64, Typed), Error> {
-    let outdir = input.outdir;
-    let relations = outdir.join("osmium-complete-relations.opl");
-    let captured = harness.reference(
-        &ToolRun::osmium("extract-relations.1")
-            .arg("cat")
-            .input(input.osmium_complete, crate::pbf_frames::Origin::Other)
-            .args(&["-t", "relation", "-f", "opl", "-o"])
-            .output(&relations)
-            .arg("--overwrite"),
-        &outdir.join("osmium-complete-relations.stdout"),
-    )?;
-    harness.require_success(&captured, "osmium cat -t relation")?;
-
-    let mut requested = Typed::default();
-    let records = opl::scan_relations(&relations, |r| {
-        for &(kind, id) in &r.members {
-            requested.push(kind, id);
+    let ours = (input.pbfhogg_simple, input.pbfhogg_simple_origin);
+    let complete = (input.osmium_complete, Origin::Other);
+    let policy = Policy::between(ours, complete)?;
+    let sides = [
+        (ours, policy),
+        (complete, policy),
+        // The old removeid PBF writer dropped the locations declaration.
+        // Its comparison therefore printed deletions without way locations.
+        ((input.osmium_simple, Origin::Other), Policy::NO_LOCATIONS),
+    ];
+    let listings = Listings::new(input.outdir);
+    let result = opl_compare::with_decodings(harness, &sides, |h, held| {
+        let paths = [held[0].as_path(), held[1].as_path(), held[2].as_path()];
+        let (compared, summaries) = h.timed("opl merge", || {
+            compare(paths, &listings, input.pbfhogg_only)
+        })?;
+        if compared.records != input.complete_relations {
+            return Err(Error::Failed(format!(
+                "{} holds {} relation records, but osmium fileinfo counted {} relations in {}",
+                listings.relations.display(),
+                compared.records,
+                input.complete_relations,
+                input.osmium_complete.display()
+            )));
         }
+        if let Some(members) = &compared.present {
+            opl_compare::log_merge(h, &listings.present, members);
+        }
+        opl_compare::publish_extract_merge(h, paths, &summaries)?;
+        opl_compare::log_merge(h, &listings.comparison, &compared.merged);
+        Ok((compared, false))
     })?;
-    if records != input.complete_relations {
-        return Err(Error::Failed(format!(
-            "{} holds {records} relation records, but osmium fileinfo counted {} relations in {}",
-            relations.display(),
-            input.complete_relations,
-            input.osmium_complete.display()
-        )));
-    }
-    requested.sort_distinct();
-    // osmium removeid refuses negative IDs, so the presence of such a member
-    // cannot be asked; that is a comparison that cannot be made, never an
-    // absence. The limit is osmium's: pbfhogg selects negative IDs exactly.
-    if let Some((kind, id)) = requested.first_negative() {
-        return Err(Error::Tool(format!(
-            "osmium's complete_ways relations reference {kind} {id}; osmium removeid cannot look \
-             up a negative ID, so simple's relations cannot be judged"
-        )));
-    }
-    Ok((relations, records, requested))
+    result.report(harness, input)
 }
 
-/// Diff pbfhogg's simple output against osmium's complete_ways output: an
-/// element only simple holds and a content difference are failures; returns
-/// the complete_ways relations simple left out, sorted.
-fn simple_vs_complete(
-    harness: &mut Harness,
-    input: &SimpleRelations<'_>,
-) -> Result<Vec<i64>, Error> {
-    let outdir = input.outdir;
-    let mut only_simple = PerType::default();
-    let mut content = PerType::default();
-    let mut left_out = Vec::new();
-    let policy = crate::opl_compare::Policy::between(
-        (input.pbfhogg_simple, input.pbfhogg_simple_origin),
-        (input.osmium_complete, crate::pbf_frames::Origin::Other),
-    )?;
-    element_diff::scan_element_diff(
-        harness,
-        (input.pbfhogg_simple, input.pbfhogg_simple_origin),
-        (input.osmium_complete, crate::pbf_frames::Origin::Other),
-        &outdir.join("pbfhogg-simple-vs-osmium-complete.diff.txt"),
-        policy,
-        |action, kind, id| match (action, kind) {
-            (OscAction::Delete, _) => only_simple.add(kind, id),
-            (OscAction::Modify, _) => content.add(kind, id),
-            (OscAction::Create, OscKind::Relation) => left_out.push(id),
-            (OscAction::Create, _) => {}
+struct Listings {
+    comparison: PathBuf,
+    relations: PathBuf,
+    ids: PathBuf,
+    present: PathBuf,
+}
+
+impl Listings {
+    fn new(outdir: &Path) -> Self {
+        Self {
+            comparison: outdir.join("pbfhogg-simple-vs-osmium-complete.diff.txt"),
+            relations: outdir.join("osmium-complete-relations.opl"),
+            ids: outdir.join("complete-relation-members.ids"),
+            present: outdir.join("osmium-simple-present-members.diff.txt"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Compared {
+    merged: Merged,
+    present: Option<Merged>,
+    only_simple: PerType,
+    content: PerType,
+    records: u64,
+    pbfhogg_only_met: usize,
+    judged: Judged,
+}
+
+impl Compared {
+    fn report(&self, harness: &mut Harness, input: &SimpleRelations<'_>) -> Result<(), Error> {
+        let label = input.label;
+        if self.only_simple.total() > 0 {
+            self.only_simple
+                .print("FAIL ", "in simple but not in complete_ways", |line| {
+                    harness.msg(line);
+                });
+            harness.fail(format!(
+                "{label} holds {} elements osmium's complete_ways omits",
+                self.only_simple.total()
+            ));
+        }
+        if self.content.total() > 0 {
+            self.content
+                .print("FAIL ", "content differs from complete_ways", |line| {
+                    harness.msg(line);
+                });
+            harness.fail(format!(
+                "{label} element content differs from osmium's complete_ways on {} IDs",
+                self.content.total()
+            ));
+        }
+        if self.pbfhogg_only_met != input.pbfhogg_only.len() {
+            return Err(Error::Failed(format!(
+                "{} of the {} relations only pbfhogg's simple holds are not in osmium's \
+                 complete_ways output, yet the simple vs complete_ways diff deleted none",
+                input.pbfhogg_only.len() - self.pbfhogg_only_met,
+                input.pbfhogg_only.len()
+            )));
+        }
+        self.judged
+            .report(harness, label, self.records, input.pbfhogg_only.len());
+        Ok(())
+    }
+}
+
+/// Walk the three decodings in object order. By the first candidate
+/// relation, the third cursor has seen every node and way in osmium simple.
+/// The index also keeps their OPL offsets for the deletion listing, so only
+/// the records the listing needs are read back.
+fn compare(
+    [ours, complete, simple]: [&Path; 3],
+    listings: &Listings,
+    pbfhogg_only: &[i64],
+) -> Result<(Compared, [Summary; 3]), Error> {
+    let mut simple = SimpleMembers::open(simple)?;
+    let mut relations = BufWriter::new(File::create(&listings.relations)?);
+    let mut requested = [Vec::new(), Vec::new()];
+    let mut result = Compared::default();
+    let (merged, [ours, complete]) = opl_compare::merge_observed(
+        Stream::open(ours)?,
+        Stream::open(complete)?,
+        &listings.comparison,
+        true,
+        |group| {
+            let kind = [OscKind::Node, OscKind::Way, OscKind::Relation][group.kind];
+            match group.class {
+                Class::FirstOnly => result.only_simple.add(kind, group.id),
+                Class::Differs => result.content.add(kind, group.id),
+                Class::SecondOnly => {}
+            }
+        },
+        |key, ours, complete| {
+            simple.advance_through(key)?;
+            if key.0 == OscKind::Relation.index()
+                && let Some(line) = complete
+            {
+                let relation = parse_relation(line).map_err(|why| {
+                    Error::Failed(format!(
+                        "OPL {} record {}: {why}",
+                        listings.relations.display(),
+                        result.records + 1
+                    ))
+                })?;
+                relations.write_all(line)?;
+                relations.write_all(b"\n")?;
+                result.records += 1;
+                for &(kind, id) in &relation.members {
+                    if let Some(ids) = requested.get_mut(kind.index()) {
+                        ids.push(id);
+                    }
+                }
+                let only = pbfhogg_only.binary_search(&relation.id).is_ok();
+                result.pbfhogg_only_met += usize::from(only);
+                result
+                    .judged
+                    .observe(&relation, &simple, ours.is_some(), only);
+            }
+            Ok(())
         },
     )?;
-    left_out.sort_unstable();
-    if left_out.windows(2).any(|w| w[0] == w[1]) {
-        return Err(Error::Failed(
-            "the simple vs complete_ways diff created one relation twice".into(),
-        ));
+    relations.flush()?;
+    simple.advance_through((OscKind::Relation.index(), i64::MAX))?;
+    let summary = simple.stream.summary();
+    result.present = simple.write_present(requested, listings, summary.counts)?;
+    result.merged = merged;
+    Ok((result, [ours, complete, summary]))
+}
+
+/// Sorted by kind and osmium ID order, with byte offsets into the simple
+/// decoding. A relation member never selects another relation into simple.
+struct SimpleMembers<'a> {
+    path: &'a Path,
+    stream: Stream,
+    key: Option<(usize, i64)>,
+    offset: u64,
+    positions: [Vec<(i64, u64)>; 2],
+}
+
+impl<'a> SimpleMembers<'a> {
+    fn open(path: &'a Path) -> Result<Self, Error> {
+        let mut stream = Stream::open(path)?;
+        let key = stream.next()?;
+        Ok(Self {
+            path,
+            stream,
+            key,
+            offset: 0,
+            positions: [Vec::new(), Vec::new()],
+        })
     }
-    let label = input.label;
-    if only_simple.total() > 0 {
-        only_simple.print("FAIL ", "in simple but not in complete_ways", |line| {
-            harness.msg(line);
-        });
-        harness.fail(format!(
-            "{label} holds {} elements osmium's complete_ways omits",
-            only_simple.total()
-        ));
+
+    fn advance_through(&mut self, through: (usize, i64)) -> Result<(), Error> {
+        let through = rank(through);
+        while let Some(key @ (kind, id)) = self.key
+            && rank(key) <= through
+        {
+            if let Some(records) = self.positions.get_mut(kind) {
+                records.push((id, self.offset));
+            }
+            self.offset += (self.stream.line().len() + 1) as u64;
+            self.key = self.stream.next()?;
+        }
+        Ok(())
     }
-    if content.total() > 0 {
-        content.print("FAIL ", "content differs from complete_ways", |line| {
-            harness.msg(line);
-        });
-        harness.fail(format!(
-            "{label} element content differs from osmium's complete_ways on {} IDs",
-            content.total()
-        ));
+
+    fn position(&self, kind: usize, id: i64) -> Option<u64> {
+        let records = self.positions.get(kind)?;
+        let index = records
+            .binary_search_by_key(&rank((kind, id)), |&(id, _)| rank((kind, id)))
+            .ok()?;
+        Some(records[index].1)
     }
-    Ok(left_out)
+
+    fn has(&self, kind: OscKind, id: i64) -> bool {
+        self.position(kind.index(), id).is_some()
+    }
+
+    /// Reproduce the old removeid diff's deletion lines. The sign gates
+    /// already refused negative input IDs and negative output references.
+    fn write_present(
+        &self,
+        requested: [Vec<i64>; 2],
+        listings: &Listings,
+        counts: [u64; 3],
+    ) -> Result<Option<Merged>, Error> {
+        if requested.iter().all(Vec::is_empty) {
+            return Ok(None);
+        }
+        let mut ids_file = BufWriter::new(File::create(&listings.ids)?);
+        let mut out = BufWriter::new(File::create(&listings.present)?);
+        let mut opl =
+            BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, File::open(self.path)?);
+        let mut record = Vec::new();
+        let mut cursor = 0;
+        let mut merged = Merged {
+            first: counts,
+            second: counts,
+            ..Merged::default()
+        };
+        for (kind, (prefix, mut ids)) in ["n", "w"].into_iter().zip(requested).enumerate() {
+            ids.sort_unstable_by_key(|&id| rank((kind, id)));
+            ids.dedup();
+            for id in ids {
+                writeln!(ids_file, "{prefix}{id}")?;
+                if let Some(offset) = self.position(kind, id) {
+                    let skip =
+                        i64::try_from(offset - cursor).map_err(|e| Error::tool(e.to_string()))?;
+                    opl.seek_relative(skip)?;
+                    record.clear();
+                    opl.read_until(b'\n', &mut record)?;
+                    if !record.ends_with(b"\n") {
+                        return Err(Error::Failed(format!(
+                            "cannot read listed record at byte {offset} in {}",
+                            self.path.display()
+                        )));
+                    }
+                    out.write_all(b"-")?;
+                    out.write_all(&record)?;
+                    cursor = offset + record.len() as u64;
+                    merged.first_only += 1;
+                    merged.second[kind] -= 1;
+                }
+            }
+        }
+        ids_file.flush()?;
+        out.flush()?;
+        merged.same = merged.second.iter().sum();
+        Ok(Some(merged))
+    }
 }
 
 /// Each complete_ways relation against simple's rule, and each relation only
@@ -192,62 +319,26 @@ struct Judged {
     unexplained: PerType,
 }
 
-/// Read the OPL relations again and judge each; an inventory that does not
-/// account for every relation the diffs named is an error.
-fn judge_relations(
-    input: &SimpleRelations<'_>,
-    relations: &Path,
-    records: u64,
-    left_out: &[i64],
-    present: &Typed,
-) -> Result<Judged, Error> {
-    let mut judged = Judged::default();
-    let mut left_out_met = 0;
-    let mut pbfhogg_only_met = 0;
-    let second = opl::scan_relations(relations, |r| {
-        let in_simple = left_out.binary_search(&r.id).is_err();
-        if !in_simple {
-            left_out_met += 1;
-        }
-        let rule = belongs_in_simple(r, present);
-        judged.expected += u64::from(rule);
+impl Judged {
+    fn observe(
+        &mut self,
+        relation: &OplRelation,
+        present: &SimpleMembers<'_>,
+        in_simple: bool,
+        only: bool,
+    ) {
+        let rule = belongs_in_simple(relation, present);
+        self.expected += u64::from(rule);
         match (rule, in_simple) {
-            (true, false) => judged.missing.add(OscKind::Relation, r.id),
-            (false, true) => judged.unmatched.add(OscKind::Relation, r.id),
+            (true, false) => self.missing.add(OscKind::Relation, relation.id),
+            (false, true) => self.unmatched.add(OscKind::Relation, relation.id),
             _ => {}
         }
-        if input.pbfhogg_only.binary_search(&r.id).is_ok() {
-            pbfhogg_only_met += 1;
-            if !first_member_outside(r, present) {
-                judged.unexplained.add(OscKind::Relation, r.id);
-            }
+        if only && !first_member_outside(relation, present) {
+            self.unexplained.add(OscKind::Relation, relation.id);
         }
-    })?;
-    if second != records {
-        return Err(Error::Failed(format!(
-            "{} read as {records} records, then as {second}",
-            relations.display()
-        )));
     }
-    if left_out_met != left_out.len() {
-        return Err(Error::Failed(format!(
-            "the simple vs complete_ways diff created {} relations, {left_out_met} of them in {}",
-            left_out.len(),
-            relations.display()
-        )));
-    }
-    if pbfhogg_only_met != input.pbfhogg_only.len() {
-        return Err(Error::Failed(format!(
-            "{} of the {} relations only pbfhogg's simple holds are not in osmium's \
-             complete_ways output, yet the simple vs complete_ways diff deleted none",
-            input.pbfhogg_only.len() - pbfhogg_only_met,
-            input.pbfhogg_only.len()
-        )));
-    }
-    Ok(judged)
-}
 
-impl Judged {
     /// Print the judgement and record its failures.
     fn report(&self, harness: &mut Harness, label: &str, records: u64, pbfhogg_only: usize) {
         let Self {
@@ -305,124 +396,9 @@ impl Judged {
     }
 }
 
-/// Run osmium removeid of every `requested` member on osmium's simple output
-/// and diff the result against it: the deletes are the members its node and
-/// way sets hold. Any other entry, or a delete nobody asked for, is an error.
-fn present_members(
-    harness: &mut Harness,
-    outdir: &Path,
-    osmium_simple: &Path,
-    requested: &Typed,
-) -> Result<Typed, Error> {
-    let mut present = Typed::default();
-    if requested.is_empty() {
-        return Ok(present);
-    }
-    let ids = outdir.join("complete-relation-members.ids");
-    std::fs::write(&ids, requested.id_file().as_bytes())?;
-    let without = outdir.join("osmium-simple-without-members.osm.pbf");
-    let captured = harness.reference(
-        &ToolRun::osmium("extract-removeid.1")
-            .arg("removeid")
-            .input(osmium_simple, crate::pbf_frames::Origin::Other)
-            .arg("-i")
-            .input(&ids, crate::pbf_frames::Origin::Other)
-            .arg("-o")
-            .output(&without)
-            .arg("--overwrite"),
-        &outdir.join("osmium-simple-without-members.stdout"),
-    )?;
-    harness.require_success(&captured, "osmium removeid")?;
-    let mut stray: Option<String> = None;
-    let policy = crate::opl_compare::Policy::between(
-        (osmium_simple, crate::pbf_frames::Origin::Other),
-        (&without, crate::pbf_frames::Origin::Other),
-    )?;
-    element_diff::scan_element_diff(
-        harness,
-        (osmium_simple, crate::pbf_frames::Origin::Other),
-        (&without, crate::pbf_frames::Origin::Other),
-        &outdir.join("osmium-simple-present-members.diff.txt"),
-        policy,
-        |action, kind, id| {
-            if action == OscAction::Delete && requested.has(kind, id) {
-                present.push(kind, id);
-            } else if stray.is_none() {
-                stray = Some(format!("{action:?} {kind:?} {id}"));
-            }
-        },
-    )?;
-    if let Some(stray) = stray {
-        return Err(Error::Failed(format!(
-            "osmium removeid of the complete_ways relation members changed more than it was \
-             asked to remove: {stray}"
-        )));
-    }
-    present.sort_distinct();
-    Ok(present)
-}
-
-/// Node and way IDs, kept apart by kind; relation references are not held.
-#[derive(Default)]
-struct Typed {
-    nodes: Vec<i64>,
-    ways: Vec<i64>,
-}
-
-impl Typed {
-    fn push(&mut self, kind: OscKind, id: i64) {
-        match kind {
-            OscKind::Node => self.nodes.push(id),
-            OscKind::Way => self.ways.push(id),
-            OscKind::Relation => {}
-        }
-    }
-
-    fn sort_distinct(&mut self) {
-        for ids in [&mut self.nodes, &mut self.ways] {
-            ids.sort_unstable();
-            ids.dedup();
-        }
-    }
-
-    /// Requires [`sort_distinct`](Self::sort_distinct) first.
-    fn has(&self, kind: OscKind, id: i64) -> bool {
-        match kind {
-            OscKind::Node => self.nodes.binary_search(&id).is_ok(),
-            OscKind::Way => self.ways.binary_search(&id).is_ok(),
-            OscKind::Relation => false,
-        }
-    }
-
-    /// The smallest negative ID held, by kind; requires
-    /// [`sort_distinct`](Self::sort_distinct) first.
-    fn first_negative(&self) -> Option<(&'static str, i64)> {
-        [("node", &self.nodes), ("way", &self.ways)]
-            .into_iter()
-            .find_map(|(kind, ids)| ids.first().filter(|&&id| id < 0).map(|&id| (kind, id)))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.ways.is_empty()
-    }
-
-    /// One typed ID per line (`n1`, `w2`), as osmium's `-i` reads them.
-    fn id_file(&self) -> String {
-        let mut text = String::new();
-        for (prefix, ids) in [("n", &self.nodes), ("w", &self.ways)] {
-            for id in ids {
-                text.push_str(prefix);
-                text.push_str(&id.to_string());
-                text.push('\n');
-            }
-        }
-        text
-    }
-}
-
 /// pbfhogg simple's rule: a direct node member in the node set or a direct
 /// way member in the way set; relation members do not count.
-fn belongs_in_simple(relation: &OplRelation, present: &Typed) -> bool {
+fn belongs_in_simple(relation: &OplRelation, present: &SimpleMembers<'_>) -> bool {
     relation
         .members
         .iter()
@@ -432,7 +408,7 @@ fn belongs_in_simple(relation: &OplRelation, present: &Typed) -> bool {
 /// osmium simple's reason to omit a relation pbfhogg's simple writes: its
 /// first node or way member is outside the sets (osmium decides on that
 /// member alone). False for a relation with no node or way member.
-fn first_member_outside(relation: &OplRelation, present: &Typed) -> bool {
+fn first_member_outside(relation: &OplRelation, present: &SimpleMembers<'_>) -> bool {
     relation
         .members
         .iter()
@@ -442,86 +418,73 @@ fn first_member_outside(relation: &OplRelation, present: &Typed) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn relation(members: &[(OscKind, i64)]) -> OplRelation {
-        OplRelation {
-            id: 1,
-            members: members.to_vec(),
-        }
-    }
+    #[test]
+    fn present_members_match_the_removeid_diff_and_keep_relations_typed() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let simple = dir.join("simple.opl");
+        let complete = dir.join("complete.opl");
+        let ours = dir.join("ours.opl");
+        let without = dir.join("without.opl");
+        let old_listing = dir.join("removeid.diff.txt");
+        let listings = Listings::new(dir);
+        let shared = "n0 T\nn2 T\nw2 T Nn2\nw3 T Nn2\n";
+        std::fs::write(&simple, format!("{shared}r4 T Mn2@,w1@\n")).unwrap();
+        std::fs::write(&ours, format!("{shared}r4 T Mn2@,w1@\nr5 T Mr4@,n9@,w3@\n")).unwrap();
+        std::fs::write(
+            &complete,
+            "n0 T\nn2 T\nn9 T\nw2 T Nn2\nw3 T Nn2\n\
+             r4 T Mn2@,w1@\nr5 T Mr4@,n9@,w3@\nr6 T Mn0@,n2@\nr7 T Mr4@\n",
+        )
+        .unwrap();
+        // The requested n9 is absent. A request for w1 cannot match another
+        // kind. removeid selects n0, n2 and w3, leaving w2 and relation 4.
+        std::fs::write(&without, "w2 T Nn2\nr4 T Mn2@,w1@\n").unwrap();
+        let (removed, _, _) = opl_compare::sequence_merge(&simple, &without, &old_listing).unwrap();
+        let (result, _) = compare([&ours, &complete, &simple], &listings, &[5]).unwrap();
 
-    fn present() -> Typed {
-        let mut present = Typed::default();
-        present.push(OscKind::Node, 10);
-        present.push(OscKind::Way, 20);
-        // A relation reference is never held, even when pushed.
-        present.push(OscKind::Relation, 30);
-        present.sort_distinct();
-        present
+        assert_eq!(result.present, Some(removed));
+        assert_eq!(
+            std::fs::read(&listings.present).unwrap(),
+            std::fs::read(old_listing).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&listings.comparison).unwrap(),
+            "+n9 T\n+r6 T Mn0@,n2@\n+r7 T Mr4@\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&listings.ids).unwrap(),
+            "n0\nn2\nn9\nw1\nw3\n"
+        );
+        assert_eq!(result.records, 4);
+        assert_eq!(result.pbfhogg_only_met, 1);
+        assert_eq!(result.judged.expected, 3);
+        assert_eq!(result.judged.missing.kinds[2].ids(), vec![6]);
+        assert_eq!(result.judged.unmatched.total(), 0);
+        assert_eq!(result.judged.unexplained.total(), 0);
     }
 
     #[test]
-    fn kinds_stay_apart() {
-        let present = present();
-        assert!(present.has(OscKind::Node, 10));
-        assert!(!present.has(OscKind::Way, 10));
-        assert!(!present.has(OscKind::Node, 20));
-        assert!(!present.has(OscKind::Relation, 30));
-        assert_eq!(present.id_file(), "n10\nw20\n");
-        assert_eq!(present.first_negative(), None);
-    }
+    fn simple_relations_still_fail_when_only_pbfhogg_keeps_them_without_a_reason() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let simple = dir.join("simple.opl");
+        let complete = dir.join("complete.opl");
+        let ours = dir.join("ours.opl");
+        let listings = Listings::new(dir);
+        let with_relations = "n2 T\nr4 T Mr5@\nr5 T Mn2@\n";
+        std::fs::write(&simple, "n2 T\n").unwrap();
+        std::fs::write(&complete, with_relations).unwrap();
+        std::fs::write(&ours, with_relations).unwrap();
 
-    #[test]
-    fn a_negative_member_is_named_not_queried() {
-        let mut ids = Typed::default();
-        ids.push(OscKind::Node, 5);
-        ids.push(OscKind::Way, -3);
-        ids.push(OscKind::Way, 0);
-        ids.sort_distinct();
-        assert_eq!(ids.first_negative(), Some(("way", -3)));
-    }
+        let (result, _) = compare([&ours, &complete, &simple], &listings, &[4, 5]).unwrap();
 
-    #[test]
-    fn simple_takes_any_direct_node_or_way_member() {
-        use OscKind::{Node, Relation, Way};
-        let present = present();
-        assert!(belongs_in_simple(
-            &relation(&[(Way, 1), (Node, 10)]),
-            &present
-        ));
-        assert!(belongs_in_simple(&relation(&[(Way, 20)]), &present));
-        // A relation member never matches, nor does an ID of the other kind.
-        assert!(!belongs_in_simple(
-            &relation(&[(Relation, 30), (Way, 10)]),
-            &present
-        ));
-        assert!(!belongs_in_simple(&relation(&[]), &present));
-    }
-
-    #[test]
-    fn osmium_omits_on_the_first_node_or_way_member_only() {
-        use OscKind::{Node, Relation, Way};
-        let present = present();
-        // First node-or-way member outside, a later one inside: the deviation.
-        assert!(first_member_outside(
-            &relation(&[(Node, 1), (Way, 20)]),
-            &present
-        ));
-        // Relation members before it are skipped, as osmium skips them.
-        assert!(first_member_outside(
-            &relation(&[(Relation, 30), (Way, 2), (Node, 10)]),
-            &present
-        ));
-        // First node-or-way member inside: osmium writes it too.
-        assert!(!first_member_outside(
-            &relation(&[(Relation, 5), (Node, 10), (Way, 3)]),
-            &present
-        ));
-        // No node or way member: no reason osmium's rule gives.
-        assert!(!first_member_outside(
-            &relation(&[(Relation, 30)]),
-            &present
-        ));
+        assert!(result.merged.identical());
+        assert_eq!(result.judged.missing.total(), 0);
+        assert_eq!(result.judged.unmatched.kinds[2].ids(), vec![4]);
+        assert_eq!(result.judged.unexplained.kinds[2].ids(), vec![4, 5]);
     }
 }

@@ -5,17 +5,12 @@
 //! The [`TagRuns`] projection records where each selected element's tag
 //! arrays lie; nothing is read from them until the blob has been accepted
 //! (validation, string table UTF-8, kind claim), so a refused blob counts
-//! nothing. The accepted arrays are then read once, as string table index
-//! pairs counted per (kind, key index, value index), or per (kind, key
-//! index) when the run counts no pair: no string is resolved per tag, no
-//! dense node's ID or coordinates are decoded. Each distinct entry is
-//! resolved and judged against the [`Selection`] once per blob: a pair the
-//! pair expressions admit is hashed for its pair row, and a key the key
-//! expressions admit adds its count to the blob's tally of that key, across
-//! kinds and values. Only then is anything merged by text, so duplicate
-//! string table entries fold into one row.
+//! nothing. The accepted arrays are then read once as SID pairs. The
+//! block's cached predicate masks select the key row and pair row independently
+//! before either counter is updated. Selected rows are resolved for the
+//! merge by text, so duplicate string table entries fold into one row.
 //!
-//! Every tag counts: block validation refused any key or value index past
+//! Block validation refused any key or value index past
 //! the string table, so on an accepted blob every index resolves, as it does
 //! for `TagIter` and `DenseTagIter`; one that does not is a broken internal
 //! invariant and an error. Index 0 is looked up like any other index, and a
@@ -26,6 +21,7 @@ use rustc_hash::FxHashMap;
 use super::Selection;
 use super::table::{CountTable, key_hash, pair_hash};
 use crate::ElementKind;
+use crate::commands::tags_filter::masks::MaskScratch;
 use crate::error::{Error, Result};
 use crate::owned::TypeFilter;
 use crate::read::block::{BlockBuffer, GroupProjection, ValidatedBlock};
@@ -117,17 +113,70 @@ struct Pending {
     count: u64,
 }
 
+use crate::tunables::TAGS_COUNT_KEY_PAGE_SIDS;
+
+type KeyPage = [u64; TAGS_COUNT_KEY_PAGE_SIDS];
+
+#[derive(Default)]
+struct KeyCounts {
+    page_slots: FxHashMap<usize, usize>,
+    pages: Vec<KeyPage>,
+    touched: Vec<(u32, usize)>,
+    last_page: Option<(usize, usize)>,
+}
+
+impl KeyCounts {
+    fn add(&mut self, sid: u32) {
+        let index = sid as usize;
+        let page = index / TAGS_COUNT_KEY_PAGE_SIDS;
+        let slot = match self.last_page {
+            Some((last, slot)) if last == page => slot,
+            _ => {
+                let next = self.page_slots.len();
+                let slot = *self.page_slots.entry(page).or_insert(next);
+                if slot == self.pages.len() {
+                    self.pages.push([0; TAGS_COUNT_KEY_PAGE_SIDS]);
+                }
+                self.last_page = Some((page, slot));
+                slot
+            }
+        };
+        let count = &mut self.pages[slot][index % TAGS_COUNT_KEY_PAGE_SIDS];
+        if *count == 0 {
+            self.touched.push((sid, slot));
+        }
+        *count += 1;
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.page_slots.clear();
+        self.last_page = None;
+        let pages = &mut self.pages;
+        self.touched.drain(..).map(move |(sid, slot)| {
+            let count = &mut pages[slot][sid as usize % TAGS_COUNT_KEY_PAGE_SIDS];
+            (sid, std::mem::take(count))
+        })
+    }
+
+    fn release_outliers(&mut self) {
+        if self.pages.capacity().saturating_mul(size_of::<KeyPage>())
+            > MAX_RETAINED_SCRATCH_CAPACITY
+        {
+            *self = Self::default();
+        } else {
+            crate::retention::release_scratch(&mut self.touched);
+        }
+    }
+}
+
 /// A worker's tally scratch, reused across its blobs.
 pub(super) struct BlobTally {
     runs: Vec<TagRun>,
-    /// Occurrences per (kind, key index, value index), when the run counts
-    /// pairs.
-    pairs: FxHashMap<(ElementKind, u32, u32), u64>,
-    /// Occurrences per (kind, key index), when it counts no pair.
-    keys: FxHashMap<(ElementKind, u32), u64>,
-    /// The selected key-row occurrences per key index, across kinds and
-    /// values.
-    key_rows: FxHashMap<u32, u64>,
+    masks: MaskScratch,
+    /// Selected pair-row occurrences per (key SID, value SID), across kinds.
+    pairs: FxHashMap<(u32, u32), u64>,
+    /// Selected key-row occurrences per SID, across kinds and values.
+    key_rows: KeyCounts,
     pending: Vec<Pending>,
     /// Where the next blob starts walking the shards. Seeded per worker and
     /// stepped per blob, so workers do not all queue on the same shard.
@@ -139,9 +188,9 @@ impl BlobTally {
     pub(super) fn new(seed: usize) -> Self {
         BlobTally {
             runs: Vec::new(),
+            masks: MaskScratch::default(),
             pairs: FxHashMap::default(),
-            keys: FxHashMap::default(),
-            key_rows: FxHashMap::default(),
+            key_rows: KeyCounts::default(),
             pending: Vec::new(),
             rotation: seed.wrapping_mul(ROTATION_STEP),
         }
@@ -155,77 +204,64 @@ impl BlobTally {
         &mut self,
         buffer: BlockBuffer<'_>,
         admits: TypeFilter,
-        selection: &Selection,
+        selection: &Selection<'_>,
         table: &CountTable,
         cancel: &crate::host::Recorder,
     ) -> Result<()> {
+        let admits = TypeFilter {
+            nodes: admits.nodes && selection.0.admits(ElementKind::Node),
+            ways: admits.ways && selection.0.admits(ElementKind::Way),
+            relations: admits.relations && selection.0.admits(ElementKind::Relation),
+        };
         let (TagRuns { .. }, accepted) =
             buffer.project(|_, _| TagRuns::new(admits, &mut self.runs))?;
-        self.count(&accepted, selection.counts_pairs())?;
-        self.select(&accepted, selection)?;
+        self.count(&accepted, selection)?;
+        self.prepare_rows(&accepted)?;
         self.merge(&accepted, table, cancel)?;
         self.release_outliers();
         Ok(())
     }
 
-    /// The accepted blob's tag occurrences by the element walk's rule
-    /// (module docs): per (kind, key index, value index) when `by_pair`,
-    /// else per (kind, key index).
-    fn count(&mut self, accepted: &ValidatedBlock<'_>, by_pair: bool) -> Result<()> {
-        let BlobTally {
-            runs, pairs, keys, ..
-        } = self;
-        pairs.clear();
-        keys.clear();
-        if by_pair {
-            walk_tags(runs, accepted, |kind, k, v| {
-                *pairs.entry((kind, k, v)).or_insert(0) += 1;
-            })
-        } else {
-            walk_tags(runs, accepted, |kind, k, _| {
-                *keys.entry((kind, k)).or_insert(0) += 1;
-            })
-        }
+    fn count(&mut self, accepted: &ValidatedBlock<'_>, selection: &Selection<'_>) -> Result<()> {
+        self.pairs.clear();
+        let mut masks = self
+            .masks
+            .block(&selection.0, |sid| accepted.string(sid as usize));
+        walk_tags(&self.runs, accepted, |kind, key, value| {
+            let hits = masks.rows(kind, key, value)?;
+            if hits.key {
+                self.key_rows.add(key);
+            }
+            if hits.pair {
+                *self.pairs.entry((key, value)).or_insert(0) += 1;
+            }
+            Ok(())
+        })
     }
 
-    /// The distinct rows the selection admits, each resolved and hashed once,
-    /// sorted by shard: every admitted pair, then every key the key
-    /// expressions admitted on any kind with any value, with its occurrences
-    /// added up.
-    fn select(&mut self, accepted: &ValidatedBlock<'_>, selection: &Selection) -> Result<()> {
+    /// Resolve and hash distinct accepted rows for the shard merge.
+    fn prepare_rows(&mut self, accepted: &ValidatedBlock<'_>) -> Result<()> {
         let BlobTally {
             pairs,
-            keys,
             key_rows,
             pending,
             ..
         } = self;
         pending.clear();
-        key_rows.clear();
-        for (&(kind, key, value), &count) in pairs.iter() {
+        for (&(key, value), &count) in pairs.iter() {
             let (k, v) = strings(accepted, key, value)?;
-            if selection.admits_pair(kind, k, v) {
-                let hash = pair_hash(k.as_bytes(), v.as_bytes());
-                pending.push(Pending {
-                    shard: CountTable::shard_of(hash),
-                    hash,
-                    key,
-                    value: Some(value),
-                    count,
-                });
-            }
-            if selection.admits_key(kind, k) {
-                *key_rows.entry(key).or_insert(0) += count;
-            }
+            let hash = pair_hash(k.as_bytes(), v.as_bytes());
+            pending.push(Pending {
+                shard: CountTable::shard_of(hash),
+                hash,
+                key,
+                value: Some(value),
+                count,
+            });
         }
-        for (&(kind, key), &count) in keys.iter() {
-            if selection.admits_key(kind, string(accepted, key)?) {
-                *key_rows.entry(key).or_insert(0) += count;
-            }
-        }
-        // Two indices holding the same text stay two entries here; the
-        // shard adds both to the one row, by bytes.
-        for (&key, &count) in key_rows.iter() {
+        // Two SIDs holding the same text stay two entries here. The shard
+        // adds both to the one row by bytes.
+        for (key, count) in key_rows.drain() {
             let hash = key_hash(string(accepted, key)?.as_bytes());
             pending.push(Pending {
                 shard: CountTable::shard_of(hash),
@@ -284,18 +320,11 @@ impl BlobTally {
         if over(self.runs.capacity(), size_of::<TagRun>()) {
             self.runs = Vec::new();
         }
-        if over(
-            self.pairs.capacity(),
-            size_of::<((ElementKind, u32, u32), u64)>(),
-        ) {
+        if over(self.pairs.capacity(), size_of::<((u32, u32), u64)>()) {
             self.pairs = FxHashMap::default();
         }
-        if over(self.keys.capacity(), size_of::<((ElementKind, u32), u64)>()) {
-            self.keys = FxHashMap::default();
-        }
-        if over(self.key_rows.capacity(), size_of::<(u32, u64)>()) {
-            self.key_rows = FxHashMap::default();
-        }
+        self.key_rows.release_outliers();
+        self.masks.release_outliers();
         if over(self.pending.capacity(), size_of::<Pending>()) {
             self.pending = Vec::new();
         }
@@ -307,7 +336,7 @@ impl BlobTally {
 fn walk_tags(
     runs: &[TagRun],
     accepted: &ValidatedBlock<'_>,
-    mut f: impl FnMut(ElementKind, u32, u32),
+    mut f: impl FnMut(ElementKind, u32, u32) -> Result<()>,
 ) -> Result<()> {
     let bytes = accepted.bytes();
     let strings = accepted.string_count();
@@ -323,7 +352,7 @@ fn walk_tags(
                 let keys = PackedUint32Iter::new(keys.in_blob(bytes)?);
                 let vals = PackedUint32Iter::new(vals.in_blob(bytes)?);
                 for (k, v) in keys.zip(vals) {
-                    f(kind, resolves(k.into())?, resolves(v.into())?);
+                    f(kind, resolves(k.into())?, resolves(v.into())?)?;
                 }
             }
             TagRun::Dense(span) => {
@@ -334,7 +363,7 @@ fn walk_tags(
                         continue;
                     }
                     let value = cursor.read_varint()?;
-                    f(ElementKind::Node, resolves(key)?, resolves(value)?);
+                    f(ElementKind::Node, resolves(key)?, resolves(value)?)?;
                 }
             }
         }
@@ -629,6 +658,59 @@ mod tests {
         // expression counts once.
         let both: Counts = [(key("k"), 13), (pair("k", "v"), 10)].into_iter().collect();
         assert_eq!(count(&["k", "k=v", "k"]), both);
+    }
+
+    #[test]
+    fn only_accepted_pairs_reach_the_histogram_and_key_pages_reset() {
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let mut strings = vec!["", "k", "v", "j", "x"];
+        let high_sid = 4 * super::TAGS_COUNT_KEY_PAGE_SIDS;
+        strings.resize(high_sid, "unused");
+        strings.push("k");
+        let high_sid = high_sid as u64;
+        let parse = |query: &str| crate::tag_expr::parse_expression(query).unwrap();
+        let expressions = [
+            parse("n/k"),
+            parse("n/k!=x"),
+            parse("w/j=x"),
+            parse("w/k=x"),
+        ];
+        let selection = Selection::new(Some(&expressions));
+        let mut tally = BlobTally::new(0);
+        let (mut st, mut groups) = (Vec::new(), Vec::new());
+
+        for key_sid in [high_sid, 1, high_sid] {
+            let bytes = block(
+                &strings,
+                &[Group {
+                    nodes: vec![plain_node(1, 0, 0, &[(key_sid, 2), (1, 4), (3, 4)], None)],
+                    ways: vec![crate::read::wire_fixtures::way(2, &[1], (3, 4))],
+                    ..Group::default()
+                }],
+            );
+            let oracle = crate::PrimitiveBlock::from_vec(bytes.clone()).unwrap();
+            let buffer =
+                crate::read::block::BlockBuffer::new(bytes, None, &mut st, &mut groups, None);
+            let table = CountTable::new();
+            tally
+                .add_blob(
+                    buffer,
+                    TypeFilter::all(),
+                    &selection,
+                    &table,
+                    &host.invocation,
+                )
+                .unwrap();
+            assert_eq!(tally.pairs.len(), 2);
+            let key_sid = u32::try_from(key_sid).unwrap();
+            assert_eq!(tally.pairs.get(&(key_sid, 2)), Some(&1));
+            assert_eq!(tally.pairs.get(&(3, 4)), Some(&1));
+            assert_eq!(
+                rows(table.into_counts(|_| true, &host.invocation).unwrap().0),
+                walked(&oracle, TypeFilter::all(), Some(&expressions)),
+            );
+        }
     }
 
     /// Rows spread over many shards merge to the same totals from any

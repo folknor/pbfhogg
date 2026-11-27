@@ -216,7 +216,9 @@ extract classification (count arrays, build block, rediscover dense, decode
 three columns, classify), ID checks, reference checks, inspect tagged-node
 count, extended inspect metadata, location checking's separate raw scanners,
 geocode pass 2 dense address extraction, tags-filter dense tags, diff element
-iteration that decodes dense metadata content equality ignores.
+iteration that decodes dense metadata content equality ignores. Single-pass
+`tags-filter` dense output still advances coordinates and metadata before
+selection, including for rejected nodes.
 
 Redesign: one block scan establishes framing, string table and group layout;
 the consumer states which fields need values and which only validation; values
@@ -649,29 +651,18 @@ extent, including spatially skipped blobs (claimed ranges there).
 
 Kind: workload-specific rewrite; strongest for small extracts.
 
-## PERF-020 - Polygon region membership walks segments per point
+## PERF-020 - Polygon extract measurement and coordinate-column classification
 
 Reported by: spatial.
 
-Mechanism: `Rings::contains` walks the latitude band's segments with exact
-crossing tests for every point inside the envelope; the multi-region grid only
-prunes bboxes. Polygon classification falls back to general element iteration
-instead of coordinate columns.
+Register a dataset polygon on bygg, measure `region-extract --polygon`,
+and run real-data extract and multi-extract verification with polygon
+regions. The Denmark bbox results and the gap are recorded in
+`reference/performance/extract.md`.
 
-Redesign: an adaptive spatial subdivision with proven region masks in
-boundary-free leaves and short unresolved lists of segments in boundary leaves;
-bbox regions join the same structure; polygon classification consumes
-coordinate columns.
-
-Payoff: point location instead of point-against-edge work; strongest for
-complex admin boundaries and many regions.
-
-Risks: boundary cells must conservatively include touching edges and
-endpoints; planar parity versus feature-union rules; periodic longitude images;
-approximate rasters or simplification break the contract. Ranks after removing
-duplicate decode.
-
-Kind: strong hypothesis.
+Polygon classification still uses general element iteration on paths
+where bbox classification can consume coordinate columns. Extend those
+column paths to polygon regions while preserving exact membership.
 
 ## PERF-021 - Multi-extract writes all destinations from one consumer
 
@@ -1080,40 +1071,13 @@ fallback, late dense metadata needs prior deltas.
 
 Kind: medium conviction, wider payoff.
 
-## PERF-042 - Tag predicates are evaluated per occurrence on resolved strings
+## PERF-042 - Tags-count merges accepted rows through shared shards
 
 Reported by: tags, decode.
 
-Mechanism: `element_matches` loops expressions then the element's resolved
-tags, after both paths collect tags into a temporary vector; common keys and
-values are resolved and compared thousands of times per block. Dense tags are
-walked three times (PERF-006); classification advances coordinates and output
-selection advances metadata and coordinates for rejected nodes. tags-count
-already counts SID tuples (`BlobTally`, 256-shard table) but `count` then
-`select` puts every tag into the `(kind, key_sid, value_sid)` histogram when any
-expression counts pairs, and repeats key selection per value. Geocode's
-fixed-key extraction does not use the numeric representation either.
-
-Redesign: per block, cache for each dictionary entry which key and value
-matchers accept it and which expressions apply per kind; occurrences combine
-integer masks (expression bit in both key and value masks; key-only needs the
-key mask; negation complements); cache each distinct matcher only against
-entries it needs; selection produces masks and dependency records without
-`Element` wrappers. For counting, apply the predicate before counters: SID-
-indexed key arrays with a touched list, pair histogram only for accepted pairs,
-counters provisional during validation.
-
-Payoff: removes repeated string work on every tagged element; key-only counting
-loses a hash lookup per occurrence.
-
-Risks: expression identity (do not cross-match `amenity=school` and
-`shop=bakery`); element-level OR, empty expressions, type restrictions,
-inversion; dense boundary finding (tag SIDs are bounded by block
-validation, so a tally needs no out-of-range handling of its own); key
-and pair rows independent, no double counts, duplicate dictionary strings merged
-by text. Medium-confidence: partition-owner counting instead of mutex shards.
-
-Kind: high conviction.
+After block-local selection and tallying, workers still merge accepted
+rows into shared mutex-protected shards. Partition-owner counting remains
+an unmeasured option.
 
 ## PERF-046 - Location checking decompresses every way blob per partition
 
@@ -1188,26 +1152,17 @@ Kind: strong hypothesis.
 
 Reported by: geocode.
 
-Already landed (format 9, ADR-0029): the reader reads only the query's own
-admin cell and trusts its interior flag, about 130 to 26 us per query on the
-germany box; the dedupe question dissolved (one list repeats no polygon).
-
-Residue, query: a containment test on a boundary (unflagged) entry still
-allocates and rebuilds all of the polygon's rings from mmap coordinates (plus
-an unwrapped copy at the antimeridian) and scans every vertex. A prepared
-per-cell edge index (the edges of each polygon that cross the cell, evaluated
-with the existing crossing expression) would make that cost proportional to
-the cell's edges, a format change from 9. It needs more than the cell's
-edges: the query's ray also crosses edges outside the cell, so each cell
-entry would carry a base parity per ring and per longitude retry.
-
-Residue, build: the flood fill (`pass3.rs` `admin_cells_for_polygon`) runs
-full containment for seeds and visited cells, one task per polygon; preparing
-rings once, refining boundary cells and keeping uniform subtrees would cut it.
+A containment test on a boundary (unflagged) entry still allocates and
+rebuilds all of the polygon's rings from mmap coordinates (plus an unwrapped
+copy at the antimeridian) and scans every vertex. A prepared per-cell edge
+index would use the existing crossing expression on the edges of each polygon
+that cross the cell. The query's ray also crosses edges outside the cell, so
+each cell entry would carry a base parity per ring and per longitude retry.
+This would change the index format.
 
 Risks: holes, even-odd self-intersections, implicit closing edges, antimeridian
-retries, simplification, stored f32 area, polygon-index ties; any change must
-keep the format 9 cover rules at `AdminEntry`.
+retries, simplification, stored f32 area, polygon-index ties, and the cover
+rules at `AdminEntry`.
 
 Kind: highest-conviction query rewrite.
 
@@ -1862,13 +1817,10 @@ Kind: measurement gap; the change is neutral on normal input.
 
 Reported by: the change writing indexed OSC creates straight into the output.
 
-`diff-pair --format osc` writes a fixed plain `diff.osc`
-(`benches/lib/diff.lua`), so only the plain-fragment route of indexed derive
-is measurable. The `.osc.gz` route (members deflated on the unit workers,
-framing glued between them) was last measured by the retired typed
-`diff-snapshots` cells, and the change that now writes creates into the
-output before the scan ends has no `.osc.gz` cell. A bench param selecting
-the output name would cover it. Likewise `merge-diffs` writes a fixed
-`merged.osc.gz`, so a plain `.osc` merge is not measurable.
+`diff-pair --format osc --output-name diff.osc.gz` selects the gzip
+route, where unit workers deflate members and framing is glued between them.
+That route was last measured by the retired typed `diff-snapshots` cells.
+The change that writes creates into the output before the scan ends still
+needs an indexed gzip cell.
 
 Kind: measurement gap.

@@ -44,11 +44,17 @@
 //! geocode index's f64 test on simplified admin rings, whose contract is not
 //! osmium parity; the two are deliberately separate.
 
+use std::sync::OnceLock;
+
 use crate::coord_fmt::from_decimicro;
 use crate::error::Error;
 use crate::geo::Bbox;
 
 use super::Result;
+
+mod subdivision;
+pub(super) use subdivision::RegionClassifier;
+use subdivision::Subdivision;
 
 /// A single polygon given as f64 input: exterior ring and holes, each a list
 /// of `(lon, lat)` in degrees. The input to [`Polygon::new`].
@@ -75,6 +81,7 @@ const MAX_BANDS: usize = 10_000;
 pub struct Polygon {
     geometries: Vec<Geometry>,
     bbox: Bbox,
+    subdivision: OnceLock<Option<Subdivision>>,
 }
 
 enum Geometry {
@@ -115,6 +122,8 @@ struct Rings {
     /// `band_starts[b]..band_starts[b + 1]` indexes `banded` for band `b`.
     band_starts: Vec<usize>,
     banded: Vec<Segment>,
+    /// The original multiplicity of directed edges, before band duplication.
+    segments: Vec<Segment>,
 }
 
 /// A directed segment from `(x1, y1)` to `(x2, y2)`, osmium's
@@ -128,7 +137,7 @@ struct Segment {
 }
 
 impl Segment {
-    /// osmium's per-segment step: `Some(true)` when `(px, py)` is an
+    /// osmium's per-segment step: `None` when `(px, py)` is an
     /// endpoint (inside, final), else whether the segment toggles parity.
     #[inline]
     fn step(&self, px: i64, py: i64) -> Option<bool> {
@@ -144,6 +153,16 @@ impl Segment {
         let ty = i128::from(py - self.y2);
         let comp = tx * ay < ax * ty;
         Some((ay > 0) == comp)
+    }
+
+    fn contains(segments: &[Self], px: i64, py: i64, mut inside: bool) -> bool {
+        for segment in segments {
+            match segment.step(px, py) {
+                None => return true,
+                Some(toggle) => inside ^= toggle,
+            }
+        }
+        inside
     }
 }
 
@@ -219,6 +238,7 @@ impl Rings {
             dy,
             band_starts,
             banded,
+            segments,
         }
     }
 
@@ -229,15 +249,7 @@ impl Rings {
         }
         let band = usize::try_from((py - self.min_y) / self.dy).unwrap_or(0);
         let segments = &self.banded[self.band_starts[band]..self.band_starts[band + 1]];
-        let mut inside = false;
-        for segment in segments {
-            match segment.step(px, py) {
-                None => return true,
-                Some(true) => inside = !inside,
-                Some(false) => {}
-            }
-        }
-        inside
+        Segment::contains(segments, px, py, false)
     }
 }
 
@@ -319,6 +331,7 @@ impl Polygon {
         Ok(Self {
             geometries: prepared,
             bbox,
+            subdivision: OnceLock::new(),
         })
     }
 
@@ -349,6 +362,16 @@ impl Polygon {
     /// the WGS84 domain is outside. That also bounds the probes of a
     /// periodic geometry, which add a turn to the longitude.
     fn contains_fix(&self, x: i64, y: i64) -> bool {
+        let subdivision = self
+            .subdivision
+            .get_or_init(|| Subdivision::for_polygon(self));
+        match subdivision {
+            Some(index) => index.contains(x, y, || self.contains_exact(x, y)),
+            None => self.contains_exact(x, y),
+        }
+    }
+
+    fn contains_exact(&self, x: i64, y: i64) -> bool {
         if !(-HALF_TURN..=HALF_TURN).contains(&x) || !(-HALF_TURN / 2..=HALF_TURN / 2).contains(&y)
         {
             return false;

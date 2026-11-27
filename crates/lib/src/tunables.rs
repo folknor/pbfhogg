@@ -1088,6 +1088,27 @@ pub(crate) const MEMBERSHIP_SPARSE_TABLE_MAX: usize = 256;
 /// Maximum number of extracts a multi-extract config may declare.
 pub(crate) const MAX_EXTRACTS: usize = 500;
 
+/// String-table entries per tags-count key counter page. One touched page
+/// costs 512 bytes, and nearby keys share a page lookup without sizing the
+/// counters to the whole string table.
+pub(crate) const TAGS_COUNT_KEY_PAGE_SIDS: usize = 64;
+
+/// Region subdivision: refine at least this many times to expose constant
+/// interior and exterior cells, even when a polygon starts with fewer
+/// segments than the leaf limit.
+pub(crate) const REGION_SUBDIVISION_MIN_DEPTH: usize = 4;
+/// Region subdivision: lookup depth limit, even at dense crossings and
+/// coincident boundaries.
+pub(crate) const REGION_SUBDIVISION_MAX_DEPTH: usize = 28;
+/// Region subdivision: bound on the segment walk in a leaf, charging a slot
+/// for each bbox check too.
+pub(crate) const REGION_SUBDIVISION_LEAF_TESTS: usize = 8;
+/// Region subdivision: bound on fixed cell storage.
+pub(crate) const REGION_SUBDIVISION_MAX_CELLS: usize = 32_767;
+/// Region subdivision: bound on replication of segments and parity events;
+/// past it the build falls back to the exact predicate.
+pub(crate) const REGION_SUBDIVISION_MAX_WORK: usize = 2_097_152;
+
 // ---------------------------------------------------------------------------
 // export
 // ---------------------------------------------------------------------------

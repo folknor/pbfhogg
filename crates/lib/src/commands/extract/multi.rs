@@ -12,7 +12,6 @@ use super::super::{
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
 };
 use crate::read::input::{InputFile, PinnedInput};
-use crate::read::region_grid::RegionGrid;
 use crate::scan::classify::ScheduledBlob;
 
 use super::common::{
@@ -22,6 +21,7 @@ use super::common::{
 use super::membership::{
     BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of, restrict,
 };
+use super::polygon::RegionClassifier;
 use super::{ExtractStats, Region};
 
 use crate::owned::{dense_node_metadata, element_metadata};
@@ -263,17 +263,12 @@ pub(super) fn try_extract_multi_single_pass(
     drop(walker);
 
     // Phase 1: Parallel node classification → N bbox_node_ids.
-    // For all-bbox regions, use columnar decode (batch IDs/lats/lons into
-    // contiguous arrays) with single-pass multi-region classification.
-    // Polygon regions fall back to element-by-element iteration.
+    // Both decode paths use one classifier for the region set. Bbox-only
+    // regions use coordinate columns and polygon regions use element iteration.
     let all_bbox = regions
         .iter()
         .all(|region| matches!(region, Region::Bbox(_)));
-    let region_bboxes: Vec<(i32, i32, i32, i32)> = inside_bbox_ints
-        .iter()
-        .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
-        .collect();
-    let grid = region_grid(&region_bboxes, host);
+    let classifier = RegionClassifier::new(regions, &inside_bbox_ints, host);
     // A kind the fused planner admits reads each blob once: selection,
     // emission and the exact claim check on the worker, overlapping blobs
     // read together (multi_fused.rs). Any other kind classifies, freezes,
@@ -289,10 +284,8 @@ pub(super) fn try_extract_multi_single_pass(
     if let Some(fused) = node_fused {
         host.invocation.marker("MULTI_NODE_FUSED_START");
         let select = super::multi_fused::MultiSelect::Nodes {
-            regions,
-            inside: &inside_bbox_ints,
-            bboxes: all_bbox.then_some(region_bboxes.as_slice()),
-            grid: grid.as_ref(),
+            classifier: &classifier,
+            columnar: all_bbox,
         };
         super::multi_fused::multi_fused_pass(
             &shared_file,
@@ -307,6 +300,7 @@ pub(super) fn try_extract_multi_single_pass(
             Some(&mut node_members),
             host,
         )?;
+        drop(classifier);
         node_members.freeze();
         host.invocation.marker("MULTI_NODE_FUSED_END");
     } else {
@@ -315,7 +309,10 @@ pub(super) fn try_extract_multi_single_pass(
         // and the observed node count. See `RawCopy`.
         let mut verified_nodes: Vec<Option<Verified>> = vec![None; node_schedule.len()];
         if all_bbox {
-            let bboxes = region_bboxes;
+            let bboxes: Vec<_> = inside_bbox_ints
+                .iter()
+                .map(|b| (b.min_lat, b.max_lat, b.min_lon, b.max_lon))
+                .collect();
             // The one classifier for every node blob, candidate or not, so that
             // verification can never change which nodes are selected.
             // Fills `scratch` with each region's matching node ids, occurrences
@@ -328,25 +325,13 @@ pub(super) fn try_extract_multi_single_pass(
                 for v in scratch.iter_mut() {
                     v.clear();
                 }
-                match &grid {
-                    Some(grid) => {
-                        columns.collect_matching_ids_multi_bbox_grid(&bboxes, grid, scratch);
-                    }
-                    None => columns.collect_matching_ids_multi_bbox(&bboxes, scratch),
-                }
+                classifier.collect_bbox_columns(columns, &bboxes, scratch);
                 // Dense columns deliberately exclude plain Node messages. Visit
                 // only those messages here; keep dense classification batched.
                 for group in block.groups() {
                     for node in group.nodes() {
                         let (lat, lon) = super::common::plain_coords(&node)?;
-                        for (region, &(min_lat, max_lat, min_lon, max_lon)) in
-                            bboxes.iter().enumerate()
-                        {
-                            if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon
-                            {
-                                scratch[region].push(node.id());
-                            }
-                        }
+                        classifier.visit(lat, lon, None, |region| scratch[region].push(node.id()));
                     }
                 }
                 Ok(())
@@ -448,37 +433,10 @@ pub(super) fn try_extract_multi_single_pass(
                         };
                         let (lat, lon) = super::common::checked_coords(lat, lon)?;
                         observed += 1;
-                        match &grid {
-                            Some(grid) => {
-                                for &region in grid.candidates(lat, lon) {
-                                    let region = region as usize;
-                                    if admits(admit, region)
-                                        && regions[region].contains_decimicro(
-                                            &inside_bbox_ints[region],
-                                            lat,
-                                            lon,
-                                        )
-                                    {
-                                        builder.push(id, region);
-                                        hits[region] += 1;
-                                    }
-                                }
-                            }
-                            None => {
-                                for region in 0..n {
-                                    if admits(admit, region)
-                                        && regions[region].contains_decimicro(
-                                            &inside_bbox_ints[region],
-                                            lat,
-                                            lon,
-                                        )
-                                    {
-                                        builder.push(id, region);
-                                        hits[region] += 1;
-                                    }
-                                }
-                            }
-                        }
+                        classifier.visit(lat, lon, admit, |region| {
+                            builder.push(id, region);
+                            hits[region] += 1;
+                        });
                     }
                     let verified = candidates
                         .filter(|_| eligible)
@@ -492,6 +450,7 @@ pub(super) fn try_extract_multi_single_pass(
                 host,
             )?;
         }
+        drop(classifier);
         node_members.freeze();
         host.invocation.marker("MULTI_NODE_CLASSIFY_END");
 
@@ -968,41 +927,6 @@ pub(super) fn open_region_writers<'a>(
         invocation: &host.invocation,
     };
     Ok((writers, framing))
-}
-
-/// The node classifier's region grid, for `GRID_REGION_THRESHOLD` regions
-/// or more; `None` below it or when the grid declines (then every node is
-/// tested against every region, with the same output).
-pub(super) fn region_grid(
-    region_bboxes: &[(i32, i32, i32, i32)],
-    host: &crate::host::Entered<'_>,
-) -> Option<RegionGrid> {
-    let n = region_bboxes.len();
-    if n < crate::tunables::GRID_REGION_THRESHOLD {
-        return None;
-    }
-    // A test can decline the grid to drive the same config down the linear
-    // scan and compare output byte for byte.
-    #[cfg(pbfhogg_test_hooks)]
-    let grid = if host.invocation.faults().forces_linear_region_grid() {
-        None
-    } else {
-        RegionGrid::build(region_bboxes)
-    };
-    #[cfg(not(pbfhogg_test_hooks))]
-    let grid = RegionGrid::build(region_bboxes);
-    if grid.is_none() {
-        // Output is unchanged (the linear classifier tests every region),
-        // but node classification cost grows with N.
-        crate::host::diag!(
-            host.diagnostics,
-            Note,
-            "extract.multi.grid_fallback",
-            "Multi-extract region grid declined {n} regions (coverage over budget or an empty interior); classifying nodes against every region"
-        );
-        host.invocation.counter("multi_extract_grid_fallback", 1);
-    }
-    grid
 }
 
 // ---------------------------------------------------------------------------

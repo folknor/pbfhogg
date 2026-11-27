@@ -71,9 +71,9 @@ use super::membership::{
     BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of,
 };
 use super::multi::{
-    RegionFraming, node_blob_regions, open_region_writers, probe_sorted_header, region_grid,
-    union_bbox,
+    RegionFraming, node_blob_regions, open_region_writers, probe_sorted_header, union_bbox,
 };
+use super::polygon::RegionClassifier;
 use super::smart::{CompletionMember, completion_members, push_parent_edges};
 use super::{ExtractStats, ExtractStrategy, Region};
 
@@ -261,17 +261,15 @@ pub(super) fn try_extract_multi_dependent(
     // --- Node classify: spatial ---
     host.invocation.marker("MULTI_DEP_NODE_CLASSIFY_START");
     let mut spatial = Membership::new(n);
-    let region_bboxes: Vec<(i32, i32, i32, i32)> = inside_bbox_ints
-        .iter()
-        .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
-        .collect();
-    let grid = region_grid(&region_bboxes, host);
+    let classifier = RegionClassifier::new(regions, &inside_bbox_ints, host);
     let all_bbox = regions
         .iter()
         .all(|region| matches!(region, Region::Bbox(_)));
     if all_bbox {
-        let bboxes = &region_bboxes;
-        let grid = &grid;
+        let bboxes: Vec<_> = inside_bbox_ints
+            .iter()
+            .map(|b| (b.min_lat, b.max_lat, b.min_lon, b.max_lon))
+            .collect();
         let node_admit = &node_admit;
         crate::scan::classify::parallel_project_phase(
             &shared_file,
@@ -290,24 +288,12 @@ pub(super) fn try_extract_multi_dependent(
                 for v in scratch.iter_mut() {
                     v.clear();
                 }
-                match grid {
-                    Some(grid) => {
-                        columns.collect_matching_ids_multi_bbox_grid(bboxes, grid, scratch);
-                    }
-                    None => columns.collect_matching_ids_multi_bbox(bboxes, scratch),
-                }
+                classifier.collect_bbox_columns(columns, &bboxes, scratch);
                 // Dense columns deliberately exclude plain Node messages.
                 for group in block.groups() {
                     for node in group.nodes() {
                         let (lat, lon) = super::common::plain_coords(&node)?;
-                        for (region, &(min_lat, max_lat, min_lon, max_lon)) in
-                            bboxes.iter().enumerate()
-                        {
-                            if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon
-                            {
-                                scratch[region].push(node.id());
-                            }
-                        }
+                        classifier.visit(lat, lon, None, |region| scratch[region].push(node.id()));
                     }
                 }
                 let admit = node_admit[position].as_deref();
@@ -325,8 +311,6 @@ pub(super) fn try_extract_multi_dependent(
             host,
         )?;
     } else {
-        let grid = &grid;
-        let inside = &inside_bbox_ints;
         let node_admit = &node_admit;
         crate::scan::classify::parallel_project_phase(
             &shared_file,
@@ -351,27 +335,7 @@ pub(super) fn try_extract_multi_dependent(
                         _ => continue,
                     };
                     let (lat, lon) = super::common::checked_coords(lat, lon)?;
-                    match grid {
-                        Some(grid) => {
-                            for &region in grid.candidates(lat, lon) {
-                                let region = region as usize;
-                                if admits(admit, region)
-                                    && regions[region].contains_decimicro(&inside[region], lat, lon)
-                                {
-                                    builder.push(id, region);
-                                }
-                            }
-                        }
-                        None => {
-                            for region in 0..n {
-                                if admits(admit, region)
-                                    && regions[region].contains_decimicro(&inside[region], lat, lon)
-                                {
-                                    builder.push(id, region);
-                                }
-                            }
-                        }
-                    }
+                    classifier.visit(lat, lon, admit, |region| builder.push(id, region));
                 }
                 Ok(builder.finish())
             },
@@ -379,6 +343,7 @@ pub(super) fn try_extract_multi_dependent(
             host,
         )?;
     }
+    drop(classifier);
     spatial.freeze();
     host.invocation.marker("MULTI_DEP_NODE_CLASSIFY_END");
 

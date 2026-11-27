@@ -50,7 +50,6 @@ use crate::blob_meta::{BlobIndex, IdTally};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::read::columnar::DenseNodeColumns;
 use crate::read::input::InputFile;
-use crate::read::region_grid::RegionGrid;
 use crate::scan::classify::ScheduledBlob;
 use crate::writer::PbfWriter;
 use crate::{Element, ElementKind};
@@ -59,13 +58,14 @@ use super::super::{
     Result, clean_metadata, clean_partial_metadata, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
 };
+use super::ExtractStats;
 use super::common::{
-    BboxInt, MatchableMember, dense_coords, dense_only_payload, matchable_members, plain_coords,
+    MatchableMember, dense_coords, dense_only_payload, matchable_members, plain_coords,
     warn_passthrough_demotions,
 };
 use super::membership::{BatchBuilder, Membership, PageBatch, admits, regions_of};
 use super::multi::{RegionFraming, write_regions};
-use super::{ExtractStats, Region};
+use super::polygon::RegionClassifier;
 use crate::owned::{dense_node_metadata, element_metadata};
 
 /// One blob of a fused kind: its schedule entry, its (exact-checked) claim,
@@ -90,13 +90,10 @@ pub(super) struct FusedKind<'a> {
 /// What decides an occurrence of the pass's kind, per region.
 pub(super) enum MultiSelect<'a> {
     /// Nodes inside each region on their exact decimicrodegree coordinates.
-    /// `bboxes` is set when every region is a bbox (dense nodes are then
-    /// tested on decoded columns); `grid` prunes the regions tested.
+    /// Dense nodes can be tested on decoded columns when every region is a bbox.
     Nodes {
-        regions: &'a [Region],
-        inside: &'a [BboxInt],
-        bboxes: Option<&'a [(i32, i32, i32, i32)]>,
-        grid: Option<&'a RegionGrid>,
+        classifier: &'a RegionClassifier<'a>,
+        columnar: bool,
     },
     /// Ways: the OR of their refs' node masks, written under `coords`.
     Ways {
@@ -284,40 +281,17 @@ pub(super) fn multi_fused_pass(
     Ok(())
 }
 
-/// Push every region `r` that `test(r)` accepts as a hit of occurrence
-/// `occ`, ascending, through the grid when one is given. Region numbers are
-/// `u32`, as the region grid numbers them.
+/// Record the matching regions of one occurrence in ascending order.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 fn spatial_hits(
-    grid: Option<&RegionGrid>,
-    n: usize,
+    classifier: &RegionClassifier<'_>,
     lat: i32,
     lon: i32,
     occ: u32,
     hits: &mut Vec<(u32, u32)>,
-    mut test: impl FnMut(usize) -> bool,
 ) {
-    match grid {
-        Some(grid) => {
-            let start = hits.len();
-            for &region in grid.candidates(lat, lon) {
-                if test(region as usize) {
-                    hits.push((occ, region));
-                }
-            }
-            // Ascending regions per occurrence keep the per-region write
-            // order of the two-phase form.
-            hits[start..].sort_unstable();
-        }
-        None => {
-            for region in 0..n {
-                if test(region) {
-                    hits.push((occ, region as u32));
-                }
-            }
-        }
-    }
+    classifier.visit(lat, lon, None, |region| hits.push((occ, region as u32)));
 }
 
 /// Whether `ids` strictly increase in canonical OSM order.
@@ -331,7 +305,7 @@ fn strictly_increasing(ids: &[i64]) -> bool {
 ///
 /// Occurrence indices and region numbers are `u32`: a validated block's
 /// decompressed size bound keeps its element count far below `u32::MAX`, and
-/// the region grid already numbers regions as `u32`.
+/// configured region counts fit in `u32`.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
@@ -393,20 +367,15 @@ fn prepare(
     local.plain_hits.clear();
     match select {
         MultiSelect::Nodes {
-            regions,
-            inside,
-            bboxes,
-            grid,
+            classifier,
+            columnar,
         } => {
-            if let Some(bboxes) = bboxes {
+            if *columnar {
                 block.decode_dense_columns(&mut local.columns)?;
                 let columns = &local.columns;
                 for i in 0..columns.len() {
                     let (lat, lon) = (columns.lats[i], columns.lons[i]);
-                    spatial_hits(*grid, n, lat, lon, i as u32, &mut local.dense_hits, |r| {
-                        let (min_lat, max_lat, min_lon, max_lon) = bboxes[r];
-                        lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon
-                    });
+                    spatial_hits(classifier, lat, lon, i as u32, &mut local.dense_hits);
                 }
                 local
                     .dense_ids
@@ -416,10 +385,7 @@ fn prepare(
                         let (lat, lon) = plain_coords(&node)?;
                         let occ = local.plain_ids.len() as u32;
                         local.plain_ids.push(node.id());
-                        spatial_hits(*grid, n, lat, lon, occ, &mut local.plain_hits, |r| {
-                            let (min_lat, max_lat, min_lon, max_lon) = bboxes[r];
-                            lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon
-                        });
+                        spatial_hits(classifier, lat, lon, occ, &mut local.plain_hits);
                     }
                 }
             } else {
@@ -447,9 +413,7 @@ fn prepare(
                     };
                     let occ = ids.len() as u32;
                     ids.push(id);
-                    spatial_hits(*grid, n, lat, lon, occ, hits, |r| {
-                        regions[r].contains_decimicro(&inside[r], lat, lon)
-                    });
+                    spatial_hits(classifier, lat, lon, occ, hits);
                 }
             }
         }

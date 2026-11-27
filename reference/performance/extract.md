@@ -37,6 +37,18 @@ task; a kind the planner refuses (an unindexed blob, an overlap skipping a
 blob, more than 8 overlapping blobs in a run) classifies, then rereads and
 writes.
 
+### Prepared polygon subdivision (bygg, 2026-11-27, working tree on 0d1e05fb)
+
+Polygon membership uses a prepared adaptive subdivision with exact fallback.
+Multi-extract uses one classifier for the region set, including bboxes. The
+subdivision bounds are set by the `REGION_SUBDIVISION_*` tunables.
+
+No dataset on bygg registers a polygon, so there is no
+`region-extract --polygon` cell against baseline `0d1e05fb`. Denmark
+`extract` and `multi-extract` verifies passed with bbox regions on the
+working tree on 0d1e05fb. Polygon timing and real-data polygon verification
+remain open.
+
 ### Complete-ways and smart read only blobs that may hold a needed ID (bygg, 2026-11-26, variant uncommitted against `4edb8193`)
 
 After classification, smart's extra-way pass reads only the way blobs whose

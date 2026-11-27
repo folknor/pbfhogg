@@ -1,7 +1,10 @@
 //! Filter elements by tag expressions. Equivalent to `osmium tags-filter`.
 
+mod classify;
+pub(super) mod masks;
 pub mod osc;
 
+use self::masks::{MaskScratch, TagPredicates};
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
@@ -10,7 +13,7 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::input::{InputSource, PinnedInput};
-use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
+use crate::tag_expr::{Expression, StringMatcher, parse_expressions};
 use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
@@ -130,13 +133,8 @@ fn kind_claims(distrust_metadata: bool) -> crate::scan::classify::KindClaims {
     }
 }
 
-/// Check if an element's tags match any applicable expression (OR semantics).
-///
-/// Callers pass exactly one kind. Keep the expression-first traversal: it
-/// rejects an inapplicable kind before walking tags. Unlike tags-count this
-/// selects the whole element, and unlike export an empty list matches nothing.
-/// The shared `tag_matches` owns wildcard and negation semantics; this loop
-/// only supplies the element quantifier on the measured classify/write paths.
+/// String-based oracle for the element predicate.
+#[cfg(test)]
 fn element_matches(
     expressions: &[Expression],
     tags: &[(&str, &str)],
@@ -147,7 +145,7 @@ fn element_matches(
             continue;
         }
         for &(key, value) in tags {
-            if tag_matches(&expr.matcher, key, value) {
+            if crate::tag_expr::tag_matches(&expr.matcher, key, value) {
                 return true;
             }
         }
@@ -421,7 +419,7 @@ pub(crate) fn tags_filter_to<'a>(
 /// Returns per-block stats.
 fn filter_block_parallel(
     block: &PrimitiveBlock,
-    expressions: &[Expression],
+    predicates: &TagPredicates<'_>,
     invert: bool,
     coords: crate::owned::WayCoords,
     bb: &mut BlockBuilder,
@@ -436,70 +434,75 @@ fn filter_block_parallel(
         relations_matched: 0,
         relations_from_relations: 0,
     };
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut scratch = MaskScratch::default();
+    let mut masks = scratch.block(predicates, |sid| block.string_table_entry(sid as usize));
     let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
-    for element in block.elements() {
-        match &element {
-            Element::DenseNode(dn) => {
-                tags_buf.clear();
-                tags_buf.extend(dn.tags());
-                if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
-                    ensure_node_capacity_local(bb, output)?;
-                    let meta = dense_node_metadata(dn)?;
-                    bb.add_node_dense(
-                        dn.id(),
-                        dn.decimicro_lat()?,
-                        dn.decimicro_lon()?,
-                        tags_buf.iter().copied(),
-                        meta.as_ref(),
-                    );
-                    stats.nodes_matched += 1;
-                }
+    use crate::ElementKind::{Node, Relation, Way};
+    let [nodes, ways, relations] = [Node, Way, Relation].map(|kind| predicates.admits(kind));
+    // Match the block iterator's order, including mixed primitive groups.
+    for group in block.groups() {
+        for dn in (nodes || invert)
+            .then(|| group.dense_nodes())
+            .into_iter()
+            .flatten()
+        {
+            let raw = dn.raw_tags().map(|(key, value)| {
+                // Dense tag SIDs were validated as nonnegative int32s.
+                (key.cast_unsigned(), value.cast_unsigned())
+            });
+            if (nodes && masks.matches(Node, raw)?) != invert {
+                ensure_node_capacity_local(bb, output)?;
+                let meta = dense_node_metadata(&dn)?;
+                bb.add_node_dense(
+                    dn.id(),
+                    dn.decimicro_lat()?,
+                    dn.decimicro_lon()?,
+                    dn.tags(),
+                    meta.as_ref(),
+                );
+                stats.nodes_matched += 1;
             }
-            Element::Node(n) => {
-                tags_buf.clear();
-                tags_buf.extend(n.tags());
-                if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
-                    ensure_node_capacity_local(bb, output)?;
-                    let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
-                    bb.add_node_partial(
-                        n.id(),
-                        n.decimicro_lat()?,
-                        n.decimicro_lon()?,
-                        tags_buf.iter().copied(),
-                        meta.as_ref(),
-                    );
-                    stats.nodes_matched += 1;
-                }
+        }
+        for n in (nodes || invert)
+            .then(|| group.nodes())
+            .into_iter()
+            .flatten()
+        {
+            if (nodes && masks.matches(Node, n.raw_tags())?) != invert {
+                ensure_node_capacity_local(bb, output)?;
+                let meta = element_metadata(Node, n.id(), &n.info())?;
+                bb.add_node_partial(
+                    n.id(),
+                    n.decimicro_lat()?,
+                    n.decimicro_lon()?,
+                    n.tags(),
+                    meta.as_ref(),
+                );
+                stats.nodes_matched += 1;
             }
-            Element::Way(w) => {
-                tags_buf.clear();
-                tags_buf.extend(w.tags());
-                if element_matches(expressions, &tags_buf, crate::ElementKind::Way) != invert {
-                    ensure_way_capacity_local(bb, output)?;
-                    way.prepare(w, coords)?;
-                    let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
-                    way.write(bb, tags_buf.iter().copied(), meta.as_ref());
-                    stats.ways_matched += 1;
-                }
+        }
+        for w in (ways || invert).then(|| group.ways()).into_iter().flatten() {
+            if (ways && masks.matches(Way, w.raw_tags())?) != invert {
+                ensure_way_capacity_local(bb, output)?;
+                way.prepare(&w, coords)?;
+                let meta = element_metadata(Way, w.id(), &w.info())?;
+                way.write(bb, w.tags(), meta.as_ref());
+                stats.ways_matched += 1;
             }
-            Element::Relation(r) => {
-                tags_buf.clear();
-                tags_buf.extend(r.tags());
-                if element_matches(expressions, &tags_buf, crate::ElementKind::Relation) != invert {
-                    ensure_relation_capacity_local(bb, output)?;
-                    r.members_into(&mut members_buf)?;
-                    let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation_partial(
-                        r.id(),
-                        tags_buf.iter().copied(),
-                        &members_buf,
-                        meta.as_ref(),
-                    );
-                    stats.relations_matched += 1;
-                }
+        }
+        for r in (relations || invert)
+            .then(|| group.relations())
+            .into_iter()
+            .flatten()
+        {
+            if (relations && masks.matches(Relation, r.raw_tags())?) != invert {
+                ensure_relation_capacity_local(bb, output)?;
+                r.members_into(&mut members_buf)?;
+                let meta = element_metadata(Relation, r.id(), &r.info())?;
+                bb.add_relation_partial(r.id(), r.tags(), &members_buf, meta.as_ref());
+                stats.relations_matched += 1;
             }
         }
     }
@@ -559,6 +562,7 @@ fn tags_filter_single_pass(
     };
 
     let limits = crate::commands::split::Limits::new(writer.compression());
+    let predicates = TagPredicates::new(expressions);
     reader.for_each_fused_block(
         |block| {
             // A builder per blob, deliberately. Keeping one per decode worker
@@ -570,7 +574,7 @@ fn tags_filter_single_pass(
             let mut bb = BlockBuilder::new();
             let mut output = Vec::new();
             let block_stats =
-                filter_block_parallel(&block, expressions, invert, coords, &mut bb, &mut output)?;
+                filter_block_parallel(&block, &predicates, invert, coords, &mut bb, &mut output)?;
             flush_local(&mut bb, &mut output)?;
             crate::commands::split::fit_blocks(&mut output, &limits)?;
             Ok((output, block_stats))
@@ -627,7 +631,6 @@ fn filter_block_pass2(
         relations_matched: 0,
         relations_from_relations: 0,
     };
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
@@ -639,16 +642,16 @@ fn filter_block_pass2(
                 let from_relation = ids.relation_dep_node_ids.get(dn.id());
                 if direct || from_way || from_relation {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    if !remove_tags || direct {
-                        tags_buf.extend(dn.tags());
-                    }
+                    let tags = (!remove_tags || direct)
+                        .then(|| dn.tags())
+                        .into_iter()
+                        .flatten();
                     let meta = dense_node_metadata(dn)?;
                     bb.add_node_dense(
                         dn.id(),
                         dn.decimicro_lat()?,
                         dn.decimicro_lon()?,
-                        tags_buf.iter().copied(),
+                        tags,
                         meta.as_ref(),
                     );
                     if direct {
@@ -666,16 +669,16 @@ fn filter_block_pass2(
                 let from_relation = ids.relation_dep_node_ids.get(n.id());
                 if direct || from_way || from_relation {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    if !remove_tags || direct {
-                        tags_buf.extend(n.tags());
-                    }
+                    let tags = (!remove_tags || direct)
+                        .then(|| n.tags())
+                        .into_iter()
+                        .flatten();
                     let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node_partial(
                         n.id(),
                         n.decimicro_lat()?,
                         n.decimicro_lon()?,
-                        tags_buf.iter().copied(),
+                        tags,
                         meta.as_ref(),
                     );
                     if direct {
@@ -691,13 +694,13 @@ fn filter_block_pass2(
                 let direct = ids.direct_way_ids.get(w.id());
                 if direct || ids.member_way_ids.get(w.id()) {
                     ensure_way_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    if !remove_tags || direct {
-                        tags_buf.extend(w.tags());
-                    }
+                    let tags = (!remove_tags || direct)
+                        .then(|| w.tags())
+                        .into_iter()
+                        .flatten();
                     way.prepare(w, coords)?;
                     let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
-                    way.write(bb, tags_buf.iter().copied(), meta.as_ref());
+                    way.write(bb, tags, meta.as_ref());
                     if direct {
                         stats.ways_matched += 1;
                     } else {
@@ -708,19 +711,14 @@ fn filter_block_pass2(
             Element::Relation(r) => {
                 if ids.included_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
-                    tags_buf.clear();
                     let direct = ids.direct_relation_ids.get(r.id());
-                    if !remove_tags || direct {
-                        tags_buf.extend(r.tags());
-                    }
+                    let tags = (!remove_tags || direct)
+                        .then(|| r.tags())
+                        .into_iter()
+                        .flatten();
                     r.members_into(&mut members_buf)?;
                     let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation_partial(
-                        r.id(),
-                        tags_buf.iter().copied(),
-                        &members_buf,
-                        meta.as_ref(),
-                    );
+                    bb.add_relation_partial(r.id(), tags, &members_buf, meta.as_ref());
                     if direct {
                         stats.relations_matched += 1;
                     } else {
@@ -796,8 +794,8 @@ fn tags_filter_two_pass(
     let mut matched_records = [0_u64; 3];
 
     // Pass 1: parallel classification via pread-from-workers.
-    // Workers own the full PrimitiveBlock lifecycle (pread → decompress →
-    // PrimitiveBlock → tag match → send compact results). Consumer merges
+    // Workers read, decompress and validate each blob, then match its tags
+    // and send compact results. The consumer merges
     // matching IDs into the IdSet collections.
     //
     // Pass 1's header walk is the run's only one: it also keeps a catalog
@@ -914,66 +912,15 @@ fn tags_filter_two_pass(
         // invocation. Concurrent users of the same invocation share it.
         let send_wait_before = classify_result_send_wait_ns(host);
 
-        /// Per-blob classification result from a worker.
-        #[derive(Default)]
-        struct ClassifyResult {
-            matched_nodes: Vec<i64>,
-            matched_ways: Vec<i64>,
-            spilled_refs: Vec<i64>,
-            matched_relations: Vec<i64>,
-        }
-
-        crate::scan::classify::parallel_classify_phase(
+        let predicates = TagPredicates::new(expressions);
+        crate::scan::classify::parallel_project_phase(
             &shared_file,
             &schedule,
             jobs,
-            Vec::<i64>::new,
-            |block, refs| {
-                refs.clear();
-                let mut result = ClassifyResult::default();
-                let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            tags_buf.clear();
-                            tags_buf.extend(dn.tags());
-                            if element_matches(expressions, &tags_buf, crate::ElementKind::Node)
-                                != invert
-                            {
-                                result.matched_nodes.push(dn.id());
-                            }
-                        }
-                        Element::Node(n) => {
-                            tags_buf.clear();
-                            tags_buf.extend(n.tags());
-                            if element_matches(expressions, &tags_buf, crate::ElementKind::Node)
-                                != invert
-                            {
-                                result.matched_nodes.push(n.id());
-                            }
-                        }
-                        Element::Way(w) => {
-                            tags_buf.clear();
-                            tags_buf.extend(w.tags());
-                            if element_matches(expressions, &tags_buf, crate::ElementKind::Way)
-                                != invert
-                            {
-                                result.matched_ways.push(w.id());
-                                refs.extend(w.refs());
-                            }
-                        }
-                        Element::Relation(r) => {
-                            tags_buf.clear();
-                            tags_buf.extend(r.tags());
-                            if element_matches(expressions, &tags_buf, crate::ElementKind::Relation)
-                                != invert
-                            {
-                                result.matched_relations.push(r.id());
-                            }
-                        }
-                    }
-                }
-                result.spilled_refs = publish_way_refs(reserved, reservation, refs);
+            classify::ClassifyScratch::default,
+            |_, buffer, scratch| {
+                let mut result = scratch.classify(buffer, &predicates, invert)?;
+                result.spilled_refs = publish_way_refs(reserved, reservation, &mut scratch.refs);
                 Ok(result)
             },
             |_seq, cr| {

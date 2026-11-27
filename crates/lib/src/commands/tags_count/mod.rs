@@ -6,10 +6,11 @@ mod table;
 mod tally;
 
 use super::require_indexdata;
+use super::tags_filter::masks::TagPredicates;
 use crate::ElementKind;
 use crate::owned::TypeFilter;
 use crate::read::input::InputSource;
-use crate::tag_expr::{Expression, StringMatcher, TagMatcher, parse_expressions, tag_matches};
+use crate::tag_expr::{Expression, parse_expressions};
 
 use super::Result;
 
@@ -60,57 +61,16 @@ impl TagCountStats {
     }
 }
 
-/// Which tags a run counts, and as what: osmium's two filters. An
-/// expression without a value matcher (no `=`) selects keys, one with a
-/// value matcher (`=`, `!=`, including `key=*`) selects pairs, and a tag
-/// both select is counted in both rows. With no expression at all every key
-/// is counted, as osmium's `TagsFilter{true}`; that is the expression `*`,
-/// which is what a typed `*` parses to as well. Built only by
-/// [`Selection::new`], so the partition cannot be written inconsistently.
-pub(super) struct Selection {
-    keys: Vec<Expression>,
-    pairs: Vec<Expression>,
-}
+/// The run's expressions, with the implicit all-keys rule for an empty list.
+struct Selection<'a>(TagPredicates<'a>);
 
-impl Selection {
-    /// The selection of a run's parsed expressions, `None` for none.
-    fn new(expressions: Option<&[Expression]>) -> Self {
-        let Some(expressions) = expressions.filter(|e| !e.is_empty()) else {
-            return Selection {
-                keys: vec![Expression {
-                    type_filter: TypeFilter::all(),
-                    matcher: TagMatcher {
-                        key: StringMatcher::Always,
-                        value: None,
-                        invert: false,
-                    },
-                }],
-                pairs: Vec::new(),
-            };
-        };
-        let (pairs, keys) = expressions
-            .iter()
-            .cloned()
-            .partition(|e| e.matcher.value.is_some());
-        Selection { keys, pairs }
-    }
-
-    /// Whether any pair is counted; without one, a blob is tallied per key.
-    pub(super) fn counts_pairs(&self) -> bool {
-        !self.pairs.is_empty()
-    }
-
-    /// Whether an occurrence of `key` on an element of `kind` counts in the
-    /// key's row.
-    pub(super) fn admits_key(&self, kind: ElementKind, key: &str) -> bool {
-        // A key expression has no value matcher, so the value is not read.
-        matches_expression(&self.keys, key, "", kind)
-    }
-
-    /// Whether the tag `key`=`value` on an element of `kind` counts in the
-    /// pair's row.
-    pub(super) fn admits_pair(&self, kind: ElementKind, key: &str, value: &str) -> bool {
-        matches_expression(&self.pairs, key, value, kind)
+impl<'a> Selection<'a> {
+    fn new(expressions: Option<&'a [Expression]>) -> Self {
+        Self(
+            expressions
+                .filter(|e| !e.is_empty())
+                .map_or_else(TagPredicates::all_keys, TagPredicates::new),
+        )
     }
 }
 
@@ -231,8 +191,8 @@ pub struct TagCountOptions<'a> {
 /// lone consumer merging per-blob maps was the whole wall at planet, with the
 /// workers parked behind it. Per-worker whole-file maps are not kept either
 /// (that shape held roughly the global cardinality once per worker).
-/// Transient per-worker storage is one blob's distinct index pairs (or keys,
-/// when no pair is counted).
+/// Transient per-worker storage includes the block-local predicate cache
+/// and the blob's distinct selected index pairs and keys.
 ///
 /// The table is not bounded independently of input: for D distinct selected
 /// key/value pairs whose value bytes total S, and K distinct keys of total
@@ -385,24 +345,4 @@ fn tags_count_inner(
         rows: results,
         stats,
     })
-}
-
-/// Check if a tag matches any expression (respecting the element's type).
-///
-/// This predicate is per tag, not per element: counting every tag on an
-/// element with one matching tag would inflate unrelated counts. Callers pass
-/// the kind of the element carrying the tag. Keep this quantifier
-/// separate from element filtering and use tag_matches for shared semantics.
-fn matches_expression(
-    expressions: &[Expression],
-    key: &str,
-    value: &str,
-    kind: ElementKind,
-) -> bool {
-    for expr in expressions {
-        if expr.type_filter.admits(kind) && tag_matches(&expr.matcher, key, value) {
-            return true;
-        }
-    }
-    false
 }

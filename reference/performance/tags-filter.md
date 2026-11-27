@@ -1,5 +1,22 @@
 # Tags Filter
 
+### Block-local SID masks for tag predicates (bygg, 2026-11-27)
+
+PBF selection checks raw SID pairs using lazy, block-local predicate masks.
+Tag counting uses the same masks and tallies only accepted key and pair rows.
+OSC filtering stays string-based because OSC has no string table.
+
+Single-iteration cells on bygg, interleaved baseline first within each workload:
+
+| Bench and dataset | `0d1e05fb` | working tree on 0d1e05fb | Verdict |
+|---|---|---|---|
+| `tag-select --omit-referenced yes`, germany | 1.7 s `31907690`, 1.7 s `780fe9f6` | 1.6 s `f74802fe`, 1.6 s `5c724b7e` | Too short to resolve. |
+| `tag-select --omit-referenced yes`, planet | 31.7 s `d04198bd`, 30.6 s `86db79ed` | 30.0 s `8fdf4abd`, 30.0 s `d6db19b6` | About 3 % faster on the working tree on 0d1e05fb versus baseline `0d1e05fb` on bygg, with the same direction in both pairs and at the noise floor. |
+| `file-info --mode tags`, planet | 24.9 s `038a984b`, 24.0 s `9a564bf9` | 24.5 s `13dc7350`, 24.7 s `f8772b1f` | Neutral. Unfiltered key counting barely uses the predicate path. |
+
+Denmark verifies passed for `tags-filter` and `inspect-tags` on the working
+tree on 0d1e05fb on bygg.
+
 ### Pass 1 inserts way refs on the workers (bygg, 2026-11-26, `1361533e` against `da1f1a55`)
 
 Pass 1 and the relation-member way walk used to send `(id, Vec<refs>)`

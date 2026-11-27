@@ -663,6 +663,12 @@
 
 ### Changed
 
+- **Default `tags-filter` is about 20 % faster on planet PBFs.** Filtering
+  for `w/highway=primary` on bygg took about 34 s, down from 42 s on a
+  warm cache at `67510574`.
+  The default two-pass filter no longer refuses malformed fields it
+  neither reads nor writes. See [DEVIATIONS.md](DEVIATIONS.md#tags-filter-pbf-validation-follows-the-fields-used-by-each-pass).
+
 - **`apply-changes` writes smaller files and finishes faster.** Rewritten
   blocks no longer repeat the source string table across every output
   block, and eligible indexed blobs reuse wire data for unchanged elements.

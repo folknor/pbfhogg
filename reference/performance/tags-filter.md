@@ -1,5 +1,50 @@
 # Tags Filter
 
+## Current baselines
+
+### Default two-pass PBF filtering validates the fields each pass uses (bygg)
+
+The baseline hotpath profile at HEAD `67510574` on bygg took 49.7 s
+(`4b67e7e7`). Across 67,893 validations, `decompress_blob_raw` used
+417 core-s and `validate_block` used 283 core-s, including 264 in
+`validate_groups` and 18 in `validate_stringtable_utf8`.
+
+`tag-select --dataset planet --filter w/highway=primary` (default
+two-pass PBF mode), `--iterations 1`, interleaved on bygg.
+A is HEAD `67510574` and B is the working tree on `67510574`.
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A | 49.3 s | `78948ecd` |
+| B | 34.9 s | `f01623d9` |
+| A | 42.4 s | `0d7470ff` |
+| B | 34.4 s | `6f0b1efc` |
+
+B was faster in both pairs. The first A cell likely had a colder cache.
+Wall time fell about 19 % in the warm pair (42.4 s to 34.4 s).
+
+Both passes check framing, packed-array consistency where countable,
+string-table UTF-8 and enforced kind claims. Pass 1 validates tags for
+kinds with predicates and skips metadata. Pass 2 validates retained
+fields before re-encoding, checking each shared dense column as a group
+when any retained node needs it. Relation closure, member-way dependency
+scans, public `PrimitiveBlock` construction and existing projection
+callers retain full validation.
+
+The two passes can now accept malformed inner framing in unread metadata,
+including malformed DenseInfo varints and duplicate or length-mismatched
+DenseInfo columns. They can also accept out-of-range indices in unread
+tags and malformed unread dense tag runs. Those fields supply neither
+selection values nor output values. The writer re-encodes retained
+fields and copies no input payload bytes.
+[DEVIATIONS.md](../../DEVIATIONS.md#tags-filter-pbf-validation-follows-the-fields-used-by-each-pass)
+
+Verification passed on the working tree. Tier 1 passed, `pbfhogg-verify all`
+on denmark passed 25 of 25 checks, and `pbfhogg-verify tags-filter` on
+germany passed.
+
+## History
+
 ### Single-pass filtering skips rejected payloads on the reader (bygg, baseline `d64b3548`)
 
 The reader filters from the frame header before allocating the body. It still
@@ -266,7 +311,7 @@ built in the main tree, no trim of its own. Run order variant, HEAD.
 
 Neutral: the variant is inside a single cell's noise.
 
-## Tags-filter
+### Earlier two-pass baselines
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel
 classification + lightweight scanner), closure + way dep scans also
@@ -391,11 +436,7 @@ against the uncommitted change: pair 1 48.5 s (`dabef763`) against 50.8 s
 Medians 49.2 s and 50.35 s, a 2.3 % gap carried by one cell and absent from
 the second pair: noise, no cost.
 
-## History
-
-### Tags-filter
-
-#### Pass-2 blob-level raw passthrough disproved (commit `a5c6854`, 2026-04-18, plantasjen)
+### Pass-2 blob-level raw passthrough disproved (commit `a5c6854`, 2026-04-18, plantasjen)
 
 A shadow counter ran the full ID-set classification per pass-2 blob without
 copying anything raw. Planet `w/highway=primary`, UUID `8c786794`: 0 of
@@ -404,7 +445,7 @@ per-element match rate, 32,835 node blobs at 0.40 %). Verdict: dropped,
 shadow removed in `0ef4107`. The pin comment in
 `crates/lib/src/commands/tags_filter/mod.rs` carries the reasoning.
 
-#### Sequential → two-pass → parallel arc
+### From sequential to parallel two-pass filtering
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel
 classification + lightweight scanner), closure + way dep scans also

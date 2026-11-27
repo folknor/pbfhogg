@@ -125,7 +125,7 @@ impl ClassifyScratch {
         self.refs.clear();
         let kinds = [ElementKind::Node, ElementKind::Way, ElementKind::Relation]
             .map(|kind| predicates.admits(kind));
-        let (_, accepted) = buffer.project(|_, _| Runs {
+        let (_, accepted) = buffer.project_tags(kinds, |_, _| Runs {
             runs: &mut self.runs,
             kinds,
             invert,
@@ -134,7 +134,6 @@ impl ClassifyScratch {
             .masks
             .block(predicates, |sid| accepted.string(sid as usize));
         let mut result = Classified::default();
-        let bytes = accepted.bytes();
         // Classification only inserts IDs into sets. Validation's plain-
         // before-dense order inside a group has no effect on those sets.
         for &run in &self.runs {
@@ -146,15 +145,15 @@ impl ClassifyScratch {
                     vals,
                     refs,
                 } => {
-                    let tags = PackedUint32Iter::new(keys.in_blob(bytes)?)
-                        .zip(PackedUint32Iter::new(vals.in_blob(bytes)?));
+                    let tags = PackedUint32Iter::new(accepted.span(keys)?)
+                        .zip(PackedUint32Iter::new(accepted.span(vals)?));
                     if masks.matches(kind, tags)? != invert {
                         match kind {
                             ElementKind::Node => result.matched_nodes.push(id),
                             ElementKind::Way => {
                                 result.matched_ways.push(id);
                                 self.refs
-                                    .extend(WayRefIter::delta_decoded(refs.in_blob(bytes)?));
+                                    .extend(WayRefIter::delta_decoded(accepted.span(refs)?));
                             }
                             ElementKind::Relation => result.matched_relations.push(id),
                         }
@@ -163,8 +162,8 @@ impl ClassifyScratch {
                 Run::Dense { ids, tags } => {
                     classify_dense(
                         &mut masks,
-                        ids.in_blob(bytes)?,
-                        tags.in_blob(bytes)?,
+                        accepted.span(ids)?,
+                        accepted.span(tags)?,
                         invert,
                         &mut result.matched_nodes,
                     )?;
@@ -220,6 +219,8 @@ fn dense_sid(value: u64) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::block_builder::BlockBuilder;
+    use crate::commands::tags_filter::{Pass2IdSets, filter_block_pass2};
+    use crate::idset::IdSet;
     use crate::owned::WayCoords;
     use crate::read::wire_fixtures::{
         Group, block, dense, field_bytes, packed, plain_node, relation, way,
@@ -277,6 +278,159 @@ mod tests {
         )
     }
 
+    fn id_set(ids: &[i64]) -> IdSet {
+        let mut set = IdSet::new();
+        for &id in ids {
+            set.insert(id);
+        }
+        set
+    }
+
+    fn pass2(
+        bytes: Vec<u8>,
+        matches: &Classified,
+        way_deps: &[i64],
+        remove_tags: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let (mut st, mut groups) = (Vec::new(), Vec::new());
+        let buffer = BlockBuffer::new(bytes, None, &mut st, &mut groups, None);
+        let (mut builder, mut output) = (BlockBuilder::new(), Vec::new());
+        let relations = id_set(&matches.matched_relations);
+        let ids = Pass2IdSets {
+            matched_node_ids: &id_set(&matches.matched_nodes),
+            direct_way_ids: &id_set(&matches.matched_ways),
+            member_way_ids: &IdSet::new(),
+            direct_relation_ids: &relations,
+            included_relation_ids: &relations,
+            way_dep_node_ids: &id_set(way_deps),
+            relation_dep_node_ids: &IdSet::new(),
+        };
+        filter_block_pass2(
+            buffer,
+            &ids,
+            remove_tags,
+            WayCoords::Drop,
+            &mut builder,
+            &mut output,
+        )?;
+        super::super::flush_local(&mut builder, &mut output)?;
+        Ok(output.into_iter().map(|block| block.bytes).collect())
+    }
+
+    #[test]
+    fn unread_columns_leave_classification_and_output_unchanged() {
+        let with_node_tags = |tags: &[u64], info: Option<&[u8]>| {
+            let mut d = dense(&[(1, 0, 0), (2, 10, -10)], tags);
+            if let Some(info) = info {
+                field_bytes(&mut d, 5, info);
+            }
+            block(
+                &["", "k", "v"],
+                &[Group {
+                    dense: Some(d),
+                    ways: vec![way(3, &[1], (1, 2))],
+                    ..Group::default()
+                }],
+            )
+        };
+        let well_formed = with_node_tags(&[1, 2, 0, 0], None);
+        let malformed = with_node_tags(&[1, 3, 0, 0], None);
+        let incomplete_runs = with_node_tags(&[1, 2, 0], None);
+        let broken_info = with_node_tags(&[1, 2, 0, 0], Some(&[0x0a, 0x05, 0x02]));
+        let classify = |bytes: &[u8], expression: &str, invert| {
+            let (mut st, mut groups) = (Vec::new(), Vec::new());
+            let buffer = BlockBuffer::new(bytes.to_vec(), None, &mut st, &mut groups, None);
+            let expr = parse_expressions(&[expression.to_owned()]).unwrap();
+            let mut scratch = ClassifyScratch::default();
+            let result = scratch.classify(buffer, &TagPredicates::new(&expr), invert)?;
+            Ok::<_, crate::Error>((result, scratch.refs))
+        };
+        let (good, deps) = classify(&well_formed, "w/k=v", false).unwrap();
+        let (selected, refs) = classify(&malformed, "w/k=v", false).unwrap();
+        assert_eq!(selected.matched_ways, good.matched_ways);
+        assert_eq!(refs, deps);
+        assert_eq!(
+            pass2(malformed.clone(), &selected, &refs, true).unwrap(),
+            pass2(well_formed.clone(), &good, &deps, true).unwrap()
+        );
+        assert_eq!(
+            pass2(incomplete_runs.clone(), &selected, &refs, true).unwrap(),
+            pass2(well_formed.clone(), &good, &deps, true).unwrap()
+        );
+        let expected = classify(&well_formed, "w/k=v", true).unwrap().0;
+        let actual = classify(&malformed, "w/k=v", true).unwrap().0;
+        assert_eq!(actual.matched_nodes, expected.matched_nodes);
+
+        let (good_nodes, _) = classify(&well_formed, "n/k=v", false).unwrap();
+        let (nodes, _) = classify(&broken_info, "n/k=v", false).unwrap();
+        assert_eq!(nodes.matched_nodes, good_nodes.matched_nodes);
+        assert_eq!(
+            pass2(broken_info.clone(), &selected, &[], true).unwrap(),
+            pass2(well_formed, &selected, &[], true).unwrap()
+        );
+
+        for bytes in [malformed, incomplete_runs] {
+            let full = PrimitiveBlock::from_vec(bytes.clone()).unwrap_err();
+            let classify = classify(&bytes, "n/k=v", false).map(drop).unwrap_err();
+            let output = pass2(bytes, &selected, &refs, false).unwrap_err();
+            for err in [classify, output] {
+                assert_eq!(
+                    std::mem::discriminant(err.kind()),
+                    std::mem::discriminant(full.kind())
+                );
+            }
+        }
+        let full = PrimitiveBlock::from_vec(broken_info.clone()).unwrap_err();
+        let err = pass2(broken_info, &nodes, &[], false).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(err.kind()),
+            std::mem::discriminant(full.kind())
+        );
+    }
+
+    #[test]
+    fn plain_metadata_is_checked_only_when_a_record_is_written() {
+        let input = |info: Option<&[u8]>| {
+            let mut w = way(3, &[1], (1, 2));
+            if let Some(info) = info {
+                field_bytes(&mut w, 4, info);
+            }
+            block(
+                &["", "k", "v"],
+                &[Group {
+                    ways: vec![w],
+                    ..Group::default()
+                }],
+            )
+        };
+        let good = input(None);
+        let bad = input(Some(&[0x08]));
+        let expr = parse_expressions(&["w/k=v".to_owned()]).unwrap();
+        let predicates = TagPredicates::new(&expr);
+        let mut scratch = ClassifyScratch::default();
+        let (mut st, mut groups) = (Vec::new(), Vec::new());
+        let checked = scratch
+            .classify(
+                BlockBuffer::new(bad.clone(), None, &mut st, &mut groups, None),
+                &predicates,
+                false,
+            )
+            .unwrap();
+        assert_eq!(checked.matched_ways, [3]);
+
+        let omitted = Classified::default();
+        assert_eq!(
+            pass2(good, &omitted, &[], false).unwrap(),
+            pass2(bad.clone(), &omitted, &[], false).unwrap()
+        );
+        let full = PrimitiveBlock::from_vec(bad.clone()).unwrap_err();
+        let output = pass2(bad, &checked, &[], false).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(output.kind()),
+            std::mem::discriminant(full.kind())
+        );
+    }
+
     #[test]
     fn filter_paths_match_a_string_oracle_on_mixed_groups() {
         let bytes = fixture();
@@ -317,6 +471,7 @@ mod tests {
 
                 let buffer = BlockBuffer::new(bytes.clone(), None, &mut st, &mut groups, None);
                 let selected = scratch.classify(buffer, &predicates, invert).unwrap();
+                let projected_output = pass2(bytes.clone(), &selected, &[], false).unwrap();
                 let mut classified = Vec::new();
                 classified.extend(
                     selected
@@ -354,6 +509,11 @@ mod tests {
                 )
                 .unwrap();
                 super::super::flush_local(&mut builder, &mut output).unwrap();
+                assert_eq!(
+                    output.iter().map(|block| &block.bytes).collect::<Vec<_>>(),
+                    projected_output.iter().collect::<Vec<_>>(),
+                    "{query:?}, invert={invert}"
+                );
                 let mut emitted = Vec::new();
                 for output_block in output {
                     let output_block = PrimitiveBlock::from_vec(output_block.bytes).unwrap();

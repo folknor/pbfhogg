@@ -6,6 +6,12 @@
 
 - Never use the `AskUserQuestion` tool - the harness runs in don't-ask mode and it will be denied. When you need a decision from the user, just ask in chat with the options laid out in prose.
 
+### Performance rules
+
+- Never propose changing the default output codec or compression level as
+  a performance lever, and never measure it to argue for one. When a
+  command turns out compression-bound, record that and look elsewhere.
+
 ### Memory rules
 
 Do not use your Memory functionality. Durable context belongs in CLAUDE.md or the relevant docs.

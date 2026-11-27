@@ -12,6 +12,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
+use crate::read::block::{BlockBuffer, Selection};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions};
 use crate::write::WriteOptions;
@@ -612,16 +613,40 @@ struct Pass2IdSets<'a> {
     relation_dep_node_ids: &'a IdSet,
 }
 
+impl Pass2IdSets<'_> {
+    fn select(&self, kind: crate::ElementKind, id: i64, remove_tags: bool) -> Selection {
+        use crate::ElementKind::{Node, Relation, Way};
+
+        let (direct, included) = match kind {
+            Node => (
+                self.matched_node_ids.get(id),
+                self.way_dep_node_ids.get(id) || self.relation_dep_node_ids.get(id),
+            ),
+            Way => (self.direct_way_ids.get(id), self.member_way_ids.get(id)),
+            Relation => {
+                if !self.included_relation_ids.get(id) {
+                    return Selection::Discard;
+                }
+                (self.direct_relation_ids.get(id), true)
+            }
+        };
+        if direct || included {
+            Selection::retain(!remove_tags || direct)
+        } else {
+            Selection::Discard
+        }
+    }
+}
+
 /// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
-#[allow(clippy::too_many_lines)]
 fn filter_block_pass2(
-    block: &PrimitiveBlock,
+    buffer: BlockBuffer<'_>,
     ids: &Pass2IdSets<'_>,
     remove_tags: bool,
     coords: crate::owned::WayCoords,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> crate::Result<TagsFilterStats> {
+) -> Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -632,47 +657,28 @@ fn filter_block_pass2(
         relations_from_relations: 0,
     };
     let mut way = crate::owned::WayScratch::default();
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-
-    for element in block.elements() {
-        match &element {
-            Element::DenseNode(dn) => {
-                let direct = ids.matched_node_ids.get(dn.id());
-                let from_way = ids.way_dep_node_ids.get(dn.id());
-                let from_relation = ids.relation_dep_node_ids.get(dn.id());
-                if direct || from_way || from_relation {
+    let block = buffer.for_selection()?;
+    let mut members = Vec::new();
+    block.visit(
+        |kind, id| ids.select(kind, id, remove_tags),
+        |element, keep_tags| {
+            match element {
+                Element::DenseNode(n) => {
                     ensure_node_capacity_local(bb, output)?;
-                    let tags = (!remove_tags || direct)
-                        .then(|| dn.tags())
-                        .into_iter()
-                        .flatten();
-                    let meta = dense_node_metadata(dn)?;
+                    let tags = keep_tags.then(|| n.tags()).into_iter().flatten();
+                    let meta = dense_node_metadata(&n)?;
                     bb.add_node_dense(
-                        dn.id(),
-                        dn.decimicro_lat()?,
-                        dn.decimicro_lon()?,
+                        n.id(),
+                        n.decimicro_lat()?,
+                        n.decimicro_lon()?,
                         tags,
                         meta.as_ref(),
                     );
-                    if direct {
-                        stats.nodes_matched += 1;
-                    } else if from_way {
-                        stats.nodes_from_ways += 1;
-                    } else {
-                        stats.nodes_from_relations += 1;
-                    }
+                    count_output_node(&mut stats, ids, n.id());
                 }
-            }
-            Element::Node(n) => {
-                let direct = ids.matched_node_ids.get(n.id());
-                let from_way = ids.way_dep_node_ids.get(n.id());
-                let from_relation = ids.relation_dep_node_ids.get(n.id());
-                if direct || from_way || from_relation {
+                Element::Node(n) => {
                     ensure_node_capacity_local(bb, output)?;
-                    let tags = (!remove_tags || direct)
-                        .then(|| n.tags())
-                        .into_iter()
-                        .flatten();
+                    let tags = keep_tags.then(|| n.tags()).into_iter().flatten();
                     let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node_partial(
                         n.id(),
@@ -681,54 +687,47 @@ fn filter_block_pass2(
                         tags,
                         meta.as_ref(),
                     );
-                    if direct {
-                        stats.nodes_matched += 1;
-                    } else if from_way {
-                        stats.nodes_from_ways += 1;
-                    } else {
-                        stats.nodes_from_relations += 1;
-                    }
+                    count_output_node(&mut stats, ids, n.id());
                 }
-            }
-            Element::Way(w) => {
-                let direct = ids.direct_way_ids.get(w.id());
-                if direct || ids.member_way_ids.get(w.id()) {
+                Element::Way(w) => {
                     ensure_way_capacity_local(bb, output)?;
-                    let tags = (!remove_tags || direct)
-                        .then(|| w.tags())
-                        .into_iter()
-                        .flatten();
-                    way.prepare(w, coords)?;
+                    let tags = keep_tags.then(|| w.tags()).into_iter().flatten();
+                    way.prepare(&w, coords)?;
                     let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
                     way.write(bb, tags, meta.as_ref());
-                    if direct {
+                    if ids.direct_way_ids.get(w.id()) {
                         stats.ways_matched += 1;
                     } else {
                         stats.ways_from_relations += 1;
                     }
                 }
-            }
-            Element::Relation(r) => {
-                if ids.included_relation_ids.get(r.id()) {
+                Element::Relation(r) => {
                     ensure_relation_capacity_local(bb, output)?;
-                    let direct = ids.direct_relation_ids.get(r.id());
-                    let tags = (!remove_tags || direct)
-                        .then(|| r.tags())
-                        .into_iter()
-                        .flatten();
-                    r.members_into(&mut members_buf)?;
+                    r.members_into(&mut members)?;
+                    let tags = keep_tags.then(|| r.tags()).into_iter().flatten();
                     let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
-                    bb.add_relation_partial(r.id(), tags, &members_buf, meta.as_ref());
-                    if direct {
+                    bb.add_relation_partial(r.id(), tags, &members, meta.as_ref());
+                    if ids.direct_relation_ids.get(r.id()) {
                         stats.relations_matched += 1;
                     } else {
                         stats.relations_from_relations += 1;
                     }
                 }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(stats)
+}
+
+fn count_output_node(stats: &mut TagsFilterStats, ids: &Pass2IdSets<'_>, id: i64) {
+    if ids.matched_node_ids.get(id) {
+        stats.nodes_matched += 1;
+    } else if ids.way_dep_node_ids.get(id) {
+        stats.nodes_from_ways += 1;
+    } else {
+        stats.nodes_from_relations += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,16 +1175,16 @@ fn tags_filter_two_pass(
         // its window, a failed blob located with the input, its ordinal and
         // its frame offset. Each worker keeps one BlockBuilder and output
         // vector across blobs, built on its own thread.
-        crate::scan::classify::parallel_classify_phase_ordered(
+        crate::scan::classify::parallel_project_phase_ordered(
             &input_file,
             &schedule,
             Some(decode_threads),
             None,
             || (BlockBuilder::new(), Vec::<OwnedBlock>::new()),
-            |block, (bb, output_blocks): &mut (BlockBuilder, Vec<OwnedBlock>)| {
+            |buffer, (bb, output_blocks): &mut (BlockBuilder, Vec<OwnedBlock>)| {
                 output_blocks.clear();
                 let block_stats =
-                    filter_block_pass2(block, &id_sets, remove_tags, coords, bb, output_blocks)?;
+                    filter_block_pass2(buffer, &id_sets, remove_tags, coords, bb, output_blocks)?;
                 flush_local(bb, output_blocks)?;
                 crate::commands::split::fit_blocks(output_blocks, &limits)?;
                 Ok((std::mem::take(output_blocks), block_stats))

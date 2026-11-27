@@ -484,19 +484,7 @@ fn classify_group(data: &[u8]) -> BlockType {
 /// No code in the crate needs to clone a `PrimitiveBlock`. For shared access, use
 /// `Arc<PrimitiveBlock>` - a single atomic increment regardless of block size.
 pub struct PrimitiveBlock {
-    /// Keeps alive the decompressed bytes borrowed by the zero-copy block view.
-    _buffer: Bytes,
-    /// Zero-copy parsed view. Borrows from `_buffer` via lifetime erasure.
-    ///
-    /// # Safety
-    ///
-    /// The `'static` lifetime is a lie - `block` actually borrows from `_buffer`.
-    /// This is safe because:
-    /// 1. `_buffer` is `Bytes` (immutable, reference-counted), never mutated.
-    /// 2. `_buffer` and `block` live in the same struct - `block` cannot outlive `_buffer`.
-    /// 3. `PrimitiveBlock` is not `Clone`, preventing accidental separation.
-    /// 4. All public access goes through `&self`, tying the real lifetime to the borrow.
-    block: WireBlock<'static>,
+    data: BlockData,
     /// The kinds of the elements the block holds, recorded by the
     /// construction-time validation pass.
     kinds: crate::element_kind::ElementKindSet,
@@ -504,44 +492,51 @@ pub struct PrimitiveBlock {
     /// same validation pass.
     element_count: u64,
     /// The census ticket of a block issued to the caller (`buffer`), set where
-    /// a block leaves the library. Declared after `_buffer`: a pooled buffer
+    /// a block leaves the library. Declared after `data`: a pooled buffer
     /// returns to its pool and records there, under the pool's permit, before
     /// the ticket retires.
     ticket: Option<crate::host::Ticket>,
 }
 
+/// Shared ownership for the full block and the scoped element projection.
+struct BlockData {
+    /// Keeps the decompressed bytes and inline tables alive and immutable.
+    bytes: Bytes,
+    wire: WireBlock<'static>,
+}
+
+impl BlockData {
+    fn new(bytes: Bytes, meta: &WireBlockMeta) -> Self {
+        let wire = WireBlock::from_inline(&bytes, meta);
+        // SAFETY: the immutable backing bytes move into the same struct and
+        // outlive all borrows of the wire view. Access to the view is confined
+        // to this module and tied to a borrow of the owner.
+        #[allow(clippy::transmute_undefined_repr)]
+        let wire = unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(wire) };
+        Self { bytes, wire }
+    }
+}
+
 impl std::fmt::Debug for PrimitiveBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrimitiveBlock")
-            .field("groups", &self.block.group_count())
-            .field("stringtable_entries", &self.block.stringtable.len())
-            .field("granularity", &self.block.granularity)
+            .field("groups", &self.data.wire.group_count())
+            .field("stringtable_entries", &self.data.wire.stringtable.len())
+            .field("granularity", &self.data.wire.granularity)
             .finish()
     }
 }
 
 impl PrimitiveBlock {
-    /// Assemble a `PrimitiveBlock` from bytes [`validate_block`] accepted,
-    /// with its offset tables already appended: builds the `WireBlock` from
-    /// the inline metadata and transmutes the lifetime to `'static` (safe
-    /// because `bytes` owns the backing data). Reached only through
-    /// [`ValidatedBlock::into_block`], which owns the bytes, the scan and the
-    /// validation result together.
+    /// Assemble a fully validated block whose offset tables are already inline.
     fn assemble(
         bytes: Bytes,
         meta: &WireBlockMeta,
         kinds: crate::element_kind::ElementKindSet,
         element_count: u64,
     ) -> PrimitiveBlock {
-        let data: &[u8] = &bytes;
-        let block = WireBlock::from_inline(data, meta);
-
-        #[allow(clippy::transmute_undefined_repr)]
-        let block = unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
-
         PrimitiveBlock {
-            _buffer: bytes,
-            block,
+            data: BlockData::new(bytes, meta),
             kinds,
             element_count,
             ticket: None,
@@ -651,7 +646,7 @@ impl PrimitiveBlock {
     /// entries are used, returns the original protobuf size (not the extended
     /// buffer).
     pub fn decompressed_size(&self) -> usize {
-        self.block.proto_len as usize
+        self.data.wire.proto_len as usize
     }
 
     /// The block's coordinate framing as `(granularity, lat_offset,
@@ -661,9 +656,9 @@ impl PrimitiveBlock {
     /// output block's (default) framing reads them the same way.
     pub(crate) fn coord_framing(&self) -> (i32, i64, i64) {
         (
-            self.block.granularity,
-            self.block.lat_offset,
-            self.block.lon_offset,
+            self.data.wire.granularity,
+            self.data.wire.lat_offset,
+            self.data.wire.lon_offset,
         )
     }
 
@@ -671,7 +666,7 @@ impl PrimitiveBlock {
     /// 1000 unless the block declares otherwise). For writers that copy raw
     /// `Info` bytes.
     pub(crate) fn date_granularity(&self) -> i32 {
-        self.block.date_granularity
+        self.data.wire.date_granularity
     }
 
     /// Returns the element type contained in this block.
@@ -699,8 +694,8 @@ impl PrimitiveBlock {
     /// all empty (or that has none) is [`Empty`](BlockType::Empty).
     pub fn block_type(&self) -> BlockType {
         let mut result: Option<BlockType> = None;
-        for i in 0..self.block.group_count() {
-            let group_data = self.block.group(i);
+        for i in 0..self.data.wire.group_count() {
+            let group_data = self.data.wire.group(i);
             let group_type = classify_group(group_data);
             if group_type == BlockType::Empty {
                 continue;
@@ -722,7 +717,7 @@ impl PrimitiveBlock {
     // wontfix(name-iter-convention): elements() is more descriptive than iter() here;
     // BlockElementsIter name matches established osmpbf public API.
     pub fn elements(&self) -> BlockElementsIter<'_> {
-        BlockElementsIter::new(&self.block)
+        BlockElementsIter::new(&self.data.wire)
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`,
@@ -730,12 +725,12 @@ impl PrimitiveBlock {
     /// dense nodes. Use this for scan-only passes that only need IDs,
     /// coordinates, refs, and tags.
     pub fn elements_skip_metadata(&self) -> BlockElementsIter<'_> {
-        BlockElementsIter::new_skip_metadata(&self.block)
+        BlockElementsIter::new_skip_metadata(&self.data.wire)
     }
 
     /// Returns the number of entries in this block's string table.
     pub fn string_table_len(&self) -> usize {
-        self.block.stringtable.len()
+        self.data.wire.stringtable.len()
     }
 
     /// Returns the string at the given string table index, or `None` if out of bounds.
@@ -745,7 +740,7 @@ impl PrimitiveBlock {
     /// the entry is returned as the file stores it. Entries were validated as
     /// UTF-8 at construction time.
     pub fn string_table_entry(&self, index: usize) -> Option<&str> {
-        self.block.stringtable.get(index).map(|bytes| {
+        self.data.wire.stringtable.get(index).map(|bytes| {
             // SAFETY: All stringtable entries were validated as UTF-8 in
             // validate_block, which every constructor funnels through
             // (BlockBuffer::project), and the appended table this reads
@@ -788,9 +783,9 @@ impl PrimitiveBlock {
             if let Some(dense) = validated_dense(&group.group) {
                 columns.decode_append(
                     &dense,
-                    self.block.granularity,
-                    self.block.lat_offset,
-                    self.block.lon_offset,
+                    self.data.wire.granularity,
+                    self.data.wire.lat_offset,
+                    self.data.wire.lon_offset,
                 )?;
             }
         }
@@ -799,7 +794,7 @@ impl PrimitiveBlock {
 
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
     pub fn groups(&self) -> GroupIter<'_> {
-        GroupIter::new(&self.block)
+        GroupIter::new(&self.data.wire)
     }
 
     /// Calls the given closure on each element, in the same order as
@@ -1122,9 +1117,9 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// projection that keeps nothing ([`NoProjection`]); a reader that needs
 /// less than a block (inspect, `check --ids`, getparents) passes its own
 /// [`GroupProjection`] through [`BlockBuffer::project`], or through
-/// [`validate_in_place`] when it holds the bytes borrowed, so it refuses
-/// exactly the blocks construction refuses, with the same error, by running
-/// the same code rather than a copy of it.
+/// [`validate_in_place`] when it holds the bytes borrowed. Both use the
+/// full scan and refuse the same blocks as construction. The dependency
+/// pass of tags-filter uses the same scan in its selective mode.
 ///
 /// `make` builds the projection once the top level is framed, from the
 /// block's scalar fields and its string table entries (buffer-relative
@@ -1138,20 +1133,22 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// `PrimitiveBlock::elements` yields: one per plain node, way and relation
 /// message and the dense ID count each dense group's validation computes.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn validate_block<P: GroupProjection>(
+fn validate_block<const FULL: bool, P: GroupProjection>(
     buffer: &[u8],
     st: &mut Vec<(u32, u32)>,
     groups: &mut Vec<(u32, u32)>,
+    tags: [bool; 3],
     make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
 ) -> Result<(P, BlockScan)> {
     let fields = super::wire::scan_block_fields(buffer, st, groups)?;
     let slice =
         |&(offset, len): &(u32, u32)| &buffer[offset as usize..offset as usize + len as usize];
     let mut projection = make(&fields, st);
-    let (kinds, element_count) = validate_groups(
+    let (kinds, element_count) = validate_groups::<FULL, _>(
         groups.len(),
         |i| slice(&groups[i]),
         st.len(),
+        tags,
         &mut projection,
     )?;
     validate_stringtable_utf8(st.iter().map(slice))?;
@@ -1181,7 +1178,7 @@ pub(crate) fn validate_in_place<P: GroupProjection>(
     claim: Option<crate::ElementKind>,
     make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
 ) -> Result<(P, BlockScan)> {
-    let (projection, scan) = validate_block(buffer, st, groups, make)?;
+    let (projection, scan) = validate_block::<true, _>(buffer, st, groups, [true; 3], make)?;
     scan.kinds.refuse_under(claim)?;
     Ok((projection, scan))
 }
@@ -1203,15 +1200,16 @@ pub(crate) struct BlockScan {
 /// contradicted claim (`None` under `KindClaims::Unchecked` or for an
 /// unindexed blob).
 ///
-/// The only ways on are [`project`](Self::project), which validates,
+/// Full validation goes through [`project`](Self::project),
 /// [`block`](Self::block), which is `project` with [`NoProjection`] followed
 /// by [`ValidatedBlock::into_block`], and
 /// [`block_rescuing`](Self::block_rescuing), which runs the same check and
 /// revalidates any rewrite: every `PrimitiveBlock` in the crate is
-/// built this way, so a projection and a block refuse the same input with the
+/// built this way, so a full projection and a block refuse the same input with the
 /// same error, and the kind-claim refusal follows validation in both. The
 /// check itself is [`validate_in_place`], which a caller holding borrowed
-/// bytes it will not build a block from calls directly.
+/// bytes it will not build a block from calls directly. The tags-filter
+/// projections expose only the fields they validate for their particular pass.
 pub(crate) struct BlockBuffer<'w> {
     buffer: Vec<u8>,
     pool: Option<&'w std::sync::Arc<crate::blob::DecompressPool>>,
@@ -1255,6 +1253,29 @@ impl<'w> BlockBuffer<'w> {
         self,
         make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
     ) -> Result<(P, ValidatedBlock<'w>)> {
+        self.project_fields::<true, _>([true; 3], make)
+    }
+
+    /// The two-pass tag filter's dependency projection. It reads IDs, way
+    /// refs and the tag arrays of kinds with predicates. Other fields still
+    /// undergo framing and packed length checks, except the contents of
+    /// unread metadata messages. Hooks receive empty slices for unread tags
+    /// and no metadata. The returned bytes can back the recorded spans but
+    /// cannot become a `PrimitiveBlock`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn project_tags<P: GroupProjection>(
+        self,
+        tags: [bool; 3],
+        make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
+    ) -> Result<(P, ValidatedBlock<'w, false>)> {
+        self.project_fields::<false, _>(tags, make)
+    }
+
+    fn project_fields<const FULL: bool, P: GroupProjection>(
+        self,
+        tags: [bool; 3],
+        make: impl FnOnce(&super::wire::BlockFields, &[(u32, u32)]) -> P,
+    ) -> Result<(P, ValidatedBlock<'w, FULL>)> {
         let BlockBuffer {
             buffer,
             pool,
@@ -1262,7 +1283,13 @@ impl<'w> BlockBuffer<'w> {
             groups,
             claim,
         } = self;
-        let (projection, scan) = match validate_in_place(&buffer, st, groups, claim, make) {
+        let result = validate_block::<FULL, _>(&buffer, st, groups, tags, make).and_then(
+            |(projection, scan)| {
+                scan.kinds.refuse_under(claim)?;
+                Ok((projection, scan))
+            },
+        );
+        let (projection, scan) = match result {
             Ok(accepted) => accepted,
             Err(e) => {
                 drop(crate::blob::pool_wrap(buffer, pool));
@@ -1285,6 +1312,33 @@ impl<'w> BlockBuffer<'w> {
     pub(crate) fn block(self) -> Result<PrimitiveBlock> {
         let (NoProjection, validated) = self.project(|_, _| NoProjection)?;
         Ok(validated.into_block())
+    }
+
+    /// Frame a block for a selective element walk. The returned view exposes
+    /// only the fallible walk, which validates before yielding elements.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn for_selection(self) -> Result<SelectionBlock> {
+        let BlockBuffer {
+            mut buffer,
+            pool,
+            st,
+            groups,
+            claim,
+        } = self;
+        let fields = match super::wire::scan_block_fields(&buffer, st, groups) {
+            Ok(fields) => fields,
+            Err(err) => {
+                drop(crate::blob::pool_wrap(buffer, pool));
+                return Err(err);
+            }
+        };
+        let meta = WireBlock::inline_tables(&mut buffer, st, groups, fields);
+        let data = BlockData::new(crate::blob::pool_wrap(buffer, pool), &meta);
+        let utf8 = validate_stringtable_utf8(
+            st.iter()
+                .map(|&(at, len)| &data.bytes[at as usize..at as usize + len as usize]),
+        );
+        Ok(SelectionBlock { data, claim, utf8 })
     }
 
     /// [`block`](Self::block) for a caller that can rewrite a refused block:
@@ -1336,12 +1390,203 @@ impl<'w> BlockBuffer<'w> {
     }
 }
 
-/// A block [`BlockBuffer::project`] accepted, still holding its bytes, the
+pub(crate) struct SelectionBlock {
+    data: BlockData,
+    claim: Option<crate::ElementKind>,
+    utf8: Result<()>,
+}
+
+impl SelectionBlock {
+    /// Walk records selected for re-encoding, in element order. Structural
+    /// checks cover the whole block. Metadata and tag values are checked
+    /// before a retained record reaches `visit`. A dense column is shared by
+    /// the group and is checked when any retained node needs it. The visitor
+    /// must keep its work provisional until success. `select` must give the
+    /// same answer for an ID throughout the walk.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn visit<'a>(
+        &'a self,
+        select: impl Fn(crate::ElementKind, i64) -> Selection,
+        mut visit: impl FnMut(Element<'a>, bool) -> Result<()>,
+    ) -> Result<()> {
+        let wire = &self.data.wire;
+        let mut output = Ok(());
+        let mut offer = |element, keep_tags| {
+            // Preserve validation errors ahead of a visitor error, and
+            // never lend a string view before its UTF-8 check succeeds.
+            if self.utf8.is_ok() && output.is_ok() {
+                output = visit(element, keep_tags);
+            }
+        };
+        let mut kinds = crate::element_kind::ElementKindSet::default();
+        for i in 0..wire.group_count() {
+            kinds = kinds.union(visit_selected_group(wire, i, &select, &mut offer)?);
+        }
+        self.utf8.as_ref().map_err(Clone::clone)?;
+        kinds.refuse_under(self.claim)?;
+        output
+    }
+}
+
+/// Which part of a record the re-encoder needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Selection {
+    Discard,
+    StripTags,
+    KeepTags,
+}
+
+impl Selection {
+    pub(crate) fn retain(keep_tags: bool) -> Self {
+        if keep_tags {
+            Self::KeepTags
+        } else {
+            Self::StripTags
+        }
+    }
+}
+
+fn visit_selected_group<'a>(
+    wire: &'a WireBlock<'static>,
+    index: usize,
+    select: &impl Fn(crate::ElementKind, i64) -> Selection,
+    visit: &mut impl FnMut(Element<'a>, bool),
+) -> Result<crate::element_kind::ElementKindSet> {
+    use crate::ElementKind::{Node as NodeKind, Relation as RelationKind, Way as WayKind};
+
+    let data = wire.group(index);
+    validate_group_framing(data)?;
+    let group = WireGroup::new(data);
+    let strings = wire.stringtable.len();
+    let mut kinds = crate::element_kind::ElementKindSet::default();
+    // Output is dense-first. Defer any dense validation failure until
+    // after the ordinary records, matching the full validator's order.
+    let dense = visit_selected_dense(wire, &group, select, visit);
+    for bytes in group.nodes() {
+        kinds.add(NodeKind);
+        let mut node = WireNode::parse(bytes)?;
+        let selection = select(NodeKind, node.id);
+        if selection != Selection::Discard {
+            validate_info(node.info_data)?;
+        }
+        let keep_tags = selection == Selection::KeepTags;
+        project_tags(
+            &mut node.keys_data,
+            &mut node.vals_data,
+            keep_tags,
+            strings,
+            "node has mismatched keys/vals tag array lengths",
+        )?;
+        if selection != Selection::Discard {
+            visit(Element::Node(Node::new(wire, node)), keep_tags);
+        }
+    }
+    for bytes in group.ways() {
+        kinds.add(WayKind);
+        let mut way = WireWay::parse(bytes)?;
+        let selection = select(WayKind, way.id);
+        if selection != Selection::Discard {
+            validate_info(way.info_data)?;
+        }
+        let keep_tags = selection == Selection::KeepTags;
+        project_tags(
+            &mut way.keys_data,
+            &mut way.vals_data,
+            keep_tags,
+            strings,
+            "way has mismatched keys/vals tag array lengths",
+        )?;
+        validate_way_geometry_arrays(&way)?;
+        if selection != Selection::Discard {
+            visit(Element::Way(Way::new(wire, way)), keep_tags);
+        }
+    }
+    for bytes in group.relations() {
+        kinds.add(RelationKind);
+        let mut relation = WireRelation::parse(bytes)?;
+        let selection = select(RelationKind, relation.id);
+        if selection != Selection::Discard {
+            validate_info(relation.info_data)?;
+        }
+        let keep_tags = selection == Selection::KeepTags;
+        project_tags(
+            &mut relation.keys_data,
+            &mut relation.vals_data,
+            keep_tags,
+            strings,
+            "relation has mismatched keys/vals tag array lengths",
+        )?;
+        validate_relation_member_arrays(&relation)?;
+        if selection != Selection::Discard {
+            visit(Element::Relation(Relation::new(wire, relation)), keep_tags);
+        }
+    }
+    if dense? {
+        kinds.add(NodeKind);
+    }
+    Ok(kinds)
+}
+
+fn visit_selected_dense<'a>(
+    wire: &'a WireBlock<'static>,
+    group: &WireGroup<'a>,
+    select: &impl Fn(crate::ElementKind, i64) -> Selection,
+    visit: &mut impl FnMut(Element<'a>, bool),
+) -> Result<bool> {
+    use super::elements::WayRefIter;
+    use crate::ElementKind::Node;
+
+    let Some(bytes) = group.dense()? else {
+        return Ok(false);
+    };
+    let mut dense = WireDenseNodes::parse(bytes)?;
+    let count = validate_dense_coordinates(&dense)?;
+    if count == 0 {
+        // With no IDs every nonempty tag run or metadata array is extraneous.
+        validate_dense_keys_vals(dense.keys_vals_data, count, wire.stringtable.len())?;
+        validate_dense_info(&dense, count)?;
+        return Ok(false);
+    }
+    let mut selection = Selection::Discard;
+    for id in WayRefIter::delta_decoded(dense.id_data) {
+        match select(Node, id) {
+            Selection::Discard => continue,
+            Selection::StripTags => {
+                selection = Selection::StripTags;
+                if dense.keys_vals_data.is_empty() {
+                    break;
+                }
+            }
+            Selection::KeepTags => {
+                selection = Selection::KeepTags;
+                break;
+            }
+        }
+    }
+    project_dense_tags(
+        &mut dense,
+        selection == Selection::KeepTags,
+        count,
+        wire.stringtable.len(),
+    )?;
+    if selection != Selection::Discard {
+        validate_dense_info(&dense, count)?;
+        for node in DenseNodeIter::new(wire, dense) {
+            let selection = select(Node, node.id());
+            if selection != Selection::Discard {
+                visit(Element::DenseNode(node), selection == Selection::KeepTags);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// A block a projection accepted, still holding its bytes, the
 /// scratch that scan filled and what it found: everything
 /// [`into_block`](Self::into_block) needs to build the `PrimitiveBlock`
-/// construction would have built, without validating twice. Dropped
-/// instead, it returns its bytes to their pool.
-pub(crate) struct ValidatedBlock<'w> {
+/// construction would have built, without validating twice, when `FULL`
+/// is true. Dropped instead, it returns its bytes to their pool.
+pub(crate) struct ValidatedBlock<'w, const FULL: bool = true> {
     /// Emptied (no capacity) once taken by `into_block`.
     buffer: Vec<u8>,
     pool: Option<&'w std::sync::Arc<crate::blob::DecompressPool>>,
@@ -1356,8 +1601,7 @@ impl ValidatedBlock<'_> {
         &self.scan
     }
 
-    /// The validated bytes, unchanged since validation: what a projection
-    /// that recorded positions instead of copies reads back.
+    /// The validated bytes, unchanged since validation.
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.buffer
     }
@@ -1365,20 +1609,6 @@ impl ValidatedBlock<'_> {
     /// How many entries the accepted block's string table holds.
     pub(crate) fn string_count(&self) -> usize {
         self.st.len()
-    }
-
-    /// String table entry `index` of the accepted block, exactly what
-    /// [`str_from_stringtable`] gives for it in the built block (the entry
-    /// as stored, index 0 included: nothing here assumes it is empty), or
-    /// `None` past the table.
-    pub(crate) fn string(&self, index: usize) -> Option<&str> {
-        let &(offset, len) = self.st.get(index)?;
-        let bytes = &self.buffer[offset as usize..offset as usize + len as usize];
-        // SAFETY: `validate_block` checked every entry of `st` as UTF-8
-        // (`validate_stringtable_utf8`) before `BlockBuffer::project` returned
-        // this value, and neither `buffer` nor `st` can change while it
-        // lives: both are private and nothing here hands out mutable access.
-        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
     }
 
     /// The block: its offset tables appended to the bytes, from the scan
@@ -1395,7 +1625,31 @@ impl ValidatedBlock<'_> {
     }
 }
 
-impl Drop for ValidatedBlock<'_> {
+impl ValidatedBlock<'_, false> {
+    /// Read a span recorded from a field handed to the projection. The
+    /// projection cannot borrow the full payload or turn it into a block.
+    pub(crate) fn span(&self, span: super::project_ids::Span) -> Result<&[u8]> {
+        span.in_blob(&self.buffer)
+    }
+}
+
+impl<const FULL: bool> ValidatedBlock<'_, FULL> {
+    /// String table entry `index` of the accepted block, exactly what
+    /// [`str_from_stringtable`] gives for it in the built block (the entry
+    /// as stored, index 0 included: nothing here assumes it is empty), or
+    /// `None` past the table.
+    pub(crate) fn string(&self, index: usize) -> Option<&str> {
+        let &(offset, len) = self.st.get(index)?;
+        let bytes = &self.buffer[offset as usize..offset as usize + len as usize];
+        // SAFETY: `validate_block` checked every entry of `st` as UTF-8
+        // (`validate_stringtable_utf8`) before either projection returned
+        // this value, and neither `buffer` nor `st` can change while it
+        // lives: both are private and nothing here hands out mutable access.
+        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+    }
+}
+
+impl<const FULL: bool> Drop for ValidatedBlock<'_, FULL> {
     fn drop(&mut self) {
         let buffer = std::mem::take(&mut self.buffer);
         if buffer.capacity() > 0 {
@@ -1405,10 +1659,9 @@ impl Drop for ValidatedBlock<'_> {
 }
 
 /// What a block scan hands each piece of a block to once that piece passed
-/// its checks: the one validator ([`validate_groups`]) with a reader's own
-/// statistics riding on it, so a reader that never builds a
-/// [`PrimitiveBlock`] refuses exactly the blocks construction refuses, in
-/// the same order.
+/// its checks. With [`BlockBuffer::project`] all fields have their full
+/// validation. [`BlockBuffer::project_tags`] clears the unused tag and
+/// metadata fields and retains the structural checks on the rest.
 ///
 /// A hook sees data that passed its own checks, not a validated block: a
 /// later piece of the same group may still fail, and the string table's
@@ -1426,7 +1679,7 @@ pub(crate) trait GroupProjection {
     fn node(&mut self, _node: &WireNode<'_>, _info: Option<&super::wire::WireInfo>) {}
     fn way(&mut self, _way: &WireWay<'_>, _info: Option<&super::wire::WireInfo>) {}
     fn relation(&mut self, _relation: &WireRelation<'_>, _info: Option<&super::wire::WireInfo>) {}
-    /// A dense message that passed every check, holding `ids` nodes, and
+    /// A dense message that passed the scan's checks, holding `ids` nodes, and
     /// its `denseinfo` when that carries any column (each present one at
     /// full length, any subset; `None` when absent or empty).
     fn dense(
@@ -1529,13 +1782,13 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
 /// block holds and its element count. The group part of [`validate_block`],
 /// whose doc says what is checked and why; reached only through it.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn validate_groups<'a>(
+fn validate_groups<'a, const FULL: bool, P: GroupProjection>(
     group_count: usize,
     group: impl Fn(usize) -> &'a [u8],
     strings: usize,
-    projection: &mut impl GroupProjection,
+    [node_tags, way_tags, relation_tags]: [bool; 3],
+    projection: &mut P,
 ) -> Result<(crate::element_kind::ElementKindSet, u64)> {
-    use super::wire::Cursor;
     use crate::ElementKind;
 
     let mut kinds = crate::element_kind::ElementKindSet::default();
@@ -1548,10 +1801,7 @@ fn validate_groups<'a>(
 
         // 1. The group's own field framing. Everything below walks this same
         //    byte range through iterators that cannot report an error.
-        let mut cursor = Cursor::new(data);
-        while let Some((_field, wire_type)) = cursor.read_tag()? {
-            cursor.skip_field(wire_type)?;
-        }
+        validate_group_framing(data)?;
 
         let group = WireGroup::new(data);
         projection.group_begin();
@@ -1562,11 +1812,12 @@ fn validate_groups<'a>(
         for element in group.nodes() {
             group_kinds.add(ElementKind::Node);
             count += 1;
-            let node = WireNode::parse(element)?;
-            let info = validate_info(node.info_data)?;
-            validate_tag_arrays(
-                node.keys_data,
-                node.vals_data,
+            let mut node = WireNode::parse(element)?;
+            let info = project_info::<FULL>(&mut node.info_data)?;
+            project_tags(
+                &mut node.keys_data,
+                &mut node.vals_data,
+                FULL || node_tags,
                 strings,
                 "node has mismatched keys/vals tag array lengths",
             )?;
@@ -1575,11 +1826,12 @@ fn validate_groups<'a>(
         for element in group.ways() {
             group_kinds.add(ElementKind::Way);
             count += 1;
-            let way = WireWay::parse(element)?;
-            let info = validate_info(way.info_data)?;
-            validate_tag_arrays(
-                way.keys_data,
-                way.vals_data,
+            let mut way = WireWay::parse(element)?;
+            let info = project_info::<FULL>(&mut way.info_data)?;
+            project_tags(
+                &mut way.keys_data,
+                &mut way.vals_data,
+                FULL || way_tags,
                 strings,
                 "way has mismatched keys/vals tag array lengths",
             )?;
@@ -1589,11 +1841,12 @@ fn validate_groups<'a>(
         for element in group.relations() {
             group_kinds.add(ElementKind::Relation);
             count += 1;
-            let relation = WireRelation::parse(element)?;
-            let info = validate_info(relation.info_data)?;
-            validate_tag_arrays(
-                relation.keys_data,
-                relation.vals_data,
+            let mut relation = WireRelation::parse(element)?;
+            let info = project_info::<FULL>(&mut relation.info_data)?;
+            project_tags(
+                &mut relation.keys_data,
+                &mut relation.vals_data,
+                FULL || relation_tags,
                 strings,
                 "relation has mismatched keys/vals tag array lengths",
             )?;
@@ -1604,19 +1857,14 @@ fn validate_groups<'a>(
         // 3. The dense group, and the parallel-array invariant every dense
         //    consumer indexes on.
         if let Some(dense_data) = group.dense()? {
-            let dense = WireDenseNodes::parse(dense_data)?;
-            let ids = packed_varint_count(dense.id_data)?;
-            let lats = packed_varint_count(dense.lat_data)?;
-            let lons = packed_varint_count(dense.lon_data)?;
-            if ids != lats || ids != lons {
-                return Err(new_wire_error(
-                    "dense group has mismatched id/lat/lon array lengths",
-                ));
-            }
-            validate_dense_keys_vals(dense.keys_vals_data, ids, strings)?;
-            let info = match dense.info_data {
-                Some(info_data) => validate_dense_info_arrays(info_data, ids)?,
-                None => None,
+            let mut dense = WireDenseNodes::parse(dense_data)?;
+            let ids = validate_dense_coordinates(&dense)?;
+            project_dense_tags(&mut dense, FULL || node_tags, ids, strings)?;
+            let info = if FULL {
+                validate_dense_info(&dense, ids)?
+            } else {
+                dense.info_data = None;
+                None
             };
             if ids > 0 {
                 group_kinds.add(ElementKind::Node);
@@ -1629,6 +1877,86 @@ fn validate_groups<'a>(
     }
 
     Ok((kinds, count))
+}
+
+fn validate_group_framing(data: &[u8]) -> Result<()> {
+    let mut cursor = super::wire::Cursor::new(data);
+    while let Some((_, wire_type)) = cursor.read_tag()? {
+        cursor.skip_field(wire_type)?;
+    }
+    Ok(())
+}
+
+fn validate_dense_coordinates(dense: &WireDenseNodes<'_>) -> Result<usize> {
+    let ids = packed_varint_count(dense.id_data)?;
+    let lats = packed_varint_count(dense.lat_data)?;
+    let lons = packed_varint_count(dense.lon_data)?;
+    if ids != lats || ids != lons {
+        return Err(new_wire_error(
+            "dense group has mismatched id/lat/lon array lengths",
+        ));
+    }
+    Ok(ids)
+}
+
+#[inline]
+fn project_info<const FULL: bool>(
+    info: &mut Option<&[u8]>,
+) -> Result<Option<super::wire::WireInfo>> {
+    if FULL {
+        validate_info(*info)
+    } else {
+        *info = None;
+        Ok(None)
+    }
+}
+
+/// Unread plain tags need only varint framing and a cardinality check. Clear
+/// their spans so the projection cannot interpret an unchecked string index.
+#[inline]
+fn project_tags(
+    keys: &mut &[u8],
+    vals: &mut &[u8],
+    keep: bool,
+    strings: usize,
+    mismatch: &'static str,
+) -> Result<()> {
+    if keep {
+        return validate_tag_arrays(keys, vals, strings, mismatch);
+    }
+    if packed_varint_count(keys)? != packed_varint_count(vals)? {
+        return Err(new_wire_error(mismatch));
+    }
+    *keys = &[];
+    *vals = &[];
+    Ok(())
+}
+
+fn project_dense_tags(
+    dense: &mut WireDenseNodes<'_>,
+    keep: bool,
+    ids: usize,
+    strings: usize,
+) -> Result<()> {
+    if keep {
+        validate_dense_keys_vals(dense.keys_vals_data, ids, strings)?;
+    } else {
+        // Run counts require interpreting keys. Still check that the packed
+        // bytes hold complete varints before discarding the column.
+        packed_varint_count(dense.keys_vals_data)?;
+        dense.keys_vals_data = &[];
+    }
+    Ok(())
+}
+
+fn validate_dense_info<'a>(
+    dense: &WireDenseNodes<'a>,
+    ids: usize,
+) -> Result<Option<WireDenseInfo<'a>>> {
+    match dense.info_data {
+        Some(data) => validate_dense_info_arrays(data, ids),
+        None => Ok(None),
+    }
 }
 
 /// The string table's UTF-8 check, after every group, as block construction
@@ -1892,15 +2220,11 @@ fn validate_info(info_data: Option<&[u8]>) -> Result<Option<super::wire::WireInf
 
 /// Unwrap a re-parse of bytes that block construction already validated.
 ///
-/// The block iterators (`PrimitiveGroup`, `BlockElementsIter`, the group
-/// element iterators, `DenseNodeIter`) and the element `info()` accessors
-/// re-parse slices of a block's bytes - a group's `DenseNodes`, `DenseInfo`
-/// and `keys_vals` varints, each `Node` / `Way` / `Relation`, each element
-/// `Info` - because the block stores no parsed layout. Every one of those re-parses
-/// runs a parser that [`validate_block`] already ran, successfully,
-/// on the same immutable bytes: `ValidatedBlock::into_block` is the only
-/// constructor and is reachable only once validation passed, and the iterators
-/// derive their slices from that block themselves. A failure here is
+/// Block iterators and element accessors re-parse slices of a block's
+/// bytes because the block stores no parsed layout. Every re-parse runs a
+/// parser that already succeeded on the same immutable bytes, during
+/// [`validate_block`] for a full block or [`SelectionBlock::visit`] for the
+/// fields yielded by a selective walk. A failure here is
 /// therefore a pbfhogg bug (a slice that never went through validation, or a
 /// validator that drifted from the parser the iterator runs), not a property
 /// of the input, and it panics naming `what` failed.
@@ -2278,18 +2602,14 @@ impl<'a> Iterator for GroupRelationIter<'a> {
 
 /// Look up a stringtable entry by index, returning it as a `&str`.
 ///
-/// Uses `from_utf8_unchecked` - the safety relies on the invariant established
-/// by `validate_block`, which every constructor funnels through and
-/// which validates every stringtable entry at construction time.
+/// Uses `from_utf8_unchecked` after every string-table entry has been
+/// validated, in `validate_block` or before a `SelectionBlock` yields an
+/// element.
 pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -> Result<&'a str> {
     if let Some(bytes) = block.stringtable.get(index) {
-        // SAFETY: All stringtable entries were validated as UTF-8 in
-        // validate_block, which every constructor funnels through, and its
-        // scan refuses a payload over `wire::MAX_BLOCK_BYTES`, so the
-        // appended table positions cannot wrap past the validated entries.
-        // The PrimitiveBlock struct does not expose any mutable access to
-        // the underlying buffer, so entries cannot have been modified since
-        // construction.
+        // SAFETY: Both walks validate the entries as UTF-8 before exposing
+        // strings. They use the same bounded scan to produce the inline
+        // tables, and the underlying bytes stay immutable.
         Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
     } else {
         Err(new_stringtable_index_out_of_bounds(index))
@@ -2298,11 +2618,10 @@ pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -
 
 /// The key and value strings of a tag on an accepted block.
 ///
-/// Block construction refused any tag key or value index past the string
-/// table (`packed_uint32_count` and `validate_dense_keys_vals`), and every
-/// tag iterator reads the indices of a block that passed it, so both lookups
-/// resolve; a miss is a broken construction invariant and panics, in
-/// release as in debug.
+/// Both readers check tag indices with `packed_uint32_count` or
+/// `validate_dense_keys_vals` before exposing a tag iterator, so both
+/// lookups resolve. A miss is a broken invariant and panics in release
+/// as in debug.
 #[inline]
 #[track_caller]
 pub(crate) fn resolved_tag<'a>(
@@ -2335,7 +2654,7 @@ fn tag_index_unresolved() -> ! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod strict_validation_tests {
-    use super::PrimitiveBlock;
+    use super::{BlockBuffer, PrimitiveBlock, Selection};
     use crate::read::elements::Element;
 
     /// Wrap `body` as protobuf field `field`, wire type 2 (length-delimited).
@@ -2768,6 +3087,81 @@ mod strict_validation_tests {
         )
     }
 
+    fn selected_validation(buffer: Vec<u8>) -> crate::Result<()> {
+        let (mut st, mut groups) = (Vec::new(), Vec::new());
+        BlockBuffer::new(buffer, None, &mut st, &mut groups, None)
+            .for_selection()?
+            .visit(|_, _| Selection::KeepTags, |_, _| Ok(()))
+    }
+
+    #[test]
+    fn selecting_every_record_matches_full_validation_on_mutated_blocks() {
+        use crate::read::wire_fixtures::{mutations, projection_fixtures};
+
+        for (fixture, bytes) in projection_fixtures() {
+            for (mutation, input) in
+                std::iter::once(("as built".to_owned(), bytes.clone())).chain(mutations(&bytes))
+            {
+                let full = PrimitiveBlock::from_vec(input.clone()).map(drop);
+                let selected = selected_validation(input);
+                assert_eq!(
+                    selected.as_ref().map_err(ToString::to_string),
+                    full.as_ref().map_err(ToString::to_string),
+                    "{fixture}: {mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_fields_preserve_error_kinds_for_malformed_tags_and_metadata() {
+        let out_of_bounds = 63;
+        let mut oversized = Vec::new();
+        varint(1 << 31, &mut oversized);
+        let dense_tags = [
+            vec![1, 1, 0],    // Too few runs.
+            vec![0, 0, 0],    // Too many runs.
+            vec![0, 1],       // Key without a value.
+            vec![0, 0x80],    // Incomplete key.
+            vec![0, 1, 0x80], // Incomplete value.
+            vec![0, out_of_bounds, 0],
+            vec![0, 1, out_of_bounds],
+            oversized,
+        ];
+        let mut malformed = dense_tags
+            .iter()
+            .map(|tags| dense_group_with(2, tags, None))
+            .collect::<Vec<_>>();
+        malformed.push(dense_group_with(2, &[], Some(&[0x0a, 0x05, 0x02])));
+        for field in 1..=6 {
+            malformed.push(dense_group_with(2, &[], Some(&packed(field, 1))));
+            malformed.push(dense_group_with(2, &[], Some(&len_field(field, &[0x80]))));
+        }
+        for field in [1, 3, 4] {
+            malformed.push(len_field(field, &len_field(4, &[0x08])));
+            malformed.push(len_field(
+                field,
+                &[len_field(2, &[out_of_bounds]), packed(3, 1)].concat(),
+            ));
+            let mut oversized = Vec::new();
+            varint(1 << 32, &mut oversized);
+            malformed.push(len_field(
+                field,
+                &[packed(2, 1), len_field(3, &oversized)].concat(),
+            ));
+        }
+        for group in malformed {
+            let input = block_with_groups(&[group]);
+            let full = PrimitiveBlock::from_vec(input.clone()).unwrap_err();
+            let selected = selected_validation(input).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(full.kind()),
+                std::mem::discriminant(selected.kind()),
+                "{full} vs {selected}"
+            );
+        }
+    }
+
     /// A block built through `BlockBuffer`, with one scratch pair and one
     /// pool shared across every case, is the block its bytes describe on
     /// their own (the unvalidated assembly of the same bytes: string table,
@@ -2810,16 +3204,20 @@ mod strict_validation_tests {
                     assert_eq!(block.string_table_len(), raw.string_table_len(), "{what}");
                     for i in 0..raw.string_table_len() {
                         assert_eq!(
-                            block.block.stringtable.get(i),
-                            raw.block.stringtable.get(i),
+                            block.data.wire.stringtable.get(i),
+                            raw.data.wire.stringtable.get(i),
                             "{what}, string {i}"
                         );
                     }
-                    assert_eq!(block.block.group_count(), raw.block.group_count(), "{what}");
-                    for i in 0..raw.block.group_count() {
+                    assert_eq!(
+                        block.data.wire.group_count(),
+                        raw.data.wire.group_count(),
+                        "{what}"
+                    );
+                    for i in 0..raw.data.wire.group_count() {
                         assert_eq!(
-                            block.block.group(i),
-                            raw.block.group(i),
+                            block.data.wire.group(i),
+                            raw.data.wire.group(i),
                             "{what}, group {i}"
                         );
                     }

@@ -202,7 +202,24 @@ Kind: high-conviction (part of PERF-004 architecture).
 
 ## PERF-006 - Validation, then a second walk to decode what was validated
 
-Reported by: decode, indexdata, check, geocode, tags, osc, merge, apply-locations.
+Default two-pass PBF `tags-filter` now uses consumer-scoped validation.
+Pass 1 checks tags for kinds with predicates and skips metadata. Pass 2
+checks retained fields before re-encoding. Relation closure and member-way
+dependency scans still use full validation. The planet workload was about
+19 % faster in the warm pair on bygg, comparing HEAD `67510574` with its
+working tree. See [tags-filter measurements](../reference/performance/tags-filter.md).
+
+Remaining work:
+
+- `check --ids` and `KindIds` share the full projection path. They need to
+  opt in to scoped validation in `commands/check/verify_ids.rs` and
+  `read/project_ids.rs`.
+- Extract classification, geocode and diff still need consumer-specific
+  validation scopes.
+- Check whether pass 2 can avoid the extra dense ID probing with
+  `--remove-tags`. In a group with a tag column, the probe can continue
+  past a retained node whose tags will be stripped to look for a direct
+  match that keeps its tags.
 
 Mechanism: `validate_groups` (block.rs) parses every ordinary element and its
 `Info`, checks every packed array and fully decodes dense `keys_vals`, then
@@ -219,7 +236,7 @@ work for ID-only and tag-only requests. Examples of the second walk: smart
 extract classification (count arrays, build block, rediscover dense, decode
 three columns, classify), ID checks, reference checks, inspect tagged-node
 count, extended inspect metadata, location checking's separate raw scanners,
-geocode pass 2 dense address extraction, tags-filter dense tags, diff element
+geocode pass 2 dense address extraction, diff element
 iteration that decodes dense metadata content equality ignores. Single-pass
 `tags-filter` dense output still advances coordinates and metadata before
 selection, including for rejected nodes.

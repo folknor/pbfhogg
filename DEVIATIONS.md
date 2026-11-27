@@ -967,6 +967,30 @@ its timestamp). The refusal is deliberate - such a
 file has no single version at the cutoff, and a snapshot carrying two
 records of one ID is not a snapshot.
 
+## tags-filter PBF: validation follows the fields used by each pass
+
+The default two-pass filter checks block, group and element framing, the
+string table's UTF-8, packed-varint framing, ordinary parallel-array counts
+and any enforced blob kind claim. The dependency pass checks tag values
+and dense tag runs for kinds with a predicate. It skips the contents of
+plain Info and DenseInfo messages. The output pass checks Info on records
+it writes and validates tag values on records whose tags it keeps. If any
+retained node in a dense group needs metadata or tags, the corresponding
+whole column is checked, since metadata uses deltas and tags share a run
+stream. The output pass also validates tag runs and metadata in empty
+dense groups.
+
+The two scans may accept bad inner framing in unread Info or DenseInfo,
+including bad packed varints, duplicate packed fields or column length
+mismatches inside unread DenseInfo. They may also accept oversized or
+out-of-table indices in unread tag arrays and missing key/value pairs or
+incorrect run counts in unread dense tags. These fields provide neither
+selection values nor output values. The command re-encodes retained fields
+after validating them and does no payload passthrough. Relation closure and
+member-way dependency scans can still refuse a block through full validation.
+The one-pass `--omit-referenced` route and public block construction use full
+validation.
+
 ## tags-filter and inspect tags: expression-syntax edge cases
 
 The matcher is built to match `osmium-tool/src/util.cpp::get_string_matcher`

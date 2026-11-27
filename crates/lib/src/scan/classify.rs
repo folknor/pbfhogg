@@ -24,8 +24,8 @@
 //! The first three each have a projection twin
 //! ([`parallel_project_phase`], [`parallel_project_phase_ordered`],
 //! [`parallel_project_accumulate`]) whose worker hands the caller the
-//! decompressed `BlockBuffer` to validate through its own projection on the
-//! block validator instead of a built block.
+//! decompressed `BlockBuffer` so each projection can validate the fields
+//! it needs before publishing results.
 //!
 //! - [`parallel_scan_blobs_raw`]: same shape as `parallel_classify_phase`
 //!   but the worker hands the caller `&[u8]` of decompressed blob bytes,
@@ -58,8 +58,7 @@ use crate::read::input::{InputFile, InputSource};
 /// indexdata claims (never the kind the phase wants: an unindexed blob
 /// replicated into every per-kind schedule stays claimless), and every
 /// block-decoding pool refuses the blob, after validating it, when it holds
-/// an element of another kind (`BlockBuffer::project`, for a block or a
-/// projection alike): the phase that scheduled it on the claim would drop
+/// an element of another kind: the phase that scheduled it on the claim would drop
 /// that element, and the phase that needed it never sees the blob. One
 /// compare per blob. An entry built with [`KindClaims::Unchecked`] carries
 /// no claim and nothing is checked; every `Unchecked` at a call site is a
@@ -174,7 +173,7 @@ impl ScheduledBlob {
     /// This entry's decompressed blob as a [`BlockBuffer`], refusing what
     /// contradicts the entry's enforced claim once validated. Every
     /// block-decoding pool hands its caller a block or a projection through
-    /// this, so both refuse the same blobs.
+    /// this, so the kind claim applies to both full and selective reads.
     ///
     /// [`BlockBuffer`]: crate::read::block::BlockBuffer
     #[inline]
@@ -890,11 +889,9 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 
 /// [`parallel_classify_phase`] for a caller that reads each blob through a
 /// projection rather than a block: `project` receives the blob's
-/// decompressed [`BlockBuffer`](crate::read::block::BlockBuffer), validates
-/// it with its own [`GroupProjection`](crate::read::block::GroupProjection)
-/// (`BlockBuffer::project`, the validator and kind-claim refusal block
-/// construction runs, so the same blobs are refused with the same errors),
-/// and may build the block from the validated bytes where it needs one.
+/// decompressed [`BlockBuffer`](crate::read::block::BlockBuffer) and
+/// chooses the validation its projection needs. It may build a block
+/// from fully validated bytes where it needs one.
 /// `project` also gets the blob's schedule position, for a caller that
 /// treats some blobs differently (multi-extract's passthrough candidates).
 /// Errors are located at the blob as in `parallel_classify_phase`.
@@ -1460,8 +1457,9 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
 /// [`parallel_classify_phase_ordered`] for a caller that reads each blob
 /// through a projection, as [`parallel_project_phase`] is to
 /// [`parallel_classify_phase`]: `project` receives the blob's decompressed
-/// [`BlockBuffer`](crate::read::block::BlockBuffer), validates it through
-/// `BlockBuffer::project` and builds the block only where it needs one.
+/// [`BlockBuffer`](crate::read::block::BlockBuffer). The projection
+/// chooses full validation or a selective read and builds a
+/// `PrimitiveBlock` only where it needs one.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel_project_phase_ordered<S, R: Send>(

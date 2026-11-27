@@ -62,20 +62,42 @@ Smart B counters: `extract_node_frames_encoded` 29,067,
 
 Verdict: kept. Smart wall time fell about 18 % across the interleaved
 cells. Complete-ways fell about 20 % in one pair. Denmark and Germany
-`verify extract` passed on B with bbox regions. Neither dataset had a
-polygon configured.
+`verify extract` passed on B with bbox regions before dataset polygons
+were registered.
 
-### Prepared polygon subdivision (bygg, 2026-11-27, working tree on 0d1e05fb)
+### Prepared polygon subdivision
 
 Polygon membership uses a prepared adaptive subdivision with exact fallback.
 Multi-extract uses one classifier for the region set, including bboxes. The
 subdivision bounds are set by the `REGION_SUBDIVISION_*` tunables.
 
-No dataset on bygg registers a polygon, so there is no
-`region-extract --polygon` cell against baseline `0d1e05fb`. Denmark
-`extract` and `multi-extract` verifies passed with bbox regions on the
-working tree on 0d1e05fb. Polygon timing and real-data polygon verification
-remain open.
+At `d5074628` on bygg, Denmark registers `polygon.copenhagen-concave` and
+Germany and Planet register `polygon.berlin-concave`. Both GeoJSON files
+live under `data/polygons/`. Each polygon lies inside its dataset bbox and
+has a concave outer ring with 9 vertices, a notch, and one hole.
+
+On bygg at `d5074628`, `pbfhogg-verify extract` passed on Denmark and
+Germany for both the bbox and the polygon, testing all three strategies
+against osmium. For `simple`, the documented first-member rule accounts
+for 157 relations only in pbfhogg's output on `copenhagen-concave` and
+899 on `berlin-concave`. `pbfhogg-verify multi-extract` also passed on
+both datasets with the mixed strips-plus-polygon config.
+
+Planet `region-extract --dataset planet --polygon berlin-concave --strategy simple`
+ran on bygg with `--iterations 1`, interleaving the subdivision commit
+`d64b3548` with its parent `8fa7af9e`. Rows are in run order.
+
+| Commit | Host | Wall | Run |
+|---|---|---:|---|
+| `8fa7af9e` | bygg | 53.5 s | `4e9c64fb` |
+| `d64b3548` | bygg | 52.1 s | `7c278e81` |
+| `8fa7af9e` | bygg | 50.7 s | `a8c666bb` |
+| `d64b3548` | bygg | 50.9 s | `ed72c79f` |
+
+Wall time was neutral on bygg between `8fa7af9e` and `d64b3548`, as
+expected for a 9-vertex ring whose per-point segment walk was already
+cheap. The expected payoff is on complex administrative boundaries with
+thousands of segments. No such polygon is registered on bygg.
 
 ### Complete-ways and smart read only blobs that may hold a needed ID (bygg, 2026-11-26, variant uncommitted against `4edb8193`)
 

@@ -44,6 +44,11 @@ seq = 4704
 file = "denmark-20260221-seq4705.osc.gz"
 xxhash = "ecbe8d21120d127e41ae6b1374d8cf34"
 
+# A concave ring with a notch and a hole, so verify extract and
+# multi-extract exercise the polygon path, not just the bbox.
+[bygg.datasets.denmark.polygon.copenhagen-concave]
+file = "polygons/copenhagen-concave.geojson"
+
 [bygg.datasets.denmark.snapshot.test-unsorted]
 download_date = "2026-04-28"
 
@@ -208,6 +213,9 @@ check-refs = "clean"
 check-ids = "clean"
 check-index = "clean"
 diff = { "4705" = "differs", "4706" = "differs", "4707" = "differs", "4708" = "differs", "4709" = "differs", "4710" = "differs", "4711" = "differs", "4712" = "differs" }
+
+[bygg.datasets.germany.polygon.berlin-concave]
+file = "polygons/berlin-concave.geojson"
 
 [bygg.datasets.germany.pbf.raw]
 file = "germany-20260224-seq4704.osm.pbf"
@@ -493,6 +501,9 @@ download_date = "2026-03-07"
 # Planet and europe keep the built-in getid/getparents IDs: they contain
 # Denmark, so the IDs exist (checked 2026-10-28) and history stays paired.
 bbox = "13.0,52.3,13.8,52.7"
+
+[bygg.datasets.planet.polygon.berlin-concave]
+file = "polygons/berlin-concave.geojson"
 
 [bygg.datasets.planet.pbf.indexed]
 file = "planet-20260223-reindexed.osm.pbf"

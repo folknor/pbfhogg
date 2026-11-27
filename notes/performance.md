@@ -628,10 +628,13 @@ requires ruling out completion IDs for the destination.
 
 Reported by: spatial.
 
-Register a dataset polygon on bygg, measure `region-extract --polygon`,
-and run real-data extract and multi-extract verification with polygon
-regions. The Denmark bbox results and the gap are recorded in
-`reference/performance/extract.md`.
+Real-data polygon verification passed for extract and multi-extract on
+Denmark and Germany at `d5074628` on bygg. The Planet comparison on bygg
+between `8fa7af9e` and `d64b3548` was neutral for `berlin-concave`.
+See `reference/performance/extract.md` for the results.
+
+Measure subdivision on a complex administrative boundary polygon with
+thousands of segments and on a multi-extract workload with many regions.
 
 Polygon classification still uses general element iteration on paths
 where bbox classification can consume coordinate columns. Extend those

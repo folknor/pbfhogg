@@ -1,5 +1,33 @@
 # Geocode
 
+## Planet build after parallel Pass 3 stage B reads and first partition (bygg, HEAD `f1426852`)
+
+Stage B now reads and decodes large buckets in parallel on the build host's
+executor. Positional reads decode directly into disjoint record ranges. The
+first partition uses per-chunk counts and prefix offsets, then reconstructs
+the previous cyclic swaps so tie order stays unchanged; later partitions keep
+the in-place sort. Read and partition chunks hold 64 Ki records, and their
+temporary buffers fit the existing 4 GiB batch estimate. Serial byte-equality
+oracle tests pass.
+
+Planet `geocode-build` on bygg, interleaved `--iterations 1` cells in run
+order:
+
+| Arm | Wall | Run |
+|---|---:|---|
+| A, HEAD `f1426852` | 1m28s | `d4615f50` |
+| B, working tree on `f1426852` | 1m22s | `4e5d3e23` |
+| A, HEAD `f1426852` | 1m28s | `c8cac755` |
+| B, working tree on `f1426852` | 1m22s | `c1c4bfc1` |
+
+The paired cells show about a 7% wall-time reduction. On B run `c1c4bfc1`,
+`GEOCODE_PASS3_STAGEB_FINE` took 11.6 s, down from 15.9 s at `f1426852` and
+18.7 s before the Stage B sort work. `GEOCODE_PASS3_STAGEB_COARSE` took 6.7 s,
+down from 8.0 s and 8.7 s at the same points. The largest remaining spans
+were Pass 2 at 26.7 s and Pass 3 stage A streets at 11.4 s. Across this
+geocode work, planet build time moved from 1m48s at `63e4e397` to 1m22s.
+Tier 1 passed; `pbfhogg-verify geocode` on Germany and `geocode-seam` passed.
+
 ## Planet build after parallel Pass 3 stage B sorting (bygg, HEAD `5f14f9c4`)
 
 Pass 3 stage B fine and coarse buckets now sort large record sets in parallel
@@ -27,8 +55,8 @@ against 33.5 GB on A, mostly mapped files and unchanged in effect. Tier 1
 passed, including byte equality against the serial oracle; `pbfhogg-verify
 geocode` on Germany and `geocode-seam` passed.
 
-The remaining serial work in stage B is each bucket's raw read and first
-partition. These now bound stage B.
+At this point, each bucket's raw read and first partition remained serial.
+These were later parallelized; see the current measurements above.
 
 ## Earlier planet build baseline (bygg, working tree on `63e4e397`)
 

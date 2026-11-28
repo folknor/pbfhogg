@@ -12,14 +12,19 @@
 
 use crate::geocode_index::format::BucketRecord;
 use crate::host::ExecutorRef;
-use crate::tunables::GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS;
+use crate::tunables::{
+    GEOCODE_STAGE_B_PARTITION_CHUNK_RECORDS, GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS,
+};
+
+#[path = "pass3_partition.rs"]
+mod first_partition;
 
 // Algorithm constants from ipnsort, not scheduling tunables. The latter
 // threshold is for the general small sort selected for a 16-byte record.
 const RECURSIVE_PIVOT_MIN: usize = 64;
 const SMALL_SORT_MAX: usize = 32;
 
-pub(super) fn sort_bucket(executor: ExecutorRef<'_>, entries: &mut [BucketRecord]) {
+pub(super) fn sort_bucket(executor: ExecutorRef<'_>, entries: &mut Vec<BucketRecord>) {
     if entries.len() <= 2 * GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS
         || executor.install(rayon::current_num_threads) == 1
     {
@@ -38,9 +43,23 @@ pub(super) fn sort_bucket(executor: ExecutorRef<'_>, entries: &mut [BucketRecord
         return;
     }
 
-    let limit = 2 * entries.len().ilog2();
+    let limit = 2 * entries.len().ilog2() - 1;
+    let pivot = choose_pivot(entries);
+    let mid = if entries.len() > GEOCODE_STAGE_B_PARTITION_CHUNK_RECORDS {
+        first_partition::partition(
+            executor,
+            entries,
+            pivot,
+            GEOCODE_STAGE_B_PARTITION_CHUNK_RECORDS,
+        )
+    } else {
+        partition::<false>(entries, pivot)
+    };
     // The scope owns all spawned branches and waits for them before encoding.
-    executor.scope(move |scope| quicksort(scope, entries, None, limit));
+    executor.scope(move |scope| {
+        let (right, pivot) = sort_left_partition(scope, entries, mid, None, limit);
+        quicksort(scope, right, Some(pivot), limit);
+    });
 }
 
 fn quicksort<'scope>(
@@ -66,22 +85,32 @@ fn quicksort<'scope>(
         }
 
         let mid = partition::<false>(entries, pivot);
-        let (left, rest) = entries.split_at_mut(mid);
-        let (pivot, right) = rest.split_at_mut(1);
-        let right_predecessor = Some(pivot[0].cell_id);
-        if left.len().min(right.len()) >= GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS {
-            scope.spawn(move |scope| quicksort(scope, left, predecessor, limit));
-        } else {
-            quicksort(scope, left, predecessor, limit);
-        }
+        let (right, pivot) = sort_left_partition(scope, entries, mid, predecessor, limit);
         entries = right;
-        predecessor = right_predecessor;
+        predecessor = Some(pivot);
     }
 
     // The standard library uses the stable general small sort for this
     // record type in a quicksort leaf. Its standalone call may use stable
     // insertion or a monotone shortcut at this size, with the same result.
     entries.sort_unstable_by_key(|entry| entry.cell_id);
+}
+
+fn sort_left_partition<'scope>(
+    scope: &rayon::Scope<'scope>,
+    entries: &'scope mut [BucketRecord],
+    mid: usize,
+    predecessor: Option<u64>,
+    limit: u32,
+) -> (&'scope mut [BucketRecord], u64) {
+    let (left, rest) = entries.split_at_mut(mid);
+    let (pivot, right) = rest.split_at_mut(1);
+    if left.len().min(right.len()) >= GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS {
+        scope.spawn(move |scope| quicksort(scope, left, predecessor, limit));
+    } else {
+        quicksort(scope, left, predecessor, limit);
+    }
+    (right, pivot[0].cell_id)
 }
 
 fn choose_pivot(entries: &[BucketRecord]) -> usize {
@@ -173,8 +202,10 @@ mod tests {
         let executor = Executor::for_tests();
         // Large enough for parallel partition branches, with payloads that
         // make every equal-key permutation observable.
-        let n =
-            u32::try_from(4 * GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS + 17).expect("fixture length");
+        let len = (4 * GEOCODE_STAGE_B_SORT_PAR_MIN_RECORDS)
+            .max(GEOCODE_STAGE_B_PARTITION_CHUNK_RECORDS)
+            + 17;
+        let n = u32::try_from(len).expect("fixture length");
         let mut random = 0x9e37_79b9_u32;
         for (case, keys) in [
             ("nondecreasing", (0..n).map(|i| i / 5).collect::<Vec<_>>()),

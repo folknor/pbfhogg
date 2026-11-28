@@ -1203,28 +1203,27 @@ rules at `AdminEntry`.
 
 Kind: highest-conviction query rewrite.
 
-## PERF-054 - Geocode build still has a serial pass 2 consumer and serial Pass 3 work
+## PERF-054 - Geocode build: serial Pass 2 consumer and Pass 3 stage A streets
 
 Reported by: geocode, pipeline.
 
-Pass 3 stage B fine and coarse bucket sorts now run in parallel on the build
-executor and preserve the serial sort's tie order. On bygg, interleaved planet
-cells on HEAD `5f14f9c4` and its working tree measured about 4% lower wall time
-for the working tree. Fine fell from 18.7 s to 15.9 s and coarse from 8.7 s to
-8.0 s. Full index byte equality against the serial oracle passed. See the
-[planet measurements](../reference/performance/geocode.md#planet-build-after-parallel-pass-3-stage-b-sorting-bygg-head-5f14f9c4).
+Stage B large-bucket reads and decoding, their first partition, and fine and
+coarse bucket sorts now run in parallel on the build executor. The first
+partition keeps the previous tie order, and serial byte-equality oracle tests
+pass. On bygg, interleaved planet `geocode-build` cells on HEAD `f1426852`
+and its working tree measured about 7% lower wall time for the working tree.
+Pass 2 took 26.7 s and Pass 3 stage A streets took 11.4 s in the latest B
+run. See the
+[current planet measurements](../reference/performance/geocode.md#planet-build-after-parallel-pass-3-stage-b-reads-and-first-partition-bygg-head-f1426852).
 
-Stage B still reads each raw bucket and runs its first partition serially;
-these are now the remaining bounds on the stage. Buckets are batched by
-estimated buffer use under 4 GiB, with an oversized bucket running alone.
-
-Pass 2 parallelizes node processing and way resolution, but one consumer
-still interns strings, encodes records, assigns offsets, writes geometry,
-collects interpolation metadata and inserts admin geometry. Workers could
-emit fragments keyed by source position, remap local string offsets and
-assign contiguous IDs and offsets with prefix sums. A retry needs to
-preserve equal-distance tie order, duplicate admin-way replacement and
-interpolation identities and string equality.
+The remaining Pass 3 target is stage A streets. Pass 2 parallelizes node
+processing and way resolution, but one consumer still interns strings, encodes
+records, assigns offsets, writes geometry, collects interpolation metadata
+and inserts admin geometry. Workers could emit fragments keyed by source
+position, remap local string offsets and assign contiguous IDs and offsets
+with prefix sums. A retry needs to preserve equal-distance tie order,
+duplicate admin-way replacement and interpolation identities and string
+equality.
 
 ## PERF-055 - Geocode street lookup chases references across source-ordered files
 

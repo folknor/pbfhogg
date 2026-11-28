@@ -19,7 +19,9 @@ use s2::latlng::LatLng;
 
 use crate::tunables::{
     ADMIN_CELL_COUNT_BUDGET, GEOCODE_ADDR_CHUNK, GEOCODE_INTERP_CHUNK, GEOCODE_NUM_BUCKETS,
-    GEOCODE_STAGE_B_BATCH_BYTES, GEOCODE_STAGE_B_CHUNK_RECORDS, GEOCODE_STREET_CHUNK,
+    GEOCODE_STAGE_B_BATCH_BYTES, GEOCODE_STAGE_B_CHUNK_RECORDS,
+    GEOCODE_STAGE_B_PARTITION_CHUNK_RECORDS, GEOCODE_STAGE_B_READ_CHUNK_RECORDS,
+    GEOCODE_STREET_CHUNK,
 };
 
 use super::Result;
@@ -27,6 +29,8 @@ use super::admin::AssembledPolygon;
 use super::cover::{Vertex, cover_segment};
 use super::pass2::SlimInterpWay;
 use crate::error::Error;
+use crate::host::ExecutorRef;
+use crate::read::read_buf::ReadBuf;
 use crate::scratch::{ScratchFile, ScratchPath, ScratchSubdir};
 
 use super::super::format::*;
@@ -771,6 +775,7 @@ pub(super) fn bucketed_cell_assignment_fused(
 fn read_bucket(
     scratch: &crate::scratch::RunScratch,
     bucket_path: &ScratchPath,
+    executor: Option<ExecutorRef<'_>>,
 ) -> Result<Vec<BucketRecord>> {
     let mut file = match crate::scratch::open(bucket_path) {
         Ok(file) => file,
@@ -782,13 +787,28 @@ fn read_bucket(
             )));
         }
     };
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut data).map_err(|e| {
+    let read_error = |e| {
         Error::from(e).context(format!(
             "failed to read scratch bucket {}",
             bucket_path.display()
         ))
-    })?;
+    };
+    // The run owns these files and Stage A has closed the last writer.
+    // Keep the whole-file read for partial tails and unavailable lengths
+    // so the existing read/parse diagnostics still apply.
+    let parallel = executor.and_then(|executor| {
+        let bytes = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let records = bytes / BucketRecord::SIZE;
+        (records > GEOCODE_STAGE_B_READ_CHUNK_RECORDS && bytes.is_multiple_of(BucketRecord::SIZE))
+            .then_some((executor, records))
+    });
+    let mut data = Vec::new();
+    let entries = if let Some((executor, records)) = parallel {
+        Some(read_bucket_chunks(file.as_file(), records, executor).map_err(read_error)?)
+    } else {
+        std::io::Read::read_to_end(&mut file, &mut data).map_err(read_error)?;
+        None
+    };
     drop(file);
     // Freed as soon as it is read to give the space back; the tree itself is
     // removed by the caller afterwards.
@@ -798,7 +818,35 @@ fn read_bucket(
             bucket_path.display()
         ))
     })?;
-    parse_bucket_file(&data)
+    entries.map_or_else(|| parse_bucket_file(&data), Ok)
+}
+
+/// Read whole packed records at fixed offsets and decode straight into the
+/// corresponding output ranges. A job holds one raw chunk at a time.
+fn read_bucket_chunks(
+    file: &File,
+    records: usize,
+    executor: ExecutorRef<'_>,
+) -> std::io::Result<Vec<BucketRecord>> {
+    let mut entries: Vec<BucketRecord> = Vec::with_capacity(records);
+    executor.install(|| {
+        entries.spare_capacity_mut()[..records]
+            .par_chunks_mut(GEOCODE_STAGE_B_READ_CHUNK_RECORDS)
+            .enumerate()
+            .try_for_each_init(ReadBuf::default, |buf, (i, out)| {
+                let offset = i * GEOCODE_STAGE_B_READ_CHUNK_RECORDS * BucketRecord::SIZE;
+                let raw = buf.read_exact_at(file, offset as u64, out.len() * BucketRecord::SIZE)?;
+                let (packed, _) = raw.as_chunks::<{ BucketRecord::SIZE }>();
+                for (index, slot) in out.iter_mut().enumerate() {
+                    slot.write(BucketRecord::from_bytes(&packed[index]));
+                }
+                Ok::<(), std::io::Error>(())
+            })
+    })?;
+    // SAFETY: each disjoint chunk initialized its entire output slice, and
+    // all chunks completed successfully before the executor returned.
+    unsafe { entries.set_len(records) };
+    Ok(entries)
 }
 
 /// A range of whole cells, with every list offset relative to the start of
@@ -1068,7 +1116,7 @@ fn write_cell_range(
 /// each input record can account for at most one cell row, one list count,
 /// one list entry and one temporary record reference. Allow for Vec growth
 /// (including old plus new allocations) and range metadata. The raw input
-/// bytes are gone by encoding time, and the sort partitions in place.
+/// bytes and the first partition's scratch are gone by encoding time.
 fn bucket_charge(path: &ScratchPath) -> u64 {
     let file_bytes = match std::fs::metadata(path.as_path()) {
         Ok(metadata) => metadata.len(),
@@ -1078,10 +1126,17 @@ fn bucket_charge(path: &ScratchPath) -> u64 {
         Err(_) => return u64::MAX,
     };
     let records = file_bytes.div_ceil(BucketRecord::SIZE as u64);
-    let ranges = records.div_ceil(GEOCODE_STAGE_B_CHUNK_RECORDS as u64);
+    let grain = GEOCODE_STAGE_B_CHUNK_RECORDS
+        .min(GEOCODE_STAGE_B_READ_CHUNK_RECORDS)
+        .min(GEOCODE_STAGE_B_PARTITION_CHUNK_RECORDS);
+    let ranges = records.div_ceil(grain as u64);
     let encoded = GeoCell::SIZE + size_of::<ListCount>() + SegmentRef::SIZE;
-    let per_record = size_of::<BucketRecord>() + 3 * (encoded + size_of::<&BucketRecord>());
-    // Cover the Vec minimum capacities, range descriptors and offsets.
+    let decoded = size_of::<BucketRecord>();
+    let encode_peak = decoded + 3 * (encoded + size_of::<&BucketRecord>());
+    let read_peak = decoded + 2 * BucketRecord::SIZE; // Include serial Vec growth.
+    let partition_peak = 2 * decoded + size_of::<usize>();
+    let per_record = encode_peak.max(read_peak).max(partition_peak);
+    // Cover the Vec minimum capacities, chunk descriptors and offsets.
     let range_overhead = 8 * size_of::<EncodedCells>();
     records
         .saturating_mul(per_record as u64)
@@ -1131,7 +1186,7 @@ fn run_stage_b(
             inputs[start..end]
                 .par_iter()
                 .map(|input| {
-                    let mut entries = read_bucket(scratch, input)?;
+                    let mut entries = read_bucket(scratch, input, Some(executor.borrowed()))?;
                     bucket_sort::sort_bucket(executor.borrowed(), &mut entries);
                     encode_bucket_ranges(&entries)
                 })
@@ -1174,7 +1229,7 @@ fn run_stage_b_serial(
     let mut prev_cell_id = None;
     for bucket in 0..GEOCODE_NUM_BUCKETS {
         cancel.check()?;
-        let mut entries = read_bucket(scratch, &bucket_path(bucket_dir, bucket)?)?;
+        let mut entries = read_bucket(scratch, &bucket_path(bucket_dir, bucket)?, None)?;
         entries.sort_unstable_by_key(|e| e.cell_id);
         let mut out = encode_cells(&entries)?;
         let Some((first, last)) = out.span else {
@@ -1524,6 +1579,42 @@ mod tests {
         data.pop();
         let err = parse_bucket_file(&data).expect_err("a partial tail must not be skipped");
         assert!(err.to_string().contains("partial trailing record"), "{err}");
+    }
+
+    #[test]
+    fn positional_bucket_read_matches_serial_with_a_short_final_chunk() {
+        let dir = crate::path_guard::tests::scratch();
+        let host = crate::host::Host::for_tests();
+        let scratch = crate::scratch::RunScratch::create(dir.path(), &host).expect("run scratch");
+        let buckets = scratch.create_subdir("buckets").expect("bucket directory");
+        let path = bucket_path(&buckets, 0).expect("bucket path");
+        let n = u32::try_from(2 * GEOCODE_STAGE_B_READ_CHUNK_RECORDS + 17).expect("record count");
+        let bytes: Vec<_> = mixed_records(n)
+            .into_iter()
+            .flat_map(BucketRecord::to_bytes)
+            .collect();
+        let read = |executor, partial| {
+            let mut file = crate::scratch::create_file(&path).expect("create bucket");
+            file.write_all(&bytes).expect("write bucket");
+            if partial {
+                file.write_all(&[1]).expect("write partial tail");
+            }
+            drop(file);
+            let result = read_bucket(&scratch, &path, executor);
+            assert!(!path.as_path().exists(), "read must free the scratch file");
+            result
+        };
+
+        let expected = read(None, false).expect("serial read");
+        let executor = Some(host.executor.borrowed());
+        let actual = read(executor, false).expect("positional read");
+        assert!(
+            actual == expected,
+            "positional reads must preserve file order"
+        );
+        let serial_error = read(None, true).expect_err("serial partial tail");
+        let parallel_error = read(executor, true).expect_err("partial tail with the executor");
+        assert_eq!(parallel_error.report(), serial_error.report());
     }
 
     #[test]
